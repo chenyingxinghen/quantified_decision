@@ -9,6 +9,99 @@ from technical_indicators import TechnicalIndicators
 from trend_line_analyzer import TrendLineAnalyzer
 import talib
 
+
+# ==================== 策略参数配置 ====================
+# 可根据回测结果调整这些参数
+
+# 数据周期参数
+LOOKBACK_PERIOD = 90  # 回看周期（天）
+TREND_ANALYZER_LOOKBACK = 120  # 趋势线分析回看周期（天）
+
+# 流动性猎取参数
+LIQUIDITY_SWEEP_THRESHOLD = 0.02  # 流动性扫荡阈值（2%）
+SPRING_RECOVERY_BARS = 5  # Spring恢复K线数量
+
+# 订单块参数
+ORDER_BLOCK_STRENGTH = 1.5  # 订单块成交量强度倍数
+ORDER_BLOCK_BREAKTHROUGH = 0.02  # 突破幅度（2%）
+ORDER_BLOCK_DISTANCE = 0.03  # 订单块回踩距离（3%）
+
+# FVG参数
+FVG_MIN_GAP_RATIO = 0.001  # FVG最小缺口比例（0.1%）
+FVG_MAX_FILLED = 0.5  # FVG最大回填比例（50%）
+FVG_DISTANCE = 0.05  # FVG距离阈值（5%）
+
+# 均线参数
+TREND_MA_LONG_PERIOD = 90  # 长期均线周期
+TREND_MA_MID_PERIOD = 30  # 中期均线周期
+TREND_MA_SHORT_PERIOD = 5  # 短期均线周期
+
+# 趋势判断参数
+TREND_MA_LONG_SLOPE_LOOKBACK = 20  # 长期均线斜率回看天数
+TREND_MA_MID_SLOPE_LOOKBACK = 10  # 中期均线斜率回看天数
+TREND_MA_SHORT_SLOPE_LOOKBACK = 3  # 短期均线斜率回看天数
+TREND_PRICE_VS_LONG_TOLERANCE = -0.03  # 价格相对长期均线容差（-3%）
+
+# 成交量参数
+VOLUME_SURGE_RATIO = 1.2  # 成交量放大倍数
+VOLUME_SHRINK_RATIO = 0.8  # 成交量萎缩倍数
+
+# ATR参数
+ATR_PERIOD = 10  # ATR计算周期
+ATR_STOP_MULTIPLIER = 1.5  # ATR止损倍数
+ATR_TARGET_MULTIPLIER = 3  # ATR目标倍数
+
+# 入场时机参数
+ENTRY_MAX_DAILY_RETURN = 0.03  # 最大当日涨幅（3%）
+ENTRY_MIN_DISTANCE_FROM_HIGH = 0.03  # 距离高点最小距离（3%）
+ENTRY_MAX_CONSECUTIVE_RISES = 3  # 最大连续上涨天数
+ENTRY_MAX_VOLUME_RATIO = 3.0  # 最大成交量倍数
+ENTRY_MAX_DISTANCE_FROM_SUPPORT = 0.08  # 距离支撑最大距离（8%）
+
+# 止损和目标参数
+MIN_RISK_REWARD_RATIO = 1.5  # 最小风险收益比
+TARGET_RISK_MULTIPLIER = 2.5  # 目标风险倍数
+TARGET_PROFIT_PCT = 0.08  # 目标收益百分比（8%）
+STOP_LOSS_MIN_PCT = 0.03  # 最小止损百分比（3%）
+STOP_LOSS_MAX_PCT = 0.06  # 最大止损百分比（6%）
+
+# 强趋势止损参数
+STRONG_TREND_THRESHOLD = 60  # 强趋势阈值
+STRONG_TREND_STOP_MIN = 0.94  # 强趋势最小止损（6%）
+STRONG_TREND_STOP_MAX = 0.96  # 强趋势最大止损（4%）
+WEAK_TREND_STOP_MIN = 0.96  # 弱趋势最小止损（4%）
+WEAK_TREND_STOP_MAX = 0.98  # 弱趋势最大止损（2%）
+
+# 置信度阈值
+MIN_CONFIDENCE = 80  # 最低置信度要求
+CONFIDENCE_STRONG_BUY = 85  # 强买入信号置信度
+CONFIDENCE_BUY = 70  # 买入信号置信度
+
+# 趋势线参数
+MIN_ENTRY_QUALITY = 85  # 最低入场质量要求
+MIN_TREND_STRENGTH = 75  # 最低趋势强度要求
+
+# 趋势强度评分阈值
+TREND_STRENGTH_STRONG = 70  # 强趋势阈值
+TREND_STRENGTH_MODERATE = 50  # 中等趋势阈值
+TREND_STRENGTH_WEAK = 40  # 弱趋势阈值
+
+# 看空信号参数
+BEARISH_MA_BREAK_THRESHOLD = 0.98  # 跌破均线阈值（2%）
+BEARISH_MIN_CONFIDENCE = 50  # 看空信号最低置信度
+BEARISH_VOLUME_SURGE = 2.0  # 看空成交量放大倍数
+
+# RSI参数
+RSI_PERIOD = 14  # RSI计算周期
+RSI_OVERSOLD = 30  # RSI超卖阈值
+RSI_OVERBOUGHT = 70  # RSI超买阈值
+RSI_GOOD_RANGE_MIN = 40  # RSI良好区间下限
+RSI_GOOD_RANGE_MAX = 65  # RSI良好区间上限
+RSI_VERY_OVERBOUGHT = 75  # RSI极度超买阈值
+
+# ======================================================
+
+
 class SMCLiquidityStrategy:
     """
     SMC策略V2 - 核心改进点：
@@ -22,25 +115,25 @@ class SMCLiquidityStrategy:
     def __init__(self):
         self.data_fetcher = DataFetcher()
         self.tech_indicators = TechnicalIndicators()
-        self.trend_analyzer = TrendLineAnalyzer(lookback_days=120)  # 使用6个月历史数据
+        self.trend_analyzer = TrendLineAnalyzer(lookback_days=TREND_ANALYZER_LOOKBACK)
         
-        # 策略参数
+        # 策略参数（保留用于向后兼容，但使用全局常量）
         self.params = {
-            'lookback_period': 90,
-            'liquidity_sweep_threshold': 0.02,
-            'spring_recovery_bars': 5,
-            'order_block_strength': 1.5,
-            'fvg_min_gap_ratio': 0.001,
+            'lookback_period': LOOKBACK_PERIOD,
+            'liquidity_sweep_threshold': LIQUIDITY_SWEEP_THRESHOLD,
+            'spring_recovery_bars': SPRING_RECOVERY_BARS,
+            'order_block_strength': ORDER_BLOCK_STRENGTH,
+            'fvg_min_gap_ratio': FVG_MIN_GAP_RATIO,
             
-            'trend_ma_long_period': 60,
-            'trend_ma_mid_period': 20,
-            'trend_ma_short_period': 5,  # 短均线周期'
+            'trend_ma_long_period': TREND_MA_LONG_PERIOD,
+            'trend_ma_mid_period': TREND_MA_MID_PERIOD,
+            'trend_ma_short_period': TREND_MA_SHORT_PERIOD,
             
-            'volume_surge_ratio': 1.2,
-            'atr_period': 10,
-            'min_entry_quality': 85,   # 最低入场质量要求
-            'min_confidence':80,       # 默认70
-            'min_trend_strength': 75,  # 最低趋势强度要求（新增）
+            'volume_surge_ratio': VOLUME_SURGE_RATIO,
+            'atr_period': ATR_PERIOD,
+            'min_entry_quality': MIN_ENTRY_QUALITY,
+            'min_confidence': MIN_CONFIDENCE,
+            'min_trend_strength': MIN_TREND_STRENGTH,
         }
     
     def screen_stock(self, stock_code):
@@ -60,14 +153,14 @@ class SMCLiquidityStrategy:
         try:
             data = self.data_fetcher.get_stock_data(stock_code, days=300)
             
-            if len(data) < 60:
+            if len(data) < TREND_MA_LONG_PERIOD:
                 return None
             
             current_price = data['close'].iloc[-1]
             
             # 计算ATR
             atr = talib.ATR(data['high'].values, data['low'].values, 
-                        data['close'].values, timeperiod=self.params['atr_period'])[-1]
+                        data['close'].values, timeperiod=ATR_PERIOD)[-1]
             
             # ========== 第一步：必须条件检查 ==========
             
@@ -79,12 +172,12 @@ class SMCLiquidityStrategy:
             # 2. 趋势线分析（新增）- 放宽条件
             trend_analysis = self.trend_analyzer.analyze(data)
             
-            # 入场质量必须 >= min_entry_quality（默认0，完全放开）
-            if trend_analysis['entry_quality'] < self.params['min_entry_quality']:
+            # 入场质量必须 >= MIN_ENTRY_QUALITY
+            if trend_analysis['entry_quality'] < MIN_ENTRY_QUALITY:
                 return None
             
-            # 趋势强度必须 >= min_trend_strength（默认0，完全放开）
-            if trend_analysis['trend_strength'] < self.params['min_trend_strength']:
+            # 趋势强度必须 >= MIN_TREND_STRENGTH
+            if trend_analysis['trend_strength'] < MIN_TREND_STRENGTH:
                 return None
             
             # 只过滤明显在通道上方的情况（放宽阻力位检查）
@@ -137,8 +230,8 @@ class SMCLiquidityStrategy:
                 timing_check, trend_analysis, data
             )
             
-            # 置信度必须 >= min_confidence（默认0，完全放开）
-            if confidence_score < self.params['min_confidence']:
+            # 置信度必须 >= MIN_CONFIDENCE
+            if confidence_score < MIN_CONFIDENCE:
                 return None
             
             # ========== 第三步：计算止损和目标 ==========
@@ -149,12 +242,12 @@ class SMCLiquidityStrategy:
             
             target = self._calculate_target(current_price, stop_loss, atr)
             
-            # 5. 风险收益比必须 >= 1.5:1（放宽）
+            # 5. 风险收益比必须 >= MIN_RISK_REWARD_RATIO
             risk = current_price - stop_loss
             reward = target - current_price
             risk_reward_ratio = reward / risk if risk > 0 else 0
             
-            if risk_reward_ratio < 1.5:
+            if risk_reward_ratio < MIN_RISK_REWARD_RATIO:
                 return None  # 风险收益比不够，过滤
             
             # ========== 第四步：生成信号和详细说明 ==========
@@ -165,9 +258,9 @@ class SMCLiquidityStrategy:
             )
             
             # 信号分级
-            if confidence_score >= 85 and len(core_signals) >= 2 and trend_analysis['entry_quality'] >= 80:
+            if confidence_score >= CONFIDENCE_STRONG_BUY and len(core_signals) >= 2 and trend_analysis['entry_quality'] >= 80:
                 signal = 'strong_buy'
-            elif confidence_score >= 70:
+            elif confidence_score >= CONFIDENCE_BUY:
                 signal = 'buy'
             else:
                 signal = 'watch'
@@ -209,33 +302,33 @@ class SMCLiquidityStrategy:
         4. 反弹识别：区分趋势转换和短期反弹
         5. 趋势强度评分：综合评估趋势质量
         """
-        if len(data) < self.params['trend_ma_long_period']:
+        if len(data) < TREND_MA_LONG_PERIOD:
             return {'is_uptrend': False, 'trend_strength': 0}
         
         # 计算三条均线
-        ma_long = talib.SMA(data['close'].values, timeperiod=self.params['trend_ma_long_period'])
-        ma_mid = talib.SMA(data['close'].values, timeperiod=self.params['trend_ma_mid_period'])
-        ma_short = talib.SMA(data['close'].values, timeperiod=self.params['trend_ma_short_period'])
+        ma_long = talib.SMA(data['close'].values, timeperiod=TREND_MA_LONG_PERIOD)
+        ma_mid = talib.SMA(data['close'].values, timeperiod=TREND_MA_MID_PERIOD)
+        ma_short = talib.SMA(data['close'].values, timeperiod=TREND_MA_SHORT_PERIOD)
         current_price = data['close'].iloc[-1]
         
         # ========== 第一步：大趋势验证（长期均线） ==========
         
         # 长期均线斜率（必须向上）
-        ma_long_slope = (ma_long[-1] - ma_long[-20]) / ma_long[-20] if ma_long[-20] > 0 else 0
+        ma_long_slope = (ma_long[-1] - ma_long[-TREND_MA_LONG_SLOPE_LOOKBACK]) / ma_long[-TREND_MA_LONG_SLOPE_LOOKBACK] if ma_long[-TREND_MA_LONG_SLOPE_LOOKBACK] > 0 else 0
         long_trend_up = ma_long_slope > 0  # 长期趋势向上
         
         # 价格相对长期均线位置
         price_vs_long = (current_price - ma_long[-1]) / ma_long[-1]
-        above_long_ma = price_vs_long > -0.03  # 允许轻微跌破3%
+        above_long_ma = price_vs_long > TREND_PRICE_VS_LONG_TOLERANCE
         
         # ========== 第二步：多周期一致性检查 ==========
         
         # 中期均线斜率
-        ma_mid_slope = (ma_mid[-1] - ma_mid[-10]) / ma_mid[-10] if ma_mid[-10] > 0 else 0
+        ma_mid_slope = (ma_mid[-1] - ma_mid[-TREND_MA_MID_SLOPE_LOOKBACK]) / ma_mid[-TREND_MA_MID_SLOPE_LOOKBACK] if ma_mid[-TREND_MA_MID_SLOPE_LOOKBACK] > 0 else 0
         mid_trend_up = ma_mid_slope > -0.01  # 允许轻微下降
         
         # 短期均线斜率
-        ma_short_slope = (ma_short[-1] - ma_short[-3]) / ma_short[-3] if ma_short[-3] > 0 else 0
+        ma_short_slope = (ma_short[-1] - ma_short[-TREND_MA_SHORT_SLOPE_LOOKBACK]) / ma_short[-TREND_MA_SHORT_SLOPE_LOOKBACK] if ma_short[-TREND_MA_SHORT_SLOPE_LOOKBACK] > 0 else 0
         short_trend_up = ma_short_slope > -0.02  # 短期允许更大波动
         
         # 均线排列（多头排列）
@@ -683,12 +776,12 @@ class SMCLiquidityStrategy:
         
         # 条件1：当日涨幅
         daily_return = (current_bar['close'] - prev_close) / prev_close
-        condition1 = daily_return < 0.03
+        condition1 = daily_return < ENTRY_MAX_DAILY_RETURN
         
         # 条件2：距离高点
         recent_high = recent_data['high'].max()
         distance_from_high = (recent_high - current_price) / recent_high
-        condition2 = distance_from_high >= 0.03
+        condition2 = distance_from_high >= ENTRY_MIN_DISTANCE_FROM_HIGH
         
         # 条件3：连续大涨检查
         consecutive_rises = 0
@@ -699,18 +792,18 @@ class SMCLiquidityStrategy:
                     consecutive_rises += 1
                 else:
                     break
-        condition3 = consecutive_rises < 3
+        condition3 = consecutive_rises < ENTRY_MAX_CONSECUTIVE_RISES
         
         # 条件4：成交量
         current_volume = data['volume'].iloc[-1]
         avg_volume = recent_data['volume'].mean()
         volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
-        condition4 = volume_ratio < 3.0
+        condition4 = volume_ratio < ENTRY_MAX_VOLUME_RATIO
         
         # 条件5：距离支撑
         recent_low = recent_data['low'].min()
         distance_from_support = (current_price - recent_low) / recent_low
-        condition5 = distance_from_support < 0.08
+        condition5 = distance_from_support < ENTRY_MAX_DISTANCE_FROM_SUPPORT
         
         is_good = condition1 and condition2 and condition3 and condition4 and condition5
         
@@ -841,9 +934,9 @@ class SMCLiquidityStrategy:
             # RSI
             if len(indicators['rsi']) > 0:
                 rsi = indicators['rsi'][-1]
-                if 40 < rsi < 65:
+                if RSI_GOOD_RANGE_MIN < rsi < RSI_GOOD_RANGE_MAX:
                     confidence += 5
-                elif rsi > 75:
+                elif rsi > RSI_VERY_OVERBOUGHT:
                     confidence -= 5
             
             # MACD
@@ -895,20 +988,20 @@ class SMCLiquidityStrategy:
             # print(f"趋势强度: {trend_strength:.0f}, 止损缓冲: {stop_buffer*100:.1f}%")
         
         # ATR止损
-        stop_candidates.append(current_price - atr * 1.5)
+        stop_candidates.append(current_price - atr * ATR_STOP_MULTIPLIER)
         
         # 选择最低的止损位（止损必须低于当前价格）
         stop_loss = min(stop_candidates) if stop_candidates else current_price * 0.97
         
         # 根据趋势强度调整最终止损范围
-        if trend_analysis.get('trend_strength', 0) >= 60:
+        if trend_analysis.get('trend_strength', 0) >= STRONG_TREND_THRESHOLD:
             # 强趋势：允许4-6%的止损空间
-            min_stop = current_price * 0.94
-            max_stop = current_price * 0.96
+            min_stop = current_price * STRONG_TREND_STOP_MIN
+            max_stop = current_price * STRONG_TREND_STOP_MAX
         else:
             # 弱趋势：保持2-4%的止损空间
-            min_stop = current_price * 0.96
-            max_stop = current_price * 0.98
+            min_stop = current_price * WEAK_TREND_STOP_MIN
+            max_stop = current_price * WEAK_TREND_STOP_MAX
         
         # 确保止损在合理范围内且低于当前价格
         stop_loss = min(stop_loss, max_stop)
@@ -924,14 +1017,14 @@ class SMCLiquidityStrategy:
         """计算目标价"""
         risk = current_price - stop_loss
         
-        # 目标：至少2.5倍风险
-        target1 = current_price + risk * 2.5
+        # 目标：至少TARGET_RISK_MULTIPLIER倍风险
+        target1 = current_price + risk * TARGET_RISK_MULTIPLIER
         
-        # 或3倍ATR
-        target2 = current_price + atr * 3
+        # 或ATR_TARGET_MULTIPLIER倍ATR
+        target2 = current_price + atr * ATR_TARGET_MULTIPLIER
         
-        # 或8%收益
-        target3 = current_price * 1.08
+        # 或TARGET_PROFIT_PCT收益
+        target3 = current_price * (1 + TARGET_PROFIT_PCT)
         
         return max(target1, target2, target3)
     
@@ -949,16 +1042,16 @@ class SMCLiquidityStrategy:
         if trend_strength >= 80:
             strength_emoji = "🔥"
             strength_desc = "极强"
-        elif trend_strength >= 70:
+        elif trend_strength >= TREND_STRENGTH_STRONG:
             strength_emoji = "💪"
             strength_desc = "强"
         elif trend_strength >= 60:
             strength_emoji = "👍"
             strength_desc = "较强"
-        elif trend_strength >= 50:
+        elif trend_strength >= TREND_STRENGTH_MODERATE:
             strength_emoji = "👌"
             strength_desc = "中等"
-        elif trend_strength >= 40:
+        elif trend_strength >= TREND_STRENGTH_WEAK:
             strength_emoji = "⚠️"
             strength_desc = "弱"
         else:
@@ -1091,11 +1184,11 @@ class SMCLiquidityStrategy:
             ma30 = talib.SMA(data['close'].values, timeperiod=30)
             ma50 = talib.SMA(data['close'].values, timeperiod=50) if len(data) >= 50 else None
             
-            if current_price < ma30[-1] * 0.98:  # 跌破MA30超过2%
+            if current_price < ma30[-1] * BEARISH_MA_BREAK_THRESHOLD:  # 跌破MA30超过2%
                 reasons.append('跌破MA30')
                 confidence += 25
             
-            if ma50 is not None and current_price < ma50[-1] * 0.98:  # 跌破MA50超过2%
+            if ma50 is not None and current_price < ma50[-1] * BEARISH_MA_BREAK_THRESHOLD:  # 跌破MA50超过2%
                 reasons.append('跌破MA50')
                 confidence += 30
             
@@ -1141,21 +1234,21 @@ class SMCLiquidityStrategy:
                     confidence += 15
             
             # RSI超买后回落
-            rsi = talib.RSI(data['close'].values, timeperiod=14)
+            rsi = talib.RSI(data['close'].values, timeperiod=RSI_PERIOD)
             if len(rsi) >= 2:
-                if rsi[-2] > 70 and rsi[-1] < 65:  # 从超买区回落
+                if rsi[-2] > RSI_OVERBOUGHT and rsi[-1] < 65:  # 从超买区回落
                     reasons.append('RSI超买回落')
                     confidence += 15
             
             # 4. 成交量异常放大的阴线
             avg_volume = data['volume'].tail(20).mean()
             if (current_bar['close'] < current_bar['open'] and  # 阴线
-                current_bar['volume'] > avg_volume * 2):  # 成交量放大2倍
+                current_bar['volume'] > avg_volume * BEARISH_VOLUME_SURGE):  # 成交量放大
                 reasons.append('放量下跌')
                 confidence += 20
             
-            # 判断是否检测到看空信号（置信度>=50即认为有看空信号）
-            detected = confidence >= 50
+            # 判断是否检测到看空信号（置信度>=BEARISH_MIN_CONFIDENCE即认为有看空信号）
+            detected = confidence >= BEARISH_MIN_CONFIDENCE
             
             return {
                 'detected': detected,

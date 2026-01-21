@@ -4,9 +4,8 @@ import pandas as pd
 import sqlite3
 import time
 from datetime import datetime, timedelta
-from config import DATABASE_PATH
+from config import DATABASE_PATH,YEARS
 
-YEARS=3
 
 import os
 

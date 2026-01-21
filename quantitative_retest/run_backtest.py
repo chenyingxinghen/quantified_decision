@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from backtest_engine import BacktestEngine
 from performance_analyzer import PerformanceAnalyzer, ReportGenerator
-
+from config import YEARS
 
 def main():
     """主函数"""
@@ -31,7 +31,7 @@ def main():
     
     # 设置回测时间范围（默认近3年）
     end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=365*YEARS)).strftime('%Y-%m-%d')
     
     print(f"\n默认回测时间范围: {start_date} 至 {end_date}")
     custom_range = input("是否自定义时间范围？(y/n): ").strip().lower()

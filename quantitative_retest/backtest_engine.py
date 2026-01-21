@@ -329,17 +329,17 @@ class StrategyInterface:
             
             elif strategy_name == 'wyckoff_spring':
                 # 威科夫策略分析，使用全部历史数据
-                from advanced_strategies import AdvancedTradingStrategies
+                from wyckoff_strategy import WyckoffStrategy
                 
                 def mock_get_data(symbol, days=None):
                     return stock_data.copy()
                 
                 # 创建策略实例并替换数据获取方法
-                if not hasattr(self, 'advanced_strategies'):
-                    self.advanced_strategies = AdvancedTradingStrategies()
+                if not hasattr(self, 'wyckoff_strategy'):
+                    self.wyckoff_strategy = WyckoffStrategy()
                 
-                self.advanced_strategies.data_fetcher.get_stock_data = mock_get_data
-                result = self.advanced_strategies.wyckoff_accumulation_strategy(stock_code)
+                self.wyckoff_strategy.data_fetcher.get_stock_data = mock_get_data
+                result = self.wyckoff_strategy.wyckoff_accumulation_strategy(stock_code)
                 return result
             
             return None

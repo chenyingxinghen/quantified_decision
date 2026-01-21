@@ -3,6 +3,7 @@ import os
 
 # 数据库配置
 DATABASE_PATH = "stock_data.db"
+YEARS=5
 
 # 市场配置
 DEFAULT_MARKETS = ['sh', 'sz_main']  # 默认只初始化上证和深圳主板
@@ -31,9 +32,9 @@ TECHNICAL_PARAMS = {
 
 # 选股条件
 SELECTION_CRITERIA = {
-    'min_turnover_rate': 2,         # 最小换手率（3%）
-    'min_market_cap': 80,           # 最小市值（80亿）
-    'max_pe': 50,                   # 最大市盈率
+    'min_turnover_rate': 1,         # 最小换手率（1%）
+    'min_market_cap': 50,           # 最小市值（80亿）
+    'max_pe': 80,                   # 最大市盈率
     'min_price': 1,                 # 最小股价
-    'max_price': 100,               # 最大股价
+    'max_price': 10,               # 最大股价
 }

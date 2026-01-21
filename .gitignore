@@ -1,7 +1,17 @@
-__pycache__/*
-.idea/*
-.kiro/*
-quantitative_retest/__pycache__/__init__.cpython-313.pyc
-quantitative_retest/__pycache__/backtest_engine.cpython-313.pyc
-quantitative_retest/__pycache__/performance_analyzer.cpython-313.pyc
+__pycache__/
+.idea/
+.kiro/
+.venv/
+*.pyc
+*.pyo
+*.pyd
+*.csv
+*.png
 stock_data.db
+quantitative_retest/stock_data.db
+
+# 回测生成的文件
+backtest_*.csv
+backtest_*.png
+screening_*.csv
+strategy_*.csv

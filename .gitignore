@@ -1,0 +1,7 @@
+__pycache__/*
+.idea/*
+.kiro/*
+quantitative_retest/__pycache__/__init__.cpython-313.pyc
+quantitative_retest/__pycache__/backtest_engine.cpython-313.pyc
+quantitative_retest/__pycache__/performance_analyzer.cpython-313.pyc
+stock_data.db

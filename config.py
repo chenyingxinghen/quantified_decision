@@ -3,7 +3,7 @@ import os
 
 # 数据库配置
 DATABASE_PATH = "stock_data.db"
-YEARS=5
+YEARS=10
 
 # 市场配置
 DEFAULT_MARKETS = ['sh', 'sz_main']  # 默认只初始化上证和深圳主板
@@ -13,10 +13,20 @@ DEFAULT_MARKETS = ['sh', 'sz_main']  # 默认只初始化上证和深圳主板
 # 'bj' - 北京证券交易所 (8xxxxx, 4xxxxx)
 
 # 数据更新配置
+USE_PROXY = True  # 是否使用
+PROXY_URL = "https://dps.kdlapi.com/api/getdps/?secret_id=o7pz3us9m7b2j7uktfek&signature=08umtmh5irm6geunoul9gt6i7i8lv07b&num={num}&format=json&sep=1&f_auth=1&generateType=1"
 UPDATE_INTERVAL = 300  # 5分钟更新一次
+# 临时断点
+TEMP_ORDER=0
+#是否补充历史数据
+BACKDATE=False
+
 MARKET_OPEN_TIME = "09:30"
 MARKET_CLOSE_TIME = "15:00"
 INCREMENTAL_UPDATE = True  # 默认使用增量更新
+WORKERS_NUM = 4
+QUEST_INTERVAL = 0.5 # 接口请求间隔
+RETRY_DELAYS = [1, 10, 60, 600, 1800, 3600]  # 重试延迟时间（秒）10分钟,30分钟, 60分钟
 
 # 技术指标参数
 TECHNICAL_PARAMS = {

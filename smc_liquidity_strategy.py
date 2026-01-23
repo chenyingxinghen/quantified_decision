@@ -14,12 +14,12 @@ import talib
 # 可根据回测结果调整这些参数
 
 # 数据周期参数
-LOOKBACK_PERIOD = 90  # 回看周期（天）
+LOOKBACK_PERIOD = 300  # 回看周期（天）
 TREND_ANALYZER_LOOKBACK = 120  # 趋势线分析回看周期（天）
 
 # 流动性猎取参数
 LIQUIDITY_SWEEP_THRESHOLD = 0.02  # 流动性扫荡阈值（2%）
-SPRING_RECOVERY_BARS = 5  # Spring恢复K线数量
+SPRING_RECOVERY_BARS = 3  # Spring恢复K线数量
 
 # 订单块参数
 ORDER_BLOCK_STRENGTH = 1.5  # 订单块成交量强度倍数
@@ -34,7 +34,7 @@ FVG_DISTANCE = 0.05  # FVG距离阈值（5%）
 # 均线参数
 TREND_MA_LONG_PERIOD = 90  # 长期均线周期
 TREND_MA_MID_PERIOD = 30  # 中期均线周期
-TREND_MA_SHORT_PERIOD = 5  # 短期均线周期
+TREND_MA_SHORT_PERIOD = 10  # 短期均线周期
 
 # 趋势判断参数
 TREND_MA_LONG_SLOPE_LOOKBACK = 20  # 长期均线斜率回看天数
@@ -53,13 +53,13 @@ ATR_TARGET_MULTIPLIER = 3  # ATR目标倍数
 
 # 入场时机参数
 ENTRY_MAX_DAILY_RETURN = 0.03  # 最大当日涨幅（3%）
-ENTRY_MIN_DISTANCE_FROM_HIGH = 0.03  # 距离高点最小距离（3%）
+ENTRY_MIN_DISTANCE_FROM_HIGH = 0.05  # 距离高点最小距离（3%）
 ENTRY_MAX_CONSECUTIVE_RISES = 3  # 最大连续上涨天数
-ENTRY_MAX_VOLUME_RATIO = 3.0  # 最大成交量倍数
+ENTRY_MAX_VOLUME_RATIO = 2.0  # 最大成交量倍数
 ENTRY_MAX_DISTANCE_FROM_SUPPORT = 0.08  # 距离支撑最大距离（8%）
 
 # 止损和目标参数
-MIN_RISK_REWARD_RATIO = 1.5  # 最小风险收益比
+MIN_RISK_REWARD_RATIO = 2  # 最小风险收益比
 TARGET_RISK_MULTIPLIER = 2.5  # 目标风险倍数
 TARGET_PROFIT_PCT = 0.08  # 目标收益百分比（8%）
 STOP_LOSS_MIN_PCT = 0.03  # 最小止损百分比（3%）
@@ -79,7 +79,7 @@ CONFIDENCE_BUY = 70  # 买入信号置信度
 
 # 趋势线参数
 MIN_ENTRY_QUALITY = 85  # 最低入场质量要求
-MIN_TREND_STRENGTH = 75  # 最低趋势强度要求
+MIN_TREND_STRENGTH = 80  # 最低趋势强度要求
 
 # 趋势强度评分阈值
 TREND_STRENGTH_STRONG = 70  # 强趋势阈值
@@ -87,8 +87,8 @@ TREND_STRENGTH_MODERATE = 50  # 中等趋势阈值
 TREND_STRENGTH_WEAK = 40  # 弱趋势阈值
 
 # 看空信号参数
-BEARISH_MA_BREAK_THRESHOLD = 0.98  # 跌破均线阈值（2%）
-BEARISH_MIN_CONFIDENCE = 50  # 看空信号最低置信度
+BEARISH_MA_BREAK_THRESHOLD = 0.96  # 跌破均线阈值（2%）
+BEARISH_MIN_CONFIDENCE = 60  # 看空信号最低置信度
 BEARISH_VOLUME_SURGE = 2.0  # 看空成交量放大倍数
 
 # RSI参数

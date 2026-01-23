@@ -15,3 +15,5 @@ backtest_*.csv
 backtest_*.png
 screening_*.csv
 strategy_*.csv
+stock_data.db-shm
+stock_data.db-wal

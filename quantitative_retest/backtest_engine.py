@@ -195,7 +195,7 @@ class DataLoader:
             for future in as_completed(futures):
                 batch_result = future.result()
                 stocks_data.update(batch_result)
-                print(f"已加载 {len(stocks_data)}/{len(all_codes)} 只股票")
+        print(f"已加载 {len(stocks_data)}/{len(all_codes)} 只股票")
         
         return stocks_data
     
@@ -623,23 +623,50 @@ class BacktestEngine:
     
     def _preprocess_data(self, all_stocks_data: Dict[str, pd.DataFrame], trading_dates: List[str]):
         """
-        预处理数据：为每个交易日预先构建历史数据索引
+        预处理数据：为每个交易日预先构建历史数据索引（优化版）
         
         返回:
             dict: {date: {stock_code: row_index}} 每个日期对应的股票数据索引
         """
-        print("正在预处理数据索引...")
+        print("正在预处理数据索引（优化版）...")
         
+        # 优化1：将交易日转换为集合，加速查找
+        trading_dates_set = set(trading_dates)
+        
+        # 优化2：为每只股票预先建立日期到索引的映射
+        stock_date_indices = {}
+        for code, stock_df in all_stocks_data.items():
+            # 只为交易日范围内的数据建立索引
+            stock_df_dates = stock_df['date'].values
+            date_to_idx = {}
+            cumulative_idx = 0
+            
+            for i, date in enumerate(stock_df_dates):
+                cumulative_idx = i + 1
+                # 只记录交易日的索引
+                if date in trading_dates_set:
+                    date_to_idx[date] = cumulative_idx
+            
+            # 为每个交易日填充索引（使用最近的历史数据）
+            last_idx = 0
+            for trade_date in trading_dates:
+                if trade_date in date_to_idx:
+                    last_idx = date_to_idx[trade_date]
+                elif trade_date > stock_df_dates[0]:  # 确保交易日在股票数据范围内
+                    # 使用最近的历史索引
+                    date_to_idx[trade_date] = last_idx
+            
+            stock_date_indices[code] = date_to_idx
+        
+        # 优化3：重组为按日期索引的结构
         date_index = {}
         for date in trading_dates:
             date_index[date] = {}
-            for code, stock_df in all_stocks_data.items():
-                # 找到该日期在DataFrame中的位置
-                mask = stock_df['date'] <= date
-                if mask.any():
-                    date_index[date][code] = mask.sum()  # 记录截止到该日期的行数
+            for code, date_to_idx in stock_date_indices.items():
+                if date in date_to_idx and date_to_idx[date] > 0:
+                    date_index[date][code] = date_to_idx[date]
         
-        print(f"预处理完成，索引了 {len(trading_dates)} 个交易日")
+        print(f"预处理完成，索引了 {len(trading_dates)} 个交易日，{len(all_stocks_data)} 只股票")
         return date_index
     
     def run(self, start_date: str, end_date: str, strategy_name: str = 'liquidity_grab'):

@@ -5,7 +5,8 @@ from data_fetcher import DataFetcher
 from stock_screener import StockScreener
 from wyckoff_strategy import WyckoffStrategy
 from price_action_analyzer import PriceActionAnalyzer
-from config import UPDATE_INTERVAL, MARKET_OPEN_TIME, MARKET_CLOSE_TIME
+from config import UPDATE_INTERVAL, MARKET_OPEN_TIME, MARKET_CLOSE_TIME, QUEST_INTERVAL, TEMP_ORDER
+
 
 class QuantStockSelector:
     def __init__(self):
@@ -31,30 +32,31 @@ class QuantStockSelector:
         
         success_count = 0
         fail_count = 0
-        
         for count, (idx, stock) in enumerate(stock_list.iterrows(), 1):
-            try:
-                self.data_fetcher.update_daily_data(stock['code'], incremental=incremental)
+            if count>TEMP_ORDER:
+                try:
+                    self.data_fetcher.update_daily_data(stock['code'], incremental=incremental)
+                    success_count += 1
+                    if count%50==0:
+                        print(f"已更新 {count}/{total_stocks} 只股票")
+                    time.sleep(QUEST_INTERVAL)  # 避免请求过于频繁
+                    
+                except Exception as e:
+                    fail_count += 1
+                    print(f"更新股票 {stock['code']} 数据失败: {e}")
+                    continue
+            else:
                 success_count += 1
+                                # 进度显示
+                if count==TEMP_ORDER:
+                    print(f"已更新 {count}/{total_stocks} 只股票")
                 
-                # 进度显示
-                if count % 100 == 0:
-                    print(f"已更新 {count}/{total_stocks} 只股票 (成功: {success_count}, 失败: {fail_count})")
-                
-                time.sleep(0.1)  # 避免请求过于频繁
-                
-            except Exception as e:
-                fail_count += 1
-                print(f"更新股票 {stock['code']} 数据失败: {e}")
-                continue
-        
         print(f"[{datetime.now()}] 数据更新完成 (成功: {success_count}, 失败: {fail_count})")
     
     def run_smc_strategy(self):
         """执行SMC流动性猎取策略"""
         from smc_liquidity_strategy import SMCLiquidityStrategy
-        from config import SELECTION_CRITERIA
-        
+
         print(f"\n{'=' * 80}")
         print("SMC流动性猎取策略")
         print(f"{'=' * 80}")
@@ -169,13 +171,12 @@ class QuantStockSelector:
         print("1. 初始化股票数据（首次使用）")
         print("2. 增量更新数据")
         print("3. 全量更新数据")
-        print("4. 查看数据库状态")
         print("\n选股策略:")
-        print("5. 威科夫积累策略 (Wyckoff Spring)")
-        print("6. SMC流动性猎取策略")
-        print("7. 整合选股 (运行所有策略)")
+        print("4. 威科夫积累策略 (Wyckoff Spring)")
+        print("5. SMC流动性猎取策略")
+        print("6. 整合选股 (运行所有策略)")
         print("\n系统功能:")
-        print("8. 启动定时更新")
+        print("7. 启动定时更新")
         print("0. 退出")
         
         while True:
@@ -194,14 +195,12 @@ class QuantStockSelector:
                     if confirm == 'y':
                         self.update_data(incremental=False)
                 elif choice == "4":
-                    self.show_database_status()
-                elif choice == "5":
                     self.run_advanced_strategy("wyckoff_accumulation")
-                elif choice == "6":
+                elif choice == "5":
                     self.run_smc_strategy()
-                elif choice == "7":
+                elif choice == "6":
                     self.run_integrated_screening()
-                elif choice == "8":
+                elif choice == "7":
                     print("启动定时更新（按Ctrl+C停止）...")
                     try:
                         self.start_scheduler()

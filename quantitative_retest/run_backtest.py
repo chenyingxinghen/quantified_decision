@@ -72,7 +72,7 @@ def main():
     
     # 绘制收益率曲线
     chart_path = f"backtest_equity_curve_{strategy_name}_{timestamp}.png"
-    analyzer.plot_equity_curve(results['equity_curve'], chart_path)
+    analyzer.plot_equity_curve(results['equity_curve'], chart_path, strategy_display)
     
     print("\n" + "=" * 80)
     print("回测完成！所有结果已保存。")

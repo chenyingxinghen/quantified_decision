@@ -7,97 +7,11 @@ from datetime import datetime
 from data_fetcher import DataFetcher
 from technical_indicators import TechnicalIndicators
 from trend_line_analyzer import TrendLineAnalyzer
+from candlestick_patterns import CandlestickPatterns
 import talib
 
-
-# ==================== 策略参数配置 ====================
-# 可根据回测结果调整这些参数
-
-# 数据周期参数
-LOOKBACK_PERIOD = 300  # 回看周期（天）
-TREND_ANALYZER_LOOKBACK = 120  # 趋势线分析回看周期（天）
-
-# 流动性猎取参数
-LIQUIDITY_SWEEP_THRESHOLD = 0.02  # 流动性扫荡阈值（2%）
-SPRING_RECOVERY_BARS = 3  # Spring恢复K线数量
-
-# 订单块参数
-ORDER_BLOCK_STRENGTH = 1.5  # 订单块成交量强度倍数
-ORDER_BLOCK_BREAKTHROUGH = 0.02  # 突破幅度（2%）
-ORDER_BLOCK_DISTANCE = 0.03  # 订单块回踩距离（3%）
-
-# FVG参数
-FVG_MIN_GAP_RATIO = 0.001  # FVG最小缺口比例（0.1%）
-FVG_MAX_FILLED = 0.5  # FVG最大回填比例（50%）
-FVG_DISTANCE = 0.05  # FVG距离阈值（5%）
-
-# 均线参数
-TREND_MA_LONG_PERIOD = 90  # 长期均线周期
-TREND_MA_MID_PERIOD = 30  # 中期均线周期
-TREND_MA_SHORT_PERIOD = 10  # 短期均线周期
-
-# 趋势判断参数
-TREND_MA_LONG_SLOPE_LOOKBACK = 20  # 长期均线斜率回看天数
-TREND_MA_MID_SLOPE_LOOKBACK = 10  # 中期均线斜率回看天数
-TREND_MA_SHORT_SLOPE_LOOKBACK = 3  # 短期均线斜率回看天数
-TREND_PRICE_VS_LONG_TOLERANCE = -0.03  # 价格相对长期均线容差（-3%）
-
-# 成交量参数
-VOLUME_SURGE_RATIO = 1.2  # 成交量放大倍数
-VOLUME_SHRINK_RATIO = 0.8  # 成交量萎缩倍数
-
-# ATR参数
-ATR_PERIOD = 10  # ATR计算周期
-ATR_STOP_MULTIPLIER = 1.5  # ATR止损倍数
-ATR_TARGET_MULTIPLIER = 3  # ATR目标倍数
-
-# 入场时机参数
-ENTRY_MAX_DAILY_RETURN = 0.03  # 最大当日涨幅（3%）
-ENTRY_MIN_DISTANCE_FROM_HIGH = 0.05  # 距离高点最小距离（3%）
-ENTRY_MAX_CONSECUTIVE_RISES = 3  # 最大连续上涨天数
-ENTRY_MAX_VOLUME_RATIO = 2.0  # 最大成交量倍数
-ENTRY_MAX_DISTANCE_FROM_SUPPORT = 0.08  # 距离支撑最大距离（8%）
-
-# 止损和目标参数
-MIN_RISK_REWARD_RATIO = 2  # 最小风险收益比
-TARGET_RISK_MULTIPLIER = 2.5  # 目标风险倍数
-TARGET_PROFIT_PCT = 0.08  # 目标收益百分比（8%）
-STOP_LOSS_MIN_PCT = 0.03  # 最小止损百分比（3%）
-STOP_LOSS_MAX_PCT = 0.06  # 最大止损百分比（6%）
-
-# 强趋势止损参数
-STRONG_TREND_THRESHOLD = 60  # 强趋势阈值
-STRONG_TREND_STOP_MIN = 0.94  # 强趋势最小止损（6%）
-STRONG_TREND_STOP_MAX = 0.96  # 强趋势最大止损（4%）
-WEAK_TREND_STOP_MIN = 0.96  # 弱趋势最小止损（4%）
-WEAK_TREND_STOP_MAX = 0.98  # 弱趋势最大止损（2%）
-
-# 置信度阈值
-MIN_CONFIDENCE = 80  # 最低置信度要求
-CONFIDENCE_STRONG_BUY = 85  # 强买入信号置信度
-CONFIDENCE_BUY = 70  # 买入信号置信度
-
-# 趋势线参数
-MIN_ENTRY_QUALITY = 85  # 最低入场质量要求
-MIN_TREND_STRENGTH = 80  # 最低趋势强度要求
-
-# 趋势强度评分阈值
-TREND_STRENGTH_STRONG = 70  # 强趋势阈值
-TREND_STRENGTH_MODERATE = 50  # 中等趋势阈值
-TREND_STRENGTH_WEAK = 40  # 弱趋势阈值
-
-# 看空信号参数
-BEARISH_MA_BREAK_THRESHOLD = 0.96  # 跌破均线阈值（2%）
-BEARISH_MIN_CONFIDENCE = 60  # 看空信号最低置信度
-BEARISH_VOLUME_SURGE = 2.0  # 看空成交量放大倍数
-
-# RSI参数
-RSI_PERIOD = 14  # RSI计算周期
-RSI_OVERSOLD = 30  # RSI超卖阈值
-RSI_OVERBOUGHT = 70  # RSI超买阈值
-RSI_GOOD_RANGE_MIN = 40  # RSI良好区间下限
-RSI_GOOD_RANGE_MAX = 65  # RSI良好区间上限
-RSI_VERY_OVERBOUGHT = 75  # RSI极度超买阈值
+# 从配置文件导入所有参数
+from strategy_config import *
 
 # ======================================================
 
@@ -115,7 +29,15 @@ class SMCLiquidityStrategy:
     def __init__(self):
         self.data_fetcher = DataFetcher()
         self.tech_indicators = TechnicalIndicators()
-        self.trend_analyzer = TrendLineAnalyzer(lookback_days=TREND_ANALYZER_LOOKBACK)
+        self.trend_analyzer = TrendLineAnalyzer(
+            long_period=TREND_LINE_LONG_PERIOD,
+            short_period=TREND_LINE_SHORT_PERIOD
+        )
+        self.candlestick_detector = CandlestickPatterns()  # K线形态检测器
+        
+        # 新增：价格行为分析器（用于通用方法）
+        from price_action_analyzer import PriceActionAnalyzer
+        self.price_action_analyzer = PriceActionAnalyzer()
         
         # 策略参数（保留用于向后兼容，但使用全局常量）
         self.params = {
@@ -243,9 +165,14 @@ class SMCLiquidityStrategy:
             target = self._calculate_target(current_price, stop_loss, atr)
             
             # 5. 风险收益比必须 >= MIN_RISK_REWARD_RATIO
-            risk = current_price - stop_loss
-            reward = target - current_price
-            risk_reward_ratio = reward / risk if risk > 0 else 0
+            # 使用价格变化率计算，支持负价格
+            current_price_abs = abs(current_price)
+            if current_price_abs > 0:
+                risk_rate = abs(current_price - stop_loss) / current_price_abs
+                reward_rate = abs(target - current_price) / current_price_abs
+                risk_reward_ratio = reward_rate / risk_rate if risk_rate > 0 else 0
+            else:
+                risk_reward_ratio = 0
             
             if risk_reward_ratio < MIN_RISK_REWARD_RATIO:
                 return None  # 风险收益比不够，过滤
@@ -259,7 +186,7 @@ class SMCLiquidityStrategy:
             
             # 信号分级
             if confidence_score >= CONFIDENCE_STRONG_BUY and len(core_signals) >= 2 and trend_analysis['entry_quality'] >= 80:
-                signal = 'strong_buy'
+                signal = 'buy'
             elif confidence_score >= CONFIDENCE_BUY:
                 signal = 'buy'
             else:
@@ -293,160 +220,9 @@ class SMCLiquidityStrategy:
     
     def _check_market_structure_strict(self, data):
         """
-        多周期趋势验证 - 避免将反弹误判为上升趋势
-        
-        核心改进：
-        1. 三周期均线系统：长期(90)、中期(30)、短期(5)
-        2. 大趋势验证：长期均线必须向上
-        3. 多周期一致性：短中长期趋势方向一致
-        4. 反弹识别：区分趋势转换和短期反弹
-        5. 趋势强度评分：综合评估趋势质量
+        多周期趋势验证 - 调用 price_action_analyzer 的通用方法
         """
-        if len(data) < TREND_MA_LONG_PERIOD:
-            return {'is_uptrend': False, 'trend_strength': 0}
-        
-        # 计算三条均线
-        ma_long = talib.SMA(data['close'].values, timeperiod=TREND_MA_LONG_PERIOD)
-        ma_mid = talib.SMA(data['close'].values, timeperiod=TREND_MA_MID_PERIOD)
-        ma_short = talib.SMA(data['close'].values, timeperiod=TREND_MA_SHORT_PERIOD)
-        current_price = data['close'].iloc[-1]
-        
-        # ========== 第一步：大趋势验证（长期均线） ==========
-        
-        # 长期均线斜率（必须向上）
-        ma_long_slope = (ma_long[-1] - ma_long[-TREND_MA_LONG_SLOPE_LOOKBACK]) / ma_long[-TREND_MA_LONG_SLOPE_LOOKBACK] if ma_long[-TREND_MA_LONG_SLOPE_LOOKBACK] > 0 else 0
-        long_trend_up = ma_long_slope > 0  # 长期趋势向上
-        
-        # 价格相对长期均线位置
-        price_vs_long = (current_price - ma_long[-1]) / ma_long[-1]
-        above_long_ma = price_vs_long > TREND_PRICE_VS_LONG_TOLERANCE
-        
-        # ========== 第二步：多周期一致性检查 ==========
-        
-        # 中期均线斜率
-        ma_mid_slope = (ma_mid[-1] - ma_mid[-TREND_MA_MID_SLOPE_LOOKBACK]) / ma_mid[-TREND_MA_MID_SLOPE_LOOKBACK] if ma_mid[-TREND_MA_MID_SLOPE_LOOKBACK] > 0 else 0
-        mid_trend_up = ma_mid_slope > -0.01  # 允许轻微下降
-        
-        # 短期均线斜率
-        ma_short_slope = (ma_short[-1] - ma_short[-TREND_MA_SHORT_SLOPE_LOOKBACK]) / ma_short[-TREND_MA_SHORT_SLOPE_LOOKBACK] if ma_short[-TREND_MA_SHORT_SLOPE_LOOKBACK] > 0 else 0
-        short_trend_up = ma_short_slope > -0.02  # 短期允许更大波动
-        
-        # 均线排列（多头排列）
-        ma_alignment = ma_short[-1] > ma_mid[-1] * 0.98 and ma_mid[-1] > ma_long[-1] * 0.98
-        
-        # ========== 第三步：反弹识别机制 ==========
-        
-        # 检查是否是下降趋势中的反弹
-        is_bounce_in_downtrend = False
-        
-        if not long_trend_up:  # 长期趋势不向上
-            # 检查价格是否短期反弹
-            recent_low = data['low'].tail(10).min()
-            bounce_strength = (current_price - recent_low) / recent_low
-            
-            # 如果短期反弹超过5%但长期趋势向下，标记为反弹
-            if bounce_strength > 0.05:
-                is_bounce_in_downtrend = True
-        
-        # ========== 第四步：HH-HL结构验证 ==========
-        
-        recent_data = data.tail(30)
-        swing_highs = []
-        swing_lows = []
-        
-        for i in range(2, len(recent_data) - 2):
-            if (recent_data.iloc[i]['high'] > recent_data.iloc[i-1]['high'] and
-                recent_data.iloc[i]['high'] > recent_data.iloc[i+1]['high']):
-                swing_highs.append(recent_data.iloc[i]['high'])
-            
-            if (recent_data.iloc[i]['low'] < recent_data.iloc[i-1]['low'] and
-                recent_data.iloc[i]['low'] < recent_data.iloc[i+1]['low']):
-                swing_lows.append(recent_data.iloc[i]['low'])
-        
-        has_hh_hl = False
-        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            has_hh_hl = (swing_highs[-1] > swing_highs[-2] and 
-                        swing_lows[-1] > swing_lows[-2])
-        
-        # ========== 第五步：趋势强度评分（0-100） ==========
-        
-        trend_strength = 0
-        
-        # 1. 长期趋势方向（30分）
-        if long_trend_up:
-            if ma_long_slope > 0.05:  # 强劲上升
-                trend_strength += 30
-            elif ma_long_slope > 0.02:
-                trend_strength += 25
-            elif ma_long_slope > 0:
-                trend_strength += 20
-        
-        # 2. 多周期一致性（25分）
-        consistency_score = sum([long_trend_up, mid_trend_up, short_trend_up])
-        if consistency_score == 3:
-            trend_strength += 25
-        elif consistency_score == 2:
-            trend_strength += 15
-        elif consistency_score == 1:
-            trend_strength += 5
-        
-        # 3. 均线排列（20分）
-        if ma_alignment:
-            trend_strength += 20
-        elif ma_short[-1] > ma_mid[-1] or ma_mid[-1] > ma_long[-1]:
-            trend_strength += 10
-        
-        # 4. HH-HL结构（15分）
-        if has_hh_hl:
-            trend_strength += 15
-        
-        # 5. 价格位置（10分）
-        if price_vs_long > 0.05:  # 价格远高于长期均线
-            trend_strength += 10
-        elif price_vs_long > 0:
-            trend_strength += 7
-        elif price_vs_long > -0.03:
-            trend_strength += 3
-        
-        # 反弹惩罚：如果是下降趋势中的反弹，大幅降低强度
-        if is_bounce_in_downtrend:
-            trend_strength = min(trend_strength * 0.5, 40)  # 最多40分
-        
-        # ========== 第六步：综合判断 ==========
-        
-        # 严格的上升趋势定义：
-        # 1. 长期趋势必须向上（核心条件）
-        # 2. 至少两个周期趋势一致
-        # 3. 不是下降趋势中的反弹
-        # 4. 趋势强度 >= 40
-        
-        is_uptrend = (
-            long_trend_up and  # 长期趋势向上（必须）
-            consistency_score >= 2 and  # 至少两个周期一致
-            not is_bounce_in_downtrend and  # 不是反弹
-            trend_strength >= 40  # 趋势强度足够
-        )
-        
-        return {
-            'is_uptrend': is_uptrend,
-            'trend_strength': trend_strength,
-            'ma_long': ma_long[-1],
-            'ma_mid': ma_mid[-1],
-            'ma_short': ma_short[-1],
-            'ma_long_slope': ma_long_slope,
-            'ma_mid_slope': ma_mid_slope,
-            'ma_short_slope': ma_short_slope,
-            'long_trend_up': long_trend_up,
-            'mid_trend_up': mid_trend_up,
-            'short_trend_up': short_trend_up,
-            'consistency_score': consistency_score,
-            'ma_alignment': ma_alignment,
-            'has_hh_hl': has_hh_hl,
-            'is_bounce': is_bounce_in_downtrend,
-            'price_vs_long_pct': price_vs_long * 100,
-            'conditions_met': consistency_score + (1 if ma_alignment else 0) + (1 if has_hh_hl else 0),
-            'strength': 'strong' if trend_strength >= 70 else ('moderate' if trend_strength >= 50 else 'weak')
-        }
+        return self.price_action_analyzer.check_multi_period_trend(data,)
 
     
     def _detect_liquidity_grab_strict(self, data):
@@ -499,11 +275,18 @@ class SMCLiquidityStrategy:
                 quality = 0
                 
                 # 收回力度（30分）
-                recovery_strength = (recovery_bar['close'] - sweep_bar['low']) / (support_low - sweep_bar['low'])
+                denominator = support_low - sweep_bar['low']
+                if denominator != 0:
+                    recovery_strength = (recovery_bar['close'] - sweep_bar['low']) / denominator
+                else:
+                    recovery_strength = 0
                 quality += min(recovery_strength * 30, 30)
                 
                 # 成交量确认（25分）
-                vol_ratio = sweep_bar['volume'] / avg_volume
+                if avg_volume != 0:
+                    vol_ratio = sweep_bar['volume'] / avg_volume
+                else:
+                    vol_ratio = 0
                 if vol_ratio > 2.5:
                     quality += 25
                 elif vol_ratio > 2.0:
@@ -758,63 +541,9 @@ class SMCLiquidityStrategy:
     
     def _check_entry_timing_strict(self, data, current_price):
         """
-        严格的入场时机检查
-        
-        避免追高的条件：
-        1. 当日涨幅 < 3%
-        2. 距离近期高点 >= 3%
-        3. 没有连续3天大涨
-        4. 成交量不是异常放大（< 3倍）
-        5. 距离支撑位 < 8%
+        严格的入场时机检查 - 调用 price_action_analyzer 的通用方法
         """
-        if len(data) < 10:
-            return {'is_good': False}
-        
-        recent_data = data.tail(10)
-        current_bar = data.iloc[-1]
-        prev_close = data.iloc[-2]['close']
-        
-        # 条件1：当日涨幅
-        daily_return = (current_bar['close'] - prev_close) / prev_close
-        condition1 = daily_return < ENTRY_MAX_DAILY_RETURN
-        
-        # 条件2：距离高点
-        recent_high = recent_data['high'].max()
-        distance_from_high = (recent_high - current_price) / recent_high
-        condition2 = distance_from_high >= ENTRY_MIN_DISTANCE_FROM_HIGH
-        
-        # 条件3：连续大涨检查
-        consecutive_rises = 0
-        for i in range(len(recent_data) - 3, len(recent_data)):
-            if i > 0:
-                ret = (recent_data.iloc[i]['close'] - recent_data.iloc[i-1]['close']) / recent_data.iloc[i-1]['close']
-                if ret > 0.02:
-                    consecutive_rises += 1
-                else:
-                    break
-        condition3 = consecutive_rises < ENTRY_MAX_CONSECUTIVE_RISES
-        
-        # 条件4：成交量
-        current_volume = data['volume'].iloc[-1]
-        avg_volume = recent_data['volume'].mean()
-        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
-        condition4 = volume_ratio < ENTRY_MAX_VOLUME_RATIO
-        
-        # 条件5：距离支撑
-        recent_low = recent_data['low'].min()
-        distance_from_support = (current_price - recent_low) / recent_low
-        condition5 = distance_from_support < ENTRY_MAX_DISTANCE_FROM_SUPPORT
-        
-        is_good = condition1 and condition2 and condition3 and condition4 and condition5
-        
-        return {
-            'is_good': is_good,
-            'daily_return_pct': daily_return * 100,
-            'distance_from_high_pct': distance_from_high * 100,
-            'consecutive_rises': consecutive_rises,
-            'volume_ratio': volume_ratio,
-            'distance_from_support_pct': distance_from_support * 100
-        }
+        return self.price_action_analyzer._check_entry_timing(data, current_price)
     
     def _calculate_confidence_v2(self, market_structure, liquidity_grab, 
                                  order_block, fvg, timing_check, trend_analysis, data):
@@ -834,100 +563,101 @@ class SMCLiquidityStrategy:
         """
         confidence = 0
         
-        # ========== 第一部分：趋势强度评分（最高25分）==========
-        # 这是核心改进，避免在弱趋势或反弹中给高分
+        # ========== 第一部分：趋势强度评分（最高15分）==========
+        # 减少长期趋势的加成权重，更多依赖信号质量
         
         trend_strength = market_structure.get('trend_strength', 0)
         
         if trend_strength >= 80:
-            confidence += 25  # 极强趋势
+            confidence += 15  # 极强趋势
         elif trend_strength >= 70:
-            confidence += 22  # 强趋势
+            confidence += 13  # 强趋势
         elif trend_strength >= 60:
-            confidence += 18  # 较强趋势
+            confidence += 11  # 较强趋势
         elif trend_strength >= 50:
-            confidence += 14  # 中等趋势
+            confidence += 8   # 中等趋势
         elif trend_strength >= 40:
-            confidence += 10  # 弱趋势
+            confidence += 5   # 弱趋势
         else:
-            confidence += 5   # 很弱的趋势
+            confidence += 2   # 很弱的趋势
         
-        # 多周期一致性加成（最高5分）
+        # 多周期一致性加成（最高3分）
         consistency_score = market_structure.get('consistency_score', 0)
         if consistency_score == 3:  # 三个周期完全一致
-            confidence += 5
-        elif consistency_score == 2:
             confidence += 3
+        elif consistency_score == 2:
+            confidence += 2
         
-        # 均线排列加成（最高5分）
+        # 均线排列加成（最高2分）
         if market_structure.get('ma_alignment', False):
-            confidence += 5
+            confidence += 2
         
         # 反弹惩罚（重要！）
-        if market_structure.get('is_bounce', False):
-            confidence -= 15  # 如果是反弹，大幅降低置信度
+        # if market_structure.get('is_bounce', False):
+        #     confidence -= 15  # 如果是反弹，大幅降低置信度
         
-        # ========== 第二部分：核心信号分数（最高40分）==========
+        # ========== 第二部分：核心信号分数（最高50分）==========
+        # 增加信号权重来补偿趋势强度的减少
         
         signal_scores = []
         
         if liquidity_grab['detected']:
-            signal_scores.append(liquidity_grab['quality'] * 0.20)
+            signal_scores.append(liquidity_grab['quality'] * 0.25)
         
         if order_block['found']:
-            signal_scores.append(order_block['quality'] * 0.20)
+            signal_scores.append(order_block['quality'] * 0.25)
         
         if fvg['detected']:
-            signal_scores.append(fvg['quality'] * 0.20)
+            signal_scores.append(fvg['quality'] * 0.25)
         
         # 取最高的两个信号分数
         signal_scores.sort(reverse=True)
         confidence += sum(signal_scores[:2])
         
-        # 多重确认加成（最高10分）
+        # 多重确认加成（最高12分）
         num_signals = len(signal_scores)
         if num_signals >= 3:
-            confidence += 10
+            confidence += 12
         elif num_signals >= 2:
-            confidence += 7
+            confidence += 8
         elif num_signals >= 1:
-            confidence += 3
+            confidence += 4
         
-        # ========== 第三部分：趋势线位置（最高15分）==========
+        # ========== 第三部分：趋势线位置（最高12分）==========
         
         entry_quality = trend_analysis['entry_quality']
         if entry_quality >= 90:
-            confidence += 15
+            confidence += 12
         elif entry_quality >= 80:
-            confidence += 13
+            confidence += 10
         elif entry_quality >= 70:
-            confidence += 11
-        elif entry_quality >= 60:
             confidence += 8
-        else:
-            confidence += 4
-        
-        # 趋势线位置额外加成（最高5分）
-        if trend_analysis['current_position'] == 'near_support':
+        elif entry_quality >= 60:
             confidence += 5
-        elif trend_analysis['current_position'] == 'mid_channel':
+        else:
             confidence += 2
         
-        # ========== 第四部分：入场时机（最高10分）==========
+        # 趋势线位置额外加成（最高3分）
+        if trend_analysis['current_position'] == 'near_support':
+            confidence += 3
+        elif trend_analysis['current_position'] == 'mid_channel':
+            confidence += 1
+        
+        # ========== 第四部分：入场时机（最高12分）==========
         
         if timing_check['is_good']:
             timing_score = 0
             if timing_check['daily_return_pct'] < 1:
-                timing_score += 3
+                timing_score += 2
             if timing_check['distance_from_high_pct'] > 5:
-                timing_score += 3
+                timing_score += 4
             if timing_check['volume_ratio'] < 2:
                 timing_score += 2
             if timing_check['distance_from_support_pct'] < 5:
-                timing_score += 2
+                timing_score += 4
             confidence += timing_score
         
-        # ========== 第五部分：技术指标辅助（最高10分）==========
+        # ========== 第五部分：技术指标辅助（最高8分）==========
         
         indicators = self.tech_indicators.calculate_all_indicators(data)
         if indicators:
@@ -935,14 +665,14 @@ class SMCLiquidityStrategy:
             if len(indicators['rsi']) > 0:
                 rsi = indicators['rsi'][-1]
                 if RSI_GOOD_RANGE_MIN < rsi < RSI_GOOD_RANGE_MAX:
-                    confidence += 5
-                elif rsi > RSI_VERY_OVERBOUGHT:
-                    confidence -= 5
+                    confidence += 4
+                elif rsi > OVERBOUGHT:
+                    confidence -= 10
             
             # MACD
             if len(indicators['macd']) > 0:
                 if indicators['macd'][-1] > indicators['macd_signal'][-1]:
-                    confidence += 5
+                    confidence += 4
         
         return min(confidence, 100)
     
@@ -954,17 +684,33 @@ class SMCLiquidityStrategy:
         1. 使用趋势线作为动态止损
         2. 根据趋势强度调整止损缓冲
         3. 趋势越强，止损越宽松（给予更多空间）
+        4. 使用价格变化率，支持负价格
         """
         stop_candidates = []
+        current_price_abs = abs(current_price)
         
         if liquidity_grab['detected']:
-            stop_candidates.append(liquidity_grab['support_level'] * 0.99)
+            # 使用相对变化率计算止损
+            support_level = liquidity_grab['support_level']
+            if current_price > 0:
+                stop_candidates.append(support_level * 0.99)
+            else:
+                # 负价格：止损应该更负（数值更小）
+                stop_candidates.append(support_level * 1.01)
         
         if order_block['found']:
-            stop_candidates.append(order_block['ob_low'] * 0.99)
+            ob_low = order_block['ob_low']
+            if current_price > 0:
+                stop_candidates.append(ob_low * 0.99)
+            else:
+                stop_candidates.append(ob_low * 1.01)
         
         if fvg['detected']:
-            stop_candidates.append(fvg['gap_low'] * 0.99)
+            gap_low = fvg['gap_low']
+            if current_price > 0:
+                stop_candidates.append(gap_low * 0.99)
+            else:
+                stop_candidates.append(gap_low * 1.01)
         
         # 趋势线止损（核心优化）
         if trend_analysis['uptrend_line']['valid']:
@@ -976,57 +722,98 @@ class SMCLiquidityStrategy:
             trend_support = (trend_analysis['uptrend_line']['slope'] * current_idx + 
                            trend_analysis['uptrend_line']['intercept'])
             
-            # 根据趋势强度调整止损位
-            # 强趋势：趋势线下方5-6%
-            # 中等趋势：趋势线下方4-5%
-            # 弱趋势：趋势线下方3-4%
-            trend_stop = trend_support * (1 - stop_buffer)
+            # 根据价格正负调整止损方向
+            if current_price > 0:
+                trend_stop = trend_support * (1 - stop_buffer)
+            else:
+                # 负价格：止损应该更负
+                trend_stop = trend_support * (1 + stop_buffer)
             stop_candidates.append(trend_stop)
-            
-            # 记录趋势强度信息（用于调试）
-            trend_strength = trend_analysis['trend_strength']
-            # print(f"趋势强度: {trend_strength:.0f}, 止损缓冲: {stop_buffer*100:.1f}%")
         
-        # ATR止损
-        stop_candidates.append(current_price - atr * ATR_STOP_MULTIPLIER)
+        # ATR止损（使用价格变化率）
+        atr_stop_rate = (atr * ATR_STOP_MULTIPLIER) / current_price_abs if current_price_abs > 0 else 0.03
+        if current_price > 0:
+            stop_candidates.append(current_price * (1 - atr_stop_rate))
+        else:
+            stop_candidates.append(current_price * (1 + atr_stop_rate))
         
-        # 选择最低的止损位（止损必须低于当前价格）
-        stop_loss = min(stop_candidates) if stop_candidates else current_price * 0.97
+        # 选择止损位
+        # 正价格：选择最小值（最低价格）
+        # 负价格：选择最大值（最负的价格）
+        if current_price > 0:
+            stop_loss = min(stop_candidates) if stop_candidates else current_price * 0.97
+        else:
+            stop_loss = max(stop_candidates) if stop_candidates else current_price * 1.03
         
         # 根据趋势强度调整最终止损范围
         if trend_analysis.get('trend_strength', 0) >= STRONG_TREND_THRESHOLD:
             # 强趋势：允许4-6%的止损空间
-            min_stop = current_price * STRONG_TREND_STOP_MIN
-            max_stop = current_price * STRONG_TREND_STOP_MAX
+            if current_price > 0:
+                min_stop = current_price * STRONG_TREND_STOP_MIN
+                max_stop = current_price * STRONG_TREND_STOP_MAX
+            else:
+                # 负价格：反转比例
+                min_stop = current_price * (2 - STRONG_TREND_STOP_MAX)
+                max_stop = current_price * (2 - STRONG_TREND_STOP_MIN)
         else:
             # 弱趋势：保持2-4%的止损空间
-            min_stop = current_price * WEAK_TREND_STOP_MIN
-            max_stop = current_price * WEAK_TREND_STOP_MAX
+            if current_price > 0:
+                min_stop = current_price * WEAK_TREND_STOP_MIN
+                max_stop = current_price * WEAK_TREND_STOP_MAX
+            else:
+                # 负价格：反转比例
+                min_stop = current_price * (2 - WEAK_TREND_STOP_MAX)
+                max_stop = current_price * (2 - WEAK_TREND_STOP_MIN)
         
-        # 确保止损在合理范围内且低于当前价格
-        stop_loss = min(stop_loss, max_stop)
-        stop_loss = max(stop_loss, min_stop)
-        
-        # 最终验证：止损必须低于当前价格
-        if stop_loss >= current_price:
-            stop_loss = current_price * 0.97
+        # 确保止损在合理范围内
+        if current_price > 0:
+            stop_loss = min(stop_loss, max_stop)
+            stop_loss = max(stop_loss, min_stop)
+            # 最终验证：止损必须低于当前价格
+            if stop_loss >= current_price:
+                stop_loss = current_price * 0.97
+        else:
+            # 负价格：止损必须更负（数值更小）
+            stop_loss = max(stop_loss, max_stop)
+            stop_loss = min(stop_loss, min_stop)
+            # 最终验证：止损必须更负
+            if stop_loss <= current_price:
+                stop_loss = current_price * 1.03
         
         return stop_loss
     
     def _calculate_target(self, current_price, stop_loss, atr):
-        """计算目标价"""
-        risk = current_price - stop_loss
+        """
+        计算目标价 - 使用价格变化率，支持负价格
+        """
+        current_price_abs = abs(current_price)
         
-        # 目标：至少TARGET_RISK_MULTIPLIER倍风险
-        target1 = current_price + risk * TARGET_RISK_MULTIPLIER
+        # 计算风险（使用变化率）
+        if current_price_abs > 0:
+            risk_rate = abs(current_price - stop_loss) / current_price_abs
+        else:
+            risk_rate = 0.03  # 默认3%风险
         
-        # 或ATR_TARGET_MULTIPLIER倍ATR
-        target2 = current_price + atr * ATR_TARGET_MULTIPLIER
+        # 目标1：固定收益率
+        if current_price > 0:
+            target1 = current_price * (1 + TARGET_PROFIT_PCT)
+        else:
+            # 负价格：目标应该更接近0（数值更大）
+            target1 = current_price * (1 - TARGET_PROFIT_PCT)
         
-        # 或TARGET_PROFIT_PCT收益
-        target3 = current_price * (1 + TARGET_PROFIT_PCT)
+        # 目标2：基于ATR
+        atr_target_rate = (atr * ATR_TARGET_MULTIPLIER) / current_price_abs if current_price_abs > 0 else 0.1
+        if current_price > 0:
+            target2 = current_price * (1 + atr_target_rate)
+        else:
+            target2 = current_price * (1 - atr_target_rate)
         
-        return max(target1, target2, target3)
+        # 选择更优的目标
+        if current_price > 0:
+            return max(target1, target2)
+        else:
+            # 负价格：选择更接近0的（数值更大的）
+            return max(target1, target2)
     
     def _generate_signal_details(self, market_structure, liquidity_grab, 
                                  order_block, fvg, timing_check, trend_analysis, confidence):
@@ -1158,121 +945,29 @@ class SMCLiquidityStrategy:
         
         return signals
     
-    def detect_bearish_signals(self, data):
+    def detect_bearish_signals(self, data, trend_strength=None, historical_signals=None, is_bottom_strategy=False):
         """
-        检测看空信号
+        检测看空信号 - 调用 price_action_analyzer 的通用方法
         
-        看空信号包括：
-        1. 跌破关键支撑位（MA50/MA30）
-        2. 看空K线形态（射击之星、乌云盖顶、三只乌鸦等）
-        3. 技术指标看空（MACD死叉、RSI超买后回落）
-        4. 成交量异常放大的阴线
+        参数:
+            data: 价格数据
+            trend_strength: 当前趋势强度（0-100）
+            historical_signals: 历史看空信号列表
+            is_bottom_strategy: 是否为底部策略
         
-        返回: {'detected': bool, 'confidence': float, 'reasons': list}
+        返回: {'detected': bool, 'confidence': float, 'reasons': list, ...}
         """
-        try:
-            if len(data) < 30:
-                return {'detected': False, 'confidence': 0, 'reasons': []}
-            
-            reasons = []
-            confidence = 0
-            
-            current_bar = data.iloc[-1]
-            current_price = current_bar['close']
-            
-            # 1. 检查是否跌破关键均线
-            ma30 = talib.SMA(data['close'].values, timeperiod=30)
-            ma50 = talib.SMA(data['close'].values, timeperiod=50) if len(data) >= 50 else None
-            
-            if current_price < ma30[-1] * BEARISH_MA_BREAK_THRESHOLD:  # 跌破MA30超过2%
-                reasons.append('跌破MA30')
-                confidence += 25
-            
-            if ma50 is not None and current_price < ma50[-1] * BEARISH_MA_BREAK_THRESHOLD:  # 跌破MA50超过2%
-                reasons.append('跌破MA50')
-                confidence += 30
-            
-            # 2. 检查看空K线形态
-            # 射击之星
-            body = abs(current_bar['close'] - current_bar['open'])
-            upper_shadow = current_bar['high'] - max(current_bar['open'], current_bar['close'])
-            lower_shadow = min(current_bar['open'], current_bar['close']) - current_bar['low']
-            
-            if upper_shadow > body * 2 and lower_shadow < body * 0.3:
-                reasons.append('射击之星形态')
-                confidence += 20
-            
-            # 乌云盖顶（两根K线形态）
-            if len(data) >= 2:
-                prev_bar = data.iloc[-2]
-                if (prev_bar['close'] > prev_bar['open'] and  # 前一根是阳线
-                    current_bar['close'] < current_bar['open'] and  # 当前是阴线
-                    current_bar['open'] > prev_bar['high'] and  # 跳空高开
-                    current_bar['close'] < (prev_bar['open'] + prev_bar['close']) / 2):  # 收盘在前一根中点下方
-                    reasons.append('乌云盖顶形态')
-                    confidence += 25
-            
-            # 三只乌鸦
-            if len(data) >= 3:
-                last_three = data.tail(3)
-                all_bearish = all(row['close'] < row['open'] for _, row in last_three.iterrows())
-                descending = (last_three.iloc[0]['close'] > last_three.iloc[1]['close'] > 
-                             last_three.iloc[2]['close'])
-                if all_bearish and descending:
-                    reasons.append('三只乌鸦形态')
-                    confidence += 30
-            
-            # 3. 技术指标看空
-            # MACD死叉
-            macd, macd_signal, macd_hist = talib.MACD(data['close'].values)
-            if len(macd) >= 2:
-                if macd[-1] < macd_signal[-1] and macd[-2] >= macd_signal[-2]:  # 刚刚死叉
-                    reasons.append('MACD死叉')
-                    confidence += 20
-                elif macd[-1] < macd_signal[-1] and macd_hist[-1] < 0:  # 持续看空
-                    reasons.append('MACD看空')
-                    confidence += 15
-            
-            # RSI超买后回落
-            rsi = talib.RSI(data['close'].values, timeperiod=RSI_PERIOD)
-            if len(rsi) >= 2:
-                if rsi[-2] > RSI_OVERBOUGHT and rsi[-1] < 65:  # 从超买区回落
-                    reasons.append('RSI超买回落')
-                    confidence += 15
-            
-            # 4. 成交量异常放大的阴线
-            avg_volume = data['volume'].tail(20).mean()
-            if (current_bar['close'] < current_bar['open'] and  # 阴线
-                current_bar['volume'] > avg_volume * BEARISH_VOLUME_SURGE):  # 成交量放大
-                reasons.append('放量下跌')
-                confidence += 20
-            
-            # 判断是否检测到看空信号（置信度>=BEARISH_MIN_CONFIDENCE即认为有看空信号）
-            detected = confidence >= BEARISH_MIN_CONFIDENCE
-            
-            return {
-                'detected': detected,
-                'confidence': min(confidence, 100),
-                'reasons': reasons
-            }
-            
-        except Exception as e:
-            print(f"检测看空信号时出错: {e}")
-            return {'detected': False, 'confidence': 0, 'reasons': []}
+        return self.price_action_analyzer.detect_bearish_signals(
+            data=data,
+            candlestick_detector=self.candlestick_detector,
+            trend_strength=trend_strength,
+            historical_signals=historical_signals,
+            is_bottom_strategy=is_bottom_strategy,
+            dynamic_threshold_enabled=BEARISH_DYNAMIC_THRESHOLD_ENABLED,
+            min_confidence=BEARISH_MIN_CONFIDENCE
+        )
     
-    def has_buy_signal(self, stock_code):
-        """
-        检查指定股票当天是否有买入信号
-        
-        用于卖出规则：只有当天存在买入信号时，才允许因止损/趋势下破而卖出
-        
-        返回: bool
-        """
-        try:
-            result = self.screen_stock(stock_code)
-            return result is not None and result['signal'] in ['buy', 'strong_buy']
-        except:
-            return False
+
     
     def batch_screen(self, stock_list, max_results=50):
         """批量筛选"""

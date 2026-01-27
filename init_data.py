@@ -37,8 +37,8 @@ class QuantStockSelector:
                 try:
                     self.data_fetcher.update_daily_data(stock['code'], incremental=incremental)
                     success_count += 1
-                    if count%50==0:
-                        print(f"已更新 {count}/{total_stocks} 只股票")
+                    # if count%50==0:
+                    print(f"已更新 {count}/{total_stocks} 只股票")
                     time.sleep(QUEST_INTERVAL)  # 避免请求过于频繁
                     
                 except Exception as e:

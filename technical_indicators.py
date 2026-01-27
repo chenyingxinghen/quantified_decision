@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import talib
 from config import TECHNICAL_PARAMS
+from strategy_config import TREND_MA_LONG_PERIOD, TREND_MA_MID_PERIOD, TREND_MA_SHORT_PERIOD
+
 
 class TechnicalIndicators:
     def __init__(self):
@@ -72,16 +74,16 @@ class TechnicalIndicators:
     
     def calculate_all_indicators(self, data):
         """计算所有技术指标"""
-        if len(data) < 30:  # 数据不足
+        if len(data) < TREND_MA_LONG_PERIOD:  # 数据不足
             return None
         
         indicators = {}
         
         try:
             # 移动平均线
-            indicators['ma5'] = self.calculate_ma(data, 5)
-            indicators['ma10'] = self.calculate_ma(data, 10)
-            indicators['ma20'] = self.calculate_ma(data, 20)
+            indicators['ma5'] = self.calculate_ma(data, TREND_MA_SHORT_PERIOD)
+            indicators['ma10'] = self.calculate_ma(data, TREND_MA_MID_PERIOD)
+            indicators['ma20'] = self.calculate_ma(data, TREND_MA_LONG_PERIOD)
             
             # RSI
             indicators['rsi'] = self.calculate_rsi(data)
@@ -114,68 +116,4 @@ class TechnicalIndicators:
             
         except Exception as e:
             print(f"计算技术指标失败: {e}")
-            return None
-    
-    def get_latest_signals(self, data):
-        """获取最新的技术信号"""
-        indicators = self.calculate_all_indicators(data)
-        if indicators is None:
-            return None
-        
-        signals = {}
-        latest_idx = -1  # 最新数据索引
-        
-        try:
-            # 均线信号
-            if (indicators['ma5'][latest_idx] > indicators['ma20'][latest_idx] and
-                indicators['ma10'][latest_idx] > indicators['ma20'][latest_idx]):
-                signals['ma_trend'] = 'bullish'
-            elif (indicators['ma5'][latest_idx] < indicators['ma20'][latest_idx] and
-                  indicators['ma10'][latest_idx] < indicators['ma20'][latest_idx]):
-                signals['ma_trend'] = 'bearish'
-            else:
-                signals['ma_trend'] = 'neutral'
-            
-            # RSI信号
-            rsi_value = indicators['rsi'][latest_idx]
-            if rsi_value > 70:
-                signals['rsi_signal'] = 'overbought'
-            elif rsi_value < 30:
-                signals['rsi_signal'] = 'oversold'
-            else:
-                signals['rsi_signal'] = 'neutral'
-            
-            # MACD信号
-            if (indicators['macd'][latest_idx] > indicators['macd_signal'][latest_idx] and
-                indicators['macd_hist'][latest_idx] > 0):
-                signals['macd_signal'] = 'bullish'
-            elif (indicators['macd'][latest_idx] < indicators['macd_signal'][latest_idx] and
-                  indicators['macd_hist'][latest_idx] < 0):
-                signals['macd_signal'] = 'bearish'
-            else:
-                signals['macd_signal'] = 'neutral'
-            
-            # 布林带信号
-            close_price = data['close'].iloc[latest_idx]
-            if close_price > indicators['bb_upper'][latest_idx]:
-                signals['bb_signal'] = 'overbought'
-            elif close_price < indicators['bb_lower'][latest_idx]:
-                signals['bb_signal'] = 'oversold'
-            else:
-                signals['bb_signal'] = 'neutral'
-            
-            # KDJ信号
-            k_value = indicators['kdj_k'][latest_idx]
-            d_value = indicators['kdj_d'][latest_idx]
-            if k_value > 80 and d_value > 80:
-                signals['kdj_signal'] = 'overbought'
-            elif k_value < 20 and d_value < 20:
-                signals['kdj_signal'] = 'oversold'
-            else:
-                signals['kdj_signal'] = 'neutral'
-            
-            return signals
-            
-        except Exception as e:
-            print(f"获取技术信号失败: {e}")
             return None

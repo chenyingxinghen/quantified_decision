@@ -2,6 +2,11 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from strategy_config import BEARISH_STRONG_TREND_THRESHOLD, BEARISH_MODERATE_TREND_THRESHOLD, \
+    BEARISH_WEAK_TREND_THRESHOLD, TREND_MA_MID_PERIOD, TREND_MA_SHORT_PERIOD, TREND_MA_LONG_PERIOD, \
+    STRONG_TREND_THRESHOLD, ENTRY_MAX_DAILY_RETURN, ENTRY_MAX_DISTANCE_FROM_SUPPORT, ENTRY_MAX_CONSECUTIVE_RISES, \
+    ENTRY_MAX_VOLUME_RATIO, ENTRY_MIN_DISTANCE_FROM_HIGH
+
 
 class PriceActionAnalyzer:
     def __init__(self):
@@ -116,7 +121,11 @@ class PriceActionAnalyzer:
             return 0
         
         # 基于价格动量
-        price_momentum = (data['close'].iloc[-1] - data['close'].iloc[-20]) / data['close'].iloc[-20] * 100
+        close_20_days_ago = data['close'].iloc[-20]
+        if close_20_days_ago != 0:
+            price_momentum = (data['close'].iloc[-1] - close_20_days_ago) / close_20_days_ago * 100
+        else:
+            price_momentum = 0
         
         # 基于成交量确认
         recent_volume = data['volume'].tail(10).mean()
@@ -125,7 +134,11 @@ class PriceActionAnalyzer:
         
         # 基于波动率
         atr = self._calculate_atr(data, 14)
-        volatility_factor = min(atr[-1] / data['close'].iloc[-1] * 100, 10) if len(atr) > 0 else 5
+        current_close = data['close'].iloc[-1]
+        if len(atr) > 0 and current_close != 0:
+            volatility_factor = min(atr[-1] / current_close * 100, 10)
+        else:
+            volatility_factor = 5
         
         # 综合强度计算
         strength = abs(price_momentum) * volume_ratio * (volatility_factor / 5)
@@ -194,7 +207,6 @@ class PriceActionAnalyzer:
         
         # 射击之星条件：上影线至少是实体的2倍，下影线很小
         if (upper_shadow >= 2 * body and 
-            lower_shadow <= 0.1 * body and 
             body > 0):
             
             return {
@@ -424,6 +436,258 @@ class PriceActionAnalyzer:
             'consistency': abs(trend_score) / 5  # 0-1的一致性评分
         }
     
+    def _check_entry_timing(self, data, current_price,
+                          max_daily_return=ENTRY_MAX_DAILY_RETURN,
+                          min_distance_from_high=ENTRY_MIN_DISTANCE_FROM_HIGH,
+                          max_consecutive_rises=ENTRY_MAX_CONSECUTIVE_RISES,
+                          max_volume_ratio=ENTRY_MAX_VOLUME_RATIO,
+                          max_distance_from_support=ENTRY_MAX_DISTANCE_FROM_SUPPORT):
+        """
+        通用的入场时机检查 - 避免追高
+        
+        条件：
+        1. 当日涨幅 < max_daily_return (默认3%)
+        2. 距离近期高点 >= min_distance_from_high (默认3%)
+        3. 没有连续max_consecutive_rises天大涨 (默认3天)
+        4. 成交量不是异常放大 (< max_volume_ratio倍，默认3倍)
+        5. 距离支撑位 < max_distance_from_support (默认8%)
+        
+        参数:
+            data: 价格数据
+            current_price: 当前价格
+            max_daily_return: 最大当日涨幅
+            min_distance_from_high: 距离高点最小距离
+            max_consecutive_rises: 最大连续上涨天数
+            max_volume_ratio: 最大成交量倍数
+            max_distance_from_support: 距离支撑最大距离
+        
+        返回: {'is_good': bool, 'daily_return_pct': float, ...}
+        """
+        if len(data) < 10:
+            return {'is_good': False}
+        
+        recent_data = data.tail(10)
+        current_bar = data.iloc[-1]
+        prev_close = data.iloc[-2]['close']
+        
+        # 条件1：当日涨幅
+        if prev_close != 0:
+            daily_return = (current_bar['close'] - prev_close) / prev_close
+        else:
+            daily_return = 0
+        condition1 = daily_return < max_daily_return
+        
+        # 条件2：距离高点
+        recent_high = recent_data['high'].max()
+        if recent_high != 0:
+            distance_from_high = (recent_high - current_price) / recent_high
+        else:
+            distance_from_high = 0
+        condition2 = distance_from_high >= min_distance_from_high
+        
+        # 条件3：连续大涨检查
+        consecutive_rises = 0
+        for i in range(len(recent_data) - 3, len(recent_data)):
+            if i > 0:
+                prev_close_val = recent_data.iloc[i-1]['close']
+                if prev_close_val != 0:
+                    ret = (recent_data.iloc[i]['close'] - prev_close_val) / prev_close_val
+                else:
+                    ret = 0
+                if ret > 0.02:
+                    consecutive_rises += 1
+                else:
+                    break
+        condition3 = consecutive_rises < max_consecutive_rises
+        
+        # 条件4：成交量
+        current_volume = data['volume'].iloc[-1]
+        avg_volume = recent_data['volume'].mean()
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+        condition4 = volume_ratio < max_volume_ratio
+        
+        # 条件5：距离支撑
+        recent_low = recent_data['low'].min()
+        if recent_low != 0:
+            distance_from_support = (current_price - recent_low) / recent_low
+        else:
+            distance_from_support = 0
+        condition5 = distance_from_support < max_distance_from_support
+        
+        is_good = condition1 and condition2 and condition3 and condition4 and condition5
+        
+        return {
+            'is_good': is_good,
+            'daily_return_pct': daily_return * 100,
+            'distance_from_high_pct': distance_from_high * 100,
+            'consecutive_rises': consecutive_rises,
+            'volume_ratio': volume_ratio,
+            'distance_from_support_pct': distance_from_support * 100
+        }
+    
+    def check_multi_period_trend(self, data, 
+                                 long_period=TREND_MA_LONG_PERIOD,
+                                 mid_period=TREND_MA_MID_PERIOD,
+                                 short_period=TREND_MA_SHORT_PERIOD):
+        """
+        多周期趋势验证 - 避免将反弹误判为上升趋势
+        
+        核心功能：
+        1. 三周期均线系统：长期、中期、短期
+        2. 大趋势验证：长期均线必须向上
+        3. 多周期一致性：短中长期趋势方向一致
+        4. 反弹识别：区分趋势转换和短期反弹
+        5. 趋势强度评分：综合评估趋势质量
+        
+        参数:
+            data: 价格数据
+            long_period: 长期均线周期 (默认90)
+            mid_period: 中期均线周期 (默认30)
+            short_period: 短期均线周期 (默认5)
+        
+        返回: {'is_uptrend': bool, 'trend_strength': float, ...}
+        """
+        import talib
+        
+        if len(data) < long_period:
+            return {'is_uptrend': False, 'trend_strength': 0}
+        
+        # 计算三条均线
+        ma_long = talib.SMA(data['close'].values, timeperiod=long_period)
+        ma_mid = talib.SMA(data['close'].values, timeperiod=mid_period)
+        ma_short = talib.SMA(data['close'].values, timeperiod=short_period)
+        current_price = data['close'].iloc[-1]
+        
+        # ========== 第一步：大趋势验证（长期均线） ==========
+        
+        # 长期均线斜率
+        long_slope_lookback = max(10, int(long_period / 5))
+        ma_long_slope = (ma_long[-1] - ma_long[-long_slope_lookback]) / ma_long[-long_slope_lookback] if ma_long[-long_slope_lookback] > 0 else 0
+        long_trend_up = ma_long_slope >= -0.01
+        
+        # 价格相对长期均线位置
+        if ma_long[-1] != 0:
+            price_vs_long = (current_price - ma_long[-1]) / ma_long[-1]
+        else:
+            price_vs_long = 0
+        above_long_ma = price_vs_long > -0.05
+        
+        # ========== 第二步：多周期一致性检查 ==========
+        
+        # 中期均线斜率
+        mid_slope_lookback = max(5, int(mid_period / 3))
+        ma_mid_slope = (ma_mid[-1] - ma_mid[-mid_slope_lookback]) / ma_mid[-mid_slope_lookback] if ma_mid[-mid_slope_lookback] > 0 else 0
+        mid_trend_up = ma_mid_slope > -0.02
+        
+        # 短期均线斜率
+        short_slope_lookback = max(2, int(short_period / 2))
+        ma_short_slope = (ma_short[-1] - ma_short[-short_slope_lookback]) / ma_short[-short_slope_lookback] if ma_short[-short_slope_lookback] > 0 else 0
+        short_trend_up = ma_short_slope > -0.05
+        
+        # 均线排列（多头排列）
+        ma_alignment = ma_short[-1] > ma_mid[-1] * 0.98 and ma_mid[-1] > ma_long[-1] * 0.98
+        
+        # ========== 第三步：反弹识别机制 ==========
+        
+        is_bounce_in_downtrend = False
+        if not long_trend_up:
+            recent_low = data['low'].tail(10).min()
+            if recent_low != 0:
+                bounce_strength = (current_price - recent_low) / recent_low
+            else:
+                bounce_strength = 0
+            if bounce_strength > 0.05:
+                is_bounce_in_downtrend = True
+        
+        # ========== 第四步：HH-HL结构验证 ==========
+        
+        recent_data = data.tail(30)
+        swing_highs = []
+        swing_lows = []
+        
+        for i in range(2, len(recent_data) - 2):
+            if (recent_data.iloc[i]['high'] > recent_data.iloc[i-1]['high'] and
+                recent_data.iloc[i]['high'] > recent_data.iloc[i+1]['high']):
+                swing_highs.append(recent_data.iloc[i]['high'])
+            
+            if (recent_data.iloc[i]['low'] < recent_data.iloc[i-1]['low'] and
+                recent_data.iloc[i]['low'] < recent_data.iloc[i+1]['low']):
+                swing_lows.append(recent_data.iloc[i]['low'])
+        
+        has_hh_hl = False
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+            has_hh_hl = (swing_highs[-1] > swing_highs[-2] and 
+                        swing_lows[-1] > swing_lows[-2])
+        
+        # ========== 第五步：趋势强度评分（0-100） ==========
+        
+        trend_strength = 0
+        
+        # 1. 长期趋势方向（30分）
+        if long_trend_up:
+            if ma_long_slope > 0.05:
+                trend_strength += 20
+            elif ma_long_slope > 0.02:
+                trend_strength += 15
+            elif ma_long_slope > 0:
+                trend_strength += 10
+        
+        # 2. 多周期一致性（35分）
+        consistency_score = sum([long_trend_up, mid_trend_up, short_trend_up])
+        if consistency_score == 3:
+            trend_strength += 35
+        elif consistency_score == 2:
+            trend_strength += 25
+        elif consistency_score == 1:
+            trend_strength += 15
+        
+        # 3. 均线排列（20分）
+        if ma_alignment:
+            trend_strength += 20
+        elif ma_short[-1] > ma_mid[-1] or ma_mid[-1] > ma_long[-1]:
+            trend_strength += 15
+        
+        # 4. HH-HL结构（20分）
+        if has_hh_hl:
+            trend_strength += 20
+        
+        # 5. 价格位置（10分）
+        if price_vs_long > 0.05:
+            trend_strength += 5
+        elif price_vs_long > 0:
+            trend_strength += 10
+        elif price_vs_long > -0.03:
+            trend_strength += 3
+        
+        # ========== 第六步：综合判断 ==========
+        
+        is_uptrend = (
+            long_trend_up and
+            consistency_score >= 2 and
+            trend_strength >= 20
+        )
+        
+        return {
+            'is_uptrend': is_uptrend,
+            'trend_strength': trend_strength,
+            'ma_long': ma_long[-1],
+            'ma_mid': ma_mid[-1],
+            'ma_short': ma_short[-1],
+            'ma_long_slope': ma_long_slope,
+            'ma_mid_slope': ma_mid_slope,
+            'ma_short_slope': ma_short_slope,
+            'long_trend_up': long_trend_up,
+            'mid_trend_up': mid_trend_up,
+            'short_trend_up': short_trend_up,
+            'consistency_score': consistency_score,
+            'ma_alignment': ma_alignment,
+            'has_hh_hl': has_hh_hl,
+            'is_bounce': is_bounce_in_downtrend,
+            'price_vs_long_pct': price_vs_long * 100,
+            'conditions_met': consistency_score + (1 if ma_alignment else 0) + (1 if has_hh_hl else 0),
+            'strength': 'strong' if trend_strength >= 70 else ('moderate' if trend_strength >= 50 else 'weak')
+        }
+    
     def get_comprehensive_analysis(self, data):
         """综合价格行为分析"""
         if len(data) < self.min_bars_for_analysis:
@@ -441,6 +705,226 @@ class PriceActionAnalyzer:
         analysis['composite_signal'] = self._generate_composite_signal(analysis)
         
         return analysis
+    
+    def detect_bearish_signals(self, data, candlestick_detector=None, trend_strength=None, 
+                              historical_signals=None, is_bottom_strategy=False,
+                              dynamic_threshold_enabled=True,
+                              min_confidence=60):
+        """
+        检测看空信号 - 通用方法
+        
+        核心功能：
+        1. 动态阈值：根据趋势强度调整看空信号阈值
+        2. 信号累积：3天内的看空信号可累积（每天衰减30%）
+        3. 顶部预警：增加顶部特征检测
+        4. 底部策略支持：对于底部反转策略，忽略顶部看空信号
+        
+        看空信号包括：
+        1. 跌破关键支撑位（MA50/MA30）
+        2. 看空K线形态（射击之星、乌云盖顶、三只乌鸦等）
+        3. 技术指标看空（MACD死叉、RSI超买后回落）
+        4. 成交量异常放大的阴线
+        5. 顶部预警信号
+        
+        参数:
+            data: 价格数据
+            candlestick_detector: K线形态检测器实例
+            trend_strength: 当前趋势强度（0-100）
+            historical_signals: 历史看空信号列表
+            is_bottom_strategy: 是否为底部策略
+            dynamic_threshold_enabled: 是否启用动态阈值
+            min_confidence: 最小置信度阈值
+        
+        返回: {'detected': bool, 'confidence': float, 'reasons': list, ...}
+        """
+        import talib
+        
+        try:
+            if len(data) < 30:
+                return {'detected': False, 'confidence': 0, 'reasons': [], 
+                       'threshold': min_confidence, 'top_warning': False}
+            
+            reasons = []
+            confidence = 0
+            top_warning = False
+            ignored_signals = []
+            
+            current_bar = data.iloc[-1]
+            current_price = current_bar['close']
+            current_date = current_bar.name if hasattr(current_bar, 'name') else None
+            
+            # ========== 动态阈值 ==========
+            
+            if dynamic_threshold_enabled and trend_strength is not None:
+                if trend_strength >= STRONG_TREND_THRESHOLD:  # 强趋势
+                    dynamic_threshold = BEARISH_STRONG_TREND_THRESHOLD
+                    reasons.append(f'强趋势逃顶模式(阈值{dynamic_threshold})')
+                elif trend_strength >= 50:  # 中等趋势
+                    dynamic_threshold = BEARISH_MODERATE_TREND_THRESHOLD
+                else:  # 弱趋势
+                    dynamic_threshold = BEARISH_WEAK_TREND_THRESHOLD
+            else:
+                dynamic_threshold = min_confidence
+            
+            # ========== 累积历史信号 ==========
+            
+            accumulated_confidence = 0
+            if historical_signals and len(historical_signals) > 0:
+                import pandas as pd
+                for hist_signal in historical_signals[-3:]:  # 最近3天
+                    if current_date and 'date' in hist_signal:
+                        try:
+                            days_ago = (pd.to_datetime(current_date) - pd.to_datetime(hist_signal['date'])).days
+                            if 0 < days_ago <= 3:
+                                decay_factor = 0.7 ** days_ago
+                                accumulated_confidence += hist_signal.get('confidence', 0) * decay_factor
+                        except:
+                            pass
+                
+                if accumulated_confidence > 0:
+                    reasons.append(f'累积历史信号+{accumulated_confidence:.1f}分')
+                    confidence += accumulated_confidence
+            
+            # ========== 顶部预警检测 ==========
+            
+            if not is_bottom_strategy:
+                ma_top = talib.SMA(data['close'].values, timeperiod=50)
+                
+                # 价格偏离均线过远
+                if ma_top[-1] != 0:
+                    price_deviation = (current_price - ma_top[-1]) / ma_top[-1]
+                else:
+                    price_deviation = 0
+                if price_deviation > 0.10:
+                    top_warning = True
+                    reasons.append(f'价格偏离MA50过远({price_deviation*100:.1f}%)')
+                    confidence += 10
+                
+                # RSI极度超买
+                rsi = talib.RSI(data['close'].values, timeperiod=14)
+                if len(rsi) >= 2 and rsi[-1] > 75:
+                    top_warning = True
+                    reasons.append(f'RSI极度超买({rsi[-1]:.1f})')
+                    confidence += 25
+                
+                # 成交量背离
+                if len(data) >= 10:
+                    recent_volume = data['volume'].tail(5).mean()
+                    prev_volume = data['volume'].tail(15).head(10).mean()
+                    close_5_days_ago = data['close'].iloc[-5]
+                    if close_5_days_ago != 0:
+                        recent_price_change = (data['close'].iloc[-1] - close_5_days_ago) / close_5_days_ago
+                    else:
+                        recent_price_change = 0
+                    
+                    if recent_price_change > 0 and recent_volume <= prev_volume * 0.8:
+                        top_warning = True
+                        reasons.append('价涨量缩背离')
+                        confidence += 10
+            else:
+                ignored_signals.append('顶部预警信号已忽略（底部策略）')
+            
+            # ========== 均线斜率变化率 ==========
+            
+            if not is_bottom_strategy:
+                if len(data) >= 60:
+                    ma_top = talib.SMA(data['close'].values, timeperiod=50)
+                    recent_slope = (ma_top[-1] - ma_top[-5]) / ma_top[-5] if ma_top[-5] > 0 else 0
+                    prev_slope = (ma_top[-5] - ma_top[-10]) / ma_top[-10] if ma_top[-10] > 0 else 0
+                    
+                    if prev_slope != 0:
+                        slope_change_rate = (recent_slope - prev_slope) / abs(prev_slope)
+                    else:
+                        slope_change_rate = 0
+                    
+                    if prev_slope > 0.01 and recent_slope < 0:
+                        if abs(slope_change_rate) > 2.0:
+                            reasons.append(f'{ma_top}斜率急转直下(变化率{slope_change_rate*100:.0f}%)')
+                            confidence += 30
+                            top_warning = True
+                        elif abs(slope_change_rate) > 1.0:
+                            reasons.append(f'{ma_top}斜率转负(变化率{slope_change_rate*100:.0f}%)')
+                            confidence += 20
+                            top_warning = True
+            else:
+                ignored_signals.append('均线斜率变化率已忽略（底部策略）')
+            
+            # ========== 跌破关键均线 ==========
+            
+            ma50 = talib.SMA(data['close'].values, timeperiod=50) if len(data) >= 50 else None
+            ma30 = talib.SMA(data['close'].values, timeperiod=30) if len(data) >= 30 else None
+            
+            if ma50 is not None and current_price < ma50[-1] * 0.98:
+                reasons.append('跌破MA50')
+                confidence += 30
+            
+            if ma30 is not None and current_price < ma30[-1] * 0.98:
+                reasons.append('跌破MA30')
+                confidence += 20
+            
+            # ========== K线形态 ==========
+            
+            if candlestick_detector:
+                bearish_patterns = candlestick_detector.detect_all_bearish_patterns(data)
+                
+                for pattern in bearish_patterns:
+                    if is_bottom_strategy and pattern.get('description') == '三只乌鸦':
+                        ignored_signals.append('三只乌鸦形态已忽略（底部策略）')
+                        continue
+                    
+                    reasons.append(pattern['description'] + '形态')
+                    confidence += pattern['score']
+            
+            # ========== 技术指标 ==========
+            
+            # MACD死叉
+            macd, macd_signal, macd_hist = talib.MACD(data['close'].values)
+            if len(macd) >= 2:
+                if macd[-1] < macd_signal[-1] and macd[-2] >= macd_signal[-2]:
+                    reasons.append('MACD死叉')
+                    confidence += 20
+                elif macd[-1] < macd_signal[-1] and macd_hist[-1] < 0:
+                    reasons.append('MACD看空')
+                    confidence += 15
+            
+            # RSI超买后回落
+            if len(data) >= 14:
+                rsi = talib.RSI(data['close'].values, timeperiod=14)
+                if len(rsi) >= 2:
+                    if rsi[-2] > 70 and rsi[-1] < 65:
+                        reasons.append('RSI超买回落')
+                        confidence += 15
+            
+            # ========== 成交量异常 ==========
+            
+            avg_volume = data['volume'].tail(20).mean()
+            if (current_bar['close'] < current_bar['open'] and
+                current_bar['volume'] > avg_volume * 2.0):
+                reasons.append('放量下跌')
+                confidence += 20
+            
+            # ========== 综合判断 ==========
+            
+            detected = confidence >= dynamic_threshold
+            
+            result = {
+                'detected': detected,
+                'confidence': min(confidence, 100),
+                'reasons': reasons,
+                'threshold': dynamic_threshold,
+                'top_warning': top_warning,
+                'accumulated_score': accumulated_confidence
+            }
+            
+            if is_bottom_strategy and ignored_signals:
+                result['ignored_signals'] = ignored_signals
+            
+            return result
+            
+        except Exception as e:
+            print(f"检测看空信号时出错: {e}")
+            return {'detected': False, 'confidence': 0, 'reasons': [], 
+                   'threshold': min_confidence, 'top_warning': False}
     
     def _generate_composite_signal(self, analysis):
         """生成综合交易信号"""

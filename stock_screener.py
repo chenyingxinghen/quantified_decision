@@ -44,8 +44,7 @@ class StockScreener:
         # 获取股票数据
         stock_data = self.data_fetcher.get_stock_data(stock_code)
         
-        if len(stock_data) < 30:
-            return False, "数据不足"
+
         
         # 价格筛选
         latest_price = stock_data['close'].iloc[-1]
@@ -63,13 +62,9 @@ class StockScreener:
             min_volume = 50000  # 备选最小成交量
             if avg_volume < min_volume:
                 return False, f"成交量不足: {avg_volume}"
+
         
-        # 获取技术信号
-        signals = self.tech_indicators.get_latest_signals(stock_data)
-        if signals is None:
-            return False, "技术指标计算失败"
-        
-        return True, signals
+        return True, "通过基础筛选"
     
 
     

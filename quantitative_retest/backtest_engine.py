@@ -9,10 +9,13 @@ from typing import List, Dict, Optional, Tuple
 import sys
 import os
 
+
 # 添加父目录到路径以导入模块
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from strategy_config import MIN_ENTRY_QUALITY, OPEN_WAIT_THRESHOLD
 from config import DATABASE_PATH
+from price_action_analyzer import PriceActionAnalyzer
+
 
 # 确保数据库路径为绝对路径 - 修正路径计算
 if not os.path.isabs(DATABASE_PATH):
@@ -85,6 +88,9 @@ class Position:
     cost: float
     no_rise_days: int = 0  # 连续未上涨天数
     last_close: float = 0.0  # 上一交易日收盘价
+    strategy_type: str = 'normal'  # 策略类型：'normal'（正常）或'bottom_reversal'（底部反转）
+    holding_days: int = 0  # 持仓天数
+    max_profit_rate: float = 0.0  # 持仓期间最大盈利率
 
 
 @dataclass
@@ -280,12 +286,10 @@ class StrategyInterface:
                             results.append(result)
         else:
             print(f"未知策略: {strategy_name}")
-            return None
-        
+
         # 选择置信度最高的信号
         if results and len(results) > 0:
             best_result = max(results, key=lambda x: x['confidence'])
-            
             return Signal(
                 stock_code=best_result['stock_code'],
                 signal_type=best_result['signal'],
@@ -298,20 +302,26 @@ class StrategyInterface:
             )
         
         return None
-    
-    def _check_bearish_signals(self, stock_data: pd.DataFrame):
+
+    def _check_bearish_signals(self, stock_data: pd.DataFrame, trend_strength=None, historical_signals=None, is_bottom_strategy=False):
         """
         检查看空信号
         
-        返回: {'detected': bool, 'confidence': float, 'reasons': list}
+        参数:
+            stock_data: 股票数据
+            trend_strength: 趋势强度（0-100）
+            historical_signals: 历史看空信号列表
+            is_bottom_strategy: 是否为底部策略（如Wyckoff），底部策略会忽略顶部看空信号
+        
+        返回: {'detected': bool, 'confidence': float, 'reasons': list, 'threshold': float, 'top_warning': bool}
         """
         try:
             from smc_liquidity_strategy import SMCLiquidityStrategy
             smc_strategy = SMCLiquidityStrategy()
-            return smc_strategy.detect_bearish_signals(stock_data)
+            return smc_strategy.detect_bearish_signals(stock_data, trend_strength, historical_signals, is_bottom_strategy)
         except Exception as e:
             print(f"检测看空信号时出错: {e}")
-            return {'detected': False, 'confidence': 0, 'reasons': []}
+            return {'detected': False, 'confidence': 0, 'reasons': [], 'threshold': 60, 'top_warning': False}
     
     def _analyze_stock_with_data_v2(self, stock_code: str, stock_data: pd.DataFrame, strategy_name: str):
         """
@@ -362,7 +372,7 @@ class PositionManager:
         self.current_position: Optional[Position] = None
     
     def buy(self, stock_code: str, date: str, price: float, 
-            stop_loss: float, target: float, capital: float) -> Position:
+            stop_loss: float, target: float, capital: float, strategy_type: str = 'normal') -> Position:
         """
         执行买入操作
         
@@ -373,16 +383,20 @@ class PositionManager:
             stop_loss: 止损价
             target: 目标价
             capital: 可用资金
+            strategy_type: 策略类型，'normal'（正常）或'bottom_reversal'（底部反转）
         
         返回:
             Position: 持仓对象
         """
+        # 处理负价格：使用绝对值确保计算正确
+        abs_price = abs(price)
+        
         # 计算手续费
         commission = capital * self.commission_rate
         available_capital = capital - commission
         
-        # 计算可买股数
-        shares = available_capital / price
+        # 计算可买股数（使用绝对价格）
+        shares = available_capital / abs_price if abs_price > 0 else 0
         
         # 总成本（包含手续费）
         cost = capital
@@ -396,103 +410,15 @@ class PositionManager:
             target=target,
             cost=cost,
             no_rise_days=0,
-            last_close=price  # 初始化为买入价
+            last_close=price,  # 初始化为买入价
+            strategy_type=strategy_type,  # 添加策略类型
+            holding_days=0,  # 初始化持仓天数
+            max_profit_rate=0.0  # 初始化最大盈利率
         )
         
         self.current_position = position
         return position
-    
-    def check_exit(self, position: Position, date: str, 
-                   open_price: float, high: float, low: float, close: float,
-                   stock_data: pd.DataFrame = None, 
-                   all_stocks_data: Dict[str, pd.DataFrame] = None) -> Tuple[bool, Optional[float], Optional[str]]:
-        """
-        检查是否触发卖出条件
-        
-        新规则：
-        1. 止损：必须当天有买入信号才能卖出
-        2. 趋势下破（跌破趋势线/市场结构反转）：必须当天有买入信号才能卖出
-        3. 看空信号：可以直接卖出（不需要买入信号）
-        
-        参数:
-            position: 当前持仓
-            date: 当前日期
-            open_price: 开盘价
-            high: 最高价
-            low: 最低价
-            close: 收盘价
-            stock_data: 股票历史数据（用于检测看空信号和趋势反转）
-            all_stocks_data: 所有股票的历史数据（用于检查是否有买入信号）
-        
-        返回:
-            (should_exit, exit_price, exit_reason): 是否卖出、卖出价格、卖出原因
-        """
-        # 买入当天不能卖出（T+1规则）
-        if date == position.buy_date:
-            return False, None, None
-        
-        # 检查是否触及止损
-        stop_loss_triggered = False
-        stop_loss_price = None
-        
-        if open_price <= position.stop_loss:
-            stop_loss_triggered = True
-            stop_loss_price = position.stop_loss
-        elif low <= position.stop_loss:
-            stop_loss_triggered = True
-            stop_loss_price = position.stop_loss
-        
-        # 情况1: 检测看空信号 - 可以直接卖出（优先级最高）
-        if stock_data is not None and len(stock_data) >= 30:
-            from smc_liquidity_strategy import SMCLiquidityStrategy
-            smc_v2 = SMCLiquidityStrategy()
-            
-            bearish_signals = smc_v2.detect_bearish_signals(stock_data)
-            
-            # 看空信号置信度必须大于65才能直接卖出
-            if bearish_signals['detected'] and bearish_signals['confidence'] > 65:
-                # 看空信号可以直接卖出，不需要检查买入信号
-                return True, close, f"bearish_signal_{int(bearish_signals['confidence'])}"
-        
-        # 情况2: 止损或趋势下破 - 必须有买入信号才能卖出
-        trend_broken = False
-        structure_reversed = False
-        
-        if stock_data is not None and len(stock_data) >= 30:
-            from trend_line_analyzer import TrendLineAnalyzer
-            from smc_liquidity_strategy import SMCLiquidityStrategy
-            
-            # 趋势线分析
-            trend_analyzer = TrendLineAnalyzer()
-            trend_analysis = trend_analyzer.analyze(stock_data)
-            
-            smc_v2 = SMCLiquidityStrategy()
-            market_structure = smc_v2._check_market_structure_strict(stock_data)
-            
-            # 检查是否触发趋势下破条件
-            trend_broken = trend_analysis['broken_support']
-            structure_reversed = not market_structure['is_uptrend']
-        
-        # 如果触发了止损或趋势下破，需要检查买入信号
-        if stop_loss_triggered or trend_broken or structure_reversed:
-            has_buy_signal = self._check_has_buy_signal_today(date, all_stocks_data)
-            
-            if has_buy_signal:
-                # 有买入信号，允许卖出（换仓）
-                if stop_loss_triggered:
-                    return True, stop_loss_price, 'stop_loss'
-                elif trend_broken:
-                    return True, close, 'broken_trendline'
-                elif structure_reversed:
-                    return True, close, 'trend_reversal_downtrend'
-            else:
-                # 没有买入信号，继续持有
-                pass
-        
-        # 更新上一交易日收盘价
-        position.last_close = close
-        
-        return False, None, None
+
     
     def _check_has_buy_signal_today(self, date: str, all_stocks_data: Dict[str, pd.DataFrame]) -> bool:
         """
@@ -547,23 +473,36 @@ class PositionManager:
         返回:
             Trade: 完整的交易记录
         """
-        # 计算卖出金额
-        sell_amount = position.shares * price
+        # 处理负价格：使用价格变化率计算收益
+        # 前复权数据可能为负，但价格变化率仍然有效
+        
+        # 计算价格变化率（相对买入价的涨跌幅）
+        if position.buy_price != 0:
+            price_change_rate = (price - position.buy_price) / abs(position.buy_price)
+        else:
+            price_change_rate = 0
+        
+        # 使用价格变化率计算卖出金额
+        # 卖出金额 = 成本 * (1 + 价格变化率)
+        sell_amount = position.cost * (1 + price_change_rate)
         
         # 计算卖出手续费
-        sell_commission = sell_amount * self.commission_rate
+        sell_commission = abs(sell_amount) * self.commission_rate
         
-        # 净收入
+        # 净收入（扣除卖出手续费）
         net_proceeds = sell_amount - sell_commission
         
         # 买入手续费
         buy_commission = position.cost * self.commission_rate
         
-        # 净利润
+        # 净利润 = 净收入 - 成本
         profit = net_proceeds - position.cost
         
-        # 收益率
-        return_rate = profit / position.cost
+        # 收益率（避免除以零）
+        if position.cost != 0:
+            return_rate = profit / position.cost
+        else:
+            return_rate = 0
         
         trade = Trade(
             stock_code=position.stock_code,
@@ -707,6 +646,8 @@ class BacktestEngine:
         
         # 遍历每个交易日
         for i, current_date in enumerate(trading_dates):
+            sold_today = False  # 标记当天是否卖出
+            
             # 检查是否有持仓
             if self.position_manager.has_position():
                 # 有持仓，检查是否触发卖出
@@ -745,8 +686,9 @@ class BacktestEngine:
                                     trade = self.position_manager.sell(position, current_date, exit_price, exit_reason)
                                     self.trades.append(trade)
                                     
-                                    # 更新资金
-                                    self.capital = position.shares * exit_price - trade.sell_commission
+                                    # 更新资金：使用交易的净收入
+                                    # 净收入 = 成本 + 利润（已经在sell方法中计算好）
+                                    self.capital = position.cost + trade.profit
                                     
                                     # 记录资金曲线
                                     self.equity_curve.append((current_date, self.capital))
@@ -757,9 +699,12 @@ class BacktestEngine:
                                     print(f"[{current_date}] 卖出 {stock_code}: {exit_price:.2f} "
                                           f"({reason_text}) 收益率: {trade.return_rate*100:.2f}% "
                                           f"资金: {self.capital:.4f}")
+                                    
+                                    sold_today = True  # 标记已卖出
             
-            else:
-                # 无持仓，寻找买入信号（优化：使用预处理的索引）
+            # 如果无持仓或当天卖出了，寻找买入信号
+            if not self.position_manager.has_position():
+                # 构建历史数据（优化：使用预处理的索引）
                 historical_data = {}
                 for code in all_stocks_data.keys():
                     if current_date in date_index and code in date_index[current_date]:
@@ -771,8 +716,42 @@ class BacktestEngine:
                 signal = self.strategy_interface.get_signals(current_date, historical_data, strategy_name)
                 
                 if signal:
-                    # 找到下一个交易日
-                    if i + 1 < len(trading_dates):
+                    # 如果当天卖出，当天就可以买入（使用当天收盘价）
+                    
+                    if sold_today:
+                        if stock_code==signal.stock_code:
+                            continue
+                        stock_code = signal.stock_code
+                        
+                        # 获取当天的收盘价作为买入价
+                        if stock_code in all_stocks_data:
+                            stock_data = all_stocks_data[stock_code]
+                            
+                            if current_date in date_index and stock_code in date_index[current_date]:
+                                row_idx = date_index[current_date][stock_code] - 1
+                                
+                                if row_idx >= 0 and row_idx < len(stock_data):
+                                    today_row = stock_data.iloc[row_idx]
+                                    
+                                    if today_row['date'] == current_date:
+                                        close_price = today_row['close']
+                                        
+                                        # 判断策略类型
+                                        strategy_type = signal.analysis.get('strategy_type', 'normal') if hasattr(signal, 'analysis') and signal.analysis else 'normal'
+                                        
+                                        # 执行买入（使用收盘价）
+                                        position = self.position_manager.buy(
+                                            stock_code, current_date, close_price,
+                                            signal.stop_loss, signal.target, self.capital,
+                                            strategy_type=strategy_type
+                                        )
+                                        
+                                        print(f"[{current_date}] 买入 {stock_code}: {close_price:.2f} "
+                                              f"止损: {signal.stop_loss:.2f} 目标: {signal.target:.2f} "
+                                              f"置信度: {signal.confidence:.1f}% (当天换仓)")
+                    
+                    # 否则，找到下一个交易日买入
+                    elif i + 1 < len(trading_dates):
                         next_date = trading_dates[i + 1]
                         stock_code = signal.stock_code
                         
@@ -798,7 +777,7 @@ class BacktestEngine:
                                         gap_up_ratio = (open_price - signal_price) / signal_price
                                         
                                         # 如果开盘跳空超过2%，等待回调
-                                        if gap_up_ratio > 0.02:
+                                        if gap_up_ratio > OPEN_WAIT_THRESHOLD:
                                             # 检查当日是否回调到合理价位
                                             if low_price <= signal_price * 1.015:
                                                 actual_entry = (low_price + min(close_price, signal_price * 1.02)) / 2
@@ -808,10 +787,14 @@ class BacktestEngine:
                                         else:
                                             actual_entry = open_price
                                         
+                                        # 判断策略类型
+                                        strategy_type = signal.analysis.get('strategy_type', 'normal') if hasattr(signal, 'analysis') and signal.analysis else 'normal'
+                                        
                                         # 执行买入
                                         position = self.position_manager.buy(
                                             stock_code, next_date, actual_entry,
-                                            signal.stop_loss, signal.target, self.capital
+                                            signal.stop_loss, signal.target, self.capital,
+                                            strategy_type=strategy_type
                                         )
                                         
                                         print(f"[{next_date}] 买入 {stock_code}: {actual_entry:.2f} "
@@ -821,7 +804,7 @@ class BacktestEngine:
             # 进度显示（减少频率）
             if (i + 1) % 100 == 0:
                 print(f"进度: {i+1}/{len(trading_dates)} 交易日 | "
-                      f"完成交易: {len(self.trades)} 笔 | 当前资金: {self.capital:.4f}")
+                    f"完成交易: {len(self.trades)} 笔 | 当前资金: {self.capital:.4f}")
         
         print("-" * 80)
         print("回测完成！")
@@ -837,119 +820,130 @@ class BacktestEngine:
         """
         优化版的退出检查（复用策略对象）
         
-        新规则：
-        1. 止损：必须当天有买入信号才能卖出
-        2. 趋势下破：必须当天有买入信号才能卖出
-        3. 看空信号：可以直接卖出
+        规则：
+        1. 止损：直接卖出（始终启用）
+        2. 止盈：根据ENABLE_TAKE_PROFIT_EXIT参数决定
+        3. 跌破支撑：根据ENABLE_SUPPORT_BREAK_EXIT参数决定
+        4. 看空信号：根据ENABLE_BEARISH_SIGNAL_EXIT参数决定
+        5. 时间止损：根据ENABLE_TIME_STOP_EXIT参数决定
         """
+        # 导入配置参数
+        from strategy_config import (
+            ENABLE_TAKE_PROFIT_EXIT, 
+            ENABLE_BEARISH_SIGNAL_EXIT,
+            ENABLE_SUPPORT_BREAK_EXIT,
+            ENABLE_TIME_STOP_EXIT,
+            TIME_STOP_DAYS,
+            TIME_STOP_MIN_LOSS_PCT
+        )
+        
         # 买入当天不能卖出（T+1规则）
         if date == position.buy_date:
             return False, None, None
         
-        # 检查是否触及止损
+        # 更新持仓天数
+        position.holding_days += 1
+        
+        # 更新最大盈利率
+        current_profit_rate = (close - position.buy_price) / abs(position.buy_price)
+        if current_profit_rate > position.max_profit_rate:
+            position.max_profit_rate = current_profit_rate
+        
+        # 检查是否触及止损（始终启用）
+        # 使用价格变化率判断，避免负价格导致的比较错误
         stop_loss_triggered = False
         stop_loss_price = None
         
-        if open_price <= position.stop_loss:
-            stop_loss_triggered = True
-            stop_loss_price = position.stop_loss
-        elif low <= position.stop_loss:
-            stop_loss_triggered = True
-            stop_loss_price = position.stop_loss
+        # 计算价格相对买入价的变化率
+        buy_price_abs = abs(position.buy_price)
+        if buy_price_abs > 0:
+            open_change_rate = (open_price - position.buy_price) / buy_price_abs
+            low_change_rate = (low - position.buy_price) / buy_price_abs
+            high_change_rate = (high - position.buy_price) / buy_price_abs
+            stop_loss_rate = (position.stop_loss - position.buy_price) / buy_price_abs
+            target_rate = (position.target - position.buy_price) / buy_price_abs if hasattr(position, 'target') else 0
+            
+            # 止损触发：价格变化率 <= 止损变化率
+            if open_change_rate <= stop_loss_rate:
+                stop_loss_triggered = True
+                stop_loss_price = position.stop_loss
+            elif low_change_rate <= stop_loss_rate:
+                stop_loss_triggered = True
+                stop_loss_price = position.stop_loss
         
-        # 情况1: 检测看空信号 - 可以直接卖出（优先级最高）
+        # 如果触发止损，直接卖出
+        if stop_loss_triggered:
+            return True, stop_loss_price, 'stop_loss'
+        
+        # 检查是否触及止盈（根据开关决定）
+        if ENABLE_TAKE_PROFIT_EXIT and hasattr(position, 'target'):
+            # 止盈触发：价格变化率 >= 目标变化率
+            if buy_price_abs > 0 and high_change_rate >= target_rate:
+                return True, position.target, 'target'
+        
+        # 检查时间止损（根据开关决定）
+        if ENABLE_TIME_STOP_EXIT:
+            # 条件1：持仓天数超过阈值
+            # 条件2：从未盈利（最大盈利率 <= 0）
+            # 条件3：当前亏损超过最小亏损比例（避免微小亏损就卖出）
+            if (position.holding_days >= TIME_STOP_DAYS and 
+                position.max_profit_rate <= 0 and 
+                current_profit_rate <= TIME_STOP_MIN_LOSS_PCT):
+                return True, close, f'time_stop_{position.holding_days}days'
+        
+        # 检测看空信号和趋势下破
         if stock_data is not None and len(stock_data) >= 30:
             from trend_line_analyzer import TrendLineAnalyzer
             
             smc_v2 = self._get_smc_strategy()
             
-            bearish_signals = smc_v2.detect_bearish_signals(stock_data)
+            # 获取趋势强度
+            market_structure = smc_v2._check_market_structure_strict(stock_data)
+            trend_strength = market_structure.get('trend_strength', 0)
             
-            # 看空信号置信度必须大于65才能直接卖出
-            if bearish_signals['detected'] and bearish_signals['confidence'] > 65:
-                # 看空信号可以直接卖出
-                return True, close, f"bearish_signal_{int(bearish_signals['confidence'])}"
+            # 获取历史看空信号（从持仓信息中）
+            historical_signals = getattr(position, 'bearish_history', [])
             
-            # 情况2: 止损或趋势下破 - 必须有买入信号才能卖出
+            # 判断是否为底部策略
+            is_bottom_strategy = getattr(position, 'strategy_type', 'normal') == 'bottom_reversal'
+            
+            bearish_signals = smc_v2.detect_bearish_signals(stock_data, trend_strength, historical_signals, is_bottom_strategy)
+            
+            # 保存当前看空信号到历史记录
+            if bearish_signals['confidence'] > 0:
+                if not hasattr(position, 'bearish_history'):
+                    position.bearish_history = []
+                position.bearish_history.append({
+                    'date': date,
+                    'confidence': bearish_signals['confidence']
+                })
+            
+            # 看空信号卖出（根据开关决定）
+            if ENABLE_BEARISH_SIGNAL_EXIT:
+                # 动态阈值判断（使用返回的threshold）
+                threshold = bearish_signals.get('threshold', 60)
+                if bearish_signals['detected'] and bearish_signals['confidence'] >= threshold:
+                    # 看空信号直接卖出
+                    reasons = ','.join(bearish_signals['reasons'][:3])  # 取前3个原因
+                    return True, close, f"bearish_{int(bearish_signals['confidence'])}_{reasons}"
+            
+            # 趋势线分析
             trend_analyzer = TrendLineAnalyzer()
             trend_analysis = trend_analyzer.analyze(stock_data)
-            
-            market_structure = smc_v2._check_market_structure_strict(stock_data)
             
             # 检查是否触发趋势下破条件
             trend_broken = trend_analysis['broken_support']
             structure_reversed = not market_structure['is_uptrend']
-            
-            # 如果触发了止损或趋势下破，需要检查买入信号
-            if stop_loss_triggered or trend_broken or structure_reversed:
-                has_buy_signal = self._check_has_buy_signal_today_optimized(
-                    date, all_stocks_data, smc_v2
-                )
-                
-                if has_buy_signal:
-                    # 有买入信号，允许卖出（换仓）
-                    if stop_loss_triggered:
-                        return True, stop_loss_price, 'stop_loss'
-                    elif trend_broken:
-                        return True, close, 'broken_trendline'
-                    elif structure_reversed:
-                        return True, close, 'trend_reversal_downtrend'
-                else:
-                    # 没有买入信号，继续持有
-                    pass
+            _=PriceActionAnalyzer()
+            # 跌破支撑卖出（根据开关决定）
+            if ENABLE_SUPPORT_BREAK_EXIT:
+                if trend_broken and (not (_._check_entry_timing(stock_data, close)['is_good'])):
+                    return True, close, 'broken_trendline'
+                # elif structure_reversed:
+                #     return True, close, 'trend_reversal_downtrend'
         
         return False, None, None
     
-    def _check_has_buy_signal_today_optimized(self, date: str, 
-                                             all_stocks_data: Dict[str, pd.DataFrame],
-                                             smc_v2) -> bool:
-        """
-        优化版：检查当天是否有任何股票存在买入信号
-        
-        优化点：
-        1. 复用传入的smc_v2对象
-        2. 只检查前N只股票（避免全量扫描）
-        3. 找到一个买入信号就立即返回
-        """
-        if all_stocks_data is None:
-            return False
-        
-        # 限制检查数量，避免性能问题（最多检查50只股票）
-        check_count = 0
-        max_check = 50
-        
-        for stock_code, stock_data in all_stocks_data.items():
-            if check_count >= max_check:
-                break
-            
-            check_count += 1
-            
-            if len(stock_data) >= 60:
-                # 获取截止到当前日期的数据
-                date_mask = stock_data['date'] <= date
-                if date_mask.any():
-                    historical_data = stock_data[date_mask]
-                    
-                    if len(historical_data) >= 60:
-                        try:
-                            # 临时替换数据获取方法
-                            original_get_data = smc_v2.data_fetcher.get_stock_data
-                            
-                            def mock_get_data(symbol, days=300):
-                                return historical_data.copy()
-                            
-                            smc_v2.data_fetcher.get_stock_data = mock_get_data
-                            
-                            try:
-                                result = smc_v2.screen_stock(stock_code)
-                                if result and result['signal'] in ['buy', 'strong_buy']:
-                                    return True  # 找到买入信号，立即返回
-                            finally:
-                                smc_v2.data_fetcher.get_stock_data = original_get_data
-                        except:
-                            continue
-        
-        return False
     
     def _format_exit_reason(self, exit_reason: str) -> str:
         """格式化退出原因"""
@@ -965,6 +959,11 @@ class BacktestEngine:
         if exit_reason.startswith('bearish_signal_'):
             confidence = exit_reason.split('_')[-1]
             reason_text = f'看空信号 (置信度{confidence}%)'
+        
+        # 处理时间止损的原因
+        if exit_reason.startswith('time_stop_'):
+            days = exit_reason.split('_')[-1].replace('days', '')
+            reason_text = f'时间止损 ({days}天未盈利)'
         
         return reason_text
     

@@ -1,6 +1,8 @@
 # 性能分析器 - 计算回测性能指标和生成可视化
 
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # 使用非GUI后端，避免多线程问题
 import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple
 from datetime import datetime
@@ -76,13 +78,14 @@ class PerformanceAnalyzer:
             'max_drawdown': max_drawdown
         }
     
-    def plot_equity_curve(self, equity_curve: List[Tuple[str, float]], save_path: str):
+    def plot_equity_curve(self, equity_curve: List[Tuple[str, float]], save_path: str, strategy_name: str = "策略"):
         """
         绘制收益率曲线
         
         参数:
             equity_curve: [(date, capital), ...] 资金曲线数据
             save_path: 图片保存路径
+            strategy_name: 策略名称，用于显示在图表标题中
         """
         if not equity_curve:
             print("警告: 资金曲线数据为空，无法绘制")
@@ -100,21 +103,21 @@ class PerformanceAnalyzer:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
         
         # 子图1: 资金曲线
-        ax1.plot(dates, capitals, linewidth=2, color='#2E86AB', label='资金曲线')
+        ax1.plot(dates, capitals, linewidth=2, color='#2E86AB', label=f'{strategy_name} - 资金曲线')
         ax1.axhline(y=initial_capital, color='gray', linestyle='--', alpha=0.5, label='初始资金')
         ax1.set_xlabel('日期', fontsize=12)
         ax1.set_ylabel('资金', fontsize=12)
-        ax1.set_title('资金曲线', fontsize=14, fontweight='bold')
+        ax1.set_title(f'{strategy_name} - 资金曲线', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         ax1.legend(fontsize=10)
         
         # 子图2: 累计收益率曲线
-        ax2.plot(dates, returns, linewidth=2, color='#A23B72', label='累计收益率')
+        ax2.plot(dates, returns, linewidth=2, color='#A23B72', label=f'{strategy_name} - 累计收益率')
         ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
         ax2.fill_between(dates, returns, 0, alpha=0.3, color='#A23B72')
         ax2.set_xlabel('日期', fontsize=12)
         ax2.set_ylabel('累计收益率 (%)', fontsize=12)
-        ax2.set_title('累计收益率曲线', fontsize=14, fontweight='bold')
+        ax2.set_title(f'{strategy_name} - 累计收益率曲线', fontsize=14, fontweight='bold')
         ax2.grid(True, alpha=0.3)
         ax2.legend(fontsize=10)
         

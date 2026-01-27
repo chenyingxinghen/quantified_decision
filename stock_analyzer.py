@@ -40,52 +40,58 @@ class StockAnalyzer:
         print("\n【步骤1】获取最新K线数据...")
         try:
             # 先从数据库获取数据
-            data = self.data_fetcher.get_stock_data(stock_code, days=300)
-            
+            stock_info = self.data_fetcher.get_stock_info(stock_code)
+            data=self.data_fetcher.get_stock_data(stock_code)
             # 检查数据是否存在且是否最新
             need_update = False
-            if data.empty or len(data) < 60:
+            if stock_info.empty:
                 print(f"  数据库中无数据，需要下载...")
                 need_update = True
             else:
-                last_date = data['date'].iloc[-1]
-                from datetime import datetime, timedelta
-                now = datetime.now()
-                today = now.strftime('%Y-%m-%d')
-                today_15pm = now.replace(hour=15, minute=0, second=0, microsecond=0)
-                
-                # 检查数据是否需要更新
-                # 1. 如果最后日期早于今天，肯定需要更新
-                # 2. 如果最后日期是今天，且当前时间已过15:00，检查更新时间
-                if last_date < today:
-                    print(f"  数据库数据过期（最后更新: {last_date}），正在更新...")
+                last_date_value = stock_info['update_time'].iloc[-1]
+                # 检查是否有有效的更新时间
+                if pd.isna(last_date_value) or last_date_value is None:
+                    print("  数据库中无有效更新时间，需要更新...")
                     need_update = True
-                elif last_date == today and now >= today_15pm:
-                    # 今天且已过15:00，检查数据的更新时间
-                    cursor = self.data_fetcher.conn.cursor()
-                    cursor.execute('''
-                        SELECT date FROM daily_data 
-                        WHERE code = ?
-                    ''', (stock_code,))
-                    result = cursor.fetchone()
-                    
-                    if result and result[0]:
-                        update_time = datetime.fromisoformat(result[0])
-                        # 如果更新时间早于今天15:00，需要更新
-                        if update_time < today_15pm:
-                            print(f"  数据库数据未在15:00后更新（更新时间: {update_time.strftime('%H:%M:%S')}），正在更新...")
-                            need_update = True
-                        else:
-                            print(f"  数据库数据已是最新（最后更新: {last_date} {update_time.strftime('%H:%M:%S')}）")
-                    else:
-                        # 没有更新时间记录，需要更新
-                        print(f"  数据库数据缺少更新时间记录，正在更新...")
-                        need_update = True
                 else:
-                    print(f"  数据库数据已是最新（最后更新: {last_date}）")
+                    # 将字符串格式的日期转换为datetime对象以便比较
+                    last_date = pd.to_datetime(last_date_value).date()
+                    today = datetime.now().date()
+                    now = datetime.now()
+                    today_15pm = now.replace(hour=15, minute=0, second=0, microsecond=0)
+                    
+                    # 检查数据是否需要更新
+                    # 1. 如果最后日期早于今天，肯定需要更新
+                    # 2. 如果最后日期是今天，且当前时间已过15:00，检查更新时间
+                    if last_date < today:
+                        print(f"  数据库数据过期（最后更新: {last_date}），正在更新...")
+                        need_update = True
+                    elif last_date == today and now >= today_15pm:
+                        # 今天且已过15:00，检查数据的更新时间
+                        cursor = self.data_fetcher.conn.cursor()
+                        cursor.execute('''
+                            SELECT update_time FROM stock_info 
+                            WHERE code = ?
+                        ''', (stock_code,))
+                        result = cursor.fetchone()
+                        if result and result[0]:
+                            update_time = datetime.fromisoformat(result[0])
+                            # 如果更新时间早于今天15:00，需要更新
+                            if update_time < today_15pm:
+                                print(f"  数据库数据未在15:00后更新（更新时间: {update_time.strftime('%H:%M:%S')}），正在更新...")
+                                need_update = True
+                            else:
+                                print(f"  数据库数据已是最新（最后更新于今日: {update_time.strftime('%H:%M:%S')}）")
+                        else:
+                            # 没有更新时间记录，需要更新
+                            print(f"  数据库数据缺少更新时间记录，正在更新...")
+                            need_update = True
+                    else:
+                        print(f"  数据库数据已是最新（最后更新: {last_date}）")
             
             # 如果需要更新，则更新数据
             if need_update:
+                self.data_fetcher.update_stock_info()
                 self.data_fetcher.update_daily_data(stock_code, incremental=True)
                 # 重新获取数据
                 data = self.data_fetcher.get_stock_data(stock_code, days=300)
@@ -95,9 +101,7 @@ class StockAnalyzer:
                 
                 print(f"  ✓ 数据更新完成")
             
-            print(f"✓ 成功获取 {len(data)} 天的K线数据")
-            print(f"  数据范围: {data['date'].iloc[0]} 至 {data['date'].iloc[-1]}")
-            
+
             # 显示最新K线信息
             latest = data.iloc[-1]
             print(f"\n  最新K线 ({latest['date']}):")

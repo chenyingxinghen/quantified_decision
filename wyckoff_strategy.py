@@ -7,60 +7,10 @@ from datetime import datetime
 from data_fetcher import DataFetcher
 from technical_indicators import TechnicalIndicators
 from price_action_analyzer import PriceActionAnalyzer
+from candlestick_patterns import CandlestickPatterns
 
-
-# ==================== 策略参数配置 ====================
-# 可根据回测结果调整这些参数
-
-# 数据周期参数
-MIN_DATA_DAYS = 60  # 最少需要的数据天数
-
-# 均线参数
-MA_SHORT_PERIOD = 5   # 短期均线周期
-MA_MID_PERIOD = 20    # 中期均线周期
-MA_LONG_PERIOD = 60   # 长期均线周期
-
-# 均线趋势判断参数
-MA_SLOPE_LOOKBACK = 6  # 均线斜率计算回看天数
-MA_PRICE_TOLERANCE = 0.02  # 价格接近均线的容差（2%）
-MA_SPREAD_MAX = 0.15  # 均线间距最大值（15%）
-MA_MIN_STRENGTH = 50  # 均线向上最低强度要求
-
-# 横盘区域参数
-CONSOLIDATION_DAYS = 20  # 横盘区域检测天数
-CONSOLIDATION_RANGE = 0.15  # 横盘区域价格波动范围（15%）
-
-# 成交量参数
-VOLUME_SHRINK_RATIO = 0.8  # 成交量萎缩比例
-VOLUME_SURGE_RATIO = 1.5  # Spring形态成交量放大比例
-
-# Spring形态检测参数
-SPRING_LOOKBACK_DAYS = 10  # Spring形态检测回看天数
-SPRING_SUPPORT_LOOKBACK = 30  # 支撑位计算回看天数
-SPRING_BREAK_THRESHOLD = 0.99  # 跌破支撑阈值（1%）
-
-# RSI参数
-RSI_OVERSOLD_MIN = 30  # RSI超卖下限
-RSI_OVERSOLD_MAX = 50  # RSI超卖上限
-
-# MACD背离检测参数
-MACD_DIVERGENCE_LOOKBACK = 20  # MACD背离检测回看天数
-MACD_DIVERGENCE_SHORT = 10  # MACD背离短期对比天数
-
-# 置信度阈值
-CONFIDENCE_BUY = 60  # 买入信号置信度阈值
-CONFIDENCE_WATCH = 40  # 观察信号置信度阈值
-
-# 止损和目标参数
-STOP_LOSS_BUFFER = 0.015  # 止损缓冲（1.5%）
-TARGET_PROFIT = 0.12  # 目标收益（12%）
-
-# 置信度权重
-CONFIDENCE_CONSOLIDATION = 20  # 横盘区域确认权重
-CONFIDENCE_VOLUME_SHRINK = 15  # 成交量萎缩权重
-CONFIDENCE_SPRING = 25  # Spring形态权重
-CONFIDENCE_RSI = 15  # RSI回升权重
-CONFIDENCE_MACD = 25  # MACD背离权重
+# 从配置文件导入所有参数
+from strategy_config import *
 
 # ======================================================
 
@@ -70,6 +20,12 @@ class WyckoffStrategy:
         self.data_fetcher = DataFetcher()
         self.tech_indicators = TechnicalIndicators()
         self.price_action = PriceActionAnalyzer()
+        self.candlestick_detector = CandlestickPatterns()  # 新增：K线形态检测器
+        from trend_line_analyzer import TrendLineAnalyzer
+        self.trend_analyzer = TrendLineAnalyzer(
+            long_period=TREND_LINE_LONG_PERIOD,
+            short_period=TREND_LINE_SHORT_PERIOD
+        )
     
     def wyckoff_accumulation_strategy(self, stock_code):
         """
@@ -79,13 +35,19 @@ class WyckoffStrategy:
         新增筛选条件：
         - 均线必须向上（MA20 > MA50 > MA60）
         - 价格在均线上方或接近均线
+
         
         返回格式与SMC策略一致，用于回测引擎
         """
         # 获取日线和周线数据
-        daily_data = self.data_fetcher.get_stock_data(stock_code)
-        
-        if len(daily_data) < MIN_DATA_DAYS:
+        daily_data = self.data_fetcher.get_stock_data(stock_code,1000)
+        long_data = daily_data.tail(min(self.trend_analyzer.long_period, len(daily_data)))
+        long_uptrend=self.trend_analyzer._find_trendline_by_segment_lows(long_data, self.trend_analyzer.long_segments)
+
+
+        if self.trend_analyzer._check_broken_support(daily_data, long_uptrend):
+            return None
+        if len(daily_data) < WYCKOFF_MIN_DATA_DAYS:
             return None
         
         # 均线向上筛选（必须条件）
@@ -108,10 +70,14 @@ class WyckoffStrategy:
         
         current_price = daily_data['close'].iloc[-1]
         
-        # 计算风险收益比
-        risk = current_price - conditions['stop_loss']
-        reward = conditions['target'] - current_price
-        risk_reward_ratio = reward / risk if risk > 0 else 0
+        # 计算风险收益比 - 使用价格变化率，支持负价格
+        current_price_abs = abs(current_price)
+        if current_price_abs > 0:
+            risk_rate = abs(current_price - conditions['stop_loss']) / current_price_abs
+            reward_rate = abs(conditions['target'] - current_price) / current_price_abs
+            risk_reward_ratio = reward_rate / risk_rate if risk_rate > 0 else 0
+        else:
+            risk_reward_ratio = 0
         
         # 返回格式与SMC策略一致
         return {
@@ -130,58 +96,106 @@ class WyckoffStrategy:
                 'indicators': indicators,
                 'wyckoff_conditions': conditions,
                 'ma_uptrend': ma_check
-            }
+            },
+            # 标记为底部策略，用于后续过滤看空信号
+            'strategy_type': 'bottom_reversal',
+            'ignore_bearish_signals': True  # 忽略顶部看空信号
         }
     
     def _check_wyckoff_accumulation(self, data, pa_analysis, indicators):
         """检查威科夫积累阶段条件"""
         current_price = data['close'].iloc[-1]
-        recent_low = data['low'].tail(CONSOLIDATION_DAYS).min()
-        recent_high = data['high'].tail(CONSOLIDATION_DAYS).max()
+        recent_low = data['low'].tail(WYCKOFF_CONSOLIDATION_DAYS).min()
+        recent_high = data['high'].tail(WYCKOFF_CONSOLIDATION_DAYS).max()
         
         conditions_met = []
         confidence = 0
         
         # 1. 价格在底部区域横盘
-        price_range = (recent_high - recent_low) / recent_low
-        if price_range < CONSOLIDATION_RANGE:
+        if recent_low != 0:
+            price_range = (recent_high - recent_low) / recent_low
+        else:
+            price_range = 0
+        if price_range < WYCKOFF_CONSOLIDATION_RANGE:
             conditions_met.append("底部横盘区域确认")
-            confidence += CONFIDENCE_CONSOLIDATION
+            confidence += WYCKOFF_CONFIDENCE_CONSOLIDATION
         
         # 2. 成交量萎缩
         recent_volume = data['volume'].tail(10).mean()
         avg_volume = data['volume'].mean()
-        if recent_volume < avg_volume * VOLUME_SHRINK_RATIO:
+        if recent_volume < avg_volume * WYCKOFF_VOLUME_SHRINK_RATIO:
             conditions_met.append("成交量萎缩")
-            confidence += CONFIDENCE_VOLUME_SHRINK
+            confidence += WYCKOFF_CONFIDENCE_VOLUME_SHRINK
         
         # 3. Spring形态 - 快速跌破支撑后回升
         if self._detect_spring_pattern(data):
             conditions_met.append("Spring形态确认")
-            confidence += CONFIDENCE_SPRING
+            confidence += WYCKOFF_CONFIDENCE_SPRING
         
         # 4. RSI超卖后回升
         if len(indicators['rsi']) > 0:
             current_rsi = indicators['rsi'][-1]
-            if RSI_OVERSOLD_MIN < current_rsi < RSI_OVERSOLD_MAX:
+            if WYCKOFF_RSI_OVERSOLD_MIN < current_rsi < WYCKOFF_RSI_OVERSOLD_MAX:
                 conditions_met.append("RSI从超卖回升")
-                confidence += CONFIDENCE_RSI
+                confidence += WYCKOFF_CONFIDENCE_RSI
         
         # 5. MACD底背离
         if self._detect_macd_bullish_divergence(data, indicators):
             conditions_met.append("MACD底背离")
-            confidence += CONFIDENCE_MACD
+            confidence += WYCKOFF_CONFIDENCE_MACD
+        
+        # 6. 判断是否在底部区域（用于忽略顶部看空信号）
+        is_in_bottom = self._is_in_bottom_area(data)
+        if is_in_bottom:
+            conditions_met.append("处于底部区域，忽略顶部看空信号")
+        
+        # 计算止损和目标价（支持负价格）
+        if current_price > 0:
+            # 正价格：止损更低，目标更高
+            stop_loss = recent_low * (1 - WYCKOFF_STOP_LOSS_BUFFER)
+            target = current_price * (1 + WYCKOFF_TARGET_PROFIT)
+        else:
+            # 负价格：止损更负（数值更小），目标更接近0（数值更大）
+            stop_loss = recent_low * (1 + WYCKOFF_STOP_LOSS_BUFFER)
+            target = current_price * (1 - WYCKOFF_TARGET_PROFIT)
         
         # 生成信号
-        signal = 'buy' if confidence >= CONFIDENCE_BUY else 'watch' if confidence >= CONFIDENCE_WATCH else 'no_signal'
-        
+        signal = 'buy' if confidence >= WYCKOFF_CONFIDENCE_BUY else 'watch' if confidence >= WYCKOFF_CONFIDENCE_WATCH else 'no_signal'
         return {
             'signal': signal,
             'confidence': confidence,
-            'stop_loss': recent_low * (1 - STOP_LOSS_BUFFER),
-            'target': current_price * (1 + TARGET_PROFIT),
-            'details': conditions_met
+            'stop_loss': stop_loss,
+            'target': target,
+            'details': conditions_met,
+            'is_in_bottom': is_in_bottom
         }
+
+    def _is_in_bottom_area(self, data):
+        """
+        判断当前价格是否在底部区域
+
+        底部区域定义：
+        1. 价格没有跌破前期低点支撑（60天内的最低点）
+        2. 价格在支撑位上方或接近支撑位（5%缓冲）
+
+        返回：
+            bool: True表示在底部区域，可以忽略顶部看空信号
+        """
+        if len(data) < WYCKOFF_BOTTOM_SUPPORT_LOOKBACK:
+            return False
+
+        current_price = data['close'].iloc[-1]
+
+        # 计算前期支撑位（60天内的最低点）
+        support_level = data['low'].tail(WYCKOFF_BOTTOM_SUPPORT_LOOKBACK).min()
+
+        # 判断是否在支撑位上方（带5%缓冲）
+        support_with_buffer = support_level * (1 - WYCKOFF_BOTTOM_SUPPORT_BUFFER)
+
+        # 如果价格在支撑位上方，说明在底部区域
+        is_above_support = current_price >= support_with_buffer
+
+        return is_above_support
     
     def _check_moving_average_uptrend(self, data):
         """
@@ -199,13 +213,13 @@ class WyckoffStrategy:
                 'details': list
             }
         """
-        if len(data) < MA_LONG_PERIOD:
+        if len(data) < WYCKOFF_MA_LONG_PERIOD:
             return {'is_uptrend': False, 'strength': 0, 'details': []}
         
         # 计算均线
-        ma_short = data['close'].rolling(window=MA_SHORT_PERIOD).mean()
-        ma_mid = data['close'].rolling(window=MA_MID_PERIOD).mean()
-        ma_long = data['close'].rolling(window=MA_LONG_PERIOD).mean()
+        ma_short = data['close'].rolling(window=WYCKOFF_MA_SHORT_PERIOD).mean()
+        ma_mid = data['close'].rolling(window=WYCKOFF_MA_MID_PERIOD).mean()
+        ma_long = data['close'].rolling(window=WYCKOFF_MA_LONG_PERIOD).mean()
         
         current_price = data['close'].iloc[-1]
         current_ma_short = ma_short.iloc[-1]
@@ -217,38 +231,38 @@ class WyckoffStrategy:
         
         # 条件1: 多头排列
         if current_ma_short > current_ma_mid > current_ma_long:
-            details.append(f"均线多头排列(MA{MA_SHORT_PERIOD}>MA{MA_MID_PERIOD}>MA{MA_LONG_PERIOD})")
+            details.append(f"均线多头排列(MA{WYCKOFF_MA_SHORT_PERIOD}>MA{WYCKOFF_MA_MID_PERIOD}>MA{WYCKOFF_MA_LONG_PERIOD})")
             strength += 40
         
         # 条件2: 均线斜率向上
-        ma_short_slope = (ma_short.iloc[-1] - ma_short.iloc[-MA_SLOPE_LOOKBACK]) / ma_short.iloc[-MA_SLOPE_LOOKBACK] if len(ma_short) >= MA_SLOPE_LOOKBACK else 0
-        ma_mid_slope = (ma_mid.iloc[-1] - ma_mid.iloc[-MA_SLOPE_LOOKBACK]) / ma_mid.iloc[-MA_SLOPE_LOOKBACK] if len(ma_mid) >= MA_SLOPE_LOOKBACK else 0
+        ma_short_slope = (ma_short.iloc[-1] - ma_short.iloc[-WYCKOFF_MA_SLOPE_LOOKBACK]) / ma_short.iloc[-WYCKOFF_MA_SLOPE_LOOKBACK] if len(ma_short) >= WYCKOFF_MA_SLOPE_LOOKBACK else 0
+        ma_mid_slope = (ma_mid.iloc[-1] - ma_mid.iloc[-WYCKOFF_MA_SLOPE_LOOKBACK]) / ma_mid.iloc[-WYCKOFF_MA_SLOPE_LOOKBACK] if len(ma_mid) >= WYCKOFF_MA_SLOPE_LOOKBACK else 0
         
         if ma_short_slope > 0 and ma_mid_slope > 0:
             details.append("均线斜率向上")
             strength += 30
         elif ma_short_slope > 0:
-            details.append(f"MA{MA_SHORT_PERIOD}向上")
+            details.append(f"MA{WYCKOFF_MA_SHORT_PERIOD}向上")
             strength += 15
         
         # 条件3: 价格位置
         price_to_ma_pct = (current_price - current_ma_short) / current_ma_short
         
         if price_to_ma_pct >= 0:
-            details.append(f"价格在MA{MA_SHORT_PERIOD}上方 (+{price_to_ma_pct*100:.1f}%)")
+            details.append(f"价格在MA{WYCKOFF_MA_SHORT_PERIOD}上方 (+{price_to_ma_pct*100:.1f}%)")
             strength += 20
-        elif price_to_ma_pct >= -MA_PRICE_TOLERANCE:
-            details.append(f"价格接近MA{MA_SHORT_PERIOD} ({price_to_ma_pct*100:.1f}%)")
+        elif price_to_ma_pct >= -WYCKOFF_MA_PRICE_TOLERANCE:
+            details.append(f"价格接近MA{WYCKOFF_MA_SHORT_PERIOD} ({price_to_ma_pct*100:.1f}%)")
             strength += 10
         
         # 条件4: 均线间距合理
         ma_spread = (current_ma_short - current_ma_long) / current_ma_long
-        if 0 < ma_spread < MA_SPREAD_MAX:
+        if 0 < ma_spread < WYCKOFF_MA_SPREAD_MAX:
             details.append("均线间距合理")
             strength += 10
         
         # 判断是否为上升趋势
-        is_uptrend = strength >= MA_MIN_STRENGTH
+        is_uptrend = strength >= WYCKOFF_MA_MIN_STRENGTH
         
         return {
             'is_uptrend': is_uptrend,
@@ -259,33 +273,33 @@ class WyckoffStrategy:
     
     def _detect_spring_pattern(self, data):
         """检测Spring形态"""
-        if len(data) < SPRING_LOOKBACK_DAYS:
+        if len(data) < WYCKOFF_SPRING_LOOKBACK_DAYS:
             return False
         
-        recent_data = data.tail(SPRING_LOOKBACK_DAYS)
-        support_level = data.tail(SPRING_SUPPORT_LOOKBACK)['low'].min()
+        recent_data = data.tail(WYCKOFF_SPRING_LOOKBACK_DAYS)
+        support_level = data.tail(WYCKOFF_SPRING_SUPPORT_LOOKBACK)['low'].min()
         
         # 寻找跌破支撑后快速回升的模式
         for i in range(len(recent_data) - 2):
-            if (recent_data.iloc[i]['low'] < support_level * SPRING_BREAK_THRESHOLD and  # 跌破支撑
+            if (recent_data.iloc[i]['low'] < support_level * WYCKOFF_SPRING_BREAK_THRESHOLD and  # 跌破支撑
                 recent_data.iloc[i+1]['close'] > recent_data.iloc[i]['close'] and  # 次日回升
-                recent_data.iloc[i]['volume'] > recent_data['volume'].mean() * VOLUME_SURGE_RATIO):  # 放量
+                recent_data.iloc[i]['volume'] > recent_data['volume'].mean() * WYCKOFF_VOLUME_SURGE_RATIO):  # 放量
                 return True
         
         return False
     
     def _detect_macd_bullish_divergence(self, data, indicators):
         """检测MACD底背离"""
-        if len(indicators['macd']) < MACD_DIVERGENCE_LOOKBACK:
+        if len(indicators['macd']) < WYCKOFF_MACD_DIVERGENCE_LOOKBACK:
             return False
         
         # 寻找价格创新低但MACD不创新低的情况
-        recent_prices = data['close'].tail(MACD_DIVERGENCE_LOOKBACK)
-        recent_macd = indicators['macd'][-MACD_DIVERGENCE_LOOKBACK:]
+        recent_prices = data['close'].tail(WYCKOFF_MACD_DIVERGENCE_LOOKBACK)
+        recent_macd = indicators['macd'][-WYCKOFF_MACD_DIVERGENCE_LOOKBACK:]
         
         # 简化的背离检测
-        if len(recent_macd) >= MACD_DIVERGENCE_SHORT:
-            return recent_macd[-1] > recent_macd[-MACD_DIVERGENCE_SHORT] and recent_prices.iloc[-1] <= recent_prices.iloc[-MACD_DIVERGENCE_SHORT]
+        if len(recent_macd) >= WYCKOFF_MACD_DIVERGENCE_SHORT:
+            return recent_macd[-1] > recent_macd[-WYCKOFF_MACD_DIVERGENCE_SHORT] and recent_prices.iloc[-1] <= recent_prices.iloc[-WYCKOFF_MACD_DIVERGENCE_SHORT]
         
         return False
     

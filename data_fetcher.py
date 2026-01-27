@@ -11,7 +11,7 @@ import requests
 import json
 
 class DataFetcher:
-    def __init__(self, use_proxy=True):
+    def __init__(self, use_proxy=config.USE_PROXY):
         # 确保使用项目根目录的数据库路径
         db_path = DATABASE_PATH
         self.conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
@@ -147,7 +147,7 @@ class DataFetcher:
         if not self.proxy_pool:
             self.get_proxy_pool()
         
-        max_retry_rounds = 3  # 最多重新获取代理池的次数
+        max_retry_rounds = 10  # 最多重新获取代理池的次数
         
         for retry_round in range(max_retry_rounds):
             # 如果不是第一轮，重新获取代理池
@@ -322,7 +322,29 @@ class DataFetcher:
                 time.sleep(delay)
         
         return pd.DataFrame()
-    
+
+    def get_stock_info(self,code=None):
+        """
+        从数据库获取股票基本信息
+
+        Args:
+            code: 股票代码，如果为None则返回所有股票信息
+
+        Returns:
+            DataFrame: 包含股票信息的数据
+        """
+        conn = sqlite3.connect(DATABASE_PATH)
+
+        if code:
+            query = "SELECT * FROM stock_info WHERE code = ?"
+            df = pd.read_sql_query(query, conn, params=(code,))
+        else:
+            query = "SELECT * FROM stock_info"
+            df = pd.read_sql_query(query, conn)
+
+        conn.close()
+        return df
+
     def update_stock_info(self, markets=['sh', 'sz_main']):
         """更新股票基本信息（包括市值、市盈率、市净率）
         
@@ -400,7 +422,7 @@ class DataFetcher:
         """获取股票最后更新日期"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT MAX(date) FROM daily_data WHERE code = ?
+            SELECT MAX(update_time) FROM stock_info WHERE code = ?
         ''', (symbol,))
         result = cursor.fetchone()
         return result[0] if result[0] else None
@@ -453,8 +475,39 @@ class DataFetcher:
                     # 1. 如果最后日期早于今天，肯定需要更新
                     # 2. 如果最后日期是今天，检查更新时间是否在15:00之后
                     need_latest = False
-                    if last_date < current_date:
-                        need_latest = True
+
+
+                    if last_date == (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d') and now >= today_15pm:
+                        spot_data = ak.stock_zh_a_spot_em()
+                        existing_stock = self.get_stock_info()
+                        
+                        # 获取最新的实时数据并更新
+                        for _, stock in existing_stock.iterrows():
+                            code = stock['code']
+                            stock_data = spot_data[spot_data['代码'] == code]
+                            if not stock_data.empty:
+                                # 更新日线数据表中的最新交易日数据
+                                cursor.execute('''
+                                    INSERT OR REPLACE INTO daily_data 
+                                    (code, date, open, high, low, close, volume, amount, turnover_rate)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ''', (
+                                    code, 
+                                    datetime.now().strftime('%Y-%m-%d'),
+                                    float(stock_data.iloc[0]['开盘']) if pd.notna(stock_data.iloc[0]['开盘']) else None,
+                                    float(stock_data.iloc[0]['最高']) if pd.notna(stock_data.iloc[0]['最高']) else None,
+                                    float(stock_data.iloc[0]['最低']) if pd.notna(stock_data.iloc[0]['最低']) else None,
+                                    float(stock_data.iloc[0]['收盘']) if pd.notna(stock_data.iloc[0]['收盘']) else None,
+                                    float(stock_data.iloc[0]['成交量']) if pd.notna(stock_data.iloc[0]['成交量']) else None,
+                                    float(stock_data.iloc[0]['成交额']) if pd.notna(stock_data.iloc[0]['成交额']) else None,
+                                    float(stock_data.iloc[0]['换手率']) if pd.notna(stock_data.iloc[0]['换手率']) else None
+                                ))
+                        
+                        # 更新stock_info的update_time
+                        update_time = datetime.now()
+                        cursor.execute('''
+                            UPDATE stock_info SET update_time = ? WHERE code = ?
+                        ''', (update_time, symbol))
                     elif last_date == current_date and now >= today_15pm:
                         # 今天且已过15:00，检查更新时间
                         cursor.execute('''
@@ -470,11 +523,19 @@ class DataFetcher:
                         else:
                             # 没有更新时间记录，需要更新
                             need_latest = True
+                    elif now<today_15pm and last_date == (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'):
+                        print("今天未过15:00,暂缓更新")
+                    elif now < today_15pm and last_date <= (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d'):
+                        need_latest = True
+
                     if config.BACKDATE:
                         if need_historical or need_latest:
                             # 一次性获取从期望起始日期到当前日期的完整数据
                             hist_start = expected_start_date.replace('-', '')
-                            hist_end = datetime.now().strftime('%Y%m%d')
+                            if datetime.now()>today_15pm:
+                                hist_end = datetime.now().strftime('%Y%m%d')
+                            else:
+                                hist_end = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
                             hist_data = self.get_historical_data(symbol, start_date=hist_start, end_date=hist_end)
                             
                             if not hist_data.empty:
@@ -506,18 +567,25 @@ class DataFetcher:
                     else:
                         if need_latest:
                             # 获取最新数据
-                            latest_data = self.get_historical_data(symbol,start_date=last_date,end_date=current_date)
+                            latest_data = self.get_historical_data(symbol, start_date=last_date.replace('-', ''), end_date=current_date.replace('-', ''))
                             
                             if not latest_data.empty:
-                                cursor.execute('''
-                                    INSERT OR REPLACE INTO daily_data 
-                                    (code, date, open, high, low, close, volume, amount, turnover_rate)
-                                    VALUES ()
-                                ''', (
-                                    symbol, row['日期'], row['开盘'], row['最高'],
-                                    row['最低'], row['收盘'], row['成交量'], row['成交额'],
-                                    row['换手率'] if '换手率' in row and pd.notna(row['换手率']) else None
-                                ))
+                                # 获取数据库中已有的日期集合
+                                cursor.execute('SELECT date FROM daily_data WHERE code = ?', (symbol,))
+                                existing_dates = set(row[0] for row in cursor.fetchall())
+                                
+                                # 只插入缺失的数据
+                                for _, row in latest_data.iterrows():
+                                    if row['日期'] not in existing_dates:
+                                        cursor.execute('''
+                                            INSERT OR REPLACE INTO daily_data 
+                                            (code, date, open, high, low, close, volume, amount, turnover_rate)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        ''', (
+                                            symbol, row['日期'], row['开盘'], row['最高'],
+                                            row['最低'], row['收盘'], row['成交量'], row['成交额'],
+                                            row['换手率'] if '换手率' in row and pd.notna(row['换手率']) else None
+                                        ))
                 else:
                     # 首次获取，获取完整历史数据
                     hist_data = self.get_historical_data(symbol)
@@ -566,7 +634,7 @@ class DataFetcher:
         except Exception as e:
             print(f"更新{symbol}数据失败: {e}")
     
-    def get_stock_data(self, symbol, days=1000):
+    def get_stock_data(self, symbol, days=1):
         """从数据库获取股票数据"""
         query = '''
             SELECT * FROM daily_data 

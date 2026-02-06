@@ -4,14 +4,13 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from data_fetcher import DataFetcher
-from technical_indicators import TechnicalIndicators
-from trend_line_analyzer import TrendLineAnalyzer
-from candlestick_patterns import CandlestickPatterns
+from core.data import DataFetcher
+from core.indicators import TechnicalIndicators
+from core.analysis import TrendLineAnalyzer, CandlestickPatterns
 import talib
 
 # 从配置文件导入所有参数
-from strategy_config import *
+from config.strategy_config import *
 
 # ======================================================
 
@@ -36,7 +35,7 @@ class SMCLiquidityStrategy:
         self.candlestick_detector = CandlestickPatterns()  # K线形态检测器
         
         # 新增：价格行为分析器（用于通用方法）
-        from price_action_analyzer import PriceActionAnalyzer
+        from core.analysis.price_action_analyzer import PriceActionAnalyzer
         self.price_action_analyzer = PriceActionAnalyzer()
         
         # 策略参数（保留用于向后兼容，但使用全局常量）

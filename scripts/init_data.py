@@ -1,16 +1,43 @@
 # 主程序入口
 import time
 from datetime import datetime
-from data_fetcher import DataFetcher
-from stock_screener import StockScreener
-from wyckoff_strategy import WyckoffStrategy
-from price_action_analyzer import PriceActionAnalyzer
+
+import sys
+import os
+
+# 添加项目根目录到路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+import config.config
+from core.data import DataFetcher, HybridDataFetcher
+from scripts.stock_screener import StockScreener
+from core.strategies import WyckoffStrategy
+from core.analysis import PriceActionAnalyzer
 from config import UPDATE_INTERVAL, MARKET_OPEN_TIME, MARKET_CLOSE_TIME, QUEST_INTERVAL, TEMP_ORDER
 
 
 class QuantStockSelector:
-    def __init__(self):
-        self.data_fetcher = DataFetcher()
+    def __init__(self, use_hybrid=True, prefer_source='yfinance'):
+        """
+        初始化量化选股系统
+        
+        Args:
+            use_hybrid: 是否使用混合数据源（支持akshare和yfinance自动切换）
+            prefer_source: 优先使用的数据源，'akshare' 或 'yfinance'
+        """
+        self.use_hybrid = use_hybrid
+        
+        if use_hybrid:
+            print(f"✓ 使用混合数据源模式（优先: {prefer_source}，备用: {'yfinance' if prefer_source == 'akshare' else 'akshare'}）")
+            self.data_fetcher = HybridDataFetcher(
+                use_proxy=config.USE_PROXY,
+                prefer_source=prefer_source
+            )
+        else:
+            print("✓ 使用标准数据源模式（仅akshare）")
+            self.data_fetcher = DataFetcher()
+        
         self.screener = StockScreener()
         self.wyckoff_strategy = WyckoffStrategy()
         self.price_action = PriceActionAnalyzer()
@@ -35,11 +62,15 @@ class QuantStockSelector:
         for count, (idx, stock) in enumerate(stock_list.iterrows(), 1):
             if count>TEMP_ORDER:
                 try:
-                    self.data_fetcher.update_daily_data(stock['code'], incremental=incremental)
-                    success_count += 1
-                    # if count%50==0:
-                    print(f"已更新 {count}/{total_stocks} 只股票")
-                    time.sleep(QUEST_INTERVAL)  # 避免请求过于频繁
+                    if config.UPDATE_TODAY_ONLY:
+                        self.data_fetcher.update_daily_data(stock['code'], incremental=incremental)
+                        return
+                    else:
+                        self.data_fetcher.update_daily_data(stock['code'], incremental=incremental)
+                        success_count += 1
+                        # if count%50==0:
+                        print(f"已更新 {count}/{total_stocks} 只股票")
+                        time.sleep(QUEST_INTERVAL)  # 避免请求过于频繁
                     
                 except Exception as e:
                     fail_count += 1
@@ -55,7 +86,7 @@ class QuantStockSelector:
     
     def run_smc_strategy(self):
         """执行SMC流动性猎取策略"""
-        from smc_liquidity_strategy import SMCLiquidityStrategy
+        from core.strategies.smc_liquidity_strategy import SMCLiquidityStrategy
 
         print(f"\n{'=' * 80}")
         print("SMC流动性猎取策略")
@@ -122,7 +153,7 @@ class QuantStockSelector:
             screener.smc_strategy.generate_report(results)
         elif choice == "2":
             candidates = screener.get_filtered_candidates()
-            results = screener.run_model_3_wyckoff_spring(candidates, top_n)
+            results = screener.run_model_2_wyckoff_spring(candidates, top_n)
             screener.smc_strategy.generate_report(results)
         elif choice == "3":
             screener.run_comprehensive_screening('all', top_n)
@@ -167,7 +198,11 @@ class QuantStockSelector:
     def interactive_mode(self):
         """交互模式"""
         print("\n=== A股量化选股系统 ===")
-        print("数据管理:")
+        if self.use_hybrid:
+            print("【混合数据源模式】支持akshare和yfinance自动切换")
+        else:
+            print("【标准模式】使用akshare数据源")
+        print("\n数据管理:")
         print("1. 初始化股票数据（首次使用）")
         print("2. 增量更新数据")
         print("3. 全量更新数据")
@@ -177,6 +212,8 @@ class QuantStockSelector:
         print("6. 整合选股 (运行所有策略)")
         print("\n系统功能:")
         print("7. 启动定时更新")
+        if self.use_hybrid:
+            print("8. 查看数据源统计")
         print("0. 退出")
         
         while True:
@@ -187,7 +224,10 @@ class QuantStockSelector:
                     break
                 elif choice == "1":
                     print("\n开始初始化股票数据（上证+深圳主板）...")
-                    self.data_fetcher.init_all_stocks_data(markets=['sh', 'sz_main'], incremental=False)
+                    if hasattr(self.data_fetcher, 'init_all_stocks_data'):
+                        self.data_fetcher.init_all_stocks_data(markets=['sh', 'sz_main'], incremental=False)
+                    else:
+                        print("⚠️ 混合数据源模式暂不支持批量初始化，请使用标准模式或使用update_data_with_fallback.py脚本")
                 elif choice == "2":
                     self.update_data(incremental=True)
                 elif choice == "3":
@@ -206,6 +246,11 @@ class QuantStockSelector:
                         self.start_scheduler()
                     except KeyboardInterrupt:
                         self.stop_scheduler()
+                elif choice == "8" and self.use_hybrid:
+                    if hasattr(self.data_fetcher, 'print_stats'):
+                        self.data_fetcher.print_stats()
+                    else:
+                        print("当前模式不支持统计信息")
                 else:
                     print("无效选择，请重新输入")
                     
@@ -453,17 +498,46 @@ class QuantStockSelector:
     
     def close(self):
         """关闭资源"""
-        self.data_fetcher.close()
+        if hasattr(self.data_fetcher, 'close'):
+            self.data_fetcher.close()
+        if hasattr(self.data_fetcher, 'conn') and self.data_fetcher.conn:
+            self.data_fetcher.conn.close()
         self.screener.close()
+        
+        # 如果使用混合数据源，打印统计信息
+        if self.use_hybrid and hasattr(self.data_fetcher, 'print_stats'):
+            self.data_fetcher.print_stats()
 
 def main():
     """主函数"""
-    selector = QuantStockSelector()
+    import argparse
+    
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='A股量化选股系统')
+    parser.add_argument(
+        '--hybrid',
+        action='store_true',
+        default=True,
+        help='使用混合数据源模式（支持akshare和yfinance自动切换）'
+    )
+    parser.add_argument(
+        '--source',
+        choices=['akshare', 'yfinance'],
+        default='yfinance',
+        help='优先使用的数据源（仅在--hybrid模式下有效）'
+    )
+    
+    args = parser.parse_args()
+    
+    selector = QuantStockSelector(
+        use_hybrid=args.hybrid,
+        prefer_source=args.source
+    )
     
     try:
         # 检查数据库是否已初始化
         cursor = selector.data_fetcher.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM stock_info")
+        cursor.execute("SELECT COUNT(*) FROM daily_data")
         stock_count = cursor.fetchone()[0]
         
         if stock_count == 0:

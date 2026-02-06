@@ -16,10 +16,10 @@ import os
 from typing import List, Dict, Optional, Tuple
 
 # 添加父目录到路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import DATABASE_PATH
-from trend_line_analyzer import TrendLineAnalyzer
-from data_fetcher import DataFetcher
+from core.analysis import TrendLineAnalyzer
+from core.data import DataFetcher
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']

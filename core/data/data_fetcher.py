@@ -5,10 +5,19 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 import config
-from config import DATABASE_PATH,YEARS, RETRY_DELAYS, WORKERS_NUM
+from config import DATABASE_PATH, YEARS, RETRY_DELAYS, WORKERS_NUM
 import os
 import requests
-import json
+
+
+# 应用akshare补丁，添加nid和create_time到请求头
+try:
+    from .akshare_patch import patch_akshare_requests
+    patch_akshare_requests()
+except ImportError:
+    print("⚠️ 未找到akshare_patch模块，请求头中不会添加nid和create_time")
+except Exception as e:
+    print(f"⚠️ 应用akshare补丁失败: {e}")
 
 class DataFetcher:
     def __init__(self, use_proxy=config.USE_PROXY):
@@ -128,7 +137,7 @@ class DataFetcher:
             del os.environ['HTTP_PROXY']
         if 'HTTPS_PROXY' in os.environ:
             del os.environ['HTTPS_PROXY']
-    
+
     def request_with_proxy_retry(self, request_func, *args, **kwargs):
         """使用代理重试机制执行请求
         
@@ -241,27 +250,38 @@ class DataFetcher:
         """
         try:
             # 使用代理重试机制获取股票列表
-            stock_list = self.request_with_proxy_retry(ak.stock_info_a_code_name)
+            # 尝试从数据库获取股票列表，如果不存在则从API获取
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM daily_data")
+            count = cursor.fetchone()[0]
             
-            # 根据市场代码过滤
-            if markets:
-                filtered_list = []
-                for _, stock in stock_list.iterrows():
-                    code = stock['code']
-                    # 上证: 60开头
-                    if 'sh' in markets and code.startswith('60'):
-                        filtered_list.append(stock)
-                    # 深圳主板: 00开头
-                    elif 'sz_main' in markets and code.startswith('00'):
-                        filtered_list.append(stock)
-                    # 创业板: 30开头
-                    elif 'sz_gem' in markets and code.startswith('30'):
-                        filtered_list.append(stock)
-                    # 北交所: 8和4开头
-                    elif 'bj' in markets and (code.startswith('8') or code.startswith('4')):
-                        filtered_list.append(stock)
-                
-                stock_list = pd.DataFrame(filtered_list)
+            if count > 0:
+                # 如果数据库中有数据，则从数据库获取股票代码列表
+                cursor.execute("SELECT DISTINCT code FROM daily_data ORDER BY code")
+                db_stocks = [row[0] for row in cursor.fetchall()]
+                stock_list = pd.DataFrame(db_stocks, columns=['code'])
+                print(f"从数据库获取到 {len(stock_list)} 条股票信息")
+            else:
+                stock_list = self.request_with_proxy_retry(ak.stock_info_a_code_name)
+                # 根据市场代码过滤
+                if markets:
+                    filtered_list = []
+                    for _, stock in stock_list.iterrows():
+                        code = stock['code']
+                        # 上证: 60开头
+                        if 'sh' in markets and code.startswith('60'):
+                            filtered_list.append(stock)
+                        # 深圳主板: 00开头
+                        elif 'sz_main' in markets and code.startswith('00'):
+                            filtered_list.append(stock)
+                        # 创业板: 30开头
+                        elif 'sz_gem' in markets and code.startswith('30'):
+                            filtered_list.append(stock)
+                        # 北交所: 8和4开头
+                        elif 'bj' in markets and (code.startswith('8') or code.startswith('4')):
+                            filtered_list.append(stock)
+
+                    stock_list = pd.DataFrame(filtered_list)
             
             return stock_list
         except Exception as e:
@@ -289,6 +309,7 @@ class DataFetcher:
         - 第4次失败：退出程序
         """
         if start_date is None:
+            print("使用默认开始日期：10年前")
             start_date = (datetime.now() - timedelta(days=365*YEARS)).strftime('%Y%m%d')
         if end_date is None:
             end_date = datetime.now().strftime('%Y%m%d')
@@ -347,7 +368,7 @@ class DataFetcher:
 
     def update_stock_info(self, markets=['sh', 'sz_main']):
         """更新股票基本信息（包括市值、市盈率、市净率）
-        
+
         Args:
             markets: 市场列表，默认['sh', 'sz_main']表示上证和深圳主板
         """
@@ -422,7 +443,7 @@ class DataFetcher:
         """获取股票最后更新日期"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT MAX(update_time) FROM stock_info WHERE code = ?
+            SELECT MAX(date) FROM daily_data WHERE code = ?
         ''', (symbol,))
         result = cursor.fetchone()
         return result[0] if result[0] else None
@@ -477,7 +498,7 @@ class DataFetcher:
                     need_latest = False
 
 
-                    if last_date == (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d') and now >= today_15pm:
+                    if config.UPDATE_TODAY_ONLY:
                         spot_data = ak.stock_zh_a_spot_em()
                         existing_stock = self.get_stock_info()
                         
@@ -508,24 +529,20 @@ class DataFetcher:
                         cursor.execute('''
                             UPDATE stock_info SET update_time = ? WHERE code = ?
                         ''', (update_time, symbol))
+                        self.conn.commit()
+                        print(f"所有股票的今日数据已更新")
+                        return
                     elif last_date == current_date and now >= today_15pm:
-                        # 今天且已过15:00，检查更新时间
-                        cursor.execute('''
-                            SELECT update_time FROM stock_info 
-                            WHERE code = ?
-                        ''', (symbol,))
-                        result = cursor.fetchone()
-                        if result and result[0]:
-                            update_time = datetime.fromisoformat(result[0])
-                            # 如果更新时间早于今天15:00，需要更新
-                            if update_time < today_15pm:
-                                need_latest = True
-                        else:
-                            # 没有更新时间记录，需要更新
-                            need_latest = True
+                        end_date=datetime.now().strftime('%Y-%m-%d')
+                        need_latest = True
                     elif now<today_15pm and last_date == (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'):
-                        print("今天未过15:00,暂缓更新")
+                        print(f"今天未过15:00,暂缓更新{symbol}")
+                        return
                     elif now < today_15pm and last_date <= (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d'):
+                        end_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+                        need_latest = True
+                    else:
+                        end_date=datetime.now() .strftime('%Y-%m-%d')
                         need_latest = True
 
                     if config.BACKDATE:
@@ -567,7 +584,7 @@ class DataFetcher:
                     else:
                         if need_latest:
                             # 获取最新数据
-                            latest_data = self.get_historical_data(symbol, start_date=last_date.replace('-', ''), end_date=current_date.replace('-', ''))
+                            latest_data = self.get_historical_data(symbol, start_date=last_date.replace('-', ''), end_date=end_date.replace('-', ''))
                             
                             if not latest_data.empty:
                                 # 获取数据库中已有的日期集合
@@ -622,14 +639,36 @@ class DataFetcher:
                             row['最低'], row['收盘'], row['成交量'], row['成交额'],
                             row['换手率'] if '换手率' in row and pd.notna(row['换手率']) else None
                         ))
-                    
-                    # 更新stock_info的update_time
-                    update_time = datetime.now()
-                    cursor.execute('''
-                        UPDATE stock_info SET update_time = ? WHERE code = ?
-                    ''', (update_time, symbol))
-            
+
+
             self.conn.commit()
+
+            # 检查当前时间是否过了15:00，确定最新的交易日
+            now = datetime.now()
+            today_15pm = now.replace(hour=15, minute=0, second=0, microsecond=0)
+            
+            if now >= today_15pm:
+                latest_trading_day = now.strftime('%Y-%m-%d')
+            else:
+                # 如果没过15:00，最新的交易日是上一个交易日
+                yesterday = now - timedelta(days=1)
+                latest_trading_day = yesterday.strftime('%Y-%m-%d')
+            
+            # 获取数据库中该股票最新的日期
+            cursor.execute('SELECT MAX(date) FROM daily_data WHERE code = ?', (symbol,))
+            result = cursor.fetchone()
+            last_date_in_db = result[0] if result[0] else None
+            
+            # 只有当数据库中的最新日期与实际最新交易日相符时，才更新update_time
+            if last_date_in_db == latest_trading_day:
+                update_time = datetime.now()
+                cursor.execute('''
+                    UPDATE stock_info SET update_time = ? WHERE code = ?
+                ''', (update_time, symbol))
+                print(f"更新{symbol}数据成功")
+            else:
+                print(f"数据未完全更新，{symbol}的最新数据日期为{last_date_in_db}，最新交易日为{latest_trading_day}，不更新update_time")
+
             
         except Exception as e:
             print(f"更新{symbol}数据失败: {e}")

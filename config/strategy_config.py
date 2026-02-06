@@ -10,17 +10,17 @@
 ENABLE_TAKE_PROFIT_EXIT = False  # 是否启用止盈卖出
 ENABLE_BEARISH_SIGNAL_EXIT = False  # 是否启用看空信号卖出
 ENABLE_SUPPORT_BREAK_EXIT = True  # 是否启用跌破支撑卖出
-ENABLE_TIME_STOP_EXIT = False  # 是否启用时间止损卖出
+ENABLE_TIME_STOP_EXIT = True  # 是否启用时间止损卖出
 
 OPEN_WAIT_THRESHOLD=0.03            #等待回调的高开阈值（3%）
 # ==================== 时间止损参数 ====================
-TIME_STOP_DAYS = 10  # 持仓未盈利天数阈值（默认7天）
-TIME_STOP_MIN_LOSS_PCT = -0.02  # 时间止损最小亏损比例（-2%，避免微小亏损就卖出）
+TIME_STOP_DAYS = 5  # 持仓未盈利天数阈值（默认7天）
+TIME_STOP_MIN_LOSS_PCT = -0.01  # 时间止损最小亏损比例（-2%，避免微小亏损就卖出）
 
 
 # 趋势线分析参数
-TREND_LINE_LONG_PERIOD = 120        # 长期趋势线回看周期（天）
-TREND_LINE_SHORT_PERIOD = 15        # 短期趋势线回看周期（天）
+TREND_LINE_LONG_PERIOD = 60        # 长期趋势线回看周期（天）
+TREND_LINE_SHORT_PERIOD = 18        # 短期趋势线回看周期（天）
 TREND_SEGMENTS=4                    # 趋势线段数
 TREND_BROKEN_THRESHOLD=0.05         # 趋势线跌破卖出容忍 5%
 
@@ -31,16 +31,16 @@ TREND_BROKEN_THRESHOLD=0.05         # 趋势线跌破卖出容忍 5%
 # ==============================================================================
 
 # ==================== 数据周期参数 ====================
-LOOKBACK_PERIOD = 30  # 回看周期（天）
+LOOKBACK_PERIOD = 60  # 回看周期（天）
 
 # ==================== 流动性猎取参数 ====================
 LIQUIDITY_SWEEP_THRESHOLD = 0.02    # 流动性扫荡阈值（2%）
-SPRING_RECOVERY_BARS = 6            # Spring恢复K线数量
+SPRING_RECOVERY_BARS = 3            # Spring恢复K线数量
 
 # ==================== 订单块参数 ====================
 ORDER_BLOCK_STRENGTH = 1.5       # 订单块成交量强度倍数
-ORDER_BLOCK_BREAKTHROUGH = 0.03  # 突破幅度（2%）
-ORDER_BLOCK_DISTANCE = 0.05      # 订单块回踩距离（3%）
+ORDER_BLOCK_BREAKTHROUGH = 0.02  # 突破幅度（2%）
+ORDER_BLOCK_DISTANCE = 0.03      # 订单块回踩距离（3%）
 
 # ==================== FVG参数 ====================
 FVG_MIN_GAP_RATIO = 0.001    # FVG最小缺口比例（0.1%）
@@ -53,13 +53,13 @@ TREND_MA_MID_PERIOD = 10    # 中期均线周期
 TREND_MA_SHORT_PERIOD = 5   # 短期均线周期
 
 # ==================== SMC趋势判断参数 ====================
-TREND_MA_LONG_SLOPE_LOOKBACK = 5     # 长期均线斜率回看天数
-TREND_MA_MID_SLOPE_LOOKBACK = 5      # 中期均线斜率回看天数
-TREND_MA_SHORT_SLOPE_LOOKBACK = 5    # 短期均线斜率回看天数
+TREND_MA_LONG_SLOPE_LOOKBACK = 2     # 长期均线斜率回看天数
+TREND_MA_MID_SLOPE_LOOKBACK = 2      # 中期均线斜率回看天数
+TREND_MA_SHORT_SLOPE_LOOKBACK = 2    # 短期均线斜率回看天数
 
 # 趋势强度评分阈值
-TREND_STRENGTH_STRONG = 70      # 强趋势阈值
-TREND_STRENGTH_MODERATE = 50    # 中等趋势阈值
+TREND_STRENGTH_STRONG = 60      # 强趋势阈值
+TREND_STRENGTH_MODERATE = 45    # 中等趋势阈值
 TREND_STRENGTH_WEAK = 30        # 弱趋势阈值
 
 # ==================== SMC成交量参数 ====================
@@ -73,7 +73,7 @@ ATR_TARGET_MULTIPLIER = 4    # ATR目标倍数
 
 # ==================== SMC入场时机参数 ====================
 ENTRY_MAX_DAILY_RETURN = 0.05    # 最大当日涨幅（5%）
-ENTRY_MAX_CONSECUTIVE_RISES = 5  # 最大连续上涨天数
+ENTRY_MAX_CONSECUTIVE_RISES = 3  # 最大连续上涨天数
 ENTRY_MAX_VOLUME_RATIO = 2.0     # 最大成交量倍数
 ENTRY_MIN_DISTANCE_FROM_HIGH= 0.1
 ENTRY_MAX_DISTANCE_FROM_SUPPORT = 0.05
@@ -85,17 +85,17 @@ STOP_LOSS_MIN_PCT = 0.02     # 最小止损百分比（2%）
 STOP_LOSS_MAX_PCT = 0.05     # 最大止损百分比（5%）
 
 # 强趋势止损参数
-STRONG_TREND_THRESHOLD = 70   # 强趋势阈值
+STRONG_TREND_THRESHOLD = 60   # 强趋势阈值
 STRONG_TREND_STOP_MIN = 0.92  # 强趋势最小止损（8%）
 STRONG_TREND_STOP_MAX = 0.96  # 强趋势最大止损（4%）
 WEAK_TREND_STOP_MIN = 0.96    # 弱趋势最小止损（4%）
 WEAK_TREND_STOP_MAX = 0.98    # 弱趋势最大止损（2%）
 
 # ==================== SMC置信度阈值 ====================
-MIN_CONFIDENCE = 65         # 最低置信度要求
+MIN_CONFIDENCE = 50         # 最低置信度要求
 CONFIDENCE_STRONG_BUY = 70  # 强买入信号置信度
-CONFIDENCE_BUY = 60         # 买入信号置信度
-MIN_ENTRY_QUALITY = 65      # 最低入场质量要求
+CONFIDENCE_BUY = 50         # 买入信号置信度
+MIN_ENTRY_QUALITY = 70      # 最低入场质量要求
 MIN_TREND_STRENGTH = 60     # 最低趋势强度要求
 
 # ==================== SMC看空信号参数 ====================
@@ -104,7 +104,7 @@ BEARISH_MIN_CONFIDENCE = 85        # 看空信号最低置信度
 BEARISH_VOLUME_SURGE = 1.5         # 看空成交量放大倍数
 
 # 动态看空阈值参数（根据趋势强度调整）
-BEARISH_DYNAMIC_THRESHOLD_ENABLED = True  # 启用动态阈值
+BEARISH_DYNAMIC_THRESHOLD_ENABLED = False  # 启用动态阈值
 BEARISH_STRONG_TREND_THRESHOLD = 85       # 强趋势看空阈值（更保守）
 BEARISH_MODERATE_TREND_THRESHOLD = 75     # 中等趋势看空阈值
 BEARISH_WEAK_TREND_THRESHOLD = 65         # 弱趋势看空阈值（更灵敏）
@@ -150,49 +150,49 @@ WYCKOFF_MA_MID_PERIOD = 30    # 中期均线周期
 WYCKOFF_MA_LONG_PERIOD = 90   # 长期均线周期
 
 # ==================== 威科夫均线趋势判断参数 ====================
-WYCKOFF_MA_SLOPE_LOOKBACK = 3        # 均线斜率计算回看天数
-WYCKOFF_MA_PRICE_TOLERANCE = 0.03    # 价格接近均线的容差（1%）
-WYCKOFF_MA_SPREAD_MAX = 0.15         # 均线间距最大值（10%）
-WYCKOFF_MA_MIN_STRENGTH = 0         # 均线向上最低强度要求
+WYCKOFF_MA_SLOPE_LOOKBACK = 3       # 均线斜率计算回看天数
+WYCKOFF_MA_PRICE_TOLERANCE = 0.01    # 价格接近均线的容差（1%）
+WYCKOFF_MA_SPREAD_MAX = 0.1         # 均线间距最大值（10%）
+WYCKOFF_MA_MIN_STRENGTH = 60         # 均线向上最低强度要求
 
 # ==================== 威科夫横盘区域参数 ====================
-WYCKOFF_CONSOLIDATION_DAYS = 20         # 横盘区域检测天数
-WYCKOFF_CONSOLIDATION_RANGE = 0.15      # 横盘区域价格波动范围（15%）
+WYCKOFF_CONSOLIDATION_DAYS = 10         # 横盘区域检测天数
+WYCKOFF_CONSOLIDATION_RANGE = 0.10      # 横盘区域价格波动范围（15%）
 
 # ==================== 威科夫成交量参数 ====================
 WYCKOFF_VOLUME_SHRINK_RATIO = 0.8     # 成交量萎缩比例
-WYCKOFF_VOLUME_SURGE_RATIO = 1.3      # Spring形态成交量放大比例
+WYCKOFF_VOLUME_SURGE_RATIO = 1.5      # Spring形态成交量放大比例
 
 # ==================== 威科夫Spring形态检测参数 ====================
 WYCKOFF_SPRING_LOOKBACK_DAYS = 10        # Spring形态检测回看天数
-WYCKOFF_SPRING_SUPPORT_LOOKBACK = 60     # 支撑位计算回看天数
-WYCKOFF_SPRING_BREAK_THRESHOLD = 0.99     # 跌破支撑阈值（1%）
+WYCKOFF_SPRING_SUPPORT_LOOKBACK = 30     # 支撑位计算回看天数
+WYCKOFF_SPRING_BREAK_THRESHOLD = 0.95    # 跌破支撑阈值（1%）
 
 # ==================== 威科夫RSI参数 ====================
-WYCKOFF_RSI_OVERSOLD_MIN = 30       # RSI超卖下限
-WYCKOFF_RSI_OVERSOLD_MAX = 50       # RSI超卖上限
+WYCKOFF_RSI_OVERSOLD_MIN = 10       # RSI超卖下限
+WYCKOFF_RSI_OVERSOLD_MAX = 40       # RSI超卖上限
 
 # ==================== 威科夫MACD背离检测参数 ====================
 WYCKOFF_MACD_DIVERGENCE_LOOKBACK = 10   # MACD背离检测回看天数
-WYCKOFF_MACD_DIVERGENCE_SHORT = 10      # MACD背离短期对比天数
+WYCKOFF_MACD_DIVERGENCE_SHORT = 5      # MACD背离短期对比天数
 
 # ==================== 威科夫置信度阈值 ====================
-WYCKOFF_CONFIDENCE_BUY = 70         # 买入信号置信度阈值
+WYCKOFF_CONFIDENCE_BUY = 50         # 买入信号置信度阈值
 WYCKOFF_CONFIDENCE_WATCH = 100      # 观察信号置信度阈值
 
 # ==================== 威科夫底部区域判断参数 ====================
-WYCKOFF_BOTTOM_SUPPORT_LOOKBACK = 60  # 底部支撑位回看天数
-WYCKOFF_BOTTOM_SUPPORT_BUFFER = 0.03  # 支撑位缓冲（5%）
+WYCKOFF_BOTTOM_SUPPORT_LOOKBACK = 20  # 底部支撑位回看天数
+WYCKOFF_BOTTOM_SUPPORT_BUFFER = 0.05  # 支撑位缓冲（5%）
 
 # ==================== 威科夫止损和目标参数 ====================
-WYCKOFF_STOP_LOSS_BUFFER = 0.01  # 止损缓冲（10%）
+WYCKOFF_STOP_LOSS_BUFFER = 0.01  # 止损缓冲（1%）
 WYCKOFF_TARGET_PROFIT = 0.3  # 目标收益（12%）
 
 # ==================== 威科夫置信度权重 ====================
-WYCKOFF_CONFIDENCE_CONSOLIDATION = 15  # 横盘区域确认权重
+WYCKOFF_CONFIDENCE_CONSOLIDATION = 20  # 横盘区域确认权重
 WYCKOFF_CONFIDENCE_VOLUME_SHRINK = 20  # 成交量萎缩权重
 WYCKOFF_CONFIDENCE_SPRING = 25  # Spring形态权重
-WYCKOFF_CONFIDENCE_RSI = 20  # RSI回升权重
+WYCKOFF_CONFIDENCE_RSI = 15  # RSI回升权重
 WYCKOFF_CONFIDENCE_MACD = 20  # MACD背离权重
 
 # ==================== 参数说明 ====================

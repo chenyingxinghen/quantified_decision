@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import talib
 from config import TECHNICAL_PARAMS
-from strategy_config import TREND_MA_LONG_PERIOD, TREND_MA_MID_PERIOD, TREND_MA_SHORT_PERIOD
+from config.strategy_config import TREND_MA_LONG_PERIOD, TREND_MA_MID_PERIOD, TREND_MA_SHORT_PERIOD
 
 
 class TechnicalIndicators:

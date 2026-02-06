@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from scipy import stats
-from strategy_config import TREND_LINE_LONG_PERIOD, TREND_LINE_SHORT_PERIOD, TREND_SEGMENTS, \
+from config.strategy_config import TREND_LINE_LONG_PERIOD, TREND_LINE_SHORT_PERIOD, TREND_SEGMENTS, \
     TREND_BROKEN_THRESHOLD
 
 

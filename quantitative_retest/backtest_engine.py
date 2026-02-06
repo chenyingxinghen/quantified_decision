@@ -12,18 +12,12 @@ import os
 
 # 添加父目录到路径以导入模块
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from strategy_config import MIN_ENTRY_QUALITY, OPEN_WAIT_THRESHOLD
+from config.strategy_config import MIN_ENTRY_QUALITY, OPEN_WAIT_THRESHOLD
 from config import DATABASE_PATH
-from price_action_analyzer import PriceActionAnalyzer
+from core.analysis import PriceActionAnalyzer
 
-
-# 确保数据库路径为绝对路径 - 修正路径计算
-if not os.path.isabs(DATABASE_PATH):
-    # 获取项目根目录（从当前文件向上两级）
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    DATABASE_PATH = os.path.join(project_root, DATABASE_PATH)
-from integrated_screener import IntegratedScreener
-from smc_liquidity_strategy import SMCLiquidityStrategy
+from scripts.integrated_screener import IntegratedScreener
+from core.strategies.smc_liquidity_strategy import SMCLiquidityStrategy
 
 
 # 全局函数用于多进程（必须在顶层定义）
@@ -316,7 +310,7 @@ class StrategyInterface:
         返回: {'detected': bool, 'confidence': float, 'reasons': list, 'threshold': float, 'top_warning': bool}
         """
         try:
-            from smc_liquidity_strategy import SMCLiquidityStrategy
+            from core.strategies. smc_liquidity_strategy import SMCLiquidityStrategy
             smc_strategy = SMCLiquidityStrategy()
             return smc_strategy.detect_bearish_signals(stock_data, trend_strength, historical_signals, is_bottom_strategy)
         except Exception as e:
@@ -339,7 +333,7 @@ class StrategyInterface:
             
             elif strategy_name == 'wyckoff_spring':
                 # 威科夫策略分析，使用全部历史数据
-                from wyckoff_strategy import WyckoffStrategy
+                from core.strategies import WyckoffStrategy
                 
                 def mock_get_data(symbol, days=None):
                     return stock_data.copy()
@@ -434,7 +428,7 @@ class PositionManager:
         if all_stocks_data is None:
             return False
         
-        from smc_liquidity_strategy import SMCLiquidityStrategy
+        from  core.strategies.smc_liquidity_strategy import SMCLiquidityStrategy
         smc_v2 = SMCLiquidityStrategy()
         
         # 检查所有股票，看是否有买入信号
@@ -556,7 +550,7 @@ class BacktestEngine:
     def _get_smc_strategy(self):
         """获取SMC策略对象（单例模式）"""
         if self._smc_strategy is None:
-            from smc_liquidity_strategy import SMCLiquidityStrategy
+            from  core.strategies.smc_liquidity_strategy import SMCLiquidityStrategy
             self._smc_strategy = SMCLiquidityStrategy()
         return self._smc_strategy
     
@@ -828,7 +822,7 @@ class BacktestEngine:
         5. 时间止损：根据ENABLE_TIME_STOP_EXIT参数决定
         """
         # 导入配置参数
-        from strategy_config import (
+        from  config.strategy_config import (
             ENABLE_TAKE_PROFIT_EXIT, 
             ENABLE_BEARISH_SIGNAL_EXIT,
             ENABLE_SUPPORT_BREAK_EXIT,
@@ -893,7 +887,7 @@ class BacktestEngine:
         
         # 检测看空信号和趋势下破
         if stock_data is not None and len(stock_data) >= 30:
-            from trend_line_analyzer import TrendLineAnalyzer
+            from core.analysis.trend_line_analyzer import TrendLineAnalyzer
             
             smc_v2 = self._get_smc_strategy()
             

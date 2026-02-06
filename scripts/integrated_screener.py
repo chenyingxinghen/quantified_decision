@@ -3,14 +3,13 @@
 
 import pandas as pd
 from datetime import datetime, timedelta
-from data_fetcher import DataFetcher
-from stock_screener import StockScreener
-from smc_liquidity_strategy import SMCLiquidityStrategy
-from wyckoff_strategy import WyckoffStrategy
-from config import TECHNICAL_PARAMS,SELECTION_CRITERIA
+from core.data import DataFetcher
+from scripts.stock_screener import StockScreener
+from core.strategies.smc_liquidity_strategy import SMCLiquidityStrategy
+from core.strategies import WyckoffStrategy
+from config import TECHNICAL_PARAMS, SELECTION_CRITERIA
 import argparse
 
-MINCONFIDENCE = 50
 TOP_N=100000
 class IntegratedScreener:
     """
@@ -38,7 +37,6 @@ class IntegratedScreener:
         print("=" * 60)
         print(f"筛选条件:")
         print(f"  • 价格区间: {SELECTION_CRITERIA['min_price']} - {SELECTION_CRITERIA['max_price']} 元")
-        print(f"  • 最小换手率: {SELECTION_CRITERIA['min_turnover_rate']}%")
         print(f"  • 最小市值: {SELECTION_CRITERIA['min_market_cap']}亿")
         print(f"  • 最大市盈率: {SELECTION_CRITERIA['max_pe']}")
         print(f"  • 数据完整性: 至少30个交易日")

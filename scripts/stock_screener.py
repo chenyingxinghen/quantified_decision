@@ -2,8 +2,8 @@
 import pandas as pd
 import sqlite3
 from datetime import datetime
-from data_fetcher import DataFetcher
-from technical_indicators import TechnicalIndicators
+from core.data import DataFetcher
+from core.indicators import TechnicalIndicators
 import os
 from config import SELECTION_CRITERIA, DATABASE_PATH
 
@@ -51,11 +51,11 @@ class StockScreener:
         if latest_price < self.criteria['min_price'] or latest_price > self.criteria['max_price']:
             return False, f"价格不符合条件: {latest_price}"
         
-        # 换手率筛选
-        if 'turnover_rate' in stock_data.columns:
-            avg_turnover_rate = stock_data['turnover_rate'].tail(5).mean()
-            if pd.isna(avg_turnover_rate) or avg_turnover_rate < self.criteria['min_turnover_rate']:
-                return False, f"换手率不足: {avg_turnover_rate if not pd.isna(avg_turnover_rate) else 'N/A'}"
+        # # 换手率筛选
+        # if 'turnover_rate' in stock_data.columns:
+        #     avg_turnover_rate = stock_data['turnover_rate'].tail(5).mean()
+        #     if pd.isna(avg_turnover_rate) or avg_turnover_rate < self.criteria['min_turnover_rate']:
+        #         return False, f"换手率不足: {avg_turnover_rate if not pd.isna(avg_turnover_rate) else 'N/A'}"
         else:
             # 如果没有换手率字段，使用成交量作为备选
             avg_volume = stock_data['volume'].tail(5).mean()

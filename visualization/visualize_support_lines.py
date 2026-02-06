@@ -13,11 +13,11 @@ import sys
 import os
 
 # 添加父目录到路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import DATABASE_PATH
-from trend_line_analyzer import TrendLineAnalyzer
-from strategy_config import TREND_LINE_LONG_PERIOD, TREND_LINE_SHORT_PERIOD
+from core.analysis import TrendLineAnalyzer
+from config.strategy_config import TREND_LINE_LONG_PERIOD, TREND_LINE_SHORT_PERIOD
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']

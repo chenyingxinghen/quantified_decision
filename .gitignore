@@ -1,19 +1,60 @@
+# Python
 __pycache__/
-.idea/
-.kiro/
-.venv/
-*.pyc
-*.pyo
-*.pyd
-*.csv
-*.png
-stock_data.db
-quantitative_retest/stock_data.db
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# 回测生成的文件
-backtest_*.csv
-backtest_*.png
-screening_*.csv
-strategy_*.csv
-stock_data.db-shm
-stock_data.db-wal
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data files
+data/*.db
+data/*.json
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backtest results
+参数存档/*.png
+参数存档/*.csv
+参数存档/*.config
+quantitative_retest/backtest_results/
+quantitative_retest/iteration_history/
+
+# Temporary files
+*.tmp
+*.bak
+.kiro/steerin/design.md
+.kiro/steerin/requirements.md

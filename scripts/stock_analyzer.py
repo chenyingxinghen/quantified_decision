@@ -8,9 +8,9 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from data_fetcher import DataFetcher
-from smc_liquidity_strategy import SMCLiquidityStrategy
-from wyckoff_strategy import WyckoffStrategy
+from core.data import DataFetcher
+from core.strategies.smc_liquidity_strategy import SMCLiquidityStrategy
+from core.strategies import WyckoffStrategy
 import sys
 
 

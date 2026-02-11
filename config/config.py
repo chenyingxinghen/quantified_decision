@@ -25,21 +25,10 @@ BACKDATE=False
 MARKET_OPEN_TIME = "09:30"
 MARKET_CLOSE_TIME = "15:00"
 INCREMENTAL_UPDATE = True  # 默认使用增量更新
-WORKERS_NUM = 3
-QUEST_INTERVAL = 1 # 接口请求间隔
+WORKERS_NUM = 1
+QUEST_INTERVAL = 3 # 接口请求间隔
 RETRY_DELAYS = []  # 重试延迟时间（秒）10分钟,30分钟, 60分钟
 
-# 技术指标参数
-TECHNICAL_PARAMS = {
-    'ma_short': 5,      # 短期均线
-    'ma_long': 20,      # 长期均线
-    'rsi_period': 14,   # RSI周期
-    'macd_fast': 12,    # MACD快线
-    'macd_slow': 26,    # MACD慢线
-    'macd_signal': 9,   # MACD信号线
-    'bb_period': 20,    # 布林带周期
-    'bb_std': 2,        # 布林带标准差
-}
 
 # 选股条件
 SELECTION_CRITERIA = {

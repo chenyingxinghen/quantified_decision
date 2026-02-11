@@ -19,7 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+.kiro
 # Virtual Environment
 .venv/
 venv/
@@ -46,15 +46,17 @@ data/*.json
 .DS_Store
 Thumbs.db
 
-# Backtest results
-参数存档/*.png
-参数存档/*.csv
-参数存档/*.config
-quantitative_retest/backtest_results/
-quantitative_retest/iteration_history/
 
 # Temporary files
 *.tmp
 *.bak
 .kiro/steerin/design.md
 .kiro/steerin/requirements.md
+
+#data
+data/
+
+# 模型
+models/
+backtest_result/
+t.py

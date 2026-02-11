@@ -252,10 +252,17 @@ class DataFetcher:
             # 使用代理重试机制获取股票列表
             # 尝试从数据库获取股票列表，如果不存在则从API获取
             cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM stock_info")
+            count_info = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM daily_data")
-            count = cursor.fetchone()[0]
-            
-            if count > 0:
+            count_data = cursor.fetchone()[0]
+
+
+            if count_info > 0:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT code FROM stock_info")
+                return cursor.fetchall()
+            elif count_data> 0:
                 # 如果数据库中有数据，则从数据库获取股票代码列表
                 cursor.execute("SELECT DISTINCT code FROM daily_data ORDER BY code")
                 db_stocks = [row[0] for row in cursor.fetchall()]

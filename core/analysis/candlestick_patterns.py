@@ -366,13 +366,19 @@ class CandlestickPatterns:
         bar3 = data.iloc[-1]
         
         # 第一根：大阴线
-        is_bearish_1 = bar1['close'] < bar1['open'] and (bar1['open'] - bar1['close']) / bar1['open'] > 0.02
+        bar1_open = float(bar1['open'])
+        bar1_close = float(bar1['close'])
+        is_bearish_1 = bar1_close < bar1_open and bar1_open > 0 and (bar1_open - bar1_close) / bar1_open > 0.02
         # 第二根：小实体
-        is_small_2 = abs(bar2['close'] - bar2['open']) / bar2['open'] < 0.01
+        bar2_open = float(bar2['open'])
+        bar2_close = float(bar2['close'])
+        is_small_2 = bar2_open > 0 and abs(bar2_close - bar2_open) / bar2_open < 0.01
         # 第三根：大阳线
-        is_bullish_3 = bar3['close'] > bar3['open'] and (bar3['close'] - bar3['open']) / bar3['open'] > 0.02
+        bar3_open = float(bar3['open'])
+        bar3_close = float(bar3['close'])
+        is_bullish_3 = bar3_close > bar3_open and bar3_open > 0 and (bar3_close - bar3_open) / bar3_open > 0.02
         # 第三根深入第一根
-        penetration = bar3['close'] > (bar1['open'] + bar1['close']) / 2
+        penetration = bar3_close > (bar1_open + bar1_close) / 2
         
         if is_bearish_1 and is_small_2 and is_bullish_3 and penetration:
             return {
@@ -403,13 +409,19 @@ class CandlestickPatterns:
         bar3 = data.iloc[-1]
         
         # 第一根：大阳线
-        is_bullish_1 = bar1['close'] > bar1['open'] and (bar1['close'] - bar1['open']) / bar1['open'] > 0.02
+        bar1_open = float(bar1['open'])
+        bar1_close = float(bar1['close'])
+        is_bullish_1 = bar1_close > bar1_open and bar1_open > 0 and (bar1_close - bar1_open) / bar1_open > 0.02
         # 第二根：小实体
-        is_small_2 = abs(bar2['close'] - bar2['open']) / bar2['open'] < 0.01
+        bar2_open = float(bar2['open'])
+        bar2_close = float(bar2['close'])
+        is_small_2 = bar2_open > 0 and abs(bar2_close - bar2_open) / bar2_open < 0.01
         # 第三根：大阴线
-        is_bearish_3 = bar3['close'] < bar3['open'] and (bar3['open'] - bar3['close']) / bar3['open'] > 0.02
+        bar3_open = float(bar3['open'])
+        bar3_close = float(bar3['close'])
+        is_bearish_3 = bar3_close < bar3_open and bar3_open > 0 and (bar3_open - bar3_close) / bar3_open > 0.02
         # 第三根深入第一根
-        penetration = bar3['close'] < (bar1['open'] + bar1['close']) / 2
+        penetration = bar3_close < (bar1_open + bar1_close) / 2
         
         if is_bullish_1 and is_small_2 and is_bearish_3 and penetration:
             return {

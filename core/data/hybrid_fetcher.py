@@ -243,7 +243,7 @@ class HybridDataFetcher:
                     else:
                         start_date = last_date.replace('-', '')
                     
-                    end_date = current_date.replace('-', '')
+                    end_date = (datetime.now()+timedelta(days=1)).strftime('%Y-%m-%d').replace('-', '')
                 else:
                     # 首次获取
                     start_date = expected_start_date.replace('-', '')

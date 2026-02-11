@@ -2,33 +2,32 @@
 import pandas as pd
 import numpy as np
 import talib
-from config import TECHNICAL_PARAMS
+
 from config.strategy_config import TREND_MA_LONG_PERIOD, TREND_MA_MID_PERIOD, TREND_MA_SHORT_PERIOD
+from config.factor_config import FactorConfig
 
 
 class TechnicalIndicators:
     def __init__(self):
-        self.params = TECHNICAL_PARAMS
+        pass
     
-    def calculate_ma(self, data, period=None):
+    def calculate_ma(self, data, period=5):
         """计算移动平均线"""
-        if period is None:
-            period = self.params['ma_short']
         return talib.SMA(data['close'].values, timeperiod=period)
     
     def calculate_rsi(self, data, period=None):
         """计算RSI指标"""
         if period is None:
-            period = self.params['rsi_period']
+            period = FactorConfig.RSI_PERIOD
         return talib.RSI(data['close'].values, timeperiod=period)
     
     def calculate_macd(self, data):
         """计算MACD指标"""
         macd, signal, hist = talib.MACD(
             data['close'].values,
-            fastperiod=self.params['macd_fast'],
-            slowperiod=self.params['macd_slow'],
-            signalperiod=self.params['macd_signal']
+            fastperiod=FactorConfig.MACD_FAST,
+            slowperiod=FactorConfig.MACD_SLOW,
+            signalperiod=FactorConfig.MACD_SIGNAL
         )
         return macd, signal, hist
     
@@ -36,9 +35,9 @@ class TechnicalIndicators:
         """计算布林带"""
         upper, middle, lower = talib.BBANDS(
             data['close'].values,
-            timeperiod=self.params['bb_period'],
-            nbdevup=self.params['bb_std'],
-            nbdevdn=self.params['bb_std']
+            timeperiod=FactorConfig.BB_PERIOD,
+            nbdevup=FactorConfig.BB_STD,
+            nbdevdn=FactorConfig.BB_STD
         )
         return upper, middle, lower
     
@@ -64,8 +63,8 @@ class TechnicalIndicators:
     def calculate_volume_indicators(self, data):
         """计算成交量指标"""
         # 成交量移动平均
-        vol_ma5 = talib.SMA(data['volume'].values, timeperiod=5)
-        vol_ma10 = talib.SMA(data['volume'].values, timeperiod=10)
+        vol_ma5 = talib.SMA(data['volume'].values, timeperiod=FactorConfig.VOLUME_MA_SHORT)
+        vol_ma10 = talib.SMA(data['volume'].values, timeperiod=FactorConfig.VOLUME_MA_LONG)
         
         # 量比
         volume_ratio = data['volume'] / vol_ma5

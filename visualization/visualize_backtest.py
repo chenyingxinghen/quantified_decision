@@ -18,7 +18,9 @@ from typing import List, Dict, Optional, Tuple
 # 添加父目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import DATABASE_PATH
+from config.strategy_config import TREND_LINE_LONG_PERIOD, TREND_LINE_SHORT_PERIOD
 from core.analysis import TrendLineAnalyzer
+from core.analysis.trend_line_analyzer import _single_date_to_day_number
 from core.data import DataFetcher
 
 # 设置中文字体
@@ -126,20 +128,18 @@ class BacktestVisualizer:
         # 自动计算止损和目标价
         if stop_loss is None:
             if trend_analysis['short_uptrend_line']['valid']:
-                support_price = (trend_analysis['short_uptrend_line']['slope'] * buy_idx + 
-                               trend_analysis['short_uptrend_line']['intercept'])
-                buffer = trend_analysis.get('suggested_stop_buffer', 0.03)
+                line = trend_analysis['short_uptrend_line']
+                # 使用日期转天数来计算趋势线价格
+                buy_date_val = data.loc[buy_idx, 'date'] if 'date' in data.columns else data.index[buy_idx]
+                support_price = self._get_trendline_y(line, buy_date_val)
+                buffer = 0.03  # 默认使用3%缓冲
                 stop_loss = support_price * (1 - buffer)
             else:
                 stop_loss = buy_price * 0.97
         
         if target is None:
-            if trend_analysis['trend_strength'] >= 70:
-                target = buy_price * 1.12
-            elif trend_analysis['trend_strength'] >= 50:
-                target = buy_price * 1.10
-            else:
-                target = buy_price * 1.08
+            # 默认使用10%目标位
+            target = buy_price * 1.10
         
         # 模拟持仓
         holding_days = 0
@@ -322,43 +322,117 @@ class BacktestVisualizer:
         ax.grid(True, alpha=0.3)
         ax.set_xlim(-1, len(data))
     
+    @staticmethod
+    def _get_trendline_y(line, date_val):
+        """计算趋势线在指定日期的y值"""
+        day_num = _single_date_to_day_number(date_val, line['base_date'])
+        return line['slope'] * day_num + line['intercept']
+    
+    @staticmethod
+    def _find_date_position(data: pd.DataFrame, date_val) -> int:
+        """
+        在data中查找日期对应的行位置（用于绘图坐标）
+        
+        处理两种情况：
+        1. data 有 DatetimeIndex -> index.get_loc
+        2. data 有 'date' 列 + 整数索引 -> 按date列值查找
+        """
+        if isinstance(data.index, pd.DatetimeIndex):
+            try:
+                return data.index.get_loc(date_val)
+            except KeyError:
+                pass
+        
+        # data 有 'date' 列的情况
+        if 'date' in data.columns:
+            date_str = str(date_val)[:10]  # 取 YYYY-MM-DD 部分
+            matches = data[data['date'].astype(str).str[:10] == date_str]
+            if not matches.empty:
+                return data.index.get_loc(matches.index[0])
+        
+        # 尝试直接 get_loc
+        try:
+            return data.index.get_loc(date_val)
+        except (KeyError, TypeError):
+            return 0
+    
     def _plot_trendlines(self, ax, data: pd.DataFrame, trend_analysis: Dict, 
                         reference_idx: int, sell_idx: Optional[int] = None,
                         label_prefix: str = '', line_style: str = '--', alpha: float = 0.7):
-        """绘制趋势线（仅支撑线，不含延长线和阻力线）"""
+        """绘制趋势线和摆动点（仅支撑线，不含延长线和阻力线）"""
         label_suffix = f" ({label_prefix})" if label_prefix else ""
         
         # 根据标签前缀选择颜色
         if '卖出时' in label_prefix:
             long_color = 'darkblue'
             short_color = 'darkcyan'
+            swing_color = 'darkgreen'
         else:
             long_color = 'blue'
             short_color = 'cyan'
+            swing_color = 'green'
+        
+        # 绘制摆动低点（仅在买入时显示）
+        if '买入时' in label_prefix or not label_prefix:
+            trend_data = data.loc[:reference_idx]
+            if len(trend_data) >= 30:
+                # 需要将trend_data转为DatetimeIndex来让摆动点识别正确工作
+                normalized_data = TrendLineAnalyzer._ensure_datetime_index(trend_data)
+                swing_lows = self.trend_analyzer._find_swing_lows(normalized_data)
+                
+                if swing_lows:
+                    # swing_lows: [(date, price, day_number), ...]
+                    swing_indices = [self._find_date_position(data, date_val) for date_val, _, _ in swing_lows]
+                    swing_prices = [price for _, price, _ in swing_lows]
+                    
+                    ax.scatter(swing_indices, swing_prices, c=swing_color, marker='^', 
+                              s=60, alpha=0.5, label=f'摆动低点{label_suffix}', zorder=3)
         
         # 只绘制长期支撑线
         uptrend = trend_analysis['uptrend_line']
         if uptrend['valid']:
-            start_idx = uptrend['start_idx']
-            end_idx = min(uptrend['end_idx'], reference_idx)
+            start_plot_idx = self._find_date_position(data, uptrend['start_date'])
+            end_plot_idx = min(self._find_date_position(data, uptrend['end_date']), reference_idx)
             
-            x_range = np.array([start_idx, end_idx])
-            y_range = uptrend['slope'] * x_range + uptrend['intercept']
+            x_range = np.array([start_plot_idx, end_plot_idx])
+            y_range = np.array([
+                self._get_trendline_y(uptrend, uptrend['start_date']),
+                self._get_trendline_y(uptrend, uptrend['end_date'])
+            ])
+            
             ax.plot(x_range, y_range, color=long_color, linestyle=line_style, 
-                   linewidth=2, label=f'长期支撑线{label_suffix}', alpha=alpha)
+                   linewidth=2.5, label=f'长期支撑线{label_suffix} (触点:{uptrend["touches"]})', 
+                   alpha=alpha, zorder=4)
+            
+            # 标注趋势线起点和终点
+            ax.plot(start_plot_idx, y_range[0], 'o', color=long_color, markersize=8, 
+                   markeredgewidth=2, markerfacecolor='none', alpha=alpha, zorder=4)
+            ax.plot(end_plot_idx, y_range[1], 's', color=long_color, markersize=8,
+                   markeredgewidth=2, markerfacecolor='none', alpha=alpha, zorder=4)
         
         # 只绘制短期支撑线
         short_uptrend = trend_analysis['short_uptrend_line']
         if short_uptrend['valid']:
-            start_idx = short_uptrend['start_idx']
-            end_idx = min(short_uptrend['end_idx'], reference_idx)
+            start_plot_idx = self._find_date_position(data, short_uptrend['start_date'])
+            end_plot_idx = min(self._find_date_position(data, short_uptrend['end_date']), reference_idx)
             
-            x_range = np.array([start_idx, end_idx])
-            y_range = short_uptrend['slope'] * x_range + short_uptrend['intercept']
+            x_range = np.array([start_plot_idx, end_plot_idx])
+            y_range = np.array([
+                self._get_trendline_y(short_uptrend, short_uptrend['start_date']),
+                self._get_trendline_y(short_uptrend, short_uptrend['end_date'])
+            ])
+            
             ax.plot(x_range, y_range, color=short_color, linestyle=line_style, 
-                   linewidth=2, label=f'短期支撑线{label_suffix}', alpha=alpha)
+                   linewidth=2.5, label=f'短期支撑线{label_suffix} (触点:{short_uptrend["touches"]})', 
+                   alpha=alpha, zorder=4)
+            
+            # 标注趋势线起点和终点
+            ax.plot(start_plot_idx, y_range[0], 'o', color=short_color, markersize=8,
+                   markeredgewidth=2, markerfacecolor='none', alpha=alpha, zorder=4)
+            ax.plot(end_plot_idx, y_range[1], 's', color=short_color, markersize=8,
+                   markeredgewidth=2, markerfacecolor='none', alpha=alpha, zorder=4)
         
-        ax.legend(loc='upper left', fontsize=9)
+        ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
     
     def _plot_trade_points(self, ax, data: pd.DataFrame, 
                           buy_date: str, sell_date: Optional[str],
@@ -574,7 +648,8 @@ def main():
     single_parser.add_argument('--sell-date', type=str, help='卖出日期')
     single_parser.add_argument('--buy-price', type=float, help='买入价格')
     single_parser.add_argument('--sell-price', type=float, help='卖出价格')
-    single_parser.add_argument('--days-before', type=int, default=60, help='买入前显示天数')
+    single_parser.add_argument('--days-before', type=int, default=TREND_LINE_LONG_PERIOD, 
+                              help=f'买入前显示天数（默认{TREND_LINE_LONG_PERIOD}）')
     single_parser.add_argument('--days-after', type=int, default=60, help='卖出后显示天数')
     single_parser.add_argument('--exit-reason', type=str, help='卖出原因')
     single_parser.add_argument('--save', type=str, help='保存路径')

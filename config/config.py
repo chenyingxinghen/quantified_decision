@@ -33,8 +33,8 @@ RETRY_DELAYS = []  # 重试延迟时间（秒）10分钟,30分钟, 60分钟
 # 选股条件
 SELECTION_CRITERIA = {
     # 'min_turnover_rate': 1,         # 最小换手率（1%）
-    'min_market_cap': 100,           # 最小市值（80亿）
+    'min_market_cap': 80,           # 最小市值（80亿）
     'max_pe': 80,                   # 最大市盈率
     'min_price': 1,                 # 最小股价
-    'max_price': 100,               # 最大股价
+    'max_price': 20,               # 最大股价
 }

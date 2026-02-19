@@ -220,198 +220,150 @@ class CandlestickPatternFactors:
         """
         看涨吞没：前一根黑线被后一根白线完全吞没
         看涨反转信号
-        
-        条件：
-        - 前一根：黑线（close < open）
-        - 后一根：白线（close > open）
-        - 后一根的close > 前一根的open
-        - 后一根的open < 前一根的close
         """
-        result = np.zeros(len(data))
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
         
-        for i in range(1, len(data)):
-            prev_is_black = data['open'].iloc[i-1] > data['close'].iloc[i-1]
-            curr_is_white = data['close'].iloc[i] > data['open'].iloc[i]
-            
-            engulfed = (
-                prev_is_black and curr_is_white and
-                data['close'].iloc[i] > data['open'].iloc[i-1] and
-                data['open'].iloc[i] < data['close'].iloc[i-1]
-            )
-            
-            result[i] = float(engulfed)
+        prev_is_black = prev_open > prev_close
+        curr_is_white = curr_close > curr_open
         
-        return result
+        engulfed = (
+            prev_is_black & curr_is_white &
+            (curr_close > prev_open) &
+            (curr_open < prev_close)
+        )
+        
+        return engulfed.fillna(False).astype(float).values
     
     def calculate_bearish_engulfing(self, data: pd.DataFrame) -> np.ndarray:
         """
         看跌吞没：前一根白线被后一根黑线完全吞没
         看跌反转信号
         """
-        result = np.zeros(len(data))
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
         
-        for i in range(1, len(data)):
-            prev_is_white = data['close'].iloc[i-1] > data['open'].iloc[i-1]
-            curr_is_black = data['open'].iloc[i] > data['close'].iloc[i]
-            
-            engulfed = (
-                prev_is_white and curr_is_black and
-                data['close'].iloc[i] < data['open'].iloc[i-1] and
-                data['open'].iloc[i] > data['close'].iloc[i-1]
-            )
-            
-            result[i] = float(engulfed)
+        prev_is_white = prev_close > prev_open
+        curr_is_black = curr_open > curr_close
         
-        return result
+        engulfed = (
+            prev_is_white & curr_is_black &
+            (curr_close < prev_open) &
+            (curr_open > prev_close)
+        )
+        
+        return engulfed.fillna(False).astype(float).values
     
     def calculate_piercing_line(self, data: pd.DataFrame) -> np.ndarray:
         """
         刺穿线：前一根黑线，后一根白线穿过前一根的中点
         看涨反转信号
-        
-        条件：
-        - 前一根：黑线
-        - 后一根：白线
-        - 后一根close > 前一根中点
-        - 后一根close < 前一根open
         """
-        result = np.zeros(len(data))
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
         
-        for i in range(1, len(data)):
-            prev_is_black = data['open'].iloc[i-1] > data['close'].iloc[i-1]
-            curr_is_white = data['close'].iloc[i] > data['open'].iloc[i]
-            
-            midpoint = (data['open'].iloc[i-1] + data['close'].iloc[i-1]) / 2
-            
-            piercing = (
-                prev_is_black and curr_is_white and
-                data['close'].iloc[i] > midpoint and
-                data['close'].iloc[i] < data['open'].iloc[i-1]
-            )
-            
-            result[i] = float(piercing)
+        prev_is_black = prev_open > prev_close
+        curr_is_white = curr_close > curr_open
+        midpoint = (prev_open + prev_close) / 2
         
-        return result
+        piercing = (
+            prev_is_black & curr_is_white &
+            (curr_close > midpoint) &
+            (curr_close < prev_open)
+        )
+        
+        return piercing.fillna(False).astype(float).values
     
     def calculate_dark_cloud_cover(self, data: pd.DataFrame) -> np.ndarray:
         """
         乌云盖顶：前一根白线，后一根黑线穿过前一根的中点
         看跌反转信号
         """
-        result = np.zeros(len(data))
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
         
-        for i in range(1, len(data)):
-            prev_is_white = data['close'].iloc[i-1] > data['open'].iloc[i-1]
-            curr_is_black = data['open'].iloc[i] > data['close'].iloc[i]
-            
-            midpoint = (data['open'].iloc[i-1] + data['close'].iloc[i-1]) / 2
-            
-            dark_cloud = (
-                prev_is_white and curr_is_black and
-                data['close'].iloc[i] < midpoint and
-                data['close'].iloc[i] > data['open'].iloc[i-1]
-            )
-            
-            result[i] = float(dark_cloud)
+        prev_is_white = prev_close > prev_open
+        curr_is_black = curr_open > curr_close
+        midpoint = (prev_open + prev_close) / 2
         
-        return result
+        dark_cloud = (
+            prev_is_white & curr_is_black &
+            (curr_close < midpoint) &
+            (curr_close > prev_open)
+        )
+        
+        return dark_cloud.fillna(False).astype(float).values
     
     def calculate_morning_star(self, data: pd.DataFrame) -> np.ndarray:
         """
         晨星：三根K线形态
-        - 第一根：黑线（下跌）
-        - 第二根：小实体（犹豫）
-        - 第三根：白线（上升）
-        看涨反转信号
         """
-        result = np.zeros(len(data))
+        open0 = data['open'].shift(2)
+        close0 = data['close'].shift(2)
+        open1 = data['open'].shift(1)
+        close1 = data['close'].shift(1)
+        open2 = data['open']
+        close2 = data['close']
         
-        for i in range(2, len(data)):
-            # 第一根黑线
-            first_is_black = data['open'].iloc[i-2] > data['close'].iloc[i-2]
-            
-            # 第二根小实体
-            second_body = np.abs(data['close'].iloc[i-1] - data['open'].iloc[i-1])
-            first_body = np.abs(data['close'].iloc[i-2] - data['open'].iloc[i-2])
-            second_is_small = second_body < first_body * 0.5
-            
-            # 第三根白线
-            third_is_white = data['close'].iloc[i] > data['open'].iloc[i]
-            
-            # 第三根close > 第一根中点
-            midpoint = (data['open'].iloc[i-2] + data['close'].iloc[i-2]) / 2
-            third_above_midpoint = data['close'].iloc[i] > midpoint
-            
-            morning_star = (
-                first_is_black and second_is_small and 
-                third_is_white and third_above_midpoint
-            )
-            
-            result[i] = float(morning_star)
+        first_is_black = open0 > close0
+        second_body = np.abs(close1 - open1)
+        first_body = np.abs(close0 - open0)
+        second_is_small = second_body < first_body * 0.5
+        third_is_white = close2 > open2
+        midpoint = (open0 + close0) / 2
+        third_above_midpoint = close2 > midpoint
         
-        return result
+        morning_star = first_is_black & second_is_small & third_is_white & third_above_midpoint
+        return morning_star.fillna(False).astype(float).values
     
     def calculate_evening_star(self, data: pd.DataFrame) -> np.ndarray:
         """
         暮星：三根K线形态
-        - 第一根：白线（上升）
-        - 第二根：小实体（犹豫）
-        - 第三根：黑线（下跌）
-        看跌反转信号
         """
-        result = np.zeros(len(data))
+        open0 = data['open'].shift(2)
+        close0 = data['close'].shift(2)
+        open1 = data['open'].shift(1)
+        close1 = data['close'].shift(1)
+        open2 = data['open']
+        close2 = data['close']
         
-        for i in range(2, len(data)):
-            # 第一根白线
-            first_is_white = data['close'].iloc[i-2] > data['open'].iloc[i-2]
-            
-            # 第二根小实体
-            second_body = np.abs(data['close'].iloc[i-1] - data['open'].iloc[i-1])
-            first_body = np.abs(data['close'].iloc[i-2] - data['open'].iloc[i-2])
-            second_is_small = second_body < first_body * 0.5
-            
-            # 第三根黑线
-            third_is_black = data['open'].iloc[i] > data['close'].iloc[i]
-            
-            # 第三根close < 第一根中点
-            midpoint = (data['open'].iloc[i-2] + data['close'].iloc[i-2]) / 2
-            third_below_midpoint = data['close'].iloc[i] < midpoint
-            
-            evening_star = (
-                first_is_white and second_is_small and 
-                third_is_black and third_below_midpoint
-            )
-            
-            result[i] = float(evening_star)
+        first_is_white = close0 > open0
+        second_body = np.abs(close1 - open1)
+        first_body = np.abs(close0 - open0)
+        second_is_small = second_body < first_body * 0.5
+        third_is_black = open2 > close2
+        midpoint = (open0 + close0) / 2
+        third_below_midpoint = close2 < midpoint
         
-        return result
+        evening_star = first_is_white & second_is_small & third_is_black & third_below_midpoint
+        return evening_star.fillna(False).astype(float).values
     
     def calculate_harami(self, data: pd.DataFrame) -> np.ndarray:
         """
         孕线：前一根大实体，后一根小实体完全在前一根内部
-        反转信号
         """
-        result = np.zeros(len(data))
+        open0 = data['open'].shift(1)
+        close0 = data['close'].shift(1)
+        open1 = data['open']
+        close1 = data['close']
         
-        for i in range(1, len(data)):
-            prev_body = np.abs(data['close'].iloc[i-1] - data['open'].iloc[i-1])
-            curr_body = np.abs(data['close'].iloc[i] - data['open'].iloc[i])
-            
-            prev_high = np.maximum(data['open'].iloc[i-1], data['close'].iloc[i-1])
-            prev_low = np.minimum(data['open'].iloc[i-1], data['close'].iloc[i-1])
-            
-            curr_high = np.maximum(data['open'].iloc[i], data['close'].iloc[i])
-            curr_low = np.minimum(data['open'].iloc[i], data['close'].iloc[i])
-            
-            harami = (
-                prev_body > curr_body * 2 and
-                curr_high < prev_high and
-                curr_low > prev_low
-            )
-            
-            result[i] = float(harami)
+        body0 = np.abs(close0 - open0)
+        body1 = np.abs(close1 - open1)
+        high0 = np.maximum(open0, close0)
+        low0 = np.minimum(open0, close0)
+        high1 = np.maximum(open1, close1)
+        low1 = np.minimum(open1, close1)
         
-        return result
+        harami = (body0 > body1 * 2) & (high1 < high0) & (low1 > low0)
+        return harami.fillna(False).astype(float).values
     
     # ==================== K线形态强度指标 ====================
     
@@ -454,45 +406,31 @@ class CandlestickPatternFactors:
     def calculate_pattern_strength(self, data: pd.DataFrame, window: int = 5) -> np.ndarray:
         """
         形态强度指标：计算最近N根K线的形态一致性
-        值越大表示形态越强
         """
-        result = np.zeros(len(data))
+        is_white = (data['close'] > data['open']).astype(int)
+        is_black = (data['open'] > data['close']).astype(int)
         
-        for i in range(window, len(data)):
-            window_data = data.iloc[i-window:i]
-            
-            # 计算同向K线数量
-            white_candles = (window_data['close'] > window_data['open']).sum()
-            black_candles = (window_data['open'] > window_data['close']).sum()
-            
-            # 形态强度 = max(白线数, 黑线数) / 总数
-            strength = max(white_candles, black_candles) / window
-            
-            result[i] = strength
+        white_count = is_white.rolling(window=window).sum()
+        black_count = is_black.rolling(window=window).sum()
         
-        return result
+        strength = np.maximum(white_count, black_count) / window
+        return strength.fillna(0).values
     
     def calculate_pattern_confirmation(self, data: pd.DataFrame, window: int = 3) -> np.ndarray:
         """
         形态确认度：检查形态是否被后续K线确认
         """
-        result = np.zeros(len(data))
+        direction = np.where(data['close'] > data['open'], 1, -1)
+        direction_ser = pd.Series(direction, index=data.index)
         
-        for i in range(window, len(data)):
-            # 当前K线方向
-            curr_direction = 1 if data['close'].iloc[i] > data['open'].iloc[i] else -1
+        # 计算后续 N-1 根线的方向一致性
+        confirm_count = pd.Series(0, index=data.index)
+        for i in range(1, window):
+            # 将后续方向向前移动，与当前位置对比
+            next_direction = direction_ser.shift(-i)
+            confirm_count += (next_direction == direction_ser).astype(int)
             
-            # 后续K线确认
-            confirmation_count = 0
-            for j in range(1, window):
-                if i + j < len(data):
-                    next_direction = 1 if data['close'].iloc[i+j] > data['open'].iloc[i+j] else -1
-                    if next_direction == curr_direction:
-                        confirmation_count += 1
-            
-            result[i] = confirmation_count / (window - 1)
-        
-        return result
+        return (confirm_count / (window - 1)).fillna(0).values
     
     def calculate_all_candlestick_patterns(self, data: pd.DataFrame) -> pd.DataFrame:
         """

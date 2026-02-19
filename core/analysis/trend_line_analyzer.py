@@ -433,22 +433,11 @@ class TrendLineAnalyzer:
                     slope, intercept, points[i], points[j],
                     touches, data, day_numbers, point_type, prefer_recent
                 )
-                if trend_type == 'long':
-                    if score > best_score:
-                        best_score = score
-                        best_line = self._build_line_dict(
-                            slope, intercept, points[i], points[j],
-                            touches, score, point_type, base_date
-                        )
-                elif trend_type == 'short':
-                    if score > best_score:
-                        best_score = score
+                if score > best_score:
+                    best_score = score
                     best_line = self._build_line_dict(
-                        np.mean(slopes), np.mean(intercepts), points[i], points[j],
-                        touches, score, point_type, base_date
-                    )
-                else:
-                    return {'valid': False}
+                        slope, intercept, points[i], points[j],
+                        touches, score, point_type, base_date)
         
         if best_line is None:
             return {'valid': False}

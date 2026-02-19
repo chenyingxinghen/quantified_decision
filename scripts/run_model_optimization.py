@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 from core.factors.train_ml_model import MLModelTrainer
 from core.factors.model_optimizer import ModelOptimizer
-from core.factors.ml_factor_model import EnsembleFactorModel
+from core.factors import EnsembleFactorModel
 from config import DATABASE_PATH, TrainingConfig
 
 
@@ -62,9 +62,8 @@ def main():
     print("\n[步骤 2] 准备训练数据")
     print("-" * 80)
     
-    X, y, factor_names = trainer.prepare_dataset(
+    X, y, returns, factor_names, dates, unbuyable = trainer.prepare_dataset(
         stocks_data,
-        forward_days=5,
         threshold=0.02
     )
     
@@ -77,7 +76,7 @@ def main():
     print("-" * 80)
     
     model_types = ['xgboost', 'lightgbm']
-    results = trainer.train_models(X, y, factor_names, model_types=model_types)
+    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, model_types=model_types)
     
     if not results:
         print("错误: 模型训练失败")

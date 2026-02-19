@@ -268,22 +268,15 @@ class Portfolio:
         
         return trade
     
-    def update_positions(self, date: str, market_data: Dict[str, pd.DataFrame]):
+    def update_positions(self, date: str, market_data: 'LazyMarketSnapshot'):
         """
-        更新所有持仓的价格
-        
-        参数:
-            date: 当前日期
-            market_data: 市场数据
+        更新所有持仓的价格（优化版：避免触发 LazyMarketSnapshot 的完整 DataFrame 加载）
         """
         for stock_code, position in self.positions.items():
-            if stock_code in market_data:
-                stock_df = market_data[stock_code]
-                # 获取当日收盘价
-                today_data = stock_df[stock_df['date'] == date]
-                if not today_data.empty:
-                    current_price = today_data.iloc[0]['close']
-                    position.update_price(current_price)
+            # 使用 get_bar 直接获取单日 Series，不触发 get_historical_data 的切片拷贝
+            bar = market_data.get_bar(stock_code)
+            if bar is not None:
+                position.update_price(bar['close'])
     
     def record_equity(self, date: str):
         """记录资产曲线"""

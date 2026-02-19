@@ -1,6 +1,5 @@
 """
 量化因子计算模块
-基于广发多因子系列文档，实现62个技术指标因子
 
 因子分类：
 1. 动量类因子 (Momentum)
@@ -79,42 +78,50 @@ class QuantitativeFactors:
         return fastk, fastd
     
     def calculate_rvi(self, data: pd.DataFrame, period: int = 10) -> np.ndarray:
-        """RVI - 相对波动率指数"""
-        close = data['close'].values
-        high = data['high'].values
-        low = data['low'].values
+        """RVI - 相对波动率指数 (向量化版)"""
+        close = data['close']
+        daily_range = data['high'] - data['low']
+        price_change = close.diff()
         
-        n = len(close)
-        rvi = np.full(n, 50.0, dtype=float)  # 默认值50
+        # 分别计算上涨日和下跌日的波动的滚动标准差
+        up_std = daily_range.where(price_change > 0).rolling(window=period).std()
+        down_std = daily_range.where(price_change < 0).rolling(window=period).std()
         
-        if n < period:
-            return rvi
-        
-        # 计算价格变化
-        price_change = np.diff(close, prepend=close[0])
-        
-        # 计算每日波动
-        daily_range = high - low
-        
-        # 分别计算上涨日和下跌日的波动
-        for i in range(period, n):
-            window_change = price_change[i-period+1:i+1]
-            window_range = daily_range[i-period+1:i+1]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rvi = 100 * up_std / (up_std + down_std)
             
-            # 确保数据是有效的
-            window_change = window_change[np.isfinite(window_change)]
-            window_range = window_range[np.isfinite(window_range)]
-            
-            # 计算标准差
-            up_std = np.std(window_range[window_change > 0]) if len(window_range[window_change > 0]) > 0 else 0
-            down_std = np.std(window_range[window_change < 0]) if len(window_range[window_change < 0]) > 0 else 0
-            
-            # 计算RVI
-            denominator = up_std + down_std
-            if denominator > 0:
-                rvi[i] = 100 * up_std / denominator
+        return rvi.fillna(50.0).values
+
+    def calculate_ulcer_index(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
+        """Ulcer指标 (向量化版)"""
+        close = data['close']
+        max_close = close.rolling(window=period).max()
         
-        return rvi
+        with np.errstate(divide='ignore', invalid='ignore'):
+            drawdowns_sq = ((close - max_close) / max_close) ** 2
+            
+        ulcer = np.sqrt(drawdowns_sq.rolling(window=period).mean())
+        return np.nan_to_num(ulcer.values, nan=0.0)
+
+    def calculate_kdj(self, data: pd.DataFrame, n: int = 9) -> tuple:
+        """KDJ指标 (向量化版)"""
+        high = data['high']
+        low = data['low']
+        close = data['close']
+        
+        low_min = low.rolling(window=n).min()
+        high_max = high.rolling(window=n).max()
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rsv = (close - low_min) / (high_max - low_min) * 100
+        rsv = rsv.fillna(50.0)
+        
+        # 计算K、D、J
+        k = rsv.ewm(alpha=1/3, adjust=False).mean()
+        d = k.ewm(alpha=1/3, adjust=False).mean()
+        j = 3 * k - 2 * d
+        
+        return k.values, d.values, j.values
     
     # ==================== 趋势类因子 ====================
     
@@ -175,19 +182,17 @@ class QuantitativeFactors:
         return ratio
     
     def calculate_ma_slope(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
-        """MA线性回归系数"""
+        """MA线性回归系数 (向量化版)"""
         ma = talib.SMA(data['close'].values, timeperiod=period)
-        slopes = np.zeros_like(ma, dtype=float)
-        
-        for i in range(period, len(ma)):
-            if not np.isnan(ma[i-period:i]).any():
-                y = ma[i-period:i]
-                x = np.arange(period)
-                slope = np.polyfit(x, y, 1)[0]
-                slopes[i] = slope
-        
-        return slopes
+        slopes = talib.LINEARREG_SLOPE(ma, timeperiod=period)
+        return np.nan_to_num(slopes, nan=0.0)
     
+    def calculate_price_slope(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
+        """价格线性回归系数 (向量化版)"""
+        close = data['close'].values
+        slopes = talib.LINEARREG_SLOPE(close, timeperiod=period)
+        return np.nan_to_num(slopes, nan=0.0)
+
     # ==================== 波动率因子 ====================
     
     def calculate_atr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
@@ -207,7 +212,7 @@ class QuantitativeFactors:
             data['close'].values,
             timeperiod=period
         )
-    
+
     def calculate_bollinger_bands(self, data: pd.DataFrame, period: int = 20) -> tuple:
         """布林带"""
         upper, middle, lower = talib.BBANDS(
@@ -217,15 +222,12 @@ class QuantitativeFactors:
             nbdevdn=self.config.BB_STD
         )
         # 计算布林带宽度和位置
-        # 使用 np.errstate 抑制除法警告，然后用 np.nan_to_num 处理结果
         with np.errstate(divide='ignore', invalid='ignore'):
             bb_width = (upper - lower) / middle
             bb_position = (data['close'].values - lower) / (upper - lower)
         
-        # 将无效值替换为合理的默认值
         bb_width = np.nan_to_num(bb_width, nan=0.0, posinf=0.0, neginf=0.0)
         bb_position = np.nan_to_num(bb_position, nan=0.5, posinf=1.0, neginf=0.0)
-        
         return bb_width, bb_position
     
     def calculate_cci(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
@@ -236,23 +238,7 @@ class QuantitativeFactors:
             data['close'].values,
             timeperiod=period
         )
-    
-    def calculate_ulcer_index(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
-        """Ulcer指标 - 衡量下行风险"""
-        close = data['close'].values
-        ulcer = np.zeros_like(close, dtype=float)
-        
-        for i in range(period, len(close)):
-            window = close[i-period:i]
-            window = window[np.isfinite(window)]
-            if len(window) > 0:
-                max_close = np.max(window)
-                if max_close > 0:
-                    drawdowns = ((window - max_close) / max_close) ** 2
-                    ulcer[i] = np.sqrt(np.mean(drawdowns))
-        
-        return ulcer
-    
+
     def calculate_price_variance(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """价格绝对方差均值"""
         close = pd.to_numeric(data['close'], errors='coerce').replace([np.inf, -np.inf], np.nan)
@@ -293,29 +279,7 @@ class QuantitativeFactors:
             data['volume'].values,
             timeperiod=period
         )
-    
-    def calculate_vr(self, data: pd.DataFrame, period: int = 26) -> np.ndarray:
-        """VR - 成交量比率"""
-        close = data['close'].values
-        volume = data['volume'].values
-        
-        vr = np.zeros_like(close, dtype=float)
-        for i in range(period, len(close)):
-            # 获取当前周期内的价格变化
-            price_change = close[i-period+1:i+1] - close[i-period:i]
-            vol_window = volume[i-period+1:i+1]  # 修正：使vol_window与price_change长度一致
-            
-            # 计算上升和下降成交量
-            up_vol = np.sum(vol_window[price_change > 0])
-            down_vol = np.sum(vol_window[price_change < 0])
-            
-            if down_vol > 0:
-                vr[i] = up_vol / down_vol
-            elif up_vol > 0:
-                vr[i] = up_vol
-        
-        return vr
-    
+
     def calculate_vroc(self, data: pd.DataFrame, period: int = 12) -> np.ndarray:
         """VROC - 量变动速率"""
         return talib.ROC(data['volume'].values, timeperiod=period)
@@ -333,7 +297,7 @@ class QuantitativeFactors:
             signalperiod=self.config.VMACD_SIGNAL
         )
         return macd, signal, hist
-    
+
     def calculate_volume_ma(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """成交量移动平均"""
         return talib.SMA(data['volume'].values, timeperiod=period)
@@ -355,30 +319,7 @@ class QuantitativeFactors:
         return np.zeros(len(data))
     
     # ==================== 价格形态因子 ====================
-    
-    def calculate_kdj(self, data: pd.DataFrame, n: int = 9) -> tuple:
-        """KDJ指标"""
-        high = data['high'].values
-        low = data['low'].values
-        close = data['close'].values
-        
-        # 计算RSV
-        rsv = np.zeros_like(close, dtype=float)
-        for i in range(n, len(close)):
-            highest = np.max(high[i-n:i])
-            lowest = np.min(low[i-n:i])
-            if highest != lowest:
-                rsv[i] = (close[i] - lowest) / (highest - lowest) * 100
-            else:
-                rsv[i] = 50  # 当最高价等于最低价时，设为50
-        
-        # 计算K、D、J
-        k = pd.Series(rsv).ewm(alpha=1/3, adjust=False).mean().values
-        d = pd.Series(k).ewm(alpha=1/3, adjust=False).mean().values
-        j = 3 * k - 2 * d
-        
-        return k, d, j
-    
+
     def calculate_willr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """W%R - 威廉指标"""
         return talib.WILLR(
@@ -391,95 +332,77 @@ class QuantitativeFactors:
     def calculate_bias(self, data: pd.DataFrame, period: int = 6) -> np.ndarray:
         """BIAS - 乖离率"""
         ma = talib.SMA(data['close'].values, timeperiod=period)
-        # 使用 np.divide 安全处理除以零的情况
         with np.errstate(divide='ignore', invalid='ignore'):
             bias = np.divide(data['close'].values - ma, ma, where=ma!=0, out=np.zeros_like(ma)) * 100
         bias = np.nan_to_num(bias, nan=0.0, posinf=0.0, neginf=0.0)
         return bias
-    
+
+    def calculate_vr(self, data: pd.DataFrame, period: int = 26) -> np.ndarray:
+        """VR - 成交量比率 (向量化版)"""
+        close = data['close']
+        volume = data['volume']
+        
+        price_diff = close.diff()
+        
+        up_vol = volume.where(price_diff > 0, 0).rolling(window=period).sum()
+        down_vol = volume.where(price_diff < 0, 0).rolling(window=period).sum()
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vr = up_vol / down_vol
+            
+        return np.nan_to_num(vr.values, nan=0.0, posinf=up_vol.max() if not up_vol.empty else 0.0)
+
     def calculate_psy(self, data: pd.DataFrame, period: int = 12) -> np.ndarray:
-        """PSY - 心理线"""
-        close = data['close'].values
-        psy = np.zeros_like(close, dtype=float)
+        """PSY - 心理线 (向量化版)"""
+        close = data['close']
+        price_diff = close.diff()
         
-        for i in range(1, len(close)):
-            # 确定窗口起始位置
-            start = max(0, i - period + 1)
-            window_size = i - start + 1
-            
-            if window_size > 1 and start > 0:
-                # 计算上涨天数（当日收盘价 > 前一日收盘价）
-                price_change = close[start:i+1] - close[start-1:i]
-                up_days = np.sum(price_change > 0)
-                psy[i] = up_days / window_size * 100
+        up_days = (price_diff > 0).astype(int).rolling(window=period).sum()
+        psy = (up_days / period) * 100
         
-        return psy
-    
+        return psy.fillna(0).values
+
     def calculate_ar_br(self, data: pd.DataFrame, period: int = 26) -> tuple:
-        """AR-BR指标"""
-        high = data['high'].values
-        low = data['low'].values
-        open_price = data['open'].values
-        close = data['close'].values
+        """AR-BR指标 (向量化版)"""
+        high = data['high']
+        low = data['low']
+        open_p = data['open']
+        close = data['close']
+        prev_close = close.shift(1)
         
-        ar = np.zeros_like(close, dtype=float)
-        br = np.zeros_like(close, dtype=float)
+        # AR: (H-O) / (O-L)
+        ho_sum = (high - open_p).rolling(window=period).sum()
+        ol_sum = (open_p - low).rolling(window=period).sum()
         
-        for i in range(period, len(close)):
-            # AR指标：(H-O)/(O-L)
-            ho_sum = np.sum(high[i-period:i] - open_price[i-period:i])
-            ol_sum = np.sum(open_price[i-period:i] - low[i-period:i])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ar = (ho_sum / ol_sum) * 100
             
-            if ol_sum > 0:
-                ar[i] = ho_sum / ol_sum * 100
-            
-            # BR指标：(H-Cy)/(Cy-L)，其中Cy是前一日收盘价
-            # 确保索引不会越界
-            if i >= period + 1:
-                hc_sum = np.sum(high[i-period:i] - close[i-period-1:i-1])
-                cl_sum = np.sum(close[i-period-1:i-1] - low[i-period:i])
-                
-                if cl_sum > 0:
-                    br[i] = hc_sum / cl_sum * 100
+        # BR: (H-Cy) / (Cy-L)
+        hc_sum = (high - prev_close).rolling(window=period).sum()
+        cl_sum = (prev_close - low).rolling(window=period).sum()
         
-        return ar, br
-    
+        with np.errstate(divide='ignore', invalid='ignore'):
+            br = (hc_sum / cl_sum) * 100
+            
+        return ar.fillna(0).values, br.fillna(0).values
+
     def calculate_cr(self, data: pd.DataFrame, period: int = 26) -> np.ndarray:
-        """CR - 能量指标"""
-        high = data['high'].values
-        low = data['low'].values
-        close = data['close'].values
+        """CR - 能量指标 (向量化版)"""
+        high = data['high']
+        low = data['low']
+        close = data['close']
         
-        # 计算中间价
+        # 中间价 = (H+L+C)/3
         mid = (high + low + close) / 3
+        prev_mid = mid.shift(1)
         
-        cr = np.zeros_like(close, dtype=float)
-        for i in range(period, len(close)):
-            # 确保索引不会越界
-            if i >= period + 1:
-                # 当前周期内的高点与前一日中间价的差
-                p1_sum = np.sum(np.maximum(0, high[i-period:i] - mid[i-period-1:i-1]))
-                # 前一日中间价与当前周期内低点的差
-                p2_sum = np.sum(np.maximum(0, mid[i-period-1:i-1] - low[i-period:i]))
-                
-                if p2_sum > 0:
-                    cr[i] = p1_sum / p2_sum * 100
+        p1 = (high - prev_mid).clip(lower=0).rolling(window=period).sum()
+        p2 = (prev_mid - low).clip(lower=0).rolling(window=period).sum()
         
-        return cr
-    
-    def calculate_price_slope(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
-        """价格线性回归系数"""
-        close = data['close'].values
-        slopes = np.zeros_like(close, dtype=float)
-        
-        for i in range(period, len(close)):
-            y = close[i-period:i]
-            x = np.arange(period)
-            if len(y) == period and not np.isnan(y).any():
-                slope = np.polyfit(x, y, 1)[0]
-                slopes[i] = slope
-        
-        return slopes
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cr = (p1 / p2) * 100
+            
+        return cr.fillna(0).values
     
     # ==================== 综合计算方法 ====================
     

@@ -8,6 +8,10 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict
 from dataclasses import asdict
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 使用黑体
+plt.rcParams['axes.unicode_minus'] = False    # 解决负号显示问题
 
 
 class PerformanceAnalyzer:
@@ -204,7 +208,7 @@ class PerformanceAnalyzer:
         
         df = pd.DataFrame([asdict(t) for t in trades])
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
-        print(f"交易记录已保存: {filepath}")
+        # print(f"交易记录已保存: {filepath}")
     
     @staticmethod
     def save_equity_curve(equity_curve: List, filepath: str):
@@ -220,8 +224,7 @@ class PerformanceAnalyzer:
     @staticmethod
     def plot_equity_curve(equity_curve: List, title: str = "Backtest Equity Curve", save_path: str = None):
         """绘制资金曲线"""
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
+
         
         if not equity_curve:
             print("警告: 无资金曲线数据，无法绘制")
@@ -250,7 +253,7 @@ class PerformanceAnalyzer:
         
         if save_path:
             plt.savefig(save_path)
-            print(f"资金曲线图已保存: {save_path}")
+            # print(f"资金曲线图已保存: {save_path}")
         else:
             plt.show()
         plt.close()
@@ -324,7 +327,7 @@ class PerformanceAnalyzer:
         
         if save_path:
             plt.savefig(save_path)
-            print(f"置信度分析图已保存: {save_path}")
+            # print(f"置信度分析图已保存: {save_path}")
         else:
             plt.show()
         plt.close()

@@ -648,9 +648,9 @@ def main():
     single_parser.add_argument('--sell-date', type=str, help='卖出日期')
     single_parser.add_argument('--buy-price', type=float, help='买入价格')
     single_parser.add_argument('--sell-price', type=float, help='卖出价格')
-    single_parser.add_argument('--days-before', type=int, default=TREND_LINE_LONG_PERIOD, 
+    single_parser.add_argument('--days-before', type=int, default=TREND_LINE_LONG_PERIOD/3, 
                               help=f'买入前显示天数（默认{TREND_LINE_LONG_PERIOD}）')
-    single_parser.add_argument('--days-after', type=int, default=60, help='卖出后显示天数')
+    single_parser.add_argument('--days-after', type=int, default=90, help='卖出后显示天数')
     single_parser.add_argument('--exit-reason', type=str, help='卖出原因')
     single_parser.add_argument('--save', type=str, help='保存路径')
     single_parser.add_argument('--simulate', action='store_true', help='模拟回测')

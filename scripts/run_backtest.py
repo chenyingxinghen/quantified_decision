@@ -20,6 +20,8 @@ from config.strategy_config import (
     COMMISSION_RATE,
     MAX_POSITIONS
 )
+import pandas as pd
+import sqlite3
 from datetime import datetime, timedelta
 
 
@@ -30,7 +32,7 @@ def main():
     print("=" * 80)
     
     # 配置参数
-    start_date = (datetime.now() - timedelta(days=365*TrainingConfig.YEARS_FOR_TRAINING)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=365*TrainingConfig.YEARS_FOR_BACKTEST)).strftime('%Y-%m-%d')
     end_date = datetime.now().strftime('%Y-%m-%d')
     initial_capital = INITIAL_CAPITAL
     commission_rate = COMMISSION_RATE
@@ -85,44 +87,77 @@ def main():
     
     # 4. 运行回测
     print("\n开始回测...")
+    
+    # 提前获取股票代码
+    stock_codes = None # 这里可以指定，不指定则从DB获取
+    if stock_codes is None:
+        conn = sqlite3.connect(DATABASE_PATH)
+        stock_codes_df = pd.read_sql_query(
+            f"SELECT DISTINCT code FROM daily_data LIMIT {TrainingConfig.STOCK_NUM}", 
+            conn
+        )
+        conn.close()
+        stock_codes = stock_codes_df['code'].tolist()
+
+    # 为了让第1个交易日就有足够的历史数据（DataHandler要求至少30天），
+    # 我们加载比回测开始日期更早的数据
+    load_start_date = (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=60)).strftime('%Y-%m-%d')
+    data_handler.load_data(load_start_date, end_date, stock_codes)
+    
     results = engine.run(
         start_date=start_date,
         end_date=end_date,
+        stock_codes=stock_codes,
         verbose=True
     )
     
     # 5. 保存结果
     print("\n保存结果...")
     
+    # 自动解析模型元数据以进行归档
+    # 预期路径格式: .../models/{weight_status}_{data_volume}/{model_type}_factor_model.pkl
+    model_dir = os.path.dirname(model_path)
+    model_name = os.path.basename(model_path)
+    
+    # 解析归档目录名 (如 weighted_5y_5000s)
+    archive_tag = os.path.basename(model_dir)
+    if archive_tag == 'models': # 如果直接放在 models 下
+        archive_tag = 'default'
+        
+    # 解析模型类别 (如 xgboost)
+    model_category = model_name.split('_')[0]
+    
+    # 构造回测标识 (包含置信度和日期)
+    backtest_tag = f"conf{int(ML_FACTOR_MIN_CONFIDENCE)}_{start_date}_to_{end_date}"
+    
+    # 创建归档路径: backtest_result/{archive_tag}/{model_category}/{backtest_tag}/
+    result_dir = os.path.join('backtest_result', archive_tag, model_category, backtest_tag)
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+        
     # 保存交易记录
-    if not os.path.exists('backtest_result'):
-        os.makedirs('backtest_result')
     PerformanceAnalyzer.save_trades_to_csv(
         results['trades'],
-        'backtest_result/backtest_trades.csv'
+        os.path.join(result_dir, 'backtest_trades.csv')
     )
     
-
-
     # 绘制资金曲线
     PerformanceAnalyzer.plot_equity_curve(
         results['equity_curve'],
         title=f"Backtest Equity Curve ({strategy.name})",
-        save_path='backtest_result/backtest_equity.png'
+        save_path=os.path.join(result_dir, 'backtest_equity.png')
     )
     
     # 绘制置信度与收益率的关系
     PerformanceAnalyzer.plot_confidence_performance(
         results['trades'],
         title=f"Confidence vs. Return ({strategy.name})",
-        save_path='backtest_result/backtest_confidence_analysis.png'
+        save_path=os.path.join(result_dir, 'backtest_confidence_analysis.png')
     )
     
     print("\n回测完成！")
-    print(f"交易记录: backtest_result/backtest_trades.csv")
-    print(f"资金曲线: backtest_result/backtest_equity.png")
-    print(f"置信度分析: backtest_result/backtest_confidence_analysis.png")
-    
+    print(f"存档目录: {result_dir}")
+
     # 6. 清理
     data_handler.close()
 

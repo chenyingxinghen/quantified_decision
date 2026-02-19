@@ -53,6 +53,8 @@ class DataHandler:
         self.conn = sqlite3.connect(db_path)
         self._data_cache: Dict[str, pd.DataFrame] = {}
         self._date_index: Dict[str, Dict[str, int]] = {}
+        self._daily_bars: Dict[str, Dict[str, pd.Series]] = {} # 每日行情快照: date -> {code -> Series}
+        self._all_trading_dates: List[str] = []
     
     def load_data(self, 
                   start_date: str,
@@ -87,8 +89,11 @@ class DataHandler:
         # 缓存数据
         self._data_cache = data
         
-        # 构建日期索引
-        self._build_date_index()
+        # 构建日期索引和每日行情映射
+        self._build_indexes()
+        
+        # 记录所有交易日
+        self._all_trading_dates = sorted(self._daily_bars.keys())
         
         print(f"数据加载完成: {len(data)} 只股票")
         return data
@@ -157,14 +162,22 @@ class DataHandler:
         
         return result
     
-    def _build_date_index(self):
-        """构建日期索引以加速查询"""
+    def _build_indexes(self):
+        """同时构建日期索引和每日行情哈希表"""
         self._date_index = {}
+        self._daily_bars = {}
         
         for code, df in self._data_cache.items():
             date_to_idx = {}
-            for idx, date in enumerate(df['date'].values):
+            for idx, row in df.iterrows():
+                date = row['date']
                 date_to_idx[date] = idx
+                
+                # 存入每日行情映射
+                if date not in self._daily_bars:
+                    self._daily_bars[date] = {}
+                self._daily_bars[date][code] = row
+            
             self._date_index[code] = date_to_idx
     
     def get_trading_dates(self, start_date: str, end_date: str) -> List[str]:
@@ -236,38 +249,61 @@ class DataHandler:
         返回:
             Series或None
         """
-        if stock_code not in self._data_cache:
-            return None
+        # 1. 优先使用预构建的每日行情映射 (O(1))
+        if date in self._daily_bars and stock_code in self._daily_bars[date]:
+            return self._daily_bars[date][stock_code]
+            
+        # 2. 如果缓存未生效（非预加载范围），使用索引定位
+        if stock_code in self._data_cache:
+            df = self._data_cache[stock_code]
+            if stock_code in self._date_index and date in self._date_index[stock_code]:
+                idx = self._date_index[stock_code][date]
+                return df.iloc[idx]
         
-        df = self._data_cache[stock_code]
-        
-        # 使用索引快速定位
-        if stock_code in self._date_index and date in self._date_index[stock_code]:
-            idx = self._date_index[stock_code][date]
-            return df.iloc[idx]
-        
-        # 回退到日期过滤
-        result = df[df['date'] == date]
-        return result.iloc[0] if not result.empty else None
+        return None
     
-    def get_market_snapshot(self, date: str) -> Dict[str, pd.DataFrame]:
+    def get_market_snapshot(self, date: str) -> 'LazyMarketSnapshot':
         """
-        获取市场快照（所有股票截止到指定日期的历史数据）
-        
-        参数:
-            date: 日期
-        
-        返回:
-            {stock_code: DataFrame}
+        获取优化的市场快照代理对象
         """
-        snapshot = {}
-        for code in self._data_cache.keys():
-            hist_data = self.get_historical_data(code, date)
-            if hist_data is not None and len(hist_data) >= 30:
-                snapshot[code] = hist_data
-        return snapshot
-    
+        return LazyMarketSnapshot(self, date)
+
     def close(self):
         """关闭数据库连接"""
         if self.conn:
             self.conn.close()
+
+
+class LazyMarketSnapshot:
+    """市场快照延迟加载代理，避免回测主循环中产生大量 DataFrame 拷贝"""
+    
+    def __init__(self, data_handler: DataHandler, date: str):
+        self.data_handler = data_handler
+        self.date = date
+        self._cache = {}
+        # 快速定位当日活跃的所有股票
+        self.stock_codes = [code for code, bars in data_handler._daily_bars.get(date, {}).items()]
+
+    def get_bar(self, stock_code):
+        """获取指定股票当日的单行行情数据 Series (不触发全量拷贝)"""
+        return self.data_handler.get_bar_data(stock_code, self.date)
+
+    def __getitem__(self, stock_code):
+        if stock_code not in self._cache:
+            # 只有在真正请求时才进行切片和拷贝
+            data = self.data_handler.get_historical_data(stock_code, self.date)
+            self._cache[stock_code] = data
+        return self._cache[stock_code]
+
+    def items(self):
+        for code in self.stock_codes:
+            yield code, self[code]
+
+    def keys(self):
+        return self.stock_codes
+
+    def __len__(self):
+        return len(self.stock_codes)
+        
+    def __contains__(self, stock_code):
+        return stock_code in self.stock_codes

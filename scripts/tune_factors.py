@@ -144,7 +144,7 @@ PARAM_TO_FACTOR_MAP = {
 class FactorTuner:
     """因子超参数调优器"""
     
-    def __init__(self, n_stocks: int = 100, years: int = 3, n_jobs: int = -1):
+    def __init__(self, n_stocks: int = 300, years: int = 3, n_jobs: int = -1):
         self.n_stocks = n_stocks
         self.years = years
         self.n_jobs = n_jobs
@@ -170,13 +170,13 @@ class FactorTuner:
         
         conn = sqlite3.connect(self.db_path)
         
-        # 选取成交量最大的前 N 只股票
+        # 随机选取 N 只股票
         stock_query = f'''
-            SELECT code, SUM(volume) as total_vol
+            SELECT code
             FROM daily_data
             WHERE date >= ?
             GROUP BY code
-            ORDER BY total_vol DESC
+            ORDER BY RANDOM()
             LIMIT ?
         '''
         stock_df = pd.read_sql_query(stock_query, conn, params=(start_date, self.n_stocks))
@@ -197,8 +197,8 @@ class FactorTuner:
             df = all_data[all_data['code'] == code].copy()
             if len(df) < 200: continue
             
-            # 5日未来收益率
-            df['target'] = df['close'].pct_change(5).shift(-5)
+            # N日未来收益率
+            df['target'] = df['close'].pct_change(TrainingConfig.FUTURE_DAYS).shift(-TrainingConfig.FUTURE_DAYS)
             # 移除 NaN 目标行
             df = df.dropna(subset=['target'])
             

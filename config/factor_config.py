@@ -20,51 +20,46 @@ class ModelConfig:
     
     # XGBoost配置
     XGBOOST_PARAMS = {
-        'n_estimators': 200,
-        'max_depth': 6,
-        'learning_rate': 0.05,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'min_child_weight': 1,
-        'gamma': 0,
-        'reg_alpha': 0,
-        'reg_lambda': 1,
-        'objective': 'binary:logistic',
-        'eval_metric': 'auc',
+        'n_estimators': 3000,
+        'max_depth': 4,              # 增加深度以改善预测区分度
+        'min_child_weight': 1.2,     # 增加权重要求，防止过拟合
+        'learning_rate': 0.015,       # 降低学习率
+        'subsample': 0.7,            
+        'colsample_bytree': 0.7,     
+        'reg_alpha': 4,            
+        'reg_lambda': 10,             
+        'objective': 'reg:logistic',
+        'eval_metric': 'auc',       
         'random_state': 42,
         'n_jobs': -1,
-        'early_stopping_rounds': 20,
+        'early_stopping_rounds': 200, 
     }
     
     # LightGBM配置
     LIGHTGBM_PARAMS = {
-        'n_estimators': 200,
-        'max_depth': 6,
-        'learning_rate': 0.05,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
+        'n_estimators': 3000,
+        'max_depth': 5,
+        'num_leaves': 31,
         'min_child_samples': 20,
-        'min_child_weight': 0.001,
-        'reg_alpha': 0,
-        'reg_lambda': 1,
-        'objective': 'binary',
-        'metric': 'auc',
+        'learning_rate': 0.015,
+        'min_data_in_leaf': 500,
+        'min_gain_to_split': 0.012,
+        'reg_alpha': 4,
+        'reg_lambda': 10,
+        'subsample': 0.6,
+        'colsample_bytree': 0.6,
+
+        'label_gain': [float(i**2 - 1) for i in range(100)], 
+        'objective': 'lambdarank',
+        'metric': 'ndcg',
+        'lambdarank_truncation_level': 100,
         'random_state': 42,
         'n_jobs': -1,
         'verbose': -1,
+        'early_stopping_rounds': 200,
+        'force_row_wise': True, 
     }
     
-    # Random Forest配置
-    RANDOM_FOREST_PARAMS = {
-        'n_estimators': 200,
-        'max_depth': 10,
-        'min_samples_split': 10,
-        'min_samples_leaf': 5,
-        'max_features': 'sqrt',
-        'bootstrap': True,
-        'random_state': 42,
-        'n_jobs': -1,
-    }
     
     # 默认使用的模型类型
     DEFAULT_MODELS = ['xgboost', 'lightgbm']
@@ -75,7 +70,6 @@ class ModelConfig:
         params_map = {
             'xgboost': cls.XGBOOST_PARAMS,
             'lightgbm': cls.LIGHTGBM_PARAMS,
-            'random_forest': cls.RANDOM_FOREST_PARAMS,
         }
         return params_map.get(model_type, {}).copy()
 
@@ -86,32 +80,27 @@ class ModelConfig:
 
 class TrainingConfig:
     """训练参数配置"""
-    # 模型训练任务类型
-    TASK_TYPE = 'classification'  # 'classification', 'regression', 'ranking'
-    # 收益率加权训练分类, TASK_TYPE = 'classification'
-    USE_WEIGHT = False
+    # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
+    TASK_TYPE = 'hybrid' 
 
-    YEARS_FOR_TRAINING=3
-    STOCK_NUM = 500
+    INCLUDE_FUNDAMENTALS = False  # 是否包含基本面因子
+    PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
+
+    YEARS_FOR_BACKTEST=2         # 回测年数
+    YEARS_FOR_TRAINING=8         # 训练年数
+    STOCK_NUM = 5000             # 股票数量
     # 数据集划分
     TRAIN_TEST_SPLIT = 0.8
-    # 预测天数
-    FUTURE_DAYS = 5
-    # 分类阈值（涨幅 > 2%）
-    RETURN_THRESHOLD = 0.02
-    # 期望收益率阈值（回归任务）
-    EXPECTED_RETURN_THRESHOLD = 0.01
-    # 交易信号阈值
-    SIGNAL_THRESHOLD = 0.5  # 调整为更通用的0.5
+
+    # 预测天数 (用于分类、回归和排序任务)
+    FUTURE_DAYS = 15
     
+
     # 缓存目录
     CACHE_DIR = 'data/factors_cache'
     # 模型保存目录
     SAVE_DIR = 'models'
     
-    # 早停
-    EARLY_STOPPING = True
-    EARLY_STOPPING_ROUNDS = 20
 
 
 # ============================================================================
@@ -126,53 +115,53 @@ class FactorConfig:
     ROC_PERIOD = 30
     MTM_PERIOD = 30
     CMO_PERIOD = 28
-    STOCHRSI_PERIOD = 9
-    RVI_PERIOD = 20
+    STOCHRSI_PERIOD = 14
+    RVI_PERIOD = 14
     
     # 趋势因子参数
-    MACD_FAST = 15
-    MACD_SLOW = 20
+    MACD_FAST = 5
+    MACD_SLOW = 26
     MACD_SIGNAL = 5
     ADX_PERIOD = 14
     DMI_PERIOD = 21
-    AROON_PERIOD = 30
-    TRIX_PERIOD = 15
+    AROON_PERIOD = 14
+    TRIX_PERIOD = 45
     
     # 均线参数
-    MA_RATIO_PERIOD = 60
-    MA_SLOPE_PERIOD = 10
+    MA_RATIO_PERIOD = 10
+    MA_SLOPE_PERIOD = 5
     
     # 波动率因子参数
-    ATR_PERIOD = 20
-    NATR_PERIOD = 21
+    ATR_PERIOD = 10
+    NATR_PERIOD = 7
     BB_PERIOD = 20
     BB_STD = 1.5
-    CCI_PERIOD = 28
-    ULCER_PERIOD = 7
-    PRICE_VAR_PERIOD = 10
+    CCI_PERIOD = 14
+    ULCER_PERIOD = 21
+    PRICE_VAR_PERIOD = 20
     
     # 成交量因子参数
-    VOLUME_MA_PERIOD = 10
-    VOLUME_STD_PERIOD = 10
+    VOLUME_MA_PERIOD = 5
+    VOLUME_STD_PERIOD = 5
     VOLUME_MA_SHORT = 5
     VOLUME_MA_LONG = 10
-    AMOUNT_MA_PERIOD = 10
-    AMOUNT_STD_PERIOD = 10
-    MFI_PERIOD = 21
+    AMOUNT_MA_PERIOD = 5
+    AMOUNT_STD_PERIOD = 5
+    MFI_PERIOD = 7
     VR_PERIOD = 26
-    VROC_PERIOD = 18
+    VROC_PERIOD = 6
     VRSI_PERIOD = 12
     VMACD_FAST = 6
     VMACD_SLOW = 30
-    VMACD_SIGNAL = 12
-    ADOSC_FAST = 3
+    VMACD_SIGNAL = 9
+    ADOSC_FAST = 2
     ADOSC_SLOW = 10
     
     # 摆动指标参数
-    KDJ_N = 21
+    KDJ_N = 5
     WILLR_PERIOD = 14
-    BIAS_PERIOD = 24
-    PSY_PERIOD = 24
+    BIAS_PERIOD = 12
+    PSY_PERIOD = 6
     AR_BR_PERIOD = 26
     CR_PERIOD = 26
     
@@ -192,7 +181,7 @@ class OptimizationConfig:
     
     # 特征选择方法
     FEATURE_SELECTION_METHOD = 'hybrid'  # 'importance', 'correlation', 'mutual_info', 'rfe', 'hybrid'
-    N_FEATURES_TO_SELECT = 40  # 增加特征数
+    N_FEATURES_TO_SELECT = 60  # 增加特征数，由 40 提高到 60，保留更多有潜在价值的因子
     
     # 特征选择阈值
     FEATURE_IMPORTANCE_THRESHOLD = 0.001
@@ -241,7 +230,8 @@ class FactorModelConfig:
         print("\n[训练配置]")
         print(f"训练集比例: {cls.training.TRAIN_TEST_SPLIT}")
         print(f"预测天数: {cls.training.FUTURE_DAYS}")
-        print(f"收益率阈值: {cls.training.RETURN_THRESHOLD}")
+        print(f"路径预测: {'开启' if cls.training.USE_PATH_BASED_LABEL else '关闭'}")
+        print(f"止盈/止损ATR倍数: {cls.training.ATR_TP_MULTIPLIER}x/{cls.training.ATR_SL_MULTIPLIER}x")
         
         print("\n[因子配置]")
         print(f"RSI周期: {cls.factor.RSI_PERIOD}")

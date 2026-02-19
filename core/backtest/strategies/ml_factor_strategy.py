@@ -9,6 +9,7 @@ import os
 import sys
 import pandas as pd
 import numpy as np
+import talib
 from typing import Dict, List, Any, Optional
 
 # 添加项目根目录到路径
@@ -17,7 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 from core.backtest.strategy import BaseStrategy, StrategySignal
 from core.factors.ml_factor_model import MLFactorModel
 from config.factor_config import TrainingConfig, FactorConfig
-from config.strategy_config import ATR_STOP_MULTIPLIER, ATR_TARGET_MULTIPLIER
+from config.strategy_config import ATR_STOP_MULTIPLIER, ATR_TARGET_MULTIPLIER, MAX_POSITIONS
 
 
 class MLFactorBacktestStrategy(BaseStrategy):
@@ -106,28 +107,30 @@ class MLFactorBacktestStrategy(BaseStrategy):
                         market_data: Dict[str, pd.DataFrame],
                         portfolio_state: Dict[str, Any]) -> List[StrategySignal]:
         """
-        生成交易信号
-        
-        参数:
-            current_date: 当前日期
-            market_data: 市场数据
-            portfolio_state: 投资组合状态
-        
-        返回:
-            信号列表
+        生成交易信号 (批量预测优化版)
         """
         signals = []
         
-        # 如果已有持仓，不生成新信号
-        if portfolio_state.get('position_count', 0) > 0:
+        # 获取当前持仓和可用头寸
+        existing_positions = portfolio_state.get('positions', {})
+        current_count = len(existing_positions)
+        available_slots = MAX_POSITIONS - current_count
+        
+        if available_slots <= 0:
             return signals
         
-        # 筛选股票
-        candidates = []
+        # 1. 收集所有符合条件的股票及其最新因子
+        valid_candidates = []
         
+        # if current_date < "2025-02-20": # 仅在回测开始的前几天打印一次总况
+        #      print(f"  [DEBUG] {current_date}: 正在检查 {len(market_data)} 只股票的市场数据...")
+
         for stock_code, stock_data in market_data.items():
-            # 数据量检查
-            if len(stock_data) < 100:
+            # 过滤已持有的股票，避免重复开仓
+            if stock_code in existing_positions:
+                continue
+                
+            if len(stock_data) < 35:
                 continue
             
             try:
@@ -137,83 +140,128 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 if factors is None or len(factors) == 0:
                     continue
                 
-                # 检查最新因子日期是否与当前日期匹配（允许10天以内的差距以兼容非交易日，但最好是严格匹配）
+                # 检查最新因子日期是否与当前日期匹配
                 latest_factor_date = factors['date'].iloc[-1] if 'date' in factors.columns else None
-                if latest_factor_date and latest_factor_date != current_date:
-                    # 如果日期不匹配，说明缓存不包含今日因子，跳过
-                    continue
+                if latest_factor_date:
+                    latest_date_str = str(latest_factor_date)[:10]
+                    if latest_date_str != current_date:
+                        continue
                 
-                # 检查NaN
-                if factors.isna().all().any():
-                    continue
-                
-                # 使用最新因子预测
-                latest_factors = factors.tail(1)
+                # 使用最新因子
+                latest_factors = factors.tail(1).copy()
                 if latest_factors.isna().all().any():
                     continue
                 
-                # 预测
-                prediction = self.model.predict_signal(latest_factors)
-                
-                # 检查置信度
-                if prediction['confidence'] < self.min_confidence:
-                    continue
-                
-                # 检查信号类型
-                if prediction['signal'] not in ['buy', 'strong_buy']:
-                    continue
-                
-                # 获取当前价格
-                current_price = stock_data['close'].iloc[-1]
-                
-                # 计算止损止盈
-                atr = self._calculate_atr(stock_data, period=FactorConfig.ATR_PERIOD)
-                stop_loss = current_price - ATR_STOP_MULTIPLIER * atr
-                take_profit = current_price + ATR_TARGET_MULTIPLIER * atr
-                
-                candidates.append({
-                    'stock_code': stock_code,
-                    'confidence': prediction['confidence'],
-                    'current_price': current_price,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit,
-                    'prediction': prediction['prediction']
+                valid_candidates.append({
+                    'code': stock_code,
+                    'factors': latest_factors,
+                    'data': stock_data
                 })
-            
-            except Exception as e:
-                # 只对前几只出错的股票打印错误详情，避免日志淹没
-                if len(self._warned_stocks) < 10 and stock_code not in self._warned_stocks:
-                    print(f"  警告: 生成 {stock_code} 信号时出错: {e}")
-                    self._warned_stocks.add(stock_code)
+            except Exception:
                 continue
         
-        # 选择置信度最高的
-        if candidates:
-            best = max(candidates, key=lambda x: x['confidence'])
+        if not valid_candidates:
+            return signals
             
-            signal = StrategySignal(
-                stock_code=best['stock_code'],
-                signal_type='buy',
-                timestamp=current_date,
-                price=best['current_price'],
-                confidence=best['confidence'],
-                stop_loss=best['stop_loss'],
-                take_profit=best['take_profit'],
-                metadata={
-                    'strategy': 'ml_factor',
-                    'model_type': self.model.model_type,
-                    'prediction': best['prediction'],
-                    'confidence': best['confidence']
-                }
-            )
-            
-            signals.append(signal)
+        # 2. 批量预测
+        all_factors_list = [c['factors'] for c in valid_candidates]
+        X_batch = pd.concat(all_factors_list, axis=0, ignore_index=True)
         
+        # 移除日期列
+        if 'date' in X_batch.columns:
+            X_batch = X_batch.drop(columns=['date'])
+            
+        # 批量获取预测得分/置信度
+        try:
+            # --- 关键修复：每日横向 Z-Score 归一化 ---
+            # 确保回测时的特征量纲与训练阶段（train_ml_model.py L549）完全一致
+            if len(X_batch) > 1:
+                # 减去均值，除以标准差。如果标准差为0则替换为1以避免除零，最后填充NaN为0
+                X_batch_norm = (X_batch - X_batch.mean()) / X_batch.std().replace(0, 1.0)
+                X_batch_norm = X_batch_norm.fillna(0)
+            else:
+                # 如果只有一只样本，无法计算标准差，统一设为 0（代表均值水平）
+                X_batch_norm = X_batch * 0
+                
+            probs = self.model.predict(X_batch_norm)
+        except Exception as e:
+            print(f"  错误: 批量预测失败: {e}")
+            return signals
+            
+        # 3. 筛选并构造候选列表
+        candidates = []
+        for i, candidate in enumerate(valid_candidates):
+            prob = probs[i]
+            confidence = float(prob * 100)
+            
+            # 基础过滤：置信度和信号阈值
+            if confidence < self.min_confidence:
+                continue
+                
+            # 改进：如果是排序任务，取消 0.5 (optimal_threshold) 的硬性过滤
+            # 因为排序模型的输出是相对分数，整体位移可能导致所有分值略低于或高于 0.5
+            if self.model.task != 'ranking':
+                if prob < self.model.optimal_threshold:
+                    continue
+                
+            stock_code = candidate['code']
+            stock_data = candidate['data']
+            current_price = stock_data['close'].iloc[-1]
+            
+            # 计算止损止盈
+            atr = self._calculate_atr(stock_data, period=FactorConfig.ATR_PERIOD)
+            stop_loss = current_price - ATR_STOP_MULTIPLIER * atr
+            take_profit = current_price + ATR_TARGET_MULTIPLIER * atr
+            
+            candidates.append({
+                'stock_code': stock_code,
+                'confidence': confidence, # 强制限制在100以内
+                'current_price': current_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'prediction': prob
+            })
+            
+        # 4. 选择最优信号 (使用置信度排序)
+        if candidates:
+            # 引入确定性随机扰动作为平局决胜
+            import hashlib
+            def get_tie_breaker(code):
+                return int(hashlib.md5(code.encode()).hexdigest(), 16) % 1000 / 100000.0
+
+            # 按置信度由高到低排序，置信度相同时使用哈希值平局决胜
+            candidates.sort(key=lambda x: (-(x['confidence'] + get_tie_breaker(x['stock_code']))))
+            
+            # 选择前 available_slots 个最优信号
+            top_candidates = candidates[:available_slots]
+            
+            # if current_date < "2025-03-01": # 仅在开始阶段输出
+                # print(f"  [DEBUG] {current_date}: 候选股票 {len(candidates)} 只, 买入头寸: {len(top_candidates)}")
+            
+            for cand in top_candidates:
+                signal = StrategySignal(
+                    stock_code=cand['stock_code'],
+                    signal_type='buy',
+                    timestamp=current_date,
+                    price=cand['current_price'],
+                    confidence=cand['confidence'],
+                    stop_loss=cand['stop_loss'],
+                    take_profit=cand['take_profit'],
+                    metadata={
+                        'strategy': 'ml_factor',
+                        'model_type': self.model.model_type,
+                        'prediction': cand['prediction'],
+                        'confidence': cand['confidence'],
+                        'candidates_count': len(candidates)
+                    }
+                )
+                signals.append(signal)
+            
         return signals
     
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
         """
-        计算简单的 ATR（平均真实波幅）
+        使用 talib 计算 ATR，确保与训练逻辑一致
         
         参数:
             data: 股票数据 DataFrame
@@ -223,26 +271,17 @@ class MLFactorBacktestStrategy(BaseStrategy):
             ATR 值
         """
         if len(data) < period + 1:
-            # 数据不足，返回最近的波动估算
-            if len(data) >= 2:
-                return float((data['high'] - data['low']).mean())
             return 0.0
             
         try:
-            high = data['high'].values
-            low = data['low'].values
-            close = data['close'].values
-            
-            # 计算 TR (True Range)
-            tr1 = high[1:] - low[1:]
-            tr2 = np.abs(high[1:] - close[:-1])
-            tr3 = np.abs(low[1:] - close[:-1])
-            
-            tr = np.maximum(tr1, np.maximum(tr2, tr3))
-            
-            # 计算 ATR (简单移动平均)
-            atr = np.mean(tr[-period:])
-            return float(atr)
+            atr_series = talib.ATR(
+                data['high'].values,
+                data['low'].values,
+                data['close'].values,
+                timeperiod=period
+            )
+            val = atr_series[-1]
+            return float(val) if np.isfinite(val) else 0.0
         except Exception:
             return 0.0
     
@@ -270,20 +309,19 @@ class MLFactorBacktestStrategy(BaseStrategy):
         
         # 1. 尝试使用日期对齐（最准确，推荐）
         if 'date' in cached_factors.columns:
+            # 确保日期列为 datetime 类型
+            if not pd.api.types.is_datetime64_any_dtype(cached_factors['date']):
+                cached_factors['date'] = pd.to_datetime(cached_factors['date'])
+            
             # 找到当前日期及之前的所有缓存
-            factors = cached_factors[cached_factors['date'] <= current_date].copy()
+            target_dt = pd.Timestamp(current_date)
+            factors = cached_factors[cached_factors['date'] <= target_dt].copy()
             if factors.empty:
-                # 可能是回测起始日早于缓存起始日
                 return None
         
         # 2. 如果缓存中没有日期列，则尝试使用行号对齐（不推荐，极易出错）
         else:
-            data_len = len(stock_data)
-            if len(cached_factors) >= data_len:
-                factors = cached_factors.iloc[:data_len].copy()
-            else:
-                # 缓存行数不够，使用全部缓存（这种情况下大概率会出现日期错位）
-                factors = cached_factors.copy()
+            raise ValueError("缓存中没有日期列，无法对齐")
         
         # 确保所有模型需要的特征列都存在
         if self.model and self.model.feature_names:

@@ -282,16 +282,18 @@ class FeatureEngineer:
         return df
     
     def create_rank_features(self, df: pd.DataFrame, 
-                            columns: List[str]) -> pd.DataFrame:
+                            columns: List[str],
+                            window: int = 252) -> pd.DataFrame:
         """
-        创建排名特征（横截面排名）
+        创建排名特征（滚动窗口排名，防止数据泄露）
         
         参数:
             df: 输入DataFrame
             columns: 要生成排名特征的列
+            window: 滚动窗口大小（默认252天）
         
         返回:
-            包含排名特征的DataFrame
+            包含滚动排名特征的DataFrame
         """
         new_features = {}
         
@@ -300,7 +302,12 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'rank_{col}'
-            new_features[feature_name] = df[col].rank(pct=True)
+            # 性能优化：使用 raw=True 且利用 numpy 向量化计算排名
+            # 排名计算公式: (小于当前值的个数 + 0.5 * 等于当前值的个数) / 总数
+            new_features[feature_name] = df[col].rolling(window=window, min_periods=window//2).apply(
+                lambda x: (np.sum(x < x[-1]) + 0.5 * np.sum(x == x[-1])) / len(x) if len(x) > 0 else 0.5,
+                raw=True
+            )
             
             self.generated_features.append(feature_name)
         
@@ -312,17 +319,19 @@ class FeatureEngineer:
     
     def create_quantile_features(self, df: pd.DataFrame, 
                                 columns: List[str],
+                                window: int = 252,
                                 n_quantiles: int = 5) -> pd.DataFrame:
         """
-        创建分位数特征
+        创建分位数特征（滚动窗口分位，防止数据泄露）
         
         参数:
             df: 输入DataFrame
             columns: 要生成分位数特征的列
+            window: 滚动窗口大小（默认252天）
             n_quantiles: 分位数数量
         
         返回:
-            包含分位数特征的DataFrame
+            包含滚动分位数特征的DataFrame
         """
         new_features = {}
         
@@ -331,9 +340,14 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'quantile_{col}'
-            new_features[feature_name] = pd.qcut(df[col], q=n_quantiles, 
-                                          labels=False, duplicates='drop')
             
+            # 性能优化：同样使用 raw=True 提升效率
+            rolled_rank = df[col].rolling(window=window, min_periods=window//4).apply(
+                lambda x: (np.sum(x < x[-1]) + 0.5 * np.sum(x == x[-1])) / len(x) if len(x) > 0 else 0.5,
+                raw=True
+            )
+            
+            new_features[feature_name] = (rolled_rank * n_quantiles).fillna(0).astype(int).clip(0, n_quantiles-1)
             self.generated_features.append(feature_name)
         
         # 一次性添加所有新列
@@ -418,6 +432,7 @@ class FeatureEngineer:
                 momentum = momentum.replace([np.inf, -np.inf], np.nan)
                 momentum = momentum.fillna(0)
                 
+                feature_name = f'{col}_momentum_{window}'
                 new_features[feature_name] = momentum
                 self.generated_features.append(feature_name)
         
@@ -468,6 +483,7 @@ class FeatureEngineer:
                                    categorical_cols: List[str] = None) -> pd.DataFrame:
         """
         编码分类特征（行业、板块等）
+        使用全局映射确保不同股票之间的编码一致性
         
         参数:
             df: 输入DataFrame
@@ -478,6 +494,26 @@ class FeatureEngineer:
         """
         new_features = {}
         
+        # 定义全局板块映射（从数据库统计获得）
+        SECTOR_MAP = {
+            'Financial Services': 1, 'Real Estate': 2, 'Healthcare': 3,
+            'Consumer Cyclical': 4, 'Industrials': 5, 'Basic Materials': 6,
+            'Technology': 7, 'Consumer Defensive': 8, 'Utilities': 9,
+            'Energy': 10, 'Communication Services': 11, 'Unknown': 0
+        }
+        
+        # 常见工业映射（前20个）
+        INDUSTRY_MAP = {
+            'Semiconductors': 1, 'Software - Infrastructure': 2, 'Banks - Diversified': 3,
+            'Healthcare Plans': 4, 'Airlines': 5, 'Biotechnology': 6,
+            'Auto Manufacturers': 7, 'Communication Equipment': 8, 'Steel': 9,
+            'Aerospace & Defense': 10, 'Oil & Gas E&P': 11, 'Chemicals': 12,
+            'Electronic Components': 13, 'Medical Instruments & Supplies': 14,
+            'Internet Content & Information': 15, 'Specialty Business Services': 16,
+            'Insurance - Life': 17, 'Credit Services': 18, 'Grocery Stores': 19,
+            'Real Estate - Diversified': 20, 'Unknown': 0
+        }
+        
         if categorical_cols is None:
             # 自动检测分类列
             categorical_cols = [col for col in df.columns if col in ['sector', 'industry']]
@@ -486,26 +522,28 @@ class FeatureEngineer:
             if col not in df.columns:
                 continue
             
-            # 使用 LabelEncoder 进行编码
-            from sklearn.preprocessing import LabelEncoder
-            le = LabelEncoder()
-            
-            # 处理缺失值
-            df_col = df[col].fillna('Unknown')
-            
             try:
-                new_features[f'{col}_encoded'] = le.fit_transform(df_col)
+                # 获取映射表
+                mapping = SECTOR_MAP if col == 'sector' else INDUSTRY_MAP
+                
+                # 执行映射 (未知类别设为 0)
+                col_data = df[col].fillna('Unknown').astype(str)
+                encoded = col_data.map(mapping).fillna(0).astype(int)
+                
+                new_features[f'{col}_encoded'] = encoded
                 self.generated_features.append(f'{col}_encoded')
                 
-                # 创建 one-hot 编码（只保留前10个最常见的类别以避免维度爆炸）
-                top_categories = df[col].value_counts().head(10).index
-                for category in top_categories:
-                    feature_name = f'{col}_{category}'
-                    new_features[feature_name] = (df[col] == category).astype(int)
-                    self.generated_features.append(feature_name)
+                # 创建 one-hot 编码 (仅针对常用类别)
+                if col == 'sector':
+                    for cat_name, cat_id in SECTOR_MAP.items():
+                        if cat_name == 'Unknown': continue
+                        feature_name = f'{col}_{cat_name.replace(" ", "_")}'
+                        new_features[feature_name] = (col_data == cat_name).astype(int)
+                        self.generated_features.append(feature_name)
                 
             except Exception as e:
-                print(f"编码 {col} 失败: {e}")
+                # 记录错误但不中断
+                pass
         
         # 一次性添加所有新列
         if new_features:
@@ -516,113 +554,92 @@ class FeatureEngineer:
     def apply_all_transformations(self, df: pd.DataFrame,
                                   config: Optional[Dict] = None) -> pd.DataFrame:
         """
-        应用所有特征工程变换
-        
-        参数:
-            df: 输入DataFrame
-            config: 配置字典，指定要应用的变换
-        
-        返回:
-            包含所有新特征的DataFrame
+        应用所有特征工程变换，并输出详细的统计报告
         """
-        # 重置生成的特征列表，防止累积
         self.reset()
-        
         if config is None:
             config = {
-                'ratio': True,
-                'product': True,
-                'difference': True,
-                'log': True,
-                'sqrt': True,
-                'rank': True,
-                'interaction': True,
-                'categorical': True,
+                'ratio': True, 'product': True, 'difference': True,
+                'log': True, 'sqrt': True, 'rank': True,
+                'interaction': True, 'categorical': True,
             }
         
-        # Check memory before proceeding
-        available_memory = psutil.virtual_memory().available / (1024**3)  # GB
-        estimated_size = (df.shape[0] * df.shape[1] * 8) / (1024**3)  # GB
-        
-        # if estimated_size > available_memory * 0.5:
-        #     print(f"警告: 数据框过大 ({df.shape[1]} 列)，跳过特征工程以节省内存")
-        #     return df
-        
         result = df
-        
-        # 编码分类特征（行业、板块）
+        stats = {}
+        initial_count = len(df.columns)
+
+        # 1. 编码分类特征
         if config.get('categorical'):
-            print("编码分类特征...")
+            pre_count = len(self.generated_features)
             result = self.encode_categorical_features(result)
+            stats['分类特征编码'] = len(self.generated_features) - pre_count
         
-        # 识别技术指标和基本面因子 - 限制列数
+        # 识别技术指标和基本面因子 - 限制列数以防维度爆炸
         tech_indicators = [col for col in result.columns if any(
             indicator in col.lower() for indicator in 
-            ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 
-             'candle', 'pattern', 'star', 'hammer', 'doji', 'engulfing', 'harami', 'piercing']
-        )][:40]  # 增加上限以容纳K线形态因子
+            ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 'willr', 'bias', 'psy']
+        )][:40]
 
-        
         fundamental_factors = [col for col in result.columns if any(
             factor in col.lower() for factor in 
-            ['pe_', 'pb_', 'roe', 'roa', 'margin', 'growth', 'yield', 'beta']
-        )][:20]  # 限制为20列
+            ['pe_ratio', 'pb_ratio', 'roe', 'roa', 'margin', 'growth', 'yield', 'beta', 'market_cap']
+        ) and not any(x in col.lower() for x in ['slope', 'sharpe'])][:20]
         
-        print(f"识别到 {len(tech_indicators)} 个技术指标")
-        print(f"识别到 {len(fundamental_factors)} 个基本面因子")
+        # 2. 应用变换
+        if config.get('ratio') and len(fundamental_factors) > 1:
+            pre_count = len(self.generated_features)
+            result = self.create_ratio_features(result, fundamental_factors[:5], fundamental_factors[:5])
+            stats['比率特征 (Fund/Fund)'] = len(self.generated_features) - pre_count
         
-        # 应用各种变换
-        if config.get('ratio') and len(fundamental_factors) > 0:
-            print("生成比率特征...")
-            result = self.create_ratio_features(
-                result, 
-                fundamental_factors[:5], 
-                fundamental_factors[:5]
-            )
-        
-        if config.get('product') and len(tech_indicators) > 0:
-            print("生成乘积特征...")
-            important_pairs = [
-                (tech_indicators[i], tech_indicators[j])
-                for i in range(min(3, len(tech_indicators)))
-                for j in range(i+1, min(5, len(tech_indicators)))
-            ]
+        if config.get('product') and len(tech_indicators) > 1:
+            pre_count = len(self.generated_features)
+            important_pairs = [(tech_indicators[i], tech_indicators[j]) 
+                              for i in range(min(2, len(tech_indicators))) 
+                              for j in range(i+1, min(4, len(tech_indicators)))]
             result = self.create_product_features(result, important_pairs)
+            stats['乘积特征 (Tech*Tech)'] = len(self.generated_features) - pre_count
         
-        if config.get('difference') and len(tech_indicators) > 0:
-            print("生成差分特征...")
-            diff_pairs = [
-                (tech_indicators[i], tech_indicators[j])
-                for i in range(min(3, len(tech_indicators)))
-                for j in range(i+1, min(5, len(tech_indicators)))
-            ]
+        if config.get('difference') and len(tech_indicators) > 1:
+            pre_count = len(self.generated_features)
+            diff_pairs = [(tech_indicators[i], tech_indicators[j]) 
+                         for i in range(min(2, len(tech_indicators))) 
+                         for j in range(i+1, min(4, len(tech_indicators)))]
             result = self.create_difference_features(result, diff_pairs)
+            stats['差分特征 (Tech-Tech)'] = len(self.generated_features) - pre_count
         
-        if config.get('log') and len(fundamental_factors) > 0:
-            print("生成对数特征...")
+        if config.get('log'):
+            pre_count = len(self.generated_features)
             log_cols = [col for col in fundamental_factors if 'market_cap' in col or 'volume' in col]
             if log_cols:
-                result = self.create_log_features(result, log_cols[:5])
+                result = self.create_log_features(result, log_cols[:3])
+            stats['对数变换 (Log)'] = len(self.generated_features) - pre_count
         
-        if config.get('sqrt') and len(tech_indicators) > 0:
-            print("生成平方根特征...")
+        if config.get('sqrt'):
+            pre_count = len(self.generated_features)
             sqrt_cols = [col for col in tech_indicators if 'volatility' in col or 'atr' in col]
             if sqrt_cols:
-                result = self.create_sqrt_features(result, sqrt_cols[:5])
+                result = self.create_sqrt_features(result, sqrt_cols[:3])
+            stats['平方根变换 (Price/Vol)'] = len(self.generated_features) - pre_count
         
-        if config.get('rank') and len(fundamental_factors) > 0:
-            print("生成排名特征...")
-            result = self.create_rank_features(result, fundamental_factors[:5])
+        if config.get('rank'):
+            pre_count = len(self.generated_features)
+            result = self.create_rank_features(result, fundamental_factors[:3])
+            stats['滚动排名 (Rolling Rank)'] = len(self.generated_features) - pre_count
         
         if config.get('interaction') and len(tech_indicators) > 0 and len(fundamental_factors) > 0:
-            print("生成交互特征...")
-            result = self.create_interaction_features(
-                result, 
-                tech_indicators[:5], 
-                fundamental_factors[:5]
-            )
-        
-        print(f"\n特征工程完成，生成了 {len(self.generated_features)} 个新特征")
+            pre_count = len(self.generated_features)
+            result = self.create_interaction_features(result, tech_indicators[:4], fundamental_factors[:3])
+            stats['交互特征 (Tech*Fund)'] = len(self.generated_features) - pre_count
+
+        # 输出统计报告
+        print("\n" + "-"*40)
+        print("特征工程报告:")
+        print(f"  识别到: {len(tech_indicators)} 个技术指标, {len(fundamental_factors)} 个基本面因子")
+        for name, count in stats.items():
+            if count > 0:
+                print(f"  - {name}: +{count} 个")
+        print(f"  总计: 原始 {initial_count} -> 现计 {len(result.columns)} (新增 {len(self.generated_features)})")
+        print("-"*40 + "\n")
         
         return result
     

@@ -91,18 +91,22 @@ class BacktestEngine:
         # 初始化策略
         self.strategy.initialize()
         
-        # 加载数据
-        if verbose:
-            print("\n加载数据...")
-        if stock_codes is None:
-            conn = sqlite3.connect(DATABASE_PATH)
-            stock_codes_df = pd.read_sql_query(
-                f"SELECT DISTINCT code FROM daily_data LIMIT {TrainingConfig.STOCK_NUM}", 
-                conn
-            )
-            conn.close()
-            stock_codes = stock_codes_df['code'].tolist()
-        self.data_handler.load_data(start_date, end_date, stock_codes)
+        # 加载数据 (如果尚未加载)
+        if not self.data_handler._data_cache:
+            if verbose:
+                print("\n加载数据...")
+            if stock_codes is None:
+                conn = sqlite3.connect(DATABASE_PATH)
+                stock_codes_df = pd.read_sql_query(
+                    f"SELECT DISTINCT code FROM daily_data LIMIT {TrainingConfig.STOCK_NUM}", 
+                    conn
+                )
+                conn.close()
+                stock_codes = stock_codes_df['code'].tolist()
+            self.data_handler.load_data(start_date, end_date, stock_codes)
+        else:
+            if verbose:
+                print(f"\n跳过加载数据 (已加载 {len(self.data_handler._data_cache)} 只股票)")
         
         # 获取交易日
         self._trading_dates = self.data_handler.get_trading_dates(start_date, end_date)
@@ -189,6 +193,10 @@ class BacktestEngine:
         
         if not signals:
             return
+
+        # 优化 4: 计算每只股票应分配的资金 (等权分配)
+        # 使用总资产除以最大持仓数，确保即使当前有现金也能按预定比例买入
+        capital_per_position = self.portfolio.total_value / self.max_positions
         
         # 处理买入信号
         for signal in signals:
@@ -207,7 +215,7 @@ class BacktestEngine:
             if next_date is None or entry_price is None:
                 continue
             
-            # 优化 1: 确保止损/止盈价相对于实际入场价有效（保持策略预期的风险/收益空间）
+            # 优化 1: 确保止损/止盈价相对于实际入场价有效
             actual_stop_loss = signal.stop_loss
             actual_take_profit = signal.take_profit
             
@@ -220,26 +228,33 @@ class BacktestEngine:
                     tp_dist = actual_take_profit - signal.price
                     actual_take_profit = entry_price + tp_dist
 
-            # 开仓
+            # 获取置信度信息并存入 metadata
+            metadata = (signal.metadata or {}).copy()
+            if 'confidence' not in metadata:
+                metadata['confidence'] = signal.confidence
+
+            # 开仓 (传入计算好的分配资金)
             position = self.portfolio.open_position(
                 stock_code=signal.stock_code,
                 date=next_date,
                 price=entry_price,
+                capital_allocation=capital_per_position,
                 stop_loss=actual_stop_loss,
                 take_profit=actual_take_profit,
-                metadata=signal.metadata or {}
+                metadata=metadata
             )
             
             if position and verbose:
                 print(f"[{next_date}] 买入 {signal.stock_code}: {entry_price:.2f} "
-                      f"(置信度: {signal.confidence:.1f}%)")
+                      f"(分配资金: {capital_per_position:.2f}, 置信度: {signal.confidence:.1f}%)")
             
             # 策略回调
             if position:
                 self.strategy.on_trade(position)
             
-            # 单次只开一仓
-            break
+            # 如果没满仓，继续检查下一个信号
+            if not self.portfolio.can_open_position():
+                break
     
     def _check_exit_signals(self, date: str, market_data: Dict, verbose: bool):
         """检查平仓信号"""
@@ -323,7 +338,7 @@ class BacktestEngine:
             position.holding_days >= TIME_STOP_DAYS and 
             position.max_profit_rate <= 0 and
             position.unrealized_pnl_pct <= TIME_STOP_MIN_LOSS_PCT):
-            return True, close, f'time_stop_{position.holding_days}days'
+            return True, close, f'time_stoploss'
         
         # 趋势破位检查
         if ENABLE_SUPPORT_BREAK_EXIT and self._check_trend_break(position.stock_code, date, market_data):
@@ -371,10 +386,16 @@ class BacktestEngine:
         if bar is None:
             return None, None
         
-        open_price = bar['open']
-        entry_price = open_price
-        
-        return next_date, entry_price
+        # 停牌检测 (成交量为0)
+        if bar.get('volume', 0) == 0:
+            return None, None
+            
+        # 一字涨停检测
+        if bar['open'] == bar['high'] == bar['low'] == bar['close']:
+            if bar['open'] > signal_price * 1.095:
+                return None, None
+
+        return next_date, bar['open']
     
     def get_results(self) -> Dict:
         """获取回测结果"""

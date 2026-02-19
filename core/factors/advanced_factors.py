@@ -14,17 +14,17 @@ class TimeSeriesFactors:
     """时间序列特征计算器"""
     
     @staticmethod
-    def calculate_price_series_features(data: pd.DataFrame) -> Dict[str, float]:
+    def calculate_price_series_features(data: pd.DataFrame) -> pd.DataFrame:
         """
-        计算价格序列特征
+        计算价格序列特征 (Rolling)
         
         参数:
             data: 包含OHLCV的DataFrame
         
         返回:
-            价格序列特征字典
+            价格序列特征 DataFrame
         """
-        features = {}
+        features = pd.DataFrame(index=data.index)
         
         if len(data) < 20:
             return features
@@ -32,69 +32,52 @@ class TimeSeriesFactors:
         close = data['close']
         high = data['high']
         low = data['low']
+        open_price = data['open']
         
-        # 高低价差比（最近20天）
-        hl_range = np.divide(high - low, close, where=close!=0, out=np.zeros_like(close))
-        hl_range_mean = hl_range.tail(20).mean()
-        hl_range_std = hl_range.tail(20).std()
-        features['hl_range_mean'] = 0.0 if pd.isna(hl_range_mean) else hl_range_mean
-        features['hl_range_std'] = 0.0 if pd.isna(hl_range_std) else hl_range_std
+        # 1. 高低价差比
+        hl_range = (high - low) / close
+        features['hl_range_mean'] = hl_range.rolling(20).mean()
+        features['hl_range_std'] = hl_range.rolling(20).std()
         
-        # 开收价差比
-        oc_ratio = np.divide(close - data['open'], data['open'], where=data['open']!=0, out=np.zeros_like(data['open']))
-        oc_ratio_mean = oc_ratio.tail(20).mean()
-        oc_ratio_std = oc_ratio.tail(20).std()
+        # 2. 开收价差比
+        oc_ratio = (close - open_price) / open_price
+        features['oc_ratio_mean'] = oc_ratio.rolling(20).mean()
+        features['oc_ratio_std'] = oc_ratio.rolling(20).std()
         
-        # 价格波动率（标准差）
+        # 3. 价格波动率
         returns = close.pct_change()
+        features['price_volatility_20'] = returns.rolling(20).std()
+        features['price_volatility_60'] = returns.rolling(60).std()
         
-        # 安全地计算统计量（排除非有限值以避免RuntimeWarning）
-        hl_range_clean = hl_range[np.isfinite(hl_range)].tail(20)
-        oc_ratio_clean = oc_ratio[np.isfinite(oc_ratio)].tail(20)
-        returns_clean = returns[np.isfinite(returns)]
+        # 4. 偏度和峰度
+        features['price_skewness'] = returns.rolling(20).skew()
+        features['price_kurtosis'] = returns.rolling(20).kurt()
         
-        features['hl_range_mean'] = hl_range_clean.mean() if len(hl_range_clean) > 0 else 0.0
-        features['hl_range_std'] = hl_range_clean.std() if len(hl_range_clean) > 1 else 0.0
+        # 5. 最高价和最低价相对于收盘价的位置 (Rolling Range)
+        roll_high = high.rolling(20).max()
+        roll_low = low.rolling(20).min()
+        roll_range = roll_high - roll_low
         
-        features['oc_ratio_mean'] = oc_ratio_clean.mean() if len(oc_ratio_clean) > 0 else 0.0
-        features['oc_ratio_std'] = oc_ratio_clean.std() if len(oc_ratio_clean) > 1 else 0.0
+        features['high_position'] = (high - roll_low) / roll_range
+        features['low_position'] = (close - roll_low) / roll_range
         
-        features['price_volatility_20'] = returns_clean.tail(20).std() if len(returns_clean.tail(20)) > 1 else 0.0
-        features['price_volatility_60'] = returns_clean.tail(60).std() if len(returns_clean.tail(60)) > 1 else 0.0
-        
-        # 偏度和峰度
-        features['price_skewness'] = returns_clean.tail(20).skew() if len(returns_clean.tail(20)) > 2 else 0.0
-        features['price_kurtosis'] = returns_clean.tail(20).kurt() if len(returns_clean.tail(20)) > 3 else 0.0
-        
-        # 最高价和最低价相对于收盘价的位置
-        high_tail_max = high.tail(20).max()
-        low_tail_min = low.tail(20).min()
-        range_val = high_tail_max - low_tail_min
-        
-        if range_val > 0:
-            high_pos = (high.iloc[-1] - low_tail_min) / range_val
-            low_pos = (close.iloc[-1] - low_tail_min) / range_val
-        else:
-            high_pos = 0.5
-            low_pos = 0.5
-        
-        features['high_position'] = 0.5 if pd.isna(high_pos) else high_pos
-        features['low_position'] = 0.5 if pd.isna(low_pos) else low_pos
+        # 补充处理
+        features = features.replace([np.inf, -np.inf], 0).fillna(0)
         
         return features
     
     @staticmethod
-    def calculate_volume_series_features(data: pd.DataFrame) -> Dict[str, float]:
+    def calculate_volume_series_features(data: pd.DataFrame) -> pd.DataFrame:
         """
-        计算成交量序列特征
+        计算成交量序列特征 (Rolling)
         
         参数:
             data: 包含OHLCV的DataFrame
         
         返回:
-            成交量序列特征字典
+            成交量序列特征 DataFrame
         """
-        features = {}
+        features = pd.DataFrame(index=data.index)
         
         if len(data) < 20:
             return features
@@ -103,99 +86,66 @@ class TimeSeriesFactors:
         amount = data['amount']
         close = data['close']
         
-        # 成交量变化率
-        vol_ma20 = volume.tail(20).mean()
-        if vol_ma20 > 0:
-            vol_change = volume.iloc[-1] / vol_ma20
-            features['volume_change_rate'] = 0.0 if pd.isna(vol_change) else vol_change
-        else:
-            features['volume_change_rate'] = 0.0
+        # 1. 成交量变化率 (V/MA20)
+        vol_ma20 = volume.rolling(20).mean()
+        features['volume_change_rate'] = volume / vol_ma20
         
-        # 成交量波动率
+        # 2. 成交量波动率
         vol_returns = volume.pct_change()
-        vol_volatility = vol_returns.tail(20).std()
-        features['volume_volatility'] = 0.0 if pd.isna(vol_volatility) else vol_volatility
+        features['volume_volatility'] = vol_returns.rolling(20).std()
         
-        # 成交量趋势（斜率）
-        try:
-            vol_trend = np.polyfit(range(20), volume.tail(20).values, 1)[0]
-            vol_trend_normalized = vol_trend / vol_ma20 if vol_ma20 > 0 else 0
-            features['volume_trend'] = 0.0 if pd.isna(vol_trend_normalized) else vol_trend_normalized
-        except:
-            features['volume_trend'] = 0.0
-        
-        # 价量相关性
+        # 3. 价量相关性
         price_returns = close.pct_change()
-        if len(price_returns) >= 20:
-            corr = price_returns.tail(20).corr(vol_returns.tail(20))
-            features['price_volume_corr'] = 0.0 if pd.isna(corr) else corr
-        else:
-            features['price_volume_corr'] = 0.0
+        features['price_volume_corr'] = price_returns.rolling(20).corr(vol_returns)
         
-        # 单位成交金额
-        if vol_ma20 > 0:
-            amt_per_vol = amount.tail(20).mean() / vol_ma20
-            features['amount_per_volume'] = 0.0 if pd.isna(amt_per_vol) else amt_per_vol
-        else:
-            features['amount_per_volume'] = 0.0
+        # 4. 单位成交金额 (均值)
+        features['amount_per_volume'] = amount.rolling(20).mean() / vol_ma20
         
-        # 成交金额变化率
-        amt_ma20 = amount.tail(20).mean()
-        if amt_ma20 > 0:
-            amt_change = amount.iloc[-1] / amt_ma20
-            features['amount_change_rate'] = 0.0 if pd.isna(amt_change) else amt_change
-        else:
-            features['amount_change_rate'] = 0.0
+        # 5. 成交金额变化率
+        amt_ma20 = amount.rolling(20).mean()
+        features['amount_change_rate'] = amount / amt_ma20
+        
+        # 补充处理
+        features = features.replace([np.inf, -np.inf], 0).fillna(0)
         
         return features
     
     @staticmethod
-    def calculate_momentum_features(data: pd.DataFrame) -> Dict[str, float]:
+    def calculate_momentum_features(data: pd.DataFrame) -> pd.DataFrame:
         """
-        计算动量特征
+        计算动量特征 (Rolling)
         
         参数:
             data: 包含OHLCV的DataFrame
         
         返回:
-            动量特征字典
+            动量特征 DataFrame
         """
-        features = {}
+        features = pd.DataFrame(index=data.index)
         
         if len(data) < 60:
             return features
         
         close = data['close']
+        
+        # 1. 不同周期的收益率
+        features['return_5d'] = close.pct_change(5)
+        features['return_10d'] = close.pct_change(10)
+        features['return_20d'] = close.pct_change(20)
+        features['return_60d'] = close.pct_change(60)
+        
+        # 2. 动量（收益率的累计）
+        # 这里直接用 pct_change 已经表达了动量，额外补充 rolling sum
         returns = close.pct_change()
+        features['momentum_5d'] = returns.rolling(5).sum()
+        features['momentum_10d'] = returns.rolling(10).sum()
+        features['momentum_20d'] = returns.rolling(20).sum()
         
-        # 不同周期的收益率
-        ret_5d = (close.iloc[-1] / close.iloc[-5] - 1) if len(close) >= 5 and close.iloc[-5] > 0 else 0
-        ret_10d = (close.iloc[-1] / close.iloc[-10] - 1) if len(close) >= 10 and close.iloc[-10] > 0 else 0
-        ret_20d = (close.iloc[-1] / close.iloc[-20] - 1) if len(close) >= 20 and close.iloc[-20] > 0 else 0
-        ret_60d = (close.iloc[-1] / close.iloc[-60] - 1) if len(close) >= 60 and close.iloc[-60] > 0 else 0
+        # 3. 加速度（动量的差值）
+        features['acceleration'] = features['momentum_10d'] - features['momentum_20d'].shift(10)
         
-        features['return_5d'] = 0.0 if pd.isna(ret_5d) else ret_5d
-        features['return_10d'] = 0.0 if pd.isna(ret_10d) else ret_10d
-        features['return_20d'] = 0.0 if pd.isna(ret_20d) else ret_20d
-        features['return_60d'] = 0.0 if pd.isna(ret_60d) else ret_60d
-        
-        # 动量（收益率的变化）
-        mom_5d = returns.tail(5).sum()
-        mom_10d = returns.tail(10).sum()
-        mom_20d = returns.tail(20).sum()
-        
-        features['momentum_5d'] = 0.0 if pd.isna(mom_5d) else mom_5d
-        features['momentum_10d'] = 0.0 if pd.isna(mom_10d) else mom_10d
-        features['momentum_20d'] = 0.0 if pd.isna(mom_20d) else mom_20d
-        
-        # 加速度（动量的变化）
-        if len(returns) >= 20:
-            recent_momentum = returns.tail(10).sum()
-            past_momentum = returns.tail(20).head(10).sum()
-            acceleration = recent_momentum - past_momentum
-            features['acceleration'] = 0.0 if pd.isna(acceleration) else acceleration
-        else:
-            features['acceleration'] = 0.0
+        # 补充处理
+        features = features.replace([np.inf, -np.inf], 0).fillna(0)
         
         return features
 
@@ -209,74 +159,16 @@ class RelativeStrengthFactors:
     
     def get_industry_average(self, industry: str) -> Dict[str, float]:
         """
-        获取行业平均指标
-        
-        参数:
-            industry: 行业名称
-        
-        返回:
-            行业平均指标字典
+        获取行业平均指标 (当前禁用，防止未来数据泄露)
         """
-        with sqlite3.connect(self.db_path) as conn:
-            query = """
-                SELECT 
-                    AVG(pe_ratio) as avg_pe,
-                    AVG(pb_ratio) as avg_pb,
-                    AVG(return_on_equity) as avg_roe,
-                    AVG(return_on_assets) as avg_roa,
-                    AVG(profit_margins) as avg_margin,
-                    AVG(revenue_growth) as avg_growth,
-                    AVG(market_cap) as avg_market_cap
-                FROM stock_info_extended
-                WHERE industry = ?
-            """
-            
-            df = pd.read_sql_query(query, conn, params=(industry,))
-        
-        if len(df) > 0:
-            return {
-                'pe': df['avg_pe'].iloc[0],
-                'pb': df['avg_pb'].iloc[0],
-                'roe': df['avg_roe'].iloc[0],
-                'roa': df['avg_roa'].iloc[0],
-                'margin': df['avg_margin'].iloc[0],
-                'growth': df['avg_growth'].iloc[0],
-                'market_cap': df['avg_market_cap'].iloc[0],
-            }
-        
+        # 注意: 数据库中仅有实时快照，在历史回测中使用会导致严重泄露
         return {}
     
     def get_sector_average(self, sector: str) -> Dict[str, float]:
         """
-        获取板块平均指标
-        
-        参数:
-            sector: 板块名称
-        
-        返回:
-            板块平均指标字典
+        获取板块平均指标 (当前禁用，防止未来数据泄露)
         """
-        with sqlite3.connect(self.db_path) as conn:
-            query = """
-                SELECT 
-                    AVG(pe_ratio) as avg_pe,
-                    AVG(pb_ratio) as avg_pb,
-                    AVG(return_on_equity) as avg_roe,
-                    AVG(market_cap) as avg_market_cap
-                FROM stock_info_extended
-                WHERE sector = ?
-            """
-            
-            df = pd.read_sql_query(query, conn, params=(sector,))
-        
-        if len(df) > 0:
-            return {
-                'pe': df['avg_pe'].iloc[0],
-                'pb': df['avg_pb'].iloc[0],
-                'roe': df['avg_roe'].iloc[0],
-                'market_cap': df['avg_market_cap'].iloc[0],
-            }
-        
+        # 注意: 数据库中仅有实时快照，在历史回测中使用会导致严重泄露
         return {}
     
     def calculate_relative_strength_factors(self, code: str, info: pd.Series) -> Dict[str, float]:
@@ -427,17 +319,17 @@ class RiskFactors:
     """风险特征计算器"""
     
     @staticmethod
-    def calculate_risk_features(data: pd.DataFrame) -> Dict[str, float]:
+    def calculate_risk_features(data: pd.DataFrame) -> pd.DataFrame:
         """
-        计算风险特征
+        计算风险特征 (Rolling)
         
         参数:
             data: 包含OHLCV的DataFrame
         
         返回:
-            风险特征字典
+            风险特征 DataFrame
         """
-        features = {}
+        features = pd.DataFrame(index=data.index)
         
         if len(data) < 20:
             return features
@@ -445,51 +337,29 @@ class RiskFactors:
         close = data['close']
         returns = close.pct_change()
         
-        # 下行风险（只考虑负收益）
-        negative_returns = returns[returns < 0]
-        if len(negative_returns) > 0:
-            downside = negative_returns.std()
-            features['downside_risk'] = 0.0 if pd.isna(downside) else downside
-        else:
-            features['downside_risk'] = 0.0
+        # 1. 下行风险 (Rolling Standard Deviation of Negative Returns)
+        negative_returns = returns.copy()
+        negative_returns[negative_returns > 0] = np.nan
+        features['downside_risk'] = negative_returns.rolling(20).std()
         
-        # 最大回撤
-        cumulative_returns = (1 + returns).cumprod()
+        # 2. 回撤
+        cumulative_returns = (1 + returns.fillna(0)).cumprod()
         running_max = cumulative_returns.expanding().max()
         drawdown = (cumulative_returns - running_max) / running_max
-        max_dd = drawdown.min()
-        features['max_drawdown'] = 0.0 if pd.isna(max_dd) else max_dd
+        features['drawdown'] = drawdown
+        features['max_drawdown_20'] = drawdown.rolling(20).min()
         
-        # 动量特征 (风险调整后)
-        returns_clean = returns[np.isfinite(returns)]
-        if len(returns_clean) > 1:
-            std = returns_clean.std()
-            if std > 0:
-                features['sharpe_ratio'] = returns_clean.mean() / std * np.sqrt(252)
-            else:
-                features['sharpe_ratio'] = 0.0
-            
-            # 索提诺比率 (只考虑下行偏差)
-            downside_returns = returns_clean[returns_clean < 0]
-            if len(downside_returns) > 1:
-                downside_std = downside_returns.std()
-                if downside_std > 0:
-                    features['sortino_ratio'] = returns_clean.mean() / downside_std * np.sqrt(252)
-                else:
-                    features['sortino_ratio'] = 0.0
-            else:
-                features['sortino_ratio'] = 0.0
-        else:
-            features['sharpe_ratio'] = 0.0
-            features['sortino_ratio'] = 0.0
+        # 3. 风险调整收益
+        roll_mean = returns.rolling(20).mean()
+        roll_std = returns.rolling(20).std()
+        features['sharpe_ratio'] = (roll_mean / roll_std) * np.sqrt(252)
         
-        # 收益率的偏度（风险不对称性）
-        skew = returns.tail(60).skew()
-        features['return_skewness'] = 0.0 if pd.isna(skew) else skew
+        # 4. 收益率偏度与峰度
+        features['return_skewness'] = returns.rolling(60).skew()
+        features['return_kurtosis'] = returns.rolling(60).kurt()
         
-        # 收益率的峰度（尾部风险）
-        kurt = returns.tail(60).kurt()
-        features['return_kurtosis'] = 0.0 if pd.isna(kurt) else kurt
+        # 补充处理
+        features = features.replace([np.inf, -np.inf], 0).fillna(0)
         
         return features
 

@@ -21,33 +21,32 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 4,              # 增加深度以改善预测区分度
-        'min_child_weight': 1.2,     # 增加权重要求，防止过拟合
-        'learning_rate': 0.015,       # 降低学习率
-        'subsample': 0.7,            
-        'colsample_bytree': 0.7,     
-        'reg_alpha': 4,            
-        'reg_lambda': 10,             
-        'objective': 'reg:logistic',
+        'max_depth': 5,              # 增加深度以改善预测区分度
+        'min_child_weight': 1,       # 增加权重要求，防止过拟合
+        'learning_rate': 0.02,       # 降低学习率
+        'subsample': 0.8,            
+        'colsample_bytree': 0.5,     
+        'reg_alpha': 3,            
+        'reg_lambda': 8,             
+        'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
         'random_state': 42,
         'n_jobs': -1,
-        'early_stopping_rounds': 200, 
+        'early_stopping_rounds': 100,
     }
     
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 5,
+        'max_depth': 4,
         'num_leaves': 31,
-        'min_child_samples': 20,
-        'learning_rate': 0.015,
-        'min_data_in_leaf': 500,
-        'min_gain_to_split': 0.012,
-        'reg_alpha': 4,
-        'reg_lambda': 10,
-        'subsample': 0.6,
-        'colsample_bytree': 0.6,
+        'learning_rate': 0.02,
+        'min_data_in_leaf': 150,
+        'min_gain_to_split': 0.01,
+        'reg_alpha': 3,
+        'reg_lambda': 8,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
 
         'label_gain': [float(i**2 - 1) for i in range(100)], 
         'objective': 'lambdarank',
@@ -56,7 +55,7 @@ class ModelConfig:
         'random_state': 42,
         'n_jobs': -1,
         'verbose': -1,
-        'early_stopping_rounds': 200,
+        'early_stopping_rounds': 100,
         'force_row_wise': True, 
     }
     
@@ -86,14 +85,14 @@ class TrainingConfig:
     INCLUDE_FUNDAMENTALS = False  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
 
-    YEARS_FOR_BACKTEST=2         # 回测年数
+    YEARS_FOR_BACKTEST=1         # 回测年数
     YEARS_FOR_TRAINING=8         # 训练年数
     STOCK_NUM = 5000             # 股票数量
     # 数据集划分
     TRAIN_TEST_SPLIT = 0.8
 
     # 预测天数 (用于分类、回归和排序任务)
-    FUTURE_DAYS = 15
+    FUTURE_DAYS = 10
     
 
     # 缓存目录
@@ -111,59 +110,59 @@ class FactorConfig:
     """因子计算参数配置"""
     
     # 动量因子参数
-    RSI_PERIOD = 21
-    ROC_PERIOD = 30
-    MTM_PERIOD = 30
-    CMO_PERIOD = 28
-    STOCHRSI_PERIOD = 14
+    RSI_PERIOD = 35
+    ROC_PERIOD = 20
+    MTM_PERIOD = 20
+    CMO_PERIOD = 35
+    STOCHRSI_PERIOD = 21
     RVI_PERIOD = 14
     
     # 趋势因子参数
-    MACD_FAST = 5
-    MACD_SLOW = 26
-    MACD_SIGNAL = 5
-    ADX_PERIOD = 14
-    DMI_PERIOD = 21
-    AROON_PERIOD = 14
-    TRIX_PERIOD = 45
+    MACD_FAST = 20
+    MACD_SLOW = 60
+    MACD_SIGNAL = 15
+    ADX_PERIOD = 7
+    DMI_PERIOD = 14
+    AROON_PERIOD = 30
+    TRIX_PERIOD = 30
     
     # 均线参数
-    MA_RATIO_PERIOD = 10
-    MA_SLOPE_PERIOD = 5
+    MA_RATIO_PERIOD = 30
+    MA_SLOPE_PERIOD = 10
     
     # 波动率因子参数
     ATR_PERIOD = 10
-    NATR_PERIOD = 7
-    BB_PERIOD = 20
+    NATR_PERIOD = 5
+    BB_PERIOD = 50
     BB_STD = 1.5
-    CCI_PERIOD = 14
+    CCI_PERIOD = 28
     ULCER_PERIOD = 21
-    PRICE_VAR_PERIOD = 20
+    PRICE_VAR_PERIOD = 10
     
     # 成交量因子参数
-    VOLUME_MA_PERIOD = 5
-    VOLUME_STD_PERIOD = 5
+    VOLUME_MA_PERIOD = 10
+    VOLUME_STD_PERIOD = 10
     VOLUME_MA_SHORT = 5
     VOLUME_MA_LONG = 10
-    AMOUNT_MA_PERIOD = 5
-    AMOUNT_STD_PERIOD = 5
-    MFI_PERIOD = 7
-    VR_PERIOD = 26
-    VROC_PERIOD = 6
-    VRSI_PERIOD = 12
-    VMACD_FAST = 6
-    VMACD_SLOW = 30
-    VMACD_SIGNAL = 9
-    ADOSC_FAST = 2
-    ADOSC_SLOW = 10
+    AMOUNT_MA_PERIOD = 10
+    AMOUNT_STD_PERIOD = 10
+    MFI_PERIOD = 28
+    VR_PERIOD = 20
+    VROC_PERIOD = 24
+    VRSI_PERIOD = 15
+    VMACD_FAST = 15
+    VMACD_SLOW = 45
+    VMACD_SIGNAL = 12
+    ADOSC_FAST = 7
+    ADOSC_SLOW = 20
     
     # 摆动指标参数
-    KDJ_N = 5
-    WILLR_PERIOD = 14
-    BIAS_PERIOD = 12
-    PSY_PERIOD = 6
-    AR_BR_PERIOD = 26
-    CR_PERIOD = 26
+    KDJ_N = 21
+    WILLR_PERIOD = 28
+    BIAS_PERIOD = 24
+    PSY_PERIOD = 12
+    AR_BR_PERIOD = 20
+    CR_PERIOD = 20
     
     # K线形态参数
     BODY_SIZE_THRESHOLD_LARGE = 0.015  # 大实体阈值（2%）

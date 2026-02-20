@@ -150,7 +150,7 @@ class MLFactorModel:
                             offset += g_size
                         y = y_ranked
                     else:
-                        raise('ranking分组失败')
+                        raise ValueError('ranking分组失败')
                     
                     # print(f"  相关度标签分布 (0-{n_bins-1}): {dict(zip(*np.unique(y, return_counts=True)))}")
                 else:
@@ -182,10 +182,10 @@ class MLFactorModel:
             dates_val = None
 
         # 3. 标准化
-        X_train_scaled = self.scaler.fit_transform(X_train_raw)
-        X_val_scaled = self.scaler.transform(X_val_raw)
-        X_train = pd.DataFrame(X_train_scaled, columns=self.feature_names)
-        X_val = pd.DataFrame(X_val_scaled, columns=self.feature_names)
+        # 已在数据准备阶段做了按日横截面 Z-Score 或者百分位处理，
+        # 此处如果再加全局 RobustScaler 会破坏横向对比信息且多余，因此移除原先的标准化步骤
+        X_train = pd.DataFrame(X_train_raw, columns=self.feature_names)
+        X_val = pd.DataFrame(X_val_raw, columns=self.feature_names)
         
         # 4. 模型拟合
         # 改进：排序任务支持样本权重，有助于通过权重惩罚（如涨停、停牌）引导模型避开不可买入样本
@@ -214,6 +214,13 @@ class MLFactorModel:
             if self.task == 'ranking':
                 # 排序任务：打印训练进度
                 callbacks.append(log_evaluation(period=50))
+                # 严重 BUG 修复: LGBM lambdarank 的 sample_weight 会被解析为 group 权重。
+                # 由于我们的数据内每个日期是按日期排的，但某股票某日是在组内的随机位置，
+                # 若传入 num_samples 长度的一维 sample_weight，LightGBM 其实只会提取每个 group 首元素的权重，完全是随机的！
+                # 因此必须针对 ranking 任务删掉 sample_weight。
+                if 'sample_weight' in fit_params:
+                    del fit_params['sample_weight']
+
             self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
         else:
             self.model.fit(X_train, y_train, sample_weight=w_train)
@@ -244,9 +251,7 @@ class MLFactorModel:
 
         if current_task == 'ranking':
             # 排序模型 (LGBMRanker) 的输出是相对分数 (Raw Score)
-            # 关键修复：使用 Sigmoid 转换，并增加 1.5 倍缩放系数增加区分度
-            # 这样原本在 [-1, 1] 范围的 score 会被拉伸，使概率分布在 [0.2, 0.8] 之间更有层次
-            return 1.0 / (1.0 + np.exp(-preds * 1.5))
+            return 1.0 / (1.0 + np.exp(-preds * 1.0))
         
         if current_task == 'regression':
             # 回归任务（如软标签）
@@ -378,7 +383,7 @@ class MLFactorModel:
     def predict(self, factors: pd.DataFrame) -> np.ndarray:
         if not self.is_trained: raise ValueError("未训练")
         X = np.nan_to_num(factors[self.feature_names].values, nan=0.0)
-        return self._get_predict_proba(self.scaler.transform(X))
+        return self._get_predict_proba(X)
 
     def predict_signal(self, factors: pd.DataFrame, threshold: float = 0.5) -> Dict:
         prob = self.predict(factors)[0]

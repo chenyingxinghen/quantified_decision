@@ -15,15 +15,23 @@ import pandas as pd
 import numpy as np
 import warnings
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from joblib import Parallel, delayed
 import scipy.stats as stats
 import re
+
+# 尝试导入 tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
+from core.factors.quantitative_factors import QuantitativeFactors
+from core.factors.candlestick_pattern_factors import CandlestickPatternFactors
 from config import DATABASE_PATH, FactorConfig, TrainingConfig
 
 # 忽略警告
@@ -35,31 +43,31 @@ warnings.filterwarnings('ignore')
 
 SEARCH_SPACE = {
     # 动量类因子
-    'RSI_PERIOD': [6, 9, 14, 21, 28],
-    'ROC_PERIOD': [5, 10, 12, 20, 30],
-    'MTM_PERIOD': [5, 10, 12, 20, 30],
-    'CMO_PERIOD': [9, 14, 21, 28],
-    'STOCHRSI_PERIOD': [9, 14, 21, 28],
-    'RVI_PERIOD': [5, 10, 14, 20],
+    'RSI_PERIOD': [6, 9, 14, 21, 28, 35],
+    'ROC_PERIOD': [5, 10, 12, 20, 30, 40],
+    'MTM_PERIOD': [5, 10, 12, 20, 30, 40],
+    'CMO_PERIOD': [9, 14, 21, 28, 35],
+    'STOCHRSI_PERIOD': [9, 14, 21, 28, 35],
+    'RVI_PERIOD': [5, 10, 14, 20, 30],
     
     # 趋势类因子
-    'MACD_FAST': [5, 10, 12, 15],
-    'MACD_SLOW': [20, 26, 30, 40],
-    'MACD_SIGNAL': [5, 9, 12],
-    'ADX_PERIOD': [7, 14, 21, 28],
-    'DMI_PERIOD': [7, 14, 21, 28],
-    'AROON_PERIOD': [14, 25, 30, 50],
-    'TRIX_PERIOD': [15, 30, 45, 60],
+    'MACD_FAST': [5, 10, 12, 15, 20],
+    'MACD_SLOW': [20, 26, 30, 40, 60],
+    'MACD_SIGNAL': [5, 7, 9, 12, 15],
+    'ADX_PERIOD': [7, 10, 14, 21, 28],
+    'DMI_PERIOD': [7, 10, 14, 21, 28],
+    'AROON_PERIOD': [14, 20, 25, 30, 50],
+    'TRIX_PERIOD': [15, 20, 30, 45, 60],
     'MA_RATIO_PERIOD': [5, 10, 20, 30, 60],
     'MA_SLOPE_PERIOD': [5, 10, 20, 30, 60],
     
     # 波动率因子
     'ATR_PERIOD': [5, 10, 14, 20, 30],
-    'NATR_PERIOD': [7, 14, 21],
-    'BB_PERIOD': [10, 20, 25, 30, 50],
-    'BB_STD': [1.5, 2.0, 2.5],
-    'CCI_PERIOD': [7, 14, 21, 28],
-    'ULCER_PERIOD': [7, 14, 21, 28],
+    'NATR_PERIOD': [5, 7, 10, 14, 21],
+    'BB_PERIOD': [10, 15, 20, 25, 30, 50],
+    'BB_STD': [1.0, 1.5, 2.0, 2.5, 3.0],
+    'CCI_PERIOD': [7, 10, 14, 21, 28],
+    'ULCER_PERIOD': [7, 10, 14, 21, 28],
     'PRICE_VAR_PERIOD': [10, 20, 30, 60],
     
     # 成交量因子
@@ -67,78 +75,78 @@ SEARCH_SPACE = {
     'VOLUME_STD_PERIOD': [5, 10, 20, 30, 60],
     'AMOUNT_MA_PERIOD': [5, 10, 20, 30, 60],
     'AMOUNT_STD_PERIOD': [5, 10, 20, 30, 60],
-    'MFI_PERIOD': [7, 14, 21, 28],
-    'VR_PERIOD': [13, 26, 39],
+    'MFI_PERIOD': [7, 10, 14, 21, 28],
+    'VR_PERIOD': [13, 20, 26, 39],
     'VROC_PERIOD': [6, 12, 18, 24],
-    'VRSI_PERIOD': [3, 6, 9, 12],
-    'VMACD_FAST': [6, 12, 15],
-    'VMACD_SLOW': [13, 26, 30],
-    'VMACD_SIGNAL': [5, 9, 12],
-    'ADOSC_FAST': [2, 3, 5],
-    'ADOSC_SLOW': [7, 10, 15],
+    'VRSI_PERIOD': [3, 6, 9, 12, 15],
+    'VMACD_FAST': [6, 12, 15, 20],
+    'VMACD_SLOW': [13, 26, 30, 45],
+    'VMACD_SIGNAL': [5, 7, 9, 12, 15],
+    'ADOSC_FAST': [2, 3, 5, 7],
+    'ADOSC_SLOW': [7, 10, 15, 20],
     
     # 摆动指标参数
     'KDJ_N': [5, 9, 14, 21],
-    'WILLR_PERIOD': [7, 14, 21, 28],
+    'WILLR_PERIOD': [7, 10, 14, 21, 28],
     'BIAS_PERIOD': [3, 6, 12, 24],
     'PSY_PERIOD': [6, 12, 18, 24],
-    'AR_BR_PERIOD': [13, 26, 39],
-    'CR_PERIOD': [13, 26, 39],
+    'AR_BR_PERIOD': [13, 20, 26, 39],
+    'CR_PERIOD': [13, 20, 26, 39],
     
     # K线形态参数
-    'BODY_SIZE_THRESHOLD_LARGE': [0.015, 0.02, 0.03],
-    'BODY_SIZE_THRESHOLD_SMALL': [0.003, 0.005, 0.008],
+    'BODY_SIZE_THRESHOLD_LARGE': [0.01, 0.015, 0.02, 0.03],
+    'BODY_SIZE_THRESHOLD_SMALL': [0.002, 0.003, 0.005, 0.008],
     'HAMMER_LOWER_SHADOW_RATIO': [1.5, 2.0, 2.5, 3.0],
-    'HAMMER_UPPER_SHADOW_RATIO': [0.5, 1.0, 1.5]
+    'HAMMER_UPPER_SHADOW_RATIO': [0.5, 0.8, 1.0, 1.5]
 }
 
-# 形态因子对参数的映射（优化评估时只计算相关的因子）
-PARAM_TO_FACTOR_MAP = {
-    'RSI_PERIOD': ['rsi_'],
-    'ROC_PERIOD': ['roc_'],
-    'MTM_PERIOD': ['mtm_'],
-    'CMO_PERIOD': ['cmo_'],
-    'STOCHRSI_PERIOD': ['stochrsi_k', 'stochrsi_d'],
-    'RVI_PERIOD': ['rvi_'],
-    'MACD_FAST': ['macd'],
-    'MACD_SLOW': ['macd'],
-    'MACD_SIGNAL': ['macd'],
-    'ADX_PERIOD': ['adx_'],
-    'DMI_PERIOD': ['plus_di', 'minus_di'],
-    'AROON_PERIOD': ['aroon_up', 'aroon_down'],
-    'TRIX_PERIOD': ['trix_'],
-    'MA_RATIO_PERIOD': ['ma_ratio_'],
-    'MA_SLOPE_PERIOD': ['ma_slope_'],
-    'ATR_PERIOD': ['atr_'],
-    'NATR_PERIOD': ['natr_'],
-    'BB_PERIOD': ['bb_width', 'bb_position'],
-    'BB_STD': ['bb_width', 'bb_position'],
-    'CCI_PERIOD': ['cci_'],
-    'ULCER_PERIOD': ['ulcer_'],
-    'PRICE_VAR_PERIOD': ['price_var_'],
-    'VOLUME_MA_PERIOD': ['vol_ma_'],
-    'VOLUME_STD_PERIOD': ['vol_std_'],
-    'AMOUNT_MA_PERIOD': ['amount_ma_'],
-    'AMOUNT_STD_PERIOD': ['amount_std_'],
-    'MFI_PERIOD': ['mfi_'],
-    'VR_PERIOD': ['vr_'],
-    'VROC_PERIOD': ['vroc_'],
-    'VRSI_PERIOD': ['vrsi_'],
-    'VMACD_FAST': ['vmacd'],
-    'VMACD_SLOW': ['vmacd'],
-    'VMACD_SIGNAL': ['vmacd'],
-    'ADOSC_FAST': ['adosc'],
-    'ADOSC_SLOW': ['adosc'],
-    'KDJ_N': ['kdj_k', 'kdj_d', 'kdj_j'],
-    'WILLR_PERIOD': ['willr_'],
-    'BIAS_PERIOD': ['bias_'],
-    'PSY_PERIOD': ['psy_'],
-    'AR_BR_PERIOD': ['ar_', 'br_'],
-    'CR_PERIOD': ['cr_'],
-    'BODY_SIZE_THRESHOLD_LARGE': ['white_candle', 'black_candle'],
-    'BODY_SIZE_THRESHOLD_SMALL': ['doji', 'marubozu'],
-    'HAMMER_LOWER_SHADOW_RATIO': ['hammer', 'hanging_man', 'shooting_star', 'inverted_hammer'],
-    'HAMMER_UPPER_SHADOW_RATIO': ['hammer', 'hanging_man', 'shooting_star', 'inverted_hammer']
+# 形态因子对参数的映射
+PARAM_TO_METHOD_MAP = {
+    'RSI_PERIOD': ('tech', 'calculate_rsi'),
+    'ROC_PERIOD': ('tech', 'calculate_roc'),
+    'MTM_PERIOD': ('tech', 'calculate_mtm'),
+    'CMO_PERIOD': ('tech', 'calculate_cmo'),
+    'STOCHRSI_PERIOD': ('tech', 'calculate_stochrsi'),
+    'RVI_PERIOD': ('tech', 'calculate_rvi'),
+    'MACD_FAST': ('tech', 'calculate_macd'),
+    'MACD_SLOW': ('tech', 'calculate_macd'),
+    'MACD_SIGNAL': ('tech', 'calculate_macd'),
+    'ADX_PERIOD': ('tech', 'calculate_adx'),
+    'DMI_PERIOD': ('tech', 'calculate_dmi'),
+    'AROON_PERIOD': ('tech', 'calculate_aroon'),
+    'TRIX_PERIOD': ('tech', 'calculate_trix'),
+    'MA_RATIO_PERIOD': ('tech', 'calculate_ma_ratio'),
+    'MA_SLOPE_PERIOD': ('tech', 'calculate_ma_slope'),
+    'ATR_PERIOD': ('tech', 'calculate_atr'),
+    'NATR_PERIOD': ('tech', 'calculate_natr'),
+    'BB_PERIOD': ('tech', 'calculate_bollinger_bands'),
+    'BB_STD': ('tech', 'calculate_bollinger_bands'),
+    'CCI_PERIOD': ('tech', 'calculate_cci'),
+    'ULCER_PERIOD': ('tech', 'calculate_ulcer_index'),
+    'PRICE_VAR_PERIOD': ('tech', 'calculate_price_variance'),
+    'VOLUME_MA_PERIOD': ('tech', 'calculate_volume_ma'),
+    'VOLUME_STD_PERIOD': ('tech', 'calculate_volume_std'),
+    'AMOUNT_MA_PERIOD': ('tech', 'calculate_amount_ma'),
+    'AMOUNT_STD_PERIOD': ('tech', 'calculate_amount_std'),
+    'MFI_PERIOD': ('tech', 'calculate_mfi'),
+    'VR_PERIOD': ('tech', 'calculate_vr'),
+    'VROC_PERIOD': ('tech', 'calculate_vroc'),
+    'VRSI_PERIOD': ('tech', 'calculate_vrsi'),
+    'VMACD_FAST': ('tech', 'calculate_vmacd'),
+    'VMACD_SLOW': ('tech', 'calculate_vmacd'),
+    'VMACD_SIGNAL': ('tech', 'calculate_vmacd'),
+    'ADOSC_FAST': ('tech', 'calculate_adosc'),
+    'ADOSC_SLOW': ('tech', 'calculate_adosc'),
+    'KDJ_N': ('tech', 'calculate_kdj'),
+    'WILLR_PERIOD': ('tech', 'calculate_willr'),
+    'BIAS_PERIOD': ('tech', 'calculate_bias'),
+    'PSY_PERIOD': ('tech', 'calculate_psy'),
+    'AR_BR_PERIOD': ('tech', 'calculate_ar_br'),
+    'CR_PERIOD': ('tech', 'calculate_cr'),
+    'BODY_SIZE_THRESHOLD_LARGE': ('candle', 'calculate_all_candlestick_patterns'),
+    'BODY_SIZE_THRESHOLD_SMALL': ('candle', 'calculate_all_candlestick_patterns'),
+    'HAMMER_LOWER_SHADOW_RATIO': ('candle', 'calculate_all_candlestick_patterns'),
+    'HAMMER_UPPER_SHADOW_RATIO': ('candle', 'calculate_all_candlestick_patterns')
 }
 
 class FactorTuner:
@@ -170,18 +178,24 @@ class FactorTuner:
         
         conn = sqlite3.connect(self.db_path)
         
-        # 随机选取 N 只股票
+        # 选取 N 只活跃股票
         stock_query = f'''
-            SELECT code
+            SELECT code, COUNT(*) as cnt
             FROM daily_data
             WHERE date >= ?
             GROUP BY code
+            HAVING cnt > 200
             ORDER BY RANDOM()
             LIMIT ?
         '''
         stock_df = pd.read_sql_query(stock_query, conn, params=(start_date, self.n_stocks))
         codes = stock_df['code'].tolist()
         
+        if not codes:
+            print("错误: 未能在数据库中找到符合条件的股票")
+            conn.close()
+            return
+
         placeholders = ','.join(['?' for _ in codes])
         data_query = f'''
             SELECT code, date, open, high, low, close, volume, amount
@@ -199,12 +213,11 @@ class FactorTuner:
             
             # N日未来收益率
             df['target'] = df['close'].pct_change(TrainingConfig.FUTURE_DAYS).shift(-TrainingConfig.FUTURE_DAYS)
-            # 移除 NaN 目标行
-            df = df.dropna(subset=['target'])
             
-            if not df.empty:
-                self.stocks_data[code] = df
-                self.forward_returns[code] = df['target']
+            # 移除 NaN 目标行，但保留原始数据用于因子计算
+            # 我们需要完整的序列来计算因子，但在计算 IC 时只取有 target 的行
+            self.stocks_data[code] = df
+            self.forward_returns[code] = df['target']
                 
         print(f"成功加载 {len(self.stocks_data)} 只股票的数据")
 
@@ -221,71 +234,80 @@ class FactorTuner:
         # 覆盖待测试的值
         setattr(TempConfig, param_name, value)
         
-        # 获取受此参数影响的因子前缀
-        target_prefixes = PARAM_TO_FACTOR_MAP.get(param_name, [])
+        # 获取计算方法映射
+        method_info = PARAM_TO_METHOD_MAP.get(param_name)
+        if not method_info:
+            return 0.0
+            
+        calc_type, method_name = method_info
         
         def process_stock(code, data):
             try:
-                # 使用临时配置初始化计算器
-                calculator = ComprehensiveFactorCalculator(config=TempConfig)
+                # 针对不同类型的因子选择不同的计算器
+                if calc_type == 'tech':
+                    calc = QuantitativeFactors(config=TempConfig)
+                else:
+                    calc = CandlestickPatternFactors(config=TempConfig)
                 
-                # 获取受此参数影响的因子前缀
-                target_prefixes = PARAM_TO_FACTOR_MAP.get(param_name, [])
+                method = getattr(calc, method_name)
                 
-                # 决定计算哪一类因子
-                # 如果前缀属于技术指标
-                factors = pd.DataFrame(index=data.index)
+                # 执行计算
+                if calc_type == 'tech':
+                    # 大多数方法只需要 data，有些可能需要额外参数
+                    # 检查参数数量
+                    import inspect
+                    sig = inspect.signature(method)
+                    if 'period' in sig.parameters:
+                        res = method(data, period=getattr(TempConfig, param_name) if 'PERIOD' in param_name else 14)
+                    elif 'n' in sig.parameters:
+                        res = method(data, n=getattr(TempConfig, 'KDJ_N'))
+                    else:
+                        res = method(data)
+                else:
+                    res = method(data)
                 
-                # 获取所有因子（基础因子，不含特征工程）
-                # 为了简化和通用，我们直接计算技术指标和K线形态，这是调优的重点
-                tech_factors = calculator.factor_calculator.calculate_all_factors(data)
-                candle_factors = calculator.candlestick_calculator.calculate_all_candlestick_patterns(data)
+                # 处理返回结果（可能是单个 array 或 tuple）
+                factor_results = []
+                if isinstance(res, tuple):
+                    for item in res:
+                        if isinstance(item, np.ndarray) or isinstance(item, pd.Series):
+                            factor_results.append(item)
+                else:
+                    factor_results.append(res)
                 
-                # 合并
-                factors = pd.concat([tech_factors, candle_factors], axis=1)
-                
-                # 如果指定了目标特征前缀，只筛选匹配的列以节省后续 IC 计算
-                if target_prefixes:
-                    relevant_cols = [c for c in factors.columns if any(c.startswith(p) for p in target_prefixes)]
-                    if not relevant_cols:
-                        return []
-                    factors = factors[relevant_cols]
-                
-                # 计算与目标的 Rank IC
-                stock_ics = []
-                # 预先获取目标的数值
                 v_target = self.forward_returns[code].values
+                stock_ics = []
                 
-                for col in factors.columns:
-                    # 确保没有 NaN
-                    v_factor = factors[col].values
-                    
+                for factor_values in factor_results:
+                    # 确保是 array 且长度一致
+                    if isinstance(factor_values, pd.Series):
+                        v_factor = factor_values.values
+                    else:
+                        v_factor = factor_values
+                        
+                    if len(v_factor) != len(v_target):
+                        continue
+                        
                     # 移除无效值
                     mask = np.isfinite(v_factor) & np.isfinite(v_target)
-                    if np.sum(mask) > 100: # 至少需要100个有效样本
-                        # 检查输入是否为常量，避免 spearmanr 产生 ConstantInputWarning
+                    if np.sum(mask) > 100:
                         v_f = v_factor[mask]
                         v_t = v_target[mask]
                         if np.ptp(v_f) > 0 and np.ptp(v_t) > 0:
                             ic, _ = stats.spearmanr(v_f, v_t)
                             if np.isfinite(ic):
-                                stock_ics.append(abs(ic)) # 使用绝对值，因为方向不重要，相关性才重要
-                        else:
-                            # 如果是常量，则相关性为 0
-                            stock_ics.append(0.0)
+                                stock_ics.append(abs(ic))
                 
                 return stock_ics
             except Exception as e:
-                # print(f"Error processing {code}: {e}")
                 return []
 
-        # 并行计算所有股票的 IC
+        # 并行计算
         results = Parallel(n_jobs=self.n_jobs)(
             delayed(process_stock)(code, data) 
             for code, data in self.stocks_data.items()
         )
         
-        # 合并所有 IC 并取平均
         all_ics = [ic for sublist in results for ic in sublist]
         return np.mean(all_ics) if all_ics else 0.0
 
@@ -298,54 +320,83 @@ class FactorTuner:
         for round_idx in range(max_rounds):
             print(f"\n[第 {round_idx + 1} 轮优化]")
             
-            # 打乱参数顺序以增加鲁棒性
             params_to_opt = list(SEARCH_SPACE.keys())
+            # 随机打乱以提高鲁棒性
             np.random.shuffle(params_to_opt)
             
-            for param_name in params_to_opt:
+            pbar = tqdm(params_to_opt, desc="优化进度")
+            for param_name in pbar:
                 values = SEARCH_SPACE[param_name]
                 current_val = self.current_config[param_name]
                 
-                print(f"正在优化 {param_name} (当前值: {current_val})...")
+                pbar.set_description(f"正在优化 {param_name}")
                 
                 best_score = -1.0
                 best_val = current_val
                 
+                # 首先评估当前值作为基准
+                base_score = self.evaluate_parameter(param_name, current_val)
+                best_score = base_score
+                
                 for val in values:
+                    if val == current_val:
+                        continue
+                        
                     score = self.evaluate_parameter(param_name, val)
-                    print(f"  - 测试值: {val:4}, Mean Abs Rank IC: {score:.6f}")
                     
-                    if score > best_score:
+                    if score > best_score * 1.001: # 只有提升超过 0.1% 才更新，避免微小波动
                         best_score = score
                         best_val = val
                 
                 if best_val != current_val:
-                    print(f"  ★ 发现更好的值: {current_val} -> {best_val} (得分: {best_score:.6f})")
+                    tqdm.write(f"  ★ {param_name}: {current_val} -> {best_val} (IC: {base_score:.6f} -> {best_score:.6f})")
                     self.current_config[param_name] = best_val
                 else:
-                    print(f"  ✓ 保持原值: {current_val}")
+                    # tqdm.write(f"  ✓ {param_name} 保持原值: {current_val}")
+                    pass
 
     def update_config_file(self):
         """将优化的参数写回 config/factor_config.py"""
         config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'factor_config.py')
         
+        if not os.path.exists(config_path):
+            print(f"错误: 配置文件不存在 {config_path}")
+            return
+
         with open(config_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+            lines = f.readlines()
             
-        modified_content = content
+        modified = False
+        new_lines = []
         
-        # 使用正则替换 FactorConfig 类中的属性
-        # 这里假设 FactorConfig 类定义在一块集中的区域
-        for param, value in self.current_config.items():
-            # 匹配形如 PARAM_NAME = VALUE 的行
-            # 支持整数、浮点数
-            pattern = rf"^(\s+{param}\s*=\s*)([\d\.]+)"
-            replacement = rf"\g<1>{value}"
-            modified_content = re.sub(pattern, replacement, modified_content, flags=re.MULTILINE)
+        # 查找 FactorConfig 类定义
+        in_factor_config = False
+        
+        for line in lines:
+            if 'class FactorConfig:' in line:
+                in_factor_config = True
+                new_lines.append(line)
+                continue
             
-        if modified_content != content:
+            if in_factor_config and line.startswith('class '): # 进入了下一个类
+                in_factor_config = False
+            
+            if in_factor_config:
+                # 匹配 param = value
+                match = re.match(r'^(\s+)([A-Z_0-9]+)(\s*=\s*)([\d\.]+)', line)
+                if match:
+                    indent, param, eq, old_val = match.groups()
+                    if param in self.current_config:
+                        new_val = self.current_config[param]
+                        if str(old_val) != str(new_val):
+                            line = f"{indent}{param}{eq}{new_val}\n"
+                            modified = True
+            
+            new_lines.append(line)
+            
+        if modified:
             with open(config_path, 'w', encoding='utf-8') as f:
-                f.write(modified_content)
+                f.writelines(new_lines)
             print(f"\n✓ 成功将优化参数写入 {config_path}")
         else:
             print("\n! 未检测到参数变化，无需更新文件")

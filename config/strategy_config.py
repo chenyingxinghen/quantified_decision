@@ -36,7 +36,7 @@ COMMISSION_RATE = 0.005
 
 # 基础参数
 INITIAL_CAPITAL = 1.0          # 初始资金
-MAX_POSITIONS = 1                   # 最大持仓数量，分散风险
+MAX_POSITIONS = 5                   # 最大持仓数量，分散风险
 
 
 

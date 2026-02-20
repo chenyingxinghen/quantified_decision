@@ -247,12 +247,12 @@ class MLModelTrainer:
                 f_close = close.shift(-forward_days)
                 f_returns = (f_close / close - 1)
                 
-                # 获取未来 n 日内的最大涨幅 (Max Run-up)
-                f_high_max = high.shift(-forward_days).rolling(window=forward_days, min_periods=1).max()
+                # 获取未来 n 日内的最大涨幅 (Max Run-up)，基于 T+1 到 T+n
+                f_high_max = high.rolling(window=forward_days).max().shift(-forward_days)
                 f_max_returns = (f_high_max / close - 1)
                 
-                # 获取未来 n 日内的最大跌幅 (Max Drawdown/Pain)
-                f_low_min = low.shift(-forward_days).rolling(window=forward_days, min_periods=1).min()
+                # 获取未来 n 日内的最大跌幅 (Max Drawdown/Pain)，基于 T+1 到 T+n
+                f_low_min = low.rolling(window=forward_days).min().shift(-forward_days)
                 f_min_returns = (f_low_min / close - 1)
 
                 # 1. 路径质量分 (Path-aware Score)
@@ -545,7 +545,7 @@ class MLModelTrainer:
         X_combined = (X_combined_float - grouped.transform('mean')) / grouped.transform('std').replace(0, 1.0)
         X_combined = X_combined.fillna(0)
         
-        # 2. 标签百分位归一化 (针对 XGBoost 回归任务)
+        # 2. 标签横向百分位排名归一化 (针对 XGBoost 回归任务)
         print("  - 标签横向百分位排名归一化 (向量化优化)...")
         # 使用同样的 groupby 逻辑处理标签
         y_df = pd.DataFrame({'y': y_combined.values, 'date': dates_combined})
@@ -553,6 +553,16 @@ class MLModelTrainer:
             lambda x: (x.rank(method='average', pct=True) - (0.5 / len(x))) if len(x) > 0 else 0.5
         )
         y_combined = pd.Series(y_norm.values)
+        
+        # 3. 惩罚不可买入样本 (涨停/停牌)
+        # 将无法买入的标的标签强制设为最低值 (0.0)，迫使模型主动降低对其的预测打分
+        # 否则模型容易被高动量特征吸引，给出高分导致假高准确率但无法实盘
+        if unbuyable_combined is not None:
+            penalty_count = np.sum(unbuyable_combined)
+            if penalty_count > 0:
+                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.0")
+                y_combined.loc[unbuyable_combined] = 0.1
+
         
         # 统计因子分类详情 (Factor Audit Report)
         all_cols = X_combined.columns.tolist()
@@ -637,11 +647,8 @@ class MLModelTrainer:
             print(f"\n样本权重: weight = abs(returns)")
             sample_weight = np.abs(returns)
             
-            # 惩罚无法买入的样本（如涨停或停牌）
-            if unbuyable_mask is not None:
-                print(f"  惩罚无法买入的样本: 权重降低为 10%")
-                sample_weight = np.where(unbuyable_mask, sample_weight * 0.1, sample_weight)
-            
+            # 由于在预处理中已经将 unbuyable_mask 对应的标签强设为 0.0，
+            # 我们希望模型充分学习这次负向惩罚，因此这里**不再**降低它们的权重。
             # 缩放权重，避免数值过大
             sample_weight = sample_weight / sample_weight.mean()
         

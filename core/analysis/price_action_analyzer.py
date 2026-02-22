@@ -72,6 +72,12 @@ class PriceActionAnalyzer:
         # 分析市场结构
         structure = self._analyze_structure(swing_highs, swing_lows, data)
         
+        # 将原子摆动点也返回，方便前端绘图
+        structure['swing_points'] = {
+            'highs': swing_highs,
+            'lows': swing_lows
+        }
+        
         return structure
     
     def find_swing_points(self, prices, point_type='high', lookback=5):

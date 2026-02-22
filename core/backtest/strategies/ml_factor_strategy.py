@@ -32,7 +32,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
     
     def __init__(self,
                  model_path: str,
-                 min_confidence: float = 60.0,
+                 min_confidence: float = 0.0,
                  use_cache: bool = True,
                  cache_dir: str = None,
                  name: str = "ML因子策略"):

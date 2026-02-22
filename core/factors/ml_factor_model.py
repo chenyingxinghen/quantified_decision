@@ -380,6 +380,16 @@ class MLFactorModel:
         if hasattr(self.model, 'feature_importances_'):
             self.feature_importance = dict(zip(self.feature_names, self.model.feature_importances_))
 
+    def get_top_factors(self, n: int = 10) -> List[Tuple[str, float]]:
+        """
+        获取重要性最高的 Top-N 因子
+        """
+        if not self.feature_importance:
+            return []
+        # 按重要性降序排列
+        sorted_factors = sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)
+        return sorted_factors[:n]
+
     def predict(self, factors: pd.DataFrame) -> np.ndarray:
         if not self.is_trained: raise ValueError("未训练")
         X = np.nan_to_num(factors[self.feature_names].values, nan=0.0)

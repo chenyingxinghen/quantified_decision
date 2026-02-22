@@ -1,0 +1,102 @@
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+ModuleNotFoundError: No module named 'fastapi'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 5, in <module>
+    from starlette import status as status
+ModuleNotFoundError: No module named 'starlette'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 7, in <module>
+    from .applications import FastAPI as FastAPI
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\applications.py", line 9, in <module>
+    from annotated_doc import Doc
+ModuleNotFoundError: No module named 'annotated_doc'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 7, in <module>
+    from .applications import FastAPI as FastAPI
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\applications.py", line 9, in <module>
+    from annotated_doc import Doc
+ModuleNotFoundError: No module named 'annotated_doc'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 7, in <module>
+    from .applications import FastAPI as FastAPI
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\applications.py", line 9, in <module>
+    from annotated_doc import Doc
+ModuleNotFoundError: No module named 'annotated_doc'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 7, in <module>
+    from .applications import FastAPI as FastAPI
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\applications.py", line 9, in <module>
+    from annotated_doc import Doc
+ModuleNotFoundError: No module named 'annotated_doc'
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\quantification-system\backend\main.py", line 13, in <module>
+    from fastapi import FastAPI, Request
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\__init__.py", line 7, in <module>
+    from .applications import FastAPI as FastAPI
+  File "G:\ai_proj\quantified_decision\.venv\Lib\site-packages\fastapi\applications.py", line 9, in <module>
+    from annotated_doc import Doc
+ModuleNotFoundError: No module named 'annotated_doc'
+[32mINFO[0m:     Started server process [[36m36528[0m]
+[32mINFO[0m:     Waiting for application startup.
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:8083[0m (Press CTRL+C to quit)

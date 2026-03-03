@@ -54,7 +54,6 @@
         :data="activeItems" 
         style="width: 100%" 
         max-height="650" 
-        @row-click="onRowClick"
         row-class-name="glass-row"
       >
         <el-table-column prop="stock_code" label="代码" width="160">
@@ -91,12 +90,13 @@
             <span class="text-mono" style="font-weight: 600">{{ row.current_price != null ? Number(row.current_price).toFixed(2) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" min-width="180" align="right">
+        <el-table-column label="操作" min-width="220" align="right">
           <template #default="{ row }">
             <div style="display: flex; gap: 8px; justify-content: flex-end; padding-right: 12px">
-              <el-button size="small" circle @click.stop="showFactors(row.stock_code)"><el-icon><PieChart /></el-icon></el-button>
-              <el-button size="small" circle @click.stop="showSignals(row.stock_code)"><el-icon><Lightning /></el-icon></el-button>
-              <el-button size="small" circle type="primary" @click.stop="goAnalysis(row.stock_code)"><el-icon><TrendCharts /></el-icon></el-button>
+              <el-tooltip content="因子快照" placement="top"><el-button size="small" circle @click.stop="showFactors(row.stock_code)"><el-icon><PieChart /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="形态识别" placement="top"><el-button size="small" circle @click.stop="showSignals(row.stock_code)"><el-icon><Lightning /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="技术分析" placement="top"><el-button size="small" circle type="primary" @click.stop="goAnalysis(row.stock_code)"><el-icon><TrendCharts /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="加入实盘验证" placement="top"><el-button size="small" circle type="success" style="background-color: var(--accent-green) !important; border-color: var(--accent-green) !important; color: #fff !important" @click.stop="addToPaperTrading(row)"><el-icon><Aim /></el-icon></el-button></el-tooltip>
             </div>
           </template>
         </el-table-column>
@@ -118,7 +118,7 @@
         </div>
         
         <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px">
-          <div v-for="item in factorList.slice(0, 20)" :key="item.name" class="factor-item glass">
+          <div v-for="item in factorList.slice(0, 10)" :key="item.name" class="factor-item glass">
             <span class="factor-name">{{ item.name }}</span>
             <span class="factor-value">{{ item.value != null ? Number(item.value).toFixed(4) : 'N/A' }}</span>
           </div>
@@ -176,8 +176,9 @@ import { stockSelector } from '../api'
 import { ElMessage } from 'element-plus'
 import { 
   Search, Refresh, Loading, PieChart, 
-  TrendCharts, Lightning, CaretTop, CaretBottom 
+  TrendCharts, Lightning, CaretTop, CaretBottom, Aim
 } from '@element-plus/icons-vue'
+import { paperTrading } from '../api'
 
 const router = useRouter()
 const loading = ref(false)
@@ -211,9 +212,12 @@ const factorVisible = ref(false)
 const factorLoading = ref(false)
 const factorCode = ref('')
 const factorData = ref({})
-const factorList = computed(() =>
-  Object.entries(factorData.value).map(([name, value]) => ({ name, value }))
-)
+const factorList = computed(() => {
+  if (factorData.value.factor_details) {
+    return factorData.value.factor_details
+  }
+  return Object.entries(factorData.value.factors || {}).map(([name, value]) => ({ name, value }))
+})
 
 const signalVisible = ref(false)
 const signalLoading = ref(false)
@@ -270,7 +274,14 @@ async function runSelection() {
       modelParams.model_types = parsed.types
     } catch (e) { console.error('解析错误', e) }
   }
-  
+
+  // 将游客本地配置指纹传给后端，以便基础筛选条件生效
+  const token = localStorage.getItem('quant_user_token')
+  if (!token || token === 'guest') {
+    const guestConfig = localStorage.getItem('quant_guest_config')
+    if (guestConfig) modelParams.guest_config = guestConfig
+  }
+
   try {
     await stockSelector.runSelection({ 
       top_n: topN.value,
@@ -324,7 +335,7 @@ async function showFactors(code) {
   factorLoading.value = true
   try {
     const { data } = await stockSelector.getFactors(code)
-    factorData.value = data.factors
+    factorData.value = data
   } catch (e) {
     ElMessage.error('获取因子数据失败')
   } finally {
@@ -349,8 +360,33 @@ function goAnalysis(code) {
   router.push({ path: '/analysis', query: { code } })
 }
 
-function onRowClick(row) {
-  goAnalysis(row.stock_code)
+function getTodayStr() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+async function addToPaperTrading(row) {
+  try {
+    // 选股日通常是结果文件中的日期，如果没有则用今天
+    const selectionDate = row.date || fileName.value?.match(/\d{4}-\d{2}-\d{2}/)?.[0] || getTodayStr()
+    
+    // 计算下一日（这里简单加1天，后续后端会自动匹配开盘价）
+    const d = new Date(selectionDate)
+    d.setDate(d.getDate() + 1)
+    const nextDay = d.toISOString().split('T')[0]
+
+    await paperTrading.buy({
+      code: row.stock_code,
+      name: row.name,
+      buy_date: nextDay,
+      buy_price: null, // 标记为下个交易日开盘价待定
+      quantity: 1
+    })
+    ElMessage.success(`${row.name} 已加入实盘验证中心 (待定下一日开盘价)`)
+  } catch (e) {
+    console.error(e)
+    ElMessage.error('加入实盘验证失败')
+  }
 }
 </script>
 

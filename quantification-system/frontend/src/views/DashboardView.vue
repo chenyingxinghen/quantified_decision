@@ -51,10 +51,7 @@
             <el-icon><Briefcase /></el-icon>
             <span>实盘监控</span>
           </div>
-          <div class="action-btn glass" @click="$router.push('/data-center')">
-            <el-icon><Coin /></el-icon>
-            <span>数据同步</span>
-          </div>
+
         </div>
       </div>
 

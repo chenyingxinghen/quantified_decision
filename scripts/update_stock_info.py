@@ -126,11 +126,10 @@ class StockInfoUpdater:
     def get_stock_list(self):
         from core.data.data_fetcher import DataFetcher
         df=DataFetcher()
-        codes=df.get_stock_list()
-        symbols=[]
-        for code in codes['code']:
-            symbols.append(self.convert_stock_code(code))
-        return  symbols
+        codes_df=df.get_stock_list()
+        # 确保返回的是干净的代码列表（不带后缀）
+        codes = [str(c).split('.')[0] for c in codes_df['code']]
+        return list(set(codes)) # 去重
     
     def convert_stock_code(self, code):
         """
@@ -142,10 +141,17 @@ class StockInfoUpdater:
         返回:
             yfinance格式代码，如 '000001.SZ'
         """
+        if '.' in code:
+            return code
+            
         if code.startswith('6'):
             return f"{code}.SS"  # 上海
-        else:
+        elif code.startswith(('0', '3')):
             return f"{code}.SZ"  # 深圳
+        elif code.startswith(('8', '4')):
+            return f"{code}.BJ"  # 北京
+        else:
+            return code
     
     def fetch_stock_info(self, code):
         """

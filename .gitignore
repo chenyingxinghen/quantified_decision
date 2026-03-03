@@ -64,3 +64,4 @@ t.py
 quantification-system/frontend/node_modules
 quantification-system/frontend/dist
 quantification-system/frontend/.*
+quantification-system/backend/log

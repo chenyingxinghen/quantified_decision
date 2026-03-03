@@ -32,21 +32,35 @@ def get_project_root() -> str:
     return PROJECT_ROOT
 
 
-# ── Paper‑trading 专用数据库 ──────────────────────────────────
-PAPER_DB_PATH = os.path.join(PROJECT_ROOT, "data", "paper_trading.db")
+# ── User 专用数据库 (包含配置、会话、模拟盘持仓) ──────────────────────────
+USER_DB_PATH = os.path.join(PROJECT_ROOT, "data", "user_data.db")
 
 
-def get_paper_db():
-    """Paper‑trading SQLite 连接"""
-    conn = sqlite3.connect(PAPER_DB_PATH, timeout=30.0)
+def get_user_db():
+    """User SQLite 连接"""
+    conn = sqlite3.connect(USER_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
-def init_paper_db():
-    """初始化 paper_trading 数据库表"""
-    conn = get_paper_db()
+def get_paper_db():
+    """兼容性别名，后续可逐步移除"""
+    return get_user_db()
+
+
+def init_user_db():
+    """初始化 user_data 数据库表"""
+    # 如果旧的 paper_trading.db 存在且 user_data.db 不存在，则进行更名
+    旧路径 = os.path.join(PROJECT_ROOT, "data", "paper_trading.db")
+    if os.path.exists(旧路径) and not os.path.exists(USER_DB_PATH):
+        try:
+            os.rename(旧路径, USER_DB_PATH)
+            print(f"✅ 已将 {旧路径} 重命名为 {USER_DB_PATH}")
+        except Exception as e:
+            print(f"⚠️ 重命名数据库失败: {e}")
+
+    conn = get_user_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS positions (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,14 +97,18 @@ def init_paper_db():
             created_at  TEXT DEFAULT (datetime('now','localtime'))
         );
     """)
-    # Add username column if not exists
+    # Add columns if not exists
     try:
         conn.execute("ALTER TABLE positions ADD COLUMN username TEXT DEFAULT 'guest'")
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN monitoring INTEGER DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
     
     conn.commit()
     conn.close()
 
 # 启动时初始化
-init_paper_db()
+init_user_db()

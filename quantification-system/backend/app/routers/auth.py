@@ -8,7 +8,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Header
 from pydantic import BaseModel
 
-from app.deps import get_paper_db
+from app.deps import get_user_db
 
 router = APIRouter(prefix="/api/auth", tags=["用户鉴权"])
 
@@ -47,7 +47,7 @@ def hash_password(password: str) -> str:
 def get_current_user_from_token(token: Optional[str]) -> str:
     if not token or token == "guest" or token == "null" or token == "undefined":
         return "guest"
-    conn = get_paper_db()
+    conn = get_user_db()
     row = conn.execute("SELECT username FROM sessions WHERE token = ?", (token,)).fetchone()
     conn.close()
     if row:
@@ -59,7 +59,7 @@ async def register(req: RegisterRequest, request: Request):
     client_ip = request.client.host if request.client else "127.0.0.1"
     check_rate_limit(client_ip, limit=5, window=60) # 限制注册频率
 
-    conn = get_paper_db()
+    conn = get_user_db()
     try:
         row = conn.execute("SELECT id FROM users WHERE username = ?", (req.username,)).fetchone()
         if row:
@@ -79,7 +79,7 @@ async def login(req: LoginRequest, request: Request):
     client_ip = request.client.host if request.client else "127.0.0.1"
     check_rate_limit(client_ip, limit=5, window=60) # 限制登录频率
     
-    conn = get_paper_db()
+    conn = get_user_db()
     try:
         row = conn.execute("SELECT password FROM users WHERE username = ?", (req.username,)).fetchone()
         
@@ -95,38 +95,38 @@ async def login(req: LoginRequest, request: Request):
     return {"token": token, "username": req.username, "message": "登录成功"}
 
 @router.post("/logout")
-async def logout(token: str = Header(None)):
+async def logout(token: str = Header(None, alias="Token")):
     if token and token not in ("guest", "null", "undefined"):
-        conn = get_paper_db()
+        conn = get_user_db()
         conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
         conn.commit()
         conn.close()
     return {"message": "已登出"}
 
 @router.get("/user/info")
-async def get_user_info(token: str = Header(None)):
+async def get_user_info(token: str = Header(None, alias="Token")):
     username = get_current_user_from_token(token)
     return {"username": username, "is_logged_in": username != "guest"}
 
 @router.get("/config")
-async def get_user_config(token: str = Header(None)):
+async def get_user_config(token: str = Header(None, alias="Token")):
     username = get_current_user_from_token(token)
     if username == "guest":
         return {"config_json": None}
         
-    conn = get_paper_db()
+    conn = get_user_db()
     row = conn.execute("SELECT config_json FROM user_configs WHERE username = ?", (username,)).fetchone()
     conn.close()
     
     return {"config_json": row["config_json"] if row else None}
 
 @router.post("/config")
-async def save_user_config(req: ConfigData, token: str = Header(None)):
+async def save_user_config(req: ConfigData, token: str = Header(None, alias="Token")):
     username = get_current_user_from_token(token)
     if username == "guest":
         return {"message": "未登录无云端同步"}
         
-    conn = get_paper_db()
+    conn = get_user_db()
     conn.execute(
         "INSERT INTO user_configs (username, config_json) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET config_json=excluded.config_json",
         (username, req.config_json)

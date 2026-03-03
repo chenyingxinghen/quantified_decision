@@ -23,3 +23,4 @@ pydantic>=2.0.0
 python-multipart>=0.0.6
 sse-starlette>=1.6.0
 starlette
+apscheduler>=3.10.1

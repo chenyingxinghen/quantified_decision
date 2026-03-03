@@ -36,9 +36,9 @@ import pandas as pd
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from config import DATABASE_PATH, SELECTION_CRITERIA
-from config.factor_config import TrainingConfig, FactorConfig
-from config.strategy_config import ML_FACTOR_MODEL_PATH
+from config import DATABASE_PATH
+from config.factor_config import TrainingConfig
+from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
 
@@ -160,13 +160,10 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
 
     conn = sqlite3.connect(db_path)
     try:
-        # 优先使用 extended 表
+        # 全部使用 extended 表
         df = pd.read_sql_query("SELECT * FROM stock_info_extended", conn)
     except Exception:
-        try:
-            df = pd.read_sql_query("SELECT * FROM stock_info", conn)
-        except Exception:
-            df = pd.DataFrame()
+        df = pd.DataFrame()
     conn.close()
 
     info_map = {}
@@ -179,6 +176,7 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
                 'pb_ratio': safe_float(row.get('pb_ratio')),
                 'sector': row.get('sector', '-'),
                 'industry': row.get('industry', '-'),
+                'is_st': row.get('is_st', 0),
             }
     return info_map
 
@@ -226,14 +224,20 @@ def pre_filter_stocks(
     all_codes: List[str],
     info_map: Dict[str, Dict],
     db_path: str,
-    criteria: Dict,
+    criteria: Optional[Dict] = None,
 ) -> Tuple[List[str], Dict]:
     """
-    根据 SELECTION_CRITERIA 过滤股票：
+    根据 Config Center 过滤股票：
     - min_market_cap：最小市值（亿）
     - max_pe：最大市盈率
     - min_price / max_price：股价范围
+    - include_st: 是否包含 ST 股
+
+    criteria 为动态筛选准则（覆盖全局常量），如果不传则使用 strategy_config 中的默认值。
     """
+    if criteria is None:
+        criteria = {}
+
     def try_float(val):
         try:
             if val is None or val == '' or val == 'None':
@@ -242,12 +246,14 @@ def pre_filter_stocks(
         except (ValueError, TypeError):
             return None
 
-    min_market_cap = try_float(criteria.get('min_market_cap', 0)) or 0
-    max_pe = try_float(criteria.get('max_pe', float('inf'))) or float('inf')
-    min_price = try_float(criteria.get('min_price', 0)) or 0
-    max_price = try_float(criteria.get('max_price', float('inf'))) or float('inf')
+    # 以全局常量为基础，动态 criteria 优先覆盖
+    min_market_cap = try_float(criteria.get('min_market_cap', MIN_MARKET_CAP)) or 0
+    max_pe         = try_float(criteria.get('max_pe', MAX_PE)) or float('inf')
+    min_price      = try_float(criteria.get('min_price', MIN_PRICE)) or 0
+    max_price      = try_float(criteria.get('max_price', MAX_PRICE)) or float('inf')
+    include_st     = bool(criteria.get('include_st', INCLUDE_ST))
 
-    # 批量获取最新价格
+    # 批量获取最新价格（单次 SQL，避免 N+1 查询）
     conn = sqlite3.connect(db_path)
     price_query = '''
         SELECT code, close
@@ -269,28 +275,33 @@ def pre_filter_stocks(
     skipped_reasons = {'market_cap': 0, 'pe': 0, 'price': 0, 'no_info': 0, 'st': 0}
 
     for code in all_codes:
-        # # 排除 ST / *ST
-        # info = info_map.get(code, {})
-        # name = info.get('name', '')
-        # if name and ('ST' in name.upper() or '退' in name):
-        #     skipped_reasons['st'] += 1
-        #     continue
+        info = info_map.get(code, {})
+        name = str(info.get('name', '') or '')
 
-        # # 市值筛选
-        # market_cap = try_float(info.get('market_cap'))
-        # if market_cap is not None and min_market_cap > 0:
-        #     if market_cap < min_market_cap:
-        #         skipped_reasons['market_cap'] += 1
-        #         continue
+        # 1. 排除 ST / *ST / 退市 (除非 include_st=True)
+        if not include_st:
+            # 优先根据数据库 is_st 标签，同时也保留“退”字检查作为补充（针对退市股）
+            # 注意：不再单纯根据 'ST' 字符串匹配，因为英文名中 contains 'st' 的单词太多 (如 Industries, Mustang)
+            is_st_flag = info.get('is_st', 0)
+            if is_st_flag == 1 or (name and '退' in name):
+                skipped_reasons['st'] += 1
+                continue
 
-        # # 市盈率筛选
-        # pe = try_float(info.get('pe_ratio'))
-        # if pe is not None and max_pe < float('inf'):
-        #     if pe <= 0 or pe > max_pe:
-        #         skipped_reasons['pe'] += 1
-        #         continue
+        # 2. 市值筛选
+        market_cap = try_float(info.get('market_cap'))
+        if market_cap is not None:
+            if market_cap < min_market_cap:
+                skipped_reasons['market_cap'] += 1
+                continue
 
-        # 股价筛选
+        # 3. 市盈率筛选
+        pe = try_float(info.get('pe_ratio'))
+        if pe is not None:
+            if pe <= 0 or pe > max_pe:
+                skipped_reasons['pe'] += 1
+                continue
+
+        # 4. 股价筛选
         price = try_float(price_map.get(code))
         if price is not None:
             if price < min_price or price > max_price:
@@ -376,6 +387,12 @@ def select_stocks(
     cache_dir: str = DEFAULT_CACHE_DIR,
     only_cache: bool = True,
     save_csv: bool = True,
+    # 新增过滤参数，用于从后端动态传入
+    min_market_cap: Optional[float] = None,
+    max_pe: Optional[float] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    include_st: Optional[bool] = None,
 ) -> List[Dict]:
     """
     执行完整的选股流程。
@@ -384,11 +401,16 @@ def select_stocks(
         model_path:      训练好的模型文件路径
         min_confidence:   最小置信度阈值（百分制）
         top_n:            输出前 N 只股票
-        apply_filter:     是否使用 SELECTION_CRITERIA 预筛选
+        apply_filter:     是否使用基础条件预筛选
         workers:          并行线程数
         cache_dir:        因子缓存目录
         only_cache:       是否只从缓存加载因子
         save_csv:         是否将结果保存为 CSV
+        min_market_cap:   (动态) 最小市值
+        max_pe:           (动态) 最大市盈率
+        min_price:        (动态) 最小价格
+        max_price:        (动态) 最大价格
+        include_st:       (动态) 是否包含 ST
 
     返回:
         按置信度降序的候选股票列表
@@ -438,18 +460,34 @@ def select_stocks(
     print("📂 加载股票列表 & 基本信息 ...")
     all_codes = get_all_stock_codes(DATABASE_PATH)
     info_map = get_stock_info_map(DATABASE_PATH)
-    print(f"   数据库中共 {len(all_codes)} 只股票，stock_info 记录 {len(info_map)} 条")
+    print(f"   数据库中共 {len(all_codes)} 只股票，stock_info_extended 记录 {len(info_map)} 条")
 
     # ------------------------------------------------------------------
     # Step 3: 基础条件预筛选
     # ------------------------------------------------------------------
     if apply_filter:
         print("\n📋 应用基础筛选条件:")
-        for k, v in SELECTION_CRITERIA.items():
+        # 构造动态筛选准则，仅使用非 None 的参数覆盖全局默认值
+        current_criteria: Dict[str, Any] = {}
+        if min_market_cap is not None: current_criteria['min_market_cap'] = min_market_cap
+        if max_pe is not None:         current_criteria['max_pe'] = max_pe
+        if min_price is not None:      current_criteria['min_price'] = min_price
+        if max_price is not None:      current_criteria['max_price'] = max_price
+        if include_st is not None:     current_criteria['include_st'] = include_st
+
+        # 打印最终生效的准则（已合并默认值）
+        effective = {
+            'min_market_cap': current_criteria.get('min_market_cap', MIN_MARKET_CAP),
+            'max_pe':         current_criteria.get('max_pe', MAX_PE),
+            'min_price':      current_criteria.get('min_price', MIN_PRICE),
+            'max_price':      current_criteria.get('max_price', MAX_PRICE),
+            'include_st':     current_criteria.get('include_st', INCLUDE_ST),
+        }
+        for k, v in effective.items():
             print(f"   {k} = {v}")
 
         candidate_codes, skip_reasons = pre_filter_stocks(
-            all_codes, info_map, DATABASE_PATH, SELECTION_CRITERIA
+            all_codes, info_map, DATABASE_PATH, current_criteria
         )
         print(f"\n   通过筛选: {len(candidate_codes)} 只")
         print(f"   排除 ST/退市: {skip_reasons['st']}")
@@ -623,13 +661,16 @@ def select_stocks(
         mc_str = f"{r['market_cap']:.0f}" if r['market_cap'] else '-'
         pe_str = f"{r['pe_ratio']:.1f}" if r['pe_ratio'] else '-'
         pb_str = f"{r['pb_ratio']:.2f}" if r['pb_ratio'] else '-'
-        sector = r.get('sector', '-')[:10]
-        industry = r.get('industry', '-')[:10]
+        
+        # 确保名称、板块、行业均为字符串，防止 NaN (float) 导致 upper() 或切片出错
+        name_str = str(r.get('name', '-') or '-')
+        sector = str(r.get('sector', '-') or '-')[:10]
+        industry = str(r.get('industry', '-') or '-')[:10]
         
         print(row_fmt.format(
             i,
             r['stock_code'],
-            r['name'][:6],
+            name_str[:6],
             sector,
             industry,
             r['confidence'],

@@ -43,7 +43,7 @@ MAX_POSITIONS = 5                   # 最大持仓数量，分散风险
 # 卖出控制参数
 ENABLE_STOP_LOSS_EXIT = True        # 是否启用止损卖出
 ENABLE_TAKE_PROFIT_EXIT = True     # 是否启用止盈卖出
-ENABLE_SUPPORT_BREAK_EXIT = False    # 是否启用跌破支撑卖出
+ENABLE_SUPPORT_BREAK_EXIT = True    # 是否启用跌破支撑卖出
 ENABLE_TIME_STOP_EXIT = True        # 是否启用时间止损卖出
 
 # 时间止损参数
@@ -63,5 +63,13 @@ SWING_LONG_WINDOW = 5               # 长期数据摆动点识别窗口
 SWING_SHORT_WINDOW = 2              # 短期数据摆动点识别窗口
 MIN_SWING_POINTS = 2                # 最少摆动点数量
 TOUCH_TOLERANCE = 0.02              # 触点容差（2%）
-MIN_TOUCHES = 2                     # 最少触点数量
-
+MIN_TOUCHES = 2                     # 趋势线最少触点数
+# ==============================================================================
+# 基本面选股过滤参数 默认不启用
+# ==============================================================================
+ENABLE_FUNDAMENTAL_FILTER = False
+MIN_MARKET_CAP = 0
+MAX_PE = 8000000000
+MIN_PRICE = 0
+MAX_PRICE = 2000000000
+INCLUDE_ST = True

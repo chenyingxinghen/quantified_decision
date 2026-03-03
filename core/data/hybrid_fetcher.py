@@ -108,7 +108,7 @@ class HybridDataFetcher:
         
         elif self.prefer_source == 'yfinance' and self.yfinance_fetcher:
             try:
-                print(f"使用yfinance获取{symbol}的历史数据...")
+                # print(f"使用yfinance获取{symbol}的历史数据...")
                 data = self.yfinance_fetcher.get_historical_data(
                     symbol, start_date=start_date, end_date=end_date
                 )
@@ -274,7 +274,7 @@ class HybridDataFetcher:
                     ))
                 
                 self.conn.commit()
-                print(f"✓ 更新{symbol}数据成功（数据源: {self.current_source}）")
+                # print(f"✓ 更新{symbol}数据成功（数据源: {self.current_source}）")
             else:
                 print(f"✗ 未能获取{symbol}的数据")
                 

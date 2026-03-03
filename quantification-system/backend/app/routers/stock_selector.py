@@ -4,7 +4,7 @@
 
 import os, sys, json, glob, traceback
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header
 from pydantic import BaseModel
 
 from app.deps import get_db_path, get_db_connection, get_project_root
@@ -173,10 +173,11 @@ class RunSelectionRequest(BaseModel):
     min_confidence: float = 0
     model_path: Optional[str] = None
     model_types: List[str] = ["lgbm", "xgboost"]
+    guest_config: Optional[str] = None  # 游客本地配置 JSON 字符串，用于基础筛选条件
 
 
 @router.post("/run")
-async def run_selection(req: RunSelectionRequest):
+async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(None, alias="Token")):
     """异步执行选股流程"""
     global _selection_task
     if _selection_task["running"]:
@@ -190,11 +191,11 @@ async def run_selection(req: RunSelectionRequest):
         "file": None
     }
 
-    import asyncio
+    import threading
     from scripts.select_stocks import select_stocks
     from config.strategy_config import ML_FACTOR_MODEL_PATH
 
-    async def _run():
+    def _run(tk: Optional[str]):
         global _selection_task
         from datetime import datetime
         try:
@@ -206,7 +207,50 @@ async def run_selection(req: RunSelectionRequest):
                 if not os.path.exists(base_path):
                     base_path = os.path.join(get_project_root(), ML_FACTOR_MODEL_PATH)
             
-            # 2. 收集需要运行的模型路径
+            # 2. 获取用户配置作为覆盖
+            user_filters = {}
+            try:
+                from app.routers.auth import get_current_user_from_token
+                username = get_current_user_from_token(tk)
+                if username != "guest":
+                    # 登录用户：从数据库读取配置
+                    from app.deps import get_user_db
+                    conn_u = get_user_db()
+                    conf_row = conn_u.execute(
+                        "SELECT config_json FROM user_configs WHERE username = ?", (username,)
+                    ).fetchone()
+                    conn_u.close()
+                    if conf_row and conf_row["config_json"]:
+                        user_conf = json.loads(conf_row["config_json"])
+                        user_filters = {
+                            "min_market_cap": user_conf.get("MIN_MARKET_CAP"),
+                            "max_pe":         user_conf.get("MAX_PE"),
+                            "min_price":      user_conf.get("MIN_PRICE"),
+                            "max_price":      user_conf.get("MAX_PRICE"),
+                            "include_st":     user_conf.get("INCLUDE_ST"),
+                            "apply_filter":   user_conf.get("ENABLE_FUNDAMENTAL_FILTER"),
+                        }
+                        user_filters = {k: v for k, v in user_filters.items() if v is not None}
+                else:
+                    # 游客用户：从请求体携带的 guest_config 字段读取
+                    if req.guest_config:
+                        try:
+                            guest_conf = json.loads(req.guest_config)
+                            user_filters = {
+                                "min_market_cap": guest_conf.get("MIN_MARKET_CAP"),
+                                "max_pe":         guest_conf.get("MAX_PE"),
+                                "min_price":      guest_conf.get("MIN_PRICE"),
+                                "max_price":      guest_conf.get("MAX_PRICE"),
+                                "include_st":     guest_conf.get("INCLUDE_ST"),
+                                "apply_filter":   guest_conf.get("ENABLE_FUNDAMENTAL_FILTER"),
+                            }
+                            user_filters = {k: v for k, v in user_filters.items() if v is not None}
+                        except Exception as ge:
+                            print(f"解析游客配置失败: {ge}")
+            except Exception as e:
+                print(f"Loading user config for selection failed: {e}")
+
+            # 3. 收集需要运行的模型路径
             run_configs = []
             if os.path.isdir(base_path):
                 if "xgboost" in req.model_types:
@@ -215,8 +259,6 @@ async def run_selection(req: RunSelectionRequest):
                 if "lgbm" in req.model_types:
                     p = os.path.join(base_path, "lightgbm_factor_model.pkl")
                     if os.path.exists(p): run_configs.append(("lgbm", p))
-                
-                # 如果没找到标准命名的，且只选了一个或都没选对，尝试 fallback 到目录本身
                 if not run_configs:
                     run_configs.append(("default", base_path))
             else:
@@ -227,23 +269,26 @@ async def run_selection(req: RunSelectionRequest):
             for m_type, p in run_configs:
                 _selection_task["progress"] = f"正在使用 {m_type} 模型进行选股..."
                 executed_types.append(m_type)
-                
-                # 使用同步方法执行
                 results = select_stocks(
                     model_path=p,
                     min_confidence=req.min_confidence,
                     top_n=req.top_n,
-                    apply_filter=req.apply_filter,
+                    apply_filter=user_filters.get("apply_filter", req.apply_filter),
                     workers=4,
-                    only_cache=False, # 允许动态计算因子
-                    save_csv=False, # 最终统一保存
+                    only_cache=True, 
+                    save_csv=False,
+                    min_market_cap=user_filters.get("min_market_cap"),
+                    max_pe=user_filters.get("max_pe"),
+                    min_price=user_filters.get("min_price"),
+                    max_price=user_filters.get("max_price"),
+                    include_st=user_filters.get("include_st"),
                 )
                 
                 for r in results:
                     r["model_type"] = m_type
                 all_results.extend(results)
 
-            # 3. 汇总分析 (按置信度排序并去重) -> 改为保留所有模型结果，并标记共振
+            # 4. 汇总分析
             code_counts = {}
             for r in all_results:
                 code = str(r.get("stock_code", "")).zfill(6)
@@ -255,17 +300,10 @@ async def run_selection(req: RunSelectionRequest):
 
             final_results = sorted(all_results, key=lambda x: (x.get("model_type", ""), -x.get("confidence", 0.0)))
 
-            # 4. 转换并保存 CSV
             import pandas as pd
             safe_results = []
             for r in final_results:
-                item = {}
-                for k, v in r.items():
-                    try:
-                        json.dumps(v)
-                        item[k] = v
-                    except (TypeError, ValueError):
-                        item[k] = str(v)
+                item = {k: (v if isinstance(v, (int, float, str, bool)) or v is None else str(v)) for k, v in r.items()}
                 safe_results.append(item)
             
             if safe_results:
@@ -286,7 +324,8 @@ async def run_selection(req: RunSelectionRequest):
         finally:
             _selection_task["running"] = False
 
-    asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run(_run()))
+    t = threading.Thread(target=_run, args=(token,), daemon=True)
+    t.start()
     return {"message": "选股任务已启动"}
 
 
@@ -319,21 +358,48 @@ async def get_stock_factors(code: str, days: int = Query(default=250, ge=30, le=
         if factors is None or factors.empty:
             raise HTTPException(status_code=500, detail="因子计算失败")
 
+        # 获取模型重要性
+        importance = {}
+        try:
+            model = _load_model()
+            if hasattr(model, 'feature_importance') and model.feature_importance:
+                importance = model.feature_importance
+            elif hasattr(model, 'models'):
+                # 对集成模型的重要性进行汇总
+                for m in model.models:
+                    if hasattr(m, 'feature_importance'):
+                        for f, v in m.feature_importance.items():
+                            importance[f] = importance.get(f, 0) + v
+        except Exception:
+            pass
+
         # 取最后一行作为"最新因子快照"
         latest = factors.iloc[-1]
-        factor_dict = {}
+        factor_list = []
         for col in factors.columns:
             v = latest[col]
             try:
                 import numpy as np
-                if pd.isna(v) or (isinstance(v, float) and np.isinf(v)):
-                    factor_dict[col] = None
-                else:
-                    factor_dict[col] = float(v)
-            except (TypeError, ValueError):
-                factor_dict[col] = None
+                val = float(v) if not (pd.isna(v) or np.isinf(v)) else None
+            except:
+                val = None
+            
+            factor_list.append({
+                "name": col,
+                "value": val,
+                "importance": float(importance.get(col, 0))
+            })
 
-        return {"code": code, "factors": factor_dict, "factor_count": len(factor_dict)}
+        # 按重要性排序
+        factor_list.sort(key=lambda x: x['importance'], reverse=True)
+
+        return {
+            "code": code, 
+            "factors": {item['name']: item['value'] for item in factor_list},
+            "factor_details": factor_list, # 额外提供带排序和重要性的列表
+            "factor_count": len(factor_list),
+            "latest_date": str(df['date'].iloc[-1])
+        }
     except HTTPException:
         raise
     except Exception as e:

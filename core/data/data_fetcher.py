@@ -208,15 +208,18 @@ class DataFetcher:
         """初始化数据库表"""
         cursor = self.conn.cursor()
         
-        # 股票基本信息表
+        # 股票基本信息表 (使用扩展后的表)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS stock_info (
+            CREATE TABLE IF NOT EXISTS stock_info_extended (
                 code TEXT PRIMARY KEY,
                 name TEXT,
+                sector TEXT,
+                industry TEXT,
                 market_cap REAL,
                 pe_ratio REAL,
                 pb_ratio REAL,
-                update_time TIMESTAMP
+                update_time TIMESTAMP,
+                is_st INTEGER DEFAULT 0
             )
         ''')
         
@@ -260,14 +263,17 @@ class DataFetcher:
 
             if count_info > 0:
                 cursor = self.conn.cursor()
-                cursor.execute("SELECT code FROM stock_info")
-                return cursor.fetchall()
+                cursor.execute("SELECT code FROM stock_info_extended")
+                # 移除后缀并去重
+                db_stocks = sorted(list(set([str(row[0]).split('.')[0] for row in cursor.fetchall()])))
+                return pd.DataFrame(db_stocks, columns=['code'])
             elif count_data> 0:
                 # 如果数据库中有数据，则从数据库获取股票代码列表
-                cursor.execute("SELECT DISTINCT code FROM daily_data ORDER BY code")
-                db_stocks = [row[0] for row in cursor.fetchall()]
+                cursor.execute("SELECT DISTINCT code FROM daily_data")
+                # 移除后缀并去重
+                db_stocks = sorted(list(set([str(row[0]).split('.')[0] for row in cursor.fetchall()])))
                 stock_list = pd.DataFrame(db_stocks, columns=['code'])
-                print(f"从数据库获取到 {len(stock_list)} 条股票信息")
+                print(f"从数据库获取到 {len(stock_list)} 条唯一股票代码")
             else:
                 stock_list = self.request_with_proxy_retry(ak.stock_info_a_code_name)
                 # 根据市场代码过滤
@@ -351,7 +357,7 @@ class DataFetcher:
         
         return pd.DataFrame()
 
-    def get_stock_info(self,code=None):
+    def get_stock_info_extended(self,code=None):
         """
         从数据库获取股票基本信息
 
@@ -364,16 +370,16 @@ class DataFetcher:
         conn = sqlite3.connect(DATABASE_PATH)
 
         if code:
-            query = "SELECT * FROM stock_info WHERE code = ?"
+            query = "SELECT * FROM stock_info_extended WHERE code = ?"
             df = pd.read_sql_query(query, conn, params=(code,))
         else:
-            query = "SELECT * FROM stock_info"
+            query = "SELECT * FROM stock_info_extended"
             df = pd.read_sql_query(query, conn)
 
         conn.close()
         return df
 
-    def update_stock_info(self, markets=['sh', 'sz_main']):
+    def update_stock_info_extended(self, markets=['sh', 'sz_main']):
         """更新股票基本信息（包括市值、市盈率、市净率）
 
         Args:
@@ -423,15 +429,16 @@ class DataFetcher:
             try:
                 # 写入基本信息（包括市值、市盈率、市净率）
                 cursor.execute('''
-                    INSERT OR REPLACE INTO stock_info 
-                    (code, name, market_cap, pe_ratio, pb_ratio)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO stock_info_extended 
+                    (code, name, market_cap, pe_ratio, pb_ratio, update_time)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 ''', (
                     stock['代码'], 
                     stock['名称'],
                     stock['总市值'] if pd.notna(stock['总市值']) else None,
                     stock['市盈率-动态'] if pd.notna(stock['市盈率-动态']) else None,
-                    stock['市净率'] if pd.notna(stock['市净率']) else None
+                    stock['市净率'] if pd.notna(stock['市净率']) else None,
+                    update_time
                 ))
                 
                 # 进度显示
@@ -459,7 +466,7 @@ class DataFetcher:
         """获取股票最后更新时间戳（用于判断是否需要更新当天数据）"""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT update_time FROM stock_info WHERE code = ?
+            SELECT update_time FROM stock_info_extended WHERE code = ?
         ''', (symbol,))
         result = cursor.fetchone()
         return result[0] if result and result[0] else None
@@ -507,7 +514,7 @@ class DataFetcher:
 
                     if config.UPDATE_TODAY_ONLY:
                         spot_data = ak.stock_zh_a_spot_em()
-                        existing_stock = self.get_stock_info()
+                        existing_stock = self.get_stock_info_extended()
                         
                         # 获取最新的实时数据并更新
                         for _, stock in existing_stock.iterrows():
@@ -531,10 +538,10 @@ class DataFetcher:
                                     float(stock_data.iloc[0]['换手率']) if pd.notna(stock_data.iloc[0]['换手率']) else None
                                 ))
                         
-                        # 更新stock_info的update_time
+                        # 更新stock_info_extended的update_time
                         update_time = datetime.now()
                         cursor.execute('''
-                            UPDATE stock_info SET update_time = ? WHERE code = ?
+                            UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                         ''', (update_time, symbol))
                         self.conn.commit()
                         print(f"所有股票的今日数据已更新")
@@ -580,10 +587,10 @@ class DataFetcher:
                                             row['换手率'] if '换手率' in row and pd.notna(row['换手率']) else None
                                         ))
                                 
-                                # 更新stock_info的update_time
+                                # 更新stock_info_extended的update_time
                                 update_time = datetime.now()
                                 cursor.execute('''
-                                    UPDATE stock_info SET update_time = ? WHERE code = ?
+                                    UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                                 ''', (update_time, symbol))
                         else:
                             # 数据已是最新且完整，跳过
@@ -626,10 +633,10 @@ class DataFetcher:
                                 row['换手率'] if '换手率' in row and pd.notna(row['换手率']) else None
                             ))
                         
-                        # 更新stock_info的update_time
+                        # 更新stock_info_extended的update_time
                         update_time = datetime.now()
                         cursor.execute('''
-                            UPDATE stock_info SET update_time = ? WHERE code = ?
+                            UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                         ''', (update_time, symbol))
             else:
                 # 全量更新
@@ -670,7 +677,7 @@ class DataFetcher:
             if last_date_in_db == latest_trading_day:
                 update_time = datetime.now()
                 cursor.execute('''
-                    UPDATE stock_info SET update_time = ? WHERE code = ?
+                    UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                 ''', (update_time, symbol))
                 print(f"更新{symbol}数据成功")
             else:
@@ -705,7 +712,7 @@ class DataFetcher:
         print(f"开始初始化股票数据（市场: {', '.join(markets)}，并行度: {workers}）...")
         
         # 1. 先更新股票基本信息
-        self.update_stock_info(markets=markets)
+        self.update_stock_info_extended(markets=markets)
         
         # 2. 获取股票列表
         stock_list = self.get_stock_list(markets=markets)
@@ -761,7 +768,7 @@ class DataFetcher:
                         elif last_date == current_date and now >= today_15pm:
                             # 今天且已过15:00，检查更新时间
                             cursor.execute('''
-                                SELECT update_time FROM stock_info 
+                                SELECT update_time FROM stock_info_extended 
                                 WHERE code = ?
                             ''', (stock_code,))
                             result = cursor.fetchone()

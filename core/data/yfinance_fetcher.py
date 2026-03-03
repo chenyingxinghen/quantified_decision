@@ -29,6 +29,13 @@ class YFinanceFetcher:
         Returns:
             yfinance格式的代码，如 '600000.SS' (上交所) 或 '000001.SZ' (深交所)
         """
+        if not isinstance(code, str):
+            code = str(code)
+            
+        # 如果已经包含后缀，直接返回
+        if '.' in code:
+            return code
+            
         if code.startswith('6'):
             # 上海证券交易所
             return f"{code}.SS"

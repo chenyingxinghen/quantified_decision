@@ -68,7 +68,9 @@ def update_multiple_stocks(symbols, prefer_source='yfinance', incremental=True):
     
     try:
         for i, symbol in enumerate(symbols, 1):
-            print(f"\n[{i}/{len(symbols)}] 正在更新 {symbol}...")
+            # print(f"\n[{i}/{len(symbols)}] 正在更新 {symbol}...")
+            if i % 100 == 0:
+                print(f"\n[{i}/{len(symbols)}]")
             try:
                 fetcher.update_daily_data(symbol, incremental=incremental)
                 success_count += 1

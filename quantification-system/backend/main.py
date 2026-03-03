@@ -14,14 +14,26 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 import os
 
+from app.scheduler import start_scheduler, stop_scheduler
+
 from app.routers import stock_selector, paper_trading, data_center, analysis, config_center, auth
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    start_scheduler()
+    yield
+    # Shutdown
+    stop_scheduler()
 
 app = FastAPI(
     title="量化决策系统 API",
     description="Stock selection, paper trading, data center, technical analysis & configuration",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # 简单的全局请求频率限制 Middleware
@@ -36,7 +48,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         # 排除静态资源和前端页面的限流，只限制 API 
-        if request.url.path.startswith("/quant/api/"):
+        if request.url.path.startswith("/api/"):
             client_ip = request.client.host if request.client else "127.0.0.1"
             now = time.time()
             if client_ip not in self.cache:
@@ -64,23 +76,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 注册路由 (增加 /quant 前缀以匹配子系统架构)
-app.include_router(auth.router, prefix="/quant")
-app.include_router(stock_selector.router, prefix="/quant") 
-app.include_router(paper_trading.router, prefix="/quant")
-app.include_router(data_center.router, prefix="/quant")
-app.include_router(analysis.router, prefix="/quant")
-app.include_router(config_center.router, prefix="/quant")
+# 注册路由 (移除 /quant 前缀，由网关负责 namespace)
+app.include_router(auth.router)
+app.include_router(stock_selector.router) 
+app.include_router(paper_trading.router)
+app.include_router(data_center.router)
+app.include_router(analysis.router)
+app.include_router(config_center.router)
 
 # 托管前端静态文件
 FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
 
 # 具体的静态资源路径映射 (优先处理)
 if os.path.exists(FRONTEND_DIST):
-    app.mount("/quant/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="quant_assets")
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="quant_assets")
 
-    # 处理 /quant 路径下的所有前端页面 (SPA Fallback)
-    @app.get("/quant/{path:path}")
+    # 处理根路径下的所有前端页面 (SPA Fallback)
+    @app.get("/{path:path}")
     async def serve_quant_frontend(path: str):
         # 尝试直接查找文件
         file_path = os.path.join(FRONTEND_DIST, path)
@@ -90,7 +102,7 @@ if os.path.exists(FRONTEND_DIST):
         return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
 
 
-@app.get("/quant/api/health")
+@app.get("/api/health")
 async def health_check():
     return {"status": "ok", "mode": "integrated"}
 

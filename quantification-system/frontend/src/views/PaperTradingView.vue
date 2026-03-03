@@ -26,23 +26,23 @@
 
     <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 24px">
       <!-- 买入表单 -->
-      <div class="card">
+      <div class="card" style="min-width: 0">
         <div class="card-header">
           <span class="card-title">新增持仓监控</span>
         </div>
-        <el-form layout="vertical" :model="buyForm" @submit.prevent="handleBuy">
-          <el-form-item label="标的代码及名称">
-            <div style="display: flex; gap: 10px">
-              <el-input v-model="buyForm.code" placeholder="代码 (如 600000)" />
-              <el-input v-model="buyForm.name" placeholder="名称" />
+        <el-form layout="vertical" :model="buyForm" @submit.prevent="handleBuy" style="overflow: hidden">
+          <el-form-item label="股票信息">
+            <div style="display: flex; gap: 10px; flex-wrap: wrap">
+              <el-input v-model="buyForm.code" placeholder="代码" style="flex: 1; min-width: 100px" />
+              <el-input v-model="buyForm.name" placeholder="名称" style="flex: 1.5; min-width: 120px" />
             </div>
           </el-form-item>
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px">
+          <div style="display: flex; flex-direction: column; gap: 0">
             <el-form-item label="买入日期">
               <el-date-picker v-model="buyForm.buy_date" type="date" format="YYYY-MM-DD" value-format="YYYY-MM-DD" style="width: 100%" />
             </el-form-item>
             <el-form-item label="买入价格">
-              <el-input-number v-model="buyForm.buy_price" :precision="3" :step="0.01" style="width: 100%" />
+              <el-input-number v-model="buyForm.buy_price" :precision="3" :step="0.01" style="width: 100%" placeholder="待定" :value-on-clear="null" />
             </el-form-item>
           </div>
           <el-button type="primary" block @click="handleBuy" :loading="buying" style="width: 100%; height: 42px; margin-top: 10px">
@@ -60,7 +60,7 @@
           </el-button>
         </div>
         <el-table :data="activePositions" style="width: 100%" row-class-name="glass-row">
-          <el-table-column prop="code" label="代码" width="110">
+          <el-table-column prop="code" label="代码" width="100">
             <template #default="{ row }">
               <span class="text-mono" style="font-weight: 700; color: var(--accent-blue)">{{ String(row.code).padStart(6, '0') }}</span>
             </template>
@@ -72,7 +72,7 @@
           <el-table-column prop="latest_price" label="最新价" width="100">
             <template #default="{ row }"><span class="text-mono" style="font-weight: 600">{{ row.latest_price != null ? Number(row.latest_price).toFixed(2) : '—' }}</span></template>
           </el-table-column>
-          <el-table-column prop="unrealized_pct" label="浮动盈亏" width="110" sortable>
+          <el-table-column prop="unrealized_pct" label="浮动盈亏" width="90" sortable>
             <template #default="{ row }">
               <span v-if="row.unrealized_pct != null" :class="row.unrealized_pct >= 0 ? 'text-up' : 'text-down'" class="text-mono" style="font-weight: 800">
                 {{ row.unrealized_pct > 0 ? '+' : '' }}{{ row.unrealized_pct }}%
@@ -80,12 +80,54 @@
               <span v-else class="text-muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" align="right" min-width="180">
+          <el-table-column label="智能分析" min-width="280">
             <template #default="{ row }">
-              <div style="display: flex; gap: 8px; justify-content: flex-end; padding-right: 12px">
-                <el-button size="small" circle @click="checkExit(row)"><el-icon><Aim /></el-icon></el-button>
-                <el-button size="small" circle type="danger" @click="openSellDialog(row)"><el-icon><Sell /></el-icon></el-button>
-                <el-button size="small" circle @click="$router.push({ path: '/analysis', query: { code: row.code } })"><el-icon><TrendCharts /></el-icon></el-button>
+              <div v-if="analysisMap[row.id]" style="padding: 10px 0">
+                <div v-if="analysisMap[row.id].status === 'pending'" class="text-secondary" style="font-size: 12px">
+                  <el-icon class="is-loading"><Loading /></el-icon> {{ analysisMap[row.id].message }}
+                </div>
+                <div v-else>
+                  <div v-for="(cond, key) in analysisMap[row.id].conditions" :key="key" style="margin-bottom: 6px">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px">
+                      <span style="font-size: 11px; font-weight: 600">{{ cond.label }}</span>
+                      <span v-if="cond.price" style="font-size: 10px; color: var(--text-secondary)">
+                        {{ Number(row.latest_price).toFixed(2) }}<!--
+                        --><span style="color: var(--text-muted); margin: 0 4px">/</span><!--
+                        -->{{ Number(cond.price).toFixed(2) }}
+                      </span>
+                      <span v-else-if="key === 'time_stop'" style="font-size: 10px; color: var(--text-secondary)">
+                        {{ cond.holding_days }}<span style="color: var(--text-muted); margin: 0 4px">/</span>{{ cond.max_days }} 天
+                      </span>
+                      <span v-if="cond.triggered" class="text-up" style="font-size: 10px; font-weight: 800">已触发</span>
+                      <span v-else style="font-size: 10px; color: var(--text-muted)">{{ cond.progress }}%</span>
+                    </div>
+                    <el-progress 
+                      :percentage="cond.progress" 
+                      :status="cond.triggered ? 'exception' : (cond.progress > 80 ? 'warning' : '')" 
+                      :show-text="false" 
+                      :stroke-width="4"
+                    />
+                  </div>
+                  <span v-if="!hasTriggered(row.id) && Object.keys(analysisMap[row.id].conditions).length > 0" class="text-muted" style="font-size: 10px">
+                    <el-icon color="var(--accent-green)"><SuccessFilled /></el-icon> 安全持有中
+                  </span>
+                  <span v-if="Object.keys(analysisMap[row.id].conditions).length === 0" class="text-muted" style="font-size: 10px">未启用智能监控</span>
+                </div>
+              </div>
+              <div v-else-if="row.buy_price != null">
+                <el-icon class="is-loading" color="var(--accent-blue)"><Loading /></el-icon>
+              </div>
+              <div v-else>
+                <span class="text-muted" style="font-size: 11px">等待价格补充</span>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" align="right" width="150" fixed="right">
+            <template #default="{ row }">
+              <div style="display: flex; gap: 8px; justify-content: flex-end; padding-right: 4px">
+                <el-tooltip content="了结获利/止损" placement="top"><el-button size="small" circle type="danger" @click="openSellDialog(row)"><el-icon><Sell /></el-icon></el-button></el-tooltip>
+                <el-tooltip content="技术分析" placement="top"><el-button size="small" circle @click="$router.push({ path: '/analysis', query: { code: row.code } })"><el-icon><TrendCharts /></el-icon></el-button></el-tooltip>
+                <el-tooltip content="删除监控" placement="top"><el-button size="small" circle type="info" plain @click="handleDelete(row)"><el-icon><Delete /></el-icon></el-button></el-tooltip>
               </div>
             </template>
           </el-table-column>
@@ -119,40 +161,6 @@
       </el-table>
     </div>
 
-    <!-- 卖出条件检测弹窗 -->
-    <el-dialog v-model="exitVisible" title="智能退出分析" width="550px" custom-class="glass-dialog">
-      <div v-if="exitLoading" class="flex-center" style="padding: 60px">
-        <el-icon class="loading-pulse" :size="40" color="var(--accent-blue)"><Loading /></el-icon>
-      </div>
-      <div v-else-if="exitData">
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px">
-          <div class="stat-card" style="padding: 16px">
-            <div class="stat-label">市场现价</div>
-            <div class="stat-value text-mono" style="font-size: 24px">{{ exitData.current_price?.toFixed(2) }}</div>
-          </div>
-          <div class="stat-card" style="padding: 16px" :style="{ borderBottom: '2px solid ' + (exitData.change_pct >= 0 ? 'var(--accent-red)' : 'var(--accent-green)') }">
-            <div class="stat-label">当前收益率</div>
-            <div class="stat-value text-mono" style="font-size: 24px" :class="exitData.change_pct >= 0 ? 'text-up' : 'text-down'">
-              {{ exitData.change_pct > 0 ? '+' : '' }}{{ exitData.change_pct }}%
-            </div>
-          </div>
-        </div>
-        
-        <h4 class="mb-16" style="color: var(--text-secondary); font-size: 13px; font-weight: 700">核心退出条件</h4>
-        <div v-for="(cond, key) in exitData.conditions" :key="key" class="exit-condition-item glass" :class="{ triggered: cond.triggered }">
-          <div style="display: flex; justify-content: space-between; align-items: center">
-            <span class="label">{{ cond.label }}</span>
-            <span :class="cond.triggered ? 'tag tag-buy' : 'tag tag-neutral'">
-              {{ cond.triggered ? '已触发' : '监控中' }}
-            </span>
-          </div>
-          <div class="details">
-            <span v-if="cond.price">目标价: <span class="text-mono">{{ cond.price }}</span></span>
-            <span v-if="cond.holding_days">已持仓: <span class="text-mono">{{ cond.holding_days }} / {{ cond.max_days }}</span> 天</span>
-          </div>
-        </div>
-      </div>
-    </el-dialog>
 
     <!-- 卖出弹窗 -->
     <el-dialog v-model="sellVisible" title="了结交易" width="400px" custom-class="glass-dialog">
@@ -179,9 +187,9 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { paperTrading } from '../api'
-import { ElMessage } from 'element-plus'
-import { Plus, Refresh, Loading, TrendCharts, Aim, Sell } from '@element-plus/icons-vue'
+import { paperTrading, authApi } from '../api'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Plus, Refresh, Loading, TrendCharts, Aim, Sell, Delete, SuccessFilled, InfoFilled } from '@element-plus/icons-vue'
 
 const loading = ref(false)
 const buying = ref(false)
@@ -198,24 +206,61 @@ const winRate = computed(() => {
 })
 
 // 买入表单
-const buyForm = ref({ code: '', name: '', buy_date: '', buy_price: 0, quantity: 1 })
+const buyForm = ref({ code: '', name: '', buy_date: '', buy_price: null, quantity: 1 })
 
-// 卖出条件
-const exitVisible = ref(false)
-const exitLoading = ref(false)
-const exitData = ref(null)
+const userConfig = ref(null)
+const analysisMap = ref({}) // { position_id: exitData }
+
+function hasTriggered(id) {
+  if (!analysisMap.value[id]) return false
+  return Object.values(analysisMap.value[id].conditions || {}).some(c => c.triggered)
+}
+
+// 简单的字符串哈希函数，用于生成配置指纹
+function getHash(str) {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash).toString(36)
+}
+
+function getTodayStr() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+}
 
 // 卖出弹窗
 const sellVisible = ref(false)
 const sellForm = ref({ position_id: 0, sell_date: '', sell_price: 0, sell_reason: '手动卖出' })
 
-onMounted(() => { loadPositions(); loadHistory() })
+onMounted(async () => { 
+  // 加载配置，确保分析逻辑正确
+  try {
+    const res = await authApi.getConfig()
+    if (res.data && res.data.config_json) {
+      userConfig.value = typeof res.data.config_json === 'string' 
+        ? JSON.parse(res.data.config_json) 
+        : res.data.config_json
+    }
+  } catch (e) { console.error('Load config failed', e) }
+  
+  loadPositions(); 
+  loadHistory() 
+})
 
 async function loadPositions() {
   loading.value = true
   try {
     const { data } = await paperTrading.getPositions('active')
     activePositions.value = data.positions
+        
+    // Wait for auto analysis silently
+    setTimeout(() => {
+        performAutoAnalysis(activePositions.value)
+    }, 500)
+    
   } catch (e) {
     ElMessage.error('加载持仓失败')
   } finally {
@@ -237,50 +282,72 @@ async function loadHistory() {
 }
 
 async function handleBuy() {
-  if (!buyForm.value.code || !buyForm.value.buy_date || !buyForm.value.buy_price) {
-    ElMessage.warning('请填写所有必填项')
+  if (!buyForm.value.code || !buyForm.value.buy_date) {
+    ElMessage.warning('代码与日期是必填项')
     return
   }
   buying.value = true
   try {
     await paperTrading.buy(buyForm.value)
     ElMessage.success('成功部署监控')
-    buyForm.value = { code: '', name: '', buy_date: '', buy_price: 0, quantity: 1 }
+    buyForm.value = { code: '', name: '', buy_date: '', buy_price: null, quantity: 1 }
     loadPositions()
+    loadHistory()
   } catch (e) {
+    console.error(e)
     ElMessage.error('记录买入失败')
   } finally {
     buying.value = false
   }
 }
 
-async function checkExit(row) {
-  exitVisible.value = true
-  exitLoading.value = true
-  exitData.value = null
-  try {
-    let params = {}
-    const saved = localStorage.getItem('quant_frontend_config')
-    if (saved) {
+async function performAutoAnalysis(positions) {
+  const today = getTodayStr()
+  for (const pos of positions) {
+    if (pos.buy_price == null) continue
+    
+    // Check Cache (Include config hash to bust cache if settings change)
+    // 使用完整序列化后的哈希，确保任何微小改动都能触发刷新
+    const configHash = userConfig.value ? getHash(JSON.stringify(userConfig.value)) : 'default'
+    const cacheKey = `quant_analysis_v7_${pos.code}_${pos.buy_date}_${pos.buy_price}_${today}_${configHash}`
+    const cached = localStorage.getItem(cacheKey)
+    if (cached) {
       try {
-        const cfg = JSON.parse(saved)
-        params = {
-          atr_period: cfg.atrPeriod,
-          atr_stop_multiplier: cfg.atrStopMultiplier,
-          atr_target_multiplier: cfg.atrTargetMultiplier,
-          time_stop_days: cfg.timeStopDays,
-          time_stop_min_loss_pct: cfg.timeStopMinLossPct
+        const parsed = JSON.parse(cached)
+        // If it was pending, we might want to re-fetch
+        if (parsed.status !== 'pending') {
+            analysisMap.value[pos.id] = parsed
+            continue
         }
       } catch (e) {}
     }
-    const { data } = await paperTrading.checkExit(row.code, row.buy_price, row.buy_date, params)
-    exitData.value = data
-  } catch (e) {
-    ElMessage.error('分析失败')
-  } finally {
-    exitLoading.value = false
+    
+    // Fetch
+    try {
+      const configParams = userConfig.value || {}
+      const { data } = await paperTrading.checkExit(pos.code, pos.buy_price, pos.buy_date, configParams)
+      analysisMap.value[pos.id] = data
+      if (data.status !== 'pending') {
+          localStorage.setItem(cacheKey, JSON.stringify(data))
+      }
+    } catch(e) {
+      console.error('Failed to auto-analyze', pos.code, e)
+    }
   }
 }
+
+async function handleDelete(row) {
+    try {
+        await ElMessageBox.confirm('确定要删除这条监控记录吗？', '确认删除', { type: 'warning' })
+        await paperTrading.delete(row.id)
+        ElMessage.success('已删除记录')
+        loadPositions()
+    } catch (e) {
+        if (e !== 'cancel') ElMessage.error('删除操作失败')
+    }
+}
+
+
 
 function openSellDialog(row) {
   sellForm.value = { position_id: row.id, sell_date: '', sell_price: row.latest_price ?? 0, sell_reason: '策略退出' }

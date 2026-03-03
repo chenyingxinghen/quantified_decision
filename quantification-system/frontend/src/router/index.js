@@ -19,12 +19,7 @@ const routes = [
         component: () => import('../views/PaperTradingView.vue'),
         meta: { title: '实盘验证', icon: 'Briefcase' },
     },
-    {
-        path: '/data-center',
-        name: 'DataCenter',
-        component: () => import('../views/DataCenterView.vue'),
-        meta: { title: '数据中心', icon: 'Coin' },
-    },
+
     {
         path: '/analysis',
         name: 'Analysis',

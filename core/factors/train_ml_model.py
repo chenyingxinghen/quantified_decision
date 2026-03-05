@@ -107,10 +107,12 @@ class MLModelTrainer:
             placeholders = ','.join(['?' for _ in batch_codes])
             
             query = f'''
-                SELECT code, date, open, high, low, close, volume, amount
-                FROM daily_data
-                WHERE code IN ({placeholders}) AND date >= ? AND date <= ?
-                ORDER BY code, date ASC
+                SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount,
+                       IFNULL(s.is_st, 0) as is_st
+                FROM daily_data d
+                LEFT JOIN stock_info_extended s ON d.code = s.code
+                WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
+                ORDER BY d.code, d.date ASC
             '''
             
             params = batch_codes + [start_date, end_date]
@@ -256,9 +258,9 @@ class MLModelTrainer:
                 f_min_returns = (f_low_min / close - 1)
 
                 # 1. 路径质量分 (Path-aware Score)
-                # 最终收益权重 1.0, 过程最大高点分红 0.2, 过程最大低点惩罚 1.5
                 # 显著惩罚回撤大、先跌后涨的标的，引导模型选择“走势稳健”的头部标的
-                y = f_returns + 0.5 * f_max_returns + 1.0 * f_min_returns
+                # 修复：使用符号位保留的幂运算，避免负收益率产生 NaN
+                y = np.sign(f_returns) * (np.abs(f_returns) ** 1.5) + 0.5 * f_max_returns + 1.0 * f_min_returns
                 
                 # 用于计算 IC 的参考收益率 (使用最终涨幅)
                 ref_returns = f_returns.values
@@ -294,7 +296,12 @@ class MLModelTrainer:
                     final_returns = target_returns[valid_idx] if isinstance(target_returns, pd.Series) else target_returns[valid_idx]
                     
                     # 封板/停牌检测
-                    is_limit_up = (data['close'] == data['high']) & (data['close'].pct_change() > 0.093)
+                    # 获取 ST 标签：如果在 data 中存在则使用，否则默认为非 ST
+                    is_st = data['is_st'].iloc[0] == 1 if 'is_st' in data.columns else False
+                    # ST 股涨停阈值取 4.5% (对应 5% 限制)，普通股取 9.3% (对应 10% 限制)
+                    limit_threshold = 0.045 if is_st else 0.093
+                    
+                    is_limit_up = (data['close'] == data['high']) & (data['close'].pct_change() > limit_threshold)
                     is_suspended = data['volume'] == 0
                     unbuyable_mask = (is_limit_up | is_suspended)[valid_idx].values
                     
@@ -560,7 +567,7 @@ class MLModelTrainer:
         if unbuyable_combined is not None:
             penalty_count = np.sum(unbuyable_combined)
             if penalty_count > 0:
-                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.0")
+                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.1")
                 y_combined.loc[unbuyable_combined] = 0.1
 
         
@@ -669,7 +676,7 @@ class MLModelTrainer:
                 extra_params = {}
                 
                 # 关键修复：确保 split_idx 对齐到日期边界 (所有任务一致)
-                raw_split_idx = int(len(dates) * 0.8)
+                raw_split_idx = int(len(dates) * TrainingConfig.TRAIN_TEST_SPLIT)
                 split_date = dates[raw_split_idx]
                 split_idx = np.searchsorted(dates, split_date, side='left')
                 

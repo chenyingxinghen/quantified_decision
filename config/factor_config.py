@@ -21,42 +21,50 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 5,              # 增加深度以改善预测区分度
-        'min_child_weight': 1,       # 增加权重要求，防止过拟合
+        'max_depth': 4,              # 增加深度以改善预测区分度
+        'min_child_weight': 5,       # 增加权重要求，防止过拟合
         'learning_rate': 0.02,       # 降低学习率
-        'subsample': 0.8,            
-        'colsample_bytree': 0.5,     
+        'subsample': 1,
+        'colsample_bytree': 1,     
+        
         'reg_alpha': 3,            
         'reg_lambda': 8,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
         'random_state': 42,
         'n_jobs': -1,
-        'early_stopping_rounds': 100,
+        'early_stopping_rounds': 50,
+        # 'verbosity': 1,              # 打印训练过程
+
+        # 'device': 'cuda',                # 使用第一个GPU
     }
     
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 4,
-        'num_leaves': 31,
+        'max_depth': 5,
+        'num_leaves': 63,
         'learning_rate': 0.02,
         'min_data_in_leaf': 150,
         'min_gain_to_split': 0.01,
+        # 'subsample_freq': 1,
+
         'reg_alpha': 3,
         'reg_lambda': 8,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
+        'subsample': 1,
+        'colsample_bytree': 1,
 
         'label_gain': [float(i**2 - 1) for i in range(100)], 
         'objective': 'lambdarank',
-        'metric': 'ndcg',
+        'metric': 'ndc',
         'lambdarank_truncation_level': 100,
         'random_state': 42,
         'n_jobs': -1,
-        'verbose': -1,
-        'early_stopping_rounds': 100,
-        'force_row_wise': True, 
+        'verbose': 0,              # 0:不打印，1:打印
+        'early_stopping_rounds': 50,
+        'force_row_wise': True,    
+
+        # 'device': 'gpu',
     }
     
     
@@ -85,14 +93,14 @@ class TrainingConfig:
     INCLUDE_FUNDAMENTALS = False  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
 
-    YEARS_FOR_BACKTEST=1         # 回测年数
+    YEARS_FOR_BACKTEST=2         # 回测年数
     YEARS_FOR_TRAINING=8         # 训练年数
     STOCK_NUM = 5000             # 股票数量
     # 数据集划分
-    TRAIN_TEST_SPLIT = 0.8
+    TRAIN_TEST_SPLIT = 0.7
 
     # 预测天数 (用于分类、回归和排序任务)
-    FUTURE_DAYS = 10
+    FUTURE_DAYS = 5
     
 
     # 缓存目录

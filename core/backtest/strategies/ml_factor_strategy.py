@@ -126,10 +126,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         #      print(f"  [DEBUG] {current_date}: 正在检查 {len(market_data)} 只股票的市场数据...")
 
         for stock_code, stock_data in market_data.items():
-            # 过滤已持有的股票，避免重复开仓
-            if stock_code in existing_positions:
-                continue
-                
+            # 基础过滤：数据量不足
             if len(stock_data) < 35:
                 continue
             
@@ -140,7 +137,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 if factors is None or len(factors) == 0:
                     continue
                 
-                # 检查最新因子日期是否与当前日期匹配
+                # 检查最新因子日期
                 latest_factor_date = factors['date'].iloc[-1] if 'date' in factors.columns else None
                 if latest_factor_date:
                     latest_date_str = str(latest_factor_date)[:10]
@@ -155,7 +152,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 valid_candidates.append({
                     'code': stock_code,
                     'factors': latest_factors,
-                    'data': stock_data
+                    'data': stock_data,
+                    'is_held': stock_code in existing_positions # 标记是否已持有
                 })
             except Exception:
                 continue
@@ -163,7 +161,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if not valid_candidates:
             return signals
             
-        # 2. 批量预测
+        # 2. 批量预测 (包含所有可用股票，确保归一化池正确)
         all_factors_list = [c['factors'] for c in valid_candidates]
         X_batch = pd.concat(all_factors_list, axis=0, ignore_index=True)
         
@@ -173,14 +171,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
             
         # 批量获取预测得分/置信度
         try:
-            # --- 关键修复：每日横向 Z-Score 归一化 ---
-            # 确保回测时的特征量纲与训练阶段（train_ml_model.py L549）完全一致
+            # 执行横向 Z-Score 归一化 (关键：此时池中包含已持有和未持有的所有股票)
             if len(X_batch) > 1:
-                # 减去均值，除以标准差。如果标准差为0则替换为1以避免除零，最后填充NaN为0
                 X_batch_norm = (X_batch - X_batch.mean()) / X_batch.std().replace(0, 1.0)
                 X_batch_norm = X_batch_norm.fillna(0)
             else:
-                # 如果只有一只样本，无法计算标准差，统一设为 0（代表均值水平）
                 X_batch_norm = X_batch * 0
                 
             probs = self.model.predict(X_batch_norm)
@@ -191,6 +186,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 3. 筛选并构造候选列表
         candidates = []
         for i, candidate in enumerate(valid_candidates):
+            # 过滤已持有的股票，不计入买入候选，但它们刚才参与了归一化计算
+            if candidate['is_held']:
+                continue
+                
             prob = probs[i]
             confidence = float(prob * 100)
             
@@ -198,8 +197,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
             if confidence < self.min_confidence:
                 continue
                 
-            # 改进：如果是排序任务，取消 0.5 (optimal_threshold) 的硬性过滤
-            # 因为排序模型的输出是相对分数，整体位移可能导致所有分值略低于或高于 0.5
+            # 排序任务取消 0.5 固定过滤
             if self.model.task != 'ranking':
                 if prob < self.model.optimal_threshold:
                     continue

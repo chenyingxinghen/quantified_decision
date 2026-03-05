@@ -16,11 +16,13 @@ async def get_kline(code: str, days: int = Query(default=250, ge=10, le=3000)):
     """获取 K 线 OHLCV 数据"""
     import pandas as pd
     conn = get_db_connection()
-    df = pd.read_sql_query(
-        "SELECT * FROM daily_data WHERE code = ? ORDER BY date DESC LIMIT ?",
-        conn, params=(code, days),
-    )
-    conn.close()
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM daily_data WHERE code = ? ORDER BY date DESC LIMIT ?",
+            conn, params=(code, days),
+        )
+    finally:
+        conn.close()
     if df.empty:
         raise HTTPException(status_code=404, detail=f"股票 {code} 无数据")
 

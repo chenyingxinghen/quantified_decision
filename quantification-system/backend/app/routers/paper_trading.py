@@ -39,29 +39,31 @@ async def list_positions(status: str = Query(default="active", pattern="^(active
     """获取持仓列表"""
     username = get_current_user_from_token(token)
     conn = get_user_db()
-    if status == "all":
-        rows = conn.execute("SELECT * FROM positions WHERE username = ? ORDER BY created_at DESC", (username,)).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM positions WHERE status = ? AND username = ? ORDER BY created_at DESC",
-            (status, username)
-        ).fetchall()
-    conn.close()
-
-    results = []
-    for r in rows:
-        d = dict(r)
-        # 注入最新价格
-        if d["status"] == "active":
-            d["latest_price"] = _get_latest_price(d["code"])
-            if d["latest_price"] and d.get("buy_price") is not None:
-                d["unrealized_pct"] = round(
-                    (d["latest_price"] - d["buy_price"]) / d["buy_price"] * 100, 2
-                )
-            else:
-                d["unrealized_pct"] = None
-        results.append(d)
-    return {"positions": results}
+    try:
+        if status == "all":
+            rows = conn.execute("SELECT * FROM positions WHERE username = ? ORDER BY created_at DESC", (username,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE status = ? AND username = ? ORDER BY created_at DESC",
+                (status, username)
+            ).fetchall()
+        
+        results = []
+        for r in rows:
+            d = dict(r)
+            # 注入最新价格
+            if d["status"] == "active":
+                d["latest_price"] = _get_latest_price(d["code"])
+                if d["latest_price"] and d.get("buy_price") is not None:
+                    d["unrealized_pct"] = round(
+                        (d["latest_price"] - d["buy_price"]) / d["buy_price"] * 100, 2
+                    )
+                else:
+                    d["unrealized_pct"] = None
+            results.append(d)
+        return {"positions": results}
+    finally:
+        conn.close()
 
 
 def _get_latest_price(code: str) -> Optional[float]:
@@ -84,25 +86,26 @@ async def buy_stock(req: BuyRequest, token: Optional[str] = Header(None, alias="
     """记录买入"""
     username = get_current_user_from_token(token)
     conn = get_user_db()
-    
-    # Check if buy_date is today or future, and if no price provided, set to None.
-    # Otherwise if we still want None by default, we just insert.
-    buy_price_val = req.buy_price
-    
-    conn.execute(
-        """INSERT INTO positions (code, name, buy_date, buy_price, quantity, notes, username)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (req.code, req.name, req.buy_date, buy_price_val, req.quantity, req.notes, username),
-    )
-    conn.commit()
-    pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.close()
-    
-    msg = "买入记录已创建"
-    if buy_price_val is None:
-        msg = "买入记录已创建 (等待收市更新开盘价)"
+    try:
+        # Check if buy_date is today or future, and if no price provided, set to None.
+        # Otherwise if we still want None by default, we just insert.
+        buy_price_val = req.buy_price
         
-    return {"id": pid, "message": msg}
+        conn.execute(
+            """INSERT INTO positions (code, name, buy_date, buy_price, quantity, notes, username)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (req.code, req.name, req.buy_date, buy_price_val, req.quantity, req.notes, username),
+        )
+        conn.commit()
+        pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        
+        msg = "买入记录已创建"
+        if buy_price_val is None:
+            msg = "买入记录已创建 (等待收市更新开盘价)"
+            
+        return {"id": pid, "message": msg}
+    finally:
+        conn.close()
 
 
 # ── 卖出 ──────────────────────────────────────────────────
@@ -112,23 +115,23 @@ async def sell_stock(req: SellRequest, token: Optional[str] = Header(None, alias
     """记录卖出"""
     username = get_current_user_from_token(token)
     conn = get_user_db()
-    row = conn.execute("SELECT * FROM positions WHERE id = ? AND username = ?", (req.position_id, username)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="持仓不存在或无权限")
-    if row["status"] != "active":
-        conn.close()
-        raise HTTPException(status_code=400, detail="持仓已关闭")
+    try:
+        row = conn.execute("SELECT * FROM positions WHERE id = ? AND username = ?", (req.position_id, username)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="持仓不存在或无权限")
+        if row["status"] != "active":
+            raise HTTPException(status_code=400, detail="持仓已关闭")
 
-    profit_pct = round((req.sell_price - row["buy_price"]) / row["buy_price"] * 100, 2)
-    conn.execute(
-        """UPDATE positions SET status='closed', sell_date=?, sell_price=?,
-           sell_reason=?, profit_pct=? WHERE id=?""",
-        (req.sell_date, req.sell_price, req.sell_reason, profit_pct, req.position_id),
-    )
-    conn.commit()
-    conn.close()
-    return {"message": "卖出已记录", "profit_pct": profit_pct}
+        profit_pct = round((req.sell_price - row["buy_price"]) / row["buy_price"] * 100, 2)
+        conn.execute(
+            """UPDATE positions SET status='closed', sell_date=?, sell_price=?,
+               sell_reason=?, profit_pct=? WHERE id=?""",
+            (req.sell_date, req.sell_price, req.sell_reason, profit_pct, req.position_id),
+        )
+        conn.commit()
+        return {"message": "卖出已记录", "profit_pct": profit_pct}
+    finally:
+        conn.close()
 
 
 # ── 监控管理 ──────────────────────────────────────────────
@@ -138,16 +141,17 @@ async def toggle_monitoring(position_id: int, token: Optional[str] = Header(None
     """开启/关闭持仓监控"""
     username = get_current_user_from_token(token)
     conn = get_user_db()
-    row = conn.execute("SELECT monitoring FROM positions WHERE id = ? AND username = ?", (position_id, username)).fetchone()
-    if not row:
+    try:
+        row = conn.execute("SELECT monitoring FROM positions WHERE id = ? AND username = ?", (position_id, username)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="持仓不存在")
+        
+        new_status = 0 if row["monitoring"] else 1
+        conn.execute("UPDATE positions SET monitoring = ? WHERE id = ?", (new_status, position_id))
+        conn.commit()
+        return {"monitoring": bool(new_status)}
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="持仓不存在")
-    
-    new_status = 0 if row["monitoring"] else 1
-    conn.execute("UPDATE positions SET monitoring = ? WHERE id = ?", (new_status, position_id))
-    conn.commit()
-    conn.close()
-    return {"monitoring": bool(new_status)}
 
 
 @router.delete("/{position_id}")
@@ -155,13 +159,15 @@ async def delete_position(position_id: int, token: Optional[str] = Header(None, 
     """删除持仓记录"""
     username = get_current_user_from_token(token)
     conn = get_user_db()
-    res = conn.execute("DELETE FROM positions WHERE id = ? AND username = ?", (position_id, username))
-    conn.commit()
-    count = res.rowcount
-    conn.close()
-    if count == 0:
-        raise HTTPException(status_code=404, detail="持仓不存在或无权限")
-    return {"message": "已删除监控记录"}
+    try:
+        res = conn.execute("DELETE FROM positions WHERE id = ? AND username = ?", (position_id, username))
+        conn.commit()
+        count = res.rowcount
+        if count == 0:
+            raise HTTPException(status_code=404, detail="持仓不存在或无权限")
+        return {"message": "已删除监控记录"}
+    finally:
+        conn.close()
 
 
 # ── 检查卖出条件 ──────────────────────────────────────────
@@ -211,17 +217,21 @@ async def check_exit_conditions(
         else:
             # 即使没 token，也可以尝试通过 code/date 找持仓的所有者 (兼顾某些调用场景)
             conn_u = get_user_db()
-            pos_row = conn_u.execute("SELECT username FROM positions WHERE code = ? AND buy_date = ? LIMIT 1", (code, buy_date)).fetchone()
-            if pos_row:
-                username = pos_row["username"]
-            conn_u.close()
+            try:
+                pos_row = conn_u.execute("SELECT username FROM positions WHERE code = ? AND buy_date = ? LIMIT 1", (code, buy_date)).fetchone()
+                if pos_row:
+                    username = pos_row["username"]
+            finally:
+                conn_u.close()
             
         if username:
             conn_u = get_user_db()
-            conf_row = conn_u.execute("SELECT config_json FROM user_configs WHERE username = ?", (username,)).fetchone()
-            if conf_row and conf_row["config_json"]:
-                db_config = json.loads(conf_row["config_json"])
-            conn_u.close()
+            try:
+                conf_row = conn_u.execute("SELECT config_json FROM user_configs WHERE username = ?", (username,)).fetchone()
+                if conf_row and conf_row["config_json"]:
+                    db_config = json.loads(conf_row["config_json"])
+            finally:
+                conn_u.close()
     except Exception as e:
         print(f"Loading user config from DB failed: {e}")
 
@@ -256,11 +266,13 @@ async def check_exit_conditions(
         import pandas as pd
         import numpy as np
         conn = get_db_connection()
-        df = pd.read_sql_query(
-            "SELECT * FROM daily_data WHERE code = ? AND date >= ? ORDER BY date ASC",
-            conn, params=(code, buy_date),
-        )
-        conn.close()
+        try:
+            df = pd.read_sql_query(
+                "SELECT * FROM daily_data WHERE code = ? AND date >= ? ORDER BY date ASC",
+                conn, params=(code, buy_date),
+            )
+        finally:
+            conn.close()
         
         # 修复：检测不到数据时，则等待数据更新后再尝试
         if df.empty:
@@ -333,11 +345,13 @@ async def check_exit_conditions(
                 analyzer = TrendLineAnalyzer()
                 # 需要更多历史数据来分析趋势线
                 conn_h = get_db_connection()
-                df_h = pd.read_sql_query(
-                    "SELECT * FROM daily_data WHERE code = ? ORDER BY date DESC LIMIT 200",
-                    conn_h, params=(code,),
-                )
-                conn_h.close()
+                try:
+                    df_h = pd.read_sql_query(
+                        "SELECT * FROM daily_data WHERE code = ? ORDER BY date DESC LIMIT 200",
+                        conn_h, params=(code,),
+                    )
+                finally:
+                    conn_h.close()
                 df_h = df_h.sort_values("date").reset_index(drop=True)
                 df_h["date"] = pd.to_datetime(df_h["date"])
                 df_h = df_h.set_index("date")
@@ -394,9 +408,11 @@ async def trade_history(limit: int = Query(default=50, ge=1, le=500), token: Opt
     """获取历史交易记录"""
     username = get_current_user_from_token(token)
     conn = get_user_db()
-    rows = conn.execute(
-        "SELECT * FROM positions WHERE status='closed' AND username = ? ORDER BY sell_date DESC LIMIT ?",
-        (username, limit)
-    ).fetchall()
-    conn.close()
-    return {"trades": [dict(r) for r in rows]}
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status='closed' AND username = ? ORDER BY sell_date DESC LIMIT ?",
+            (username, limit)
+        ).fetchall()
+        return {"trades": [dict(r) for r in rows]}
+    finally:
+        conn.close()

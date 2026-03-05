@@ -228,7 +228,9 @@ class HybridDataFetcher:
                 first_date = self._get_first_update_date(symbol)
                 
                 expected_start_date = (datetime.now() - timedelta(days=365*YEARS)).strftime('%Y-%m-%d')
-                current_date = datetime.now().strftime('%Y-%m-%d')
+                today_17pm = datetime.now().replace(hour=17, minute=0, second=0, microsecond=0)
+                current_date = datetime.now() if datetime.now()> today_17pm else datetime.now()-timedelta(days=1)
+                current_date = current_date.strftime('%Y-%m-%d')
                 
                 if last_date and first_date:
                     need_historical = first_date > expected_start_date

@@ -15,7 +15,7 @@
 
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
-ML_FACTOR_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
 
 
 # ==============================================================================
@@ -36,7 +36,7 @@ COMMISSION_RATE = 0.005
 
 # 基础参数
 INITIAL_CAPITAL = 1.0          # 初始资金
-MAX_POSITIONS = 5                   # 最大持仓数量，分散风险
+MAX_POSITIONS = 1                   # 最大持仓数量，分散风险
 
 
 

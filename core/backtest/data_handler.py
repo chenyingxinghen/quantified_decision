@@ -18,10 +18,12 @@ def _load_stock_batch(args):
     conn = sqlite3.connect(db_path)
     placeholders = ','.join(['?' for _ in stock_codes])
     query = f'''
-        SELECT code, date, open, high, low, close, volume, amount, turnover_rate
-        FROM daily_data
-        WHERE code IN ({placeholders}) AND date >= ? AND date <= ?
-        ORDER BY code, date
+        SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount, d.turnover_rate,
+               IFNULL(s.is_st, 0) as is_st
+        FROM daily_data d
+        LEFT JOIN stock_info_extended s ON d.code = s.code
+        WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
+        ORDER BY d.code, d.date
     '''
     
     params = stock_codes + [start_date, end_date]
@@ -116,10 +118,12 @@ class DataHandler:
         """串行加载"""
         placeholders = ','.join(['?' for _ in stock_codes])
         query = f'''
-            SELECT code, date, open, high, low, close, volume, amount, turnover_rate
-            FROM daily_data
-            WHERE code IN ({placeholders}) AND date >= ? AND date <= ?
-            ORDER BY code, date
+            SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount, d.turnover_rate,
+                   IFNULL(s.is_st, 0) as is_st
+            FROM daily_data d
+            LEFT JOIN stock_info_extended s ON d.code = s.code
+            WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
+            ORDER BY d.code, d.date
         '''
         
         params = stock_codes + [start_date, end_date]

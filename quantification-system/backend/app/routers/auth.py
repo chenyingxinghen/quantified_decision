@@ -48,10 +48,12 @@ def get_current_user_from_token(token: Optional[str]) -> str:
     if not token or token == "guest" or token == "null" or token == "undefined":
         return "guest"
     conn = get_user_db()
-    row = conn.execute("SELECT username FROM sessions WHERE token = ?", (token,)).fetchone()
-    conn.close()
-    if row:
-        return row["username"]
+    try:
+        row = conn.execute("SELECT username FROM sessions WHERE token = ?", (token,)).fetchone()
+        if row:
+            return row["username"]
+    finally:
+        conn.close()
     return "guest"
 
 @router.post("/register")
@@ -98,9 +100,11 @@ async def login(req: LoginRequest, request: Request):
 async def logout(token: str = Header(None, alias="Token")):
     if token and token not in ("guest", "null", "undefined"):
         conn = get_user_db()
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+        finally:
+            conn.close()
     return {"message": "已登出"}
 
 @router.get("/user/info")
@@ -115,10 +119,11 @@ async def get_user_config(token: str = Header(None, alias="Token")):
         return {"config_json": None}
         
     conn = get_user_db()
-    row = conn.execute("SELECT config_json FROM user_configs WHERE username = ?", (username,)).fetchone()
-    conn.close()
-    
-    return {"config_json": row["config_json"] if row else None}
+    try:
+        row = conn.execute("SELECT config_json FROM user_configs WHERE username = ?", (username,)).fetchone()
+        return {"config_json": row["config_json"] if row else None}
+    finally:
+        conn.close()
 
 @router.post("/config")
 async def save_user_config(req: ConfigData, token: str = Header(None, alias="Token")):
@@ -127,10 +132,12 @@ async def save_user_config(req: ConfigData, token: str = Header(None, alias="Tok
         return {"message": "未登录无云端同步"}
         
     conn = get_user_db()
-    conn.execute(
-        "INSERT INTO user_configs (username, config_json) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET config_json=excluded.config_json",
-        (username, req.config_json)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO user_configs (username, config_json) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET config_json=excluded.config_json",
+            (username, req.config_json)
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"message": "配置已同步至云端"}

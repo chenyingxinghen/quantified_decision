@@ -390,9 +390,14 @@ class BacktestEngine:
         if bar.get('volume', 0) == 0:
             return None, None
             
-        # 一字涨停检测
+        # 一字涨停检测 (一字涨停无法买入)
         if bar['open'] == bar['high'] == bar['low'] == bar['close']:
-            if bar['open'] > signal_price * 1.095:
+            # 获取 ST 标签：优先从行情 bar 中获取，否则设为非 ST
+            is_st = bar.get('is_st', 0) == 1
+            # ST 股涨停阈值取 1.045, 普通股取 1.095
+            limit_threshold = 1.045 if is_st else 1.095
+            
+            if bar['open'] > signal_price * limit_threshold:
                 return None, None
 
         return next_date, bar['open']

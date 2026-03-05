@@ -22,6 +22,8 @@ def auto_fill_paper_trading_prices():
     If found, update the positions with the retrieved price.
     """
     logger.info("Starting auto-fill paper trading prices...")
+    paper_conn = None
+    data_conn = None
     try:
         paper_conn = get_paper_db()
         data_conn = get_db_connection()
@@ -47,11 +49,12 @@ def auto_fill_paper_trading_prices():
                 logger.info(f"Filled buy_price {open_price} for {code} on {buy_date}")
         
         paper_conn.commit()
-        paper_conn.close()
-        data_conn.close()
         logger.info(f"Auto-filled {filled_count} prices successfully.")
     except Exception as e:
         logger.error(f"Error in auto_fill_paper_trading_prices: {e}")
+    finally:
+        if paper_conn: paper_conn.close()
+        if data_conn: data_conn.close()
 
 async def check_yfinance_update():
     """
@@ -66,6 +69,7 @@ async def check_yfinance_update():
 
     trial_symbol = "600000"
     
+    data_conn = None
     try:
         # 获取数据库记录的最新日期
         data_conn = get_db_connection()
@@ -73,8 +77,10 @@ async def check_yfinance_update():
         cursor.execute("SELECT MAX(date) FROM daily_data WHERE code=?", (trial_symbol,))
         row = cursor.fetchone()
         db_last_date = row[0] if row and row[0] else None
-        data_conn.close()
+    finally:
+        if data_conn: data_conn.close()
         
+    try:
         if not db_last_date:
             logger.info(f"数据库中未发现 {trial_symbol} 的记录，跳过预检。")
             return True
@@ -83,10 +89,11 @@ async def check_yfinance_update():
         
         yf_fetcher = YFinanceFetcher()
         yf_start = db_last_date.replace("-", "")
+        yf_end = (datetime.now()+timedelta(days=1)).strftime("%Y%m%d").replace('-','')
         
         # yf.get_historical_data 是同步的，放到线程池执行
         loop = asyncio.get_event_loop()
-        df = await loop.run_in_executor(None, lambda: yf_fetcher.get_historical_data(trial_symbol, start_date=yf_start))
+        df = await loop.run_in_executor(None, lambda: yf_fetcher.get_historical_data(trial_symbol, start_date=yf_start, end_date=yf_end))
         
         if not df.empty:
             yf_last_date = df['日期'].max()
@@ -140,7 +147,7 @@ scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 def start_scheduler():
     # Schedule to run from Monday to Friday at 19:00
     # 市场在周末及节假日通常不更新，这里只针对工作日设定单次触发
-    trigger = CronTrigger(day_of_week="mon-fri", hour=19, minute=0, timezone="Asia/Shanghai")
+    trigger = CronTrigger(day_of_week="mon-fri", hour=17, minute=30, timezone="Asia/Shanghai")
     scheduler.add_job(daily_data_update_job, trigger, id="daily_data_update", replace_existing=True)
     scheduler.start()
     logger.info("APScheduler started: Daily data update scheduled for Mon-Fri at 19:00.")

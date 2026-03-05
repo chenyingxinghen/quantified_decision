@@ -139,8 +139,19 @@ class ComprehensiveFactorCalculator:
                 
             # E. 交易状态因子 (涨停/停牌)
             status_factors = pd.DataFrame(index=data.index)
-            # 简单涨停检测：涨幅 > 9.3% 且 收盘=最高
-            status_factors['is_limit_up'] = ((data['close'] == data['high']) & (data['close'].pct_change() > 0.093)).astype(int)
+            # 获取 ST 标签：如果在 data 中存在则直接使用，否则通过 fundamental_calculator 查询数据库
+            is_st = False
+            if 'is_st' in data.columns:
+                is_st = data['is_st'].iloc[0] == 1
+            else:
+                info = self.fundamental_calculator.get_stock_info(code)
+                if info is not None:
+                    is_st = info.get('is_st') == 1
+            
+            # ST 股涨停阈值取 4.5% (对应 5% 限制)，普通股取 9.3% (对应 10% 限制)
+            limit_threshold = 0.045 if is_st else 0.093
+            
+            status_factors['is_limit_up'] = ((data['close'] == data['high']) & (data['close'].pct_change() > limit_threshold)).astype(int)
             # 停牌检测：成交量为 0
             status_factors['is_suspended'] = (data['volume'] == 0).astype(int)
 

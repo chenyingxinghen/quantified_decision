@@ -311,10 +311,6 @@ class BacktestEngine:
         if buy_price_abs == 0:
             return False, None, None
         
-        open_change_rate = (open_price - position.entry_price) / buy_price_abs
-        low_change_rate = (low - position.entry_price) / buy_price_abs
-        high_change_rate = (high - position.entry_price) / buy_price_abs
-        
         # 止损检查
         if position.stop_loss and ENABLE_STOP_LOSS_EXIT:
             if open_price <= position.stop_loss:
@@ -322,7 +318,7 @@ class BacktestEngine:
                 return True, open_price, 'stop_loss'
             if low <= position.stop_loss:
                 # 日内触及止损价
-                return True, position.stop_loss, 'stop_loss'
+                return True, position.close, 'stop_loss'
         
         # 止盈检查
         if ENABLE_TAKE_PROFIT_EXIT and position.take_profit:
@@ -333,10 +329,9 @@ class BacktestEngine:
                 # 日内触及止盈价
                 return True, position.take_profit, 'take_profit'
         
-        # 时间止损（持仓超过阙值未盈利且亏损超过阙值）
+        # 时间止损（持仓超过阙值且亏损超过阙值）
         if (ENABLE_TIME_STOP_EXIT and 
             position.holding_days >= TIME_STOP_DAYS and 
-            position.max_profit_rate <= 0 and
             position.unrealized_pnl_pct <= TIME_STOP_MIN_LOSS_PCT):
             return True, close, f'time_stoploss'
         

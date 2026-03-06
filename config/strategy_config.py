@@ -43,8 +43,8 @@ MAX_POSITIONS = 1                   # 最大持仓数量，分散风险
 # 卖出控制参数
 ENABLE_STOP_LOSS_EXIT = True        # 是否启用止损卖出
 ENABLE_TAKE_PROFIT_EXIT = True     # 是否启用止盈卖出
-ENABLE_SUPPORT_BREAK_EXIT = True    # 是否启用跌破支撑卖出
-ENABLE_TIME_STOP_EXIT = True        # 是否启用时间止损卖出
+ENABLE_SUPPORT_BREAK_EXIT = False    # 是否启用跌破支撑卖出
+ENABLE_TIME_STOP_EXIT = False        # 是否启用时间止损卖出
 
 # 时间止损参数
 TIME_STOP_DAYS = 10                 # 增加时间止损天数，匹配预测周期
@@ -69,7 +69,7 @@ MIN_TOUCHES = 2                     # 趋势线最少触点数
 # ==============================================================================
 ENABLE_FUNDAMENTAL_FILTER = False
 MIN_MARKET_CAP = 0
-MAX_PE = 8000000000
+MAX_PE = None
 MIN_PRICE = 0
-MAX_PRICE = 2000000000
+MAX_PRICE = None
 INCLUDE_ST = True

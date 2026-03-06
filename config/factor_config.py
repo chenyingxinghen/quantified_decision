@@ -56,7 +56,7 @@ class ModelConfig:
 
         'label_gain': [float(i**2 - 1) for i in range(100)], 
         'objective': 'lambdarank',
-        'metric': 'ndc',
+        'metric': 'ndcg',
         'lambdarank_truncation_level': 100,
         'random_state': 42,
         'n_jobs': -1,

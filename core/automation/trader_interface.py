@@ -1,0 +1,217 @@
+"""
+easytrader 交易接口封装
+
+负责与同花顺/各券商客户端进行 GUI 交互。
+"""
+
+import sys
+import os
+import time
+import json
+import logging
+import pandas as pd
+from typing import List, Dict, Optional, Any
+
+# 添加项目根目录
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+
+from core.automation.easytrader_patch import RobustClientTrader, get_patched_trader
+from config.automation_config import TRADER_TYPE, CONFIG_JSON_PATH, DRY_RUN
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(PROJECT_ROOT,'logs', "trader.log"), encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("AutoTraderInterface")
+
+class AutoTrader:
+    """自动化交易接口包装类 (已集成 Easytrader 补丁)"""
+    
+    def __init__(self):
+        self.user = None
+        self.is_connected = False
+        self.dry_run = DRY_RUN
+        
+        # 确保数据目录存在
+        os.makedirs(os.path.join(PROJECT_ROOT, "data", "automation"), exist_ok=True)
+        
+    def connect(self):
+        """连接交易客户端"""
+        if self.dry_run:
+            logger.info("模拟模式 (Dry Run) 已启用，跳过真实连接步骤。")
+            self.is_connected = True
+            return True
+            
+        try:
+            logger.info(f"正在启动 {TRADER_TYPE} 交易客户端并连接...")
+            
+            # 使用补丁后的 RobustClientTrader
+            self.user = get_patched_trader('ths') 
+            
+            # 这里的路径通常在配置文件或硬编码。
+            exe_path = r'F:\同花顺\同花顺\xiadan.exe'
+            logger.info(f"连接路径: {exe_path}")
+            
+            self.user.connect(exe_path)
+            self.is_connected = True
+            logger.info("交易客户端连接成功！")
+            return True
+        except Exception as e:
+            logger.error(f"连接交易客户端失败: {e}")
+            self.is_connected = False
+            return False
+
+    def get_balance(self) -> Dict:
+        """获取资金状况"""
+        if self.dry_run:
+            return {"可用金额": 1000000.0, "总资产": 1000000.0, "可用": 1000000.0}
+            
+        if not self.is_connected:
+            if not self.connect(): return {}
+            
+        try:
+            # easytrader 的 balance 返回通常是列表
+            res = self.user.balance
+            if isinstance(res, list) and len(res) > 0:
+                return res[0]
+            return res
+        except Exception as e:
+            logger.error(f"获取资金失败: {e}", exc_info=True)
+            return {}
+
+    def get_positions(self) -> List[Dict]:
+        """获取当前持仓"""
+        if self.dry_run:
+            return []
+            
+        if not self.is_connected:
+            if not self.connect(): return []
+            
+        try:
+            return self.user.position
+        except Exception as e:
+            logger.error(f"获取持仓失败: {e}")
+            return []
+
+    def buy(self, stock_code: str, amount: int, price: Optional[float] = None) -> Dict:
+        """执行买入指令"""
+        logger.info(f"尝试买入: {stock_code}, 数量: {amount}, 价格: {price or '市价'}")
+        
+        if self.dry_run:
+            logger.info(f"模拟买入成功: {stock_code}, {amount}股")
+            return {"status": "success", "msg": "dry_run", "entrust_no": "999999"}
+            
+        if not self.is_connected:
+            if not self.connect(): return {"status": "error", "msg": "not_connected"}
+            
+        try:
+            # 对于 GUI 自动化（如同花顺），通常需要填写具体价格。
+            # 如果 price 为 None，easytrader 内部格式化可能会报 NoneType 错误。
+            if price is None:
+                err_msg = "买入失败: 未提供价格。GUI 自动化建议提供具体价格（如涨停价或最新价）。"
+                logger.error(err_msg)
+                return {"status": "error", "msg": err_msg}
+
+            # # 截图保存，用于调试
+            # try:
+            #     shot_path = os.path.join(PROJECT_ROOT, "logs", f"buy_{stock_code}_after.png")
+            #     self.user._main.capture_as_image().save(shot_path)
+            #     logger.info(f"已保存买入后截图: {shot_path}")
+            # except:
+            #     pass
+                
+            res = self.user.buy(stock_code, price=price, amount=amount)
+            logger.info(f"买入响应: {res}")
+            return res
+        except Exception as e:
+            logger.error(f"买入执行失败: {e}")
+            return {"status": "error", "msg": str(e)}
+
+    def sell(self, stock_code: str, amount: int, price: Optional[float] = None) -> Dict:
+        """执行卖出指令"""
+        logger.info(f"尝试卖出: {stock_code}, 数量: {amount}, 价格: {price or '市价'}")
+        
+        if self.dry_run:
+            logger.info(f"模拟卖出成功: {stock_code}, {amount}股")
+            return {"status": "success", "msg": "dry_run", "entrust_no": "888888"}
+            
+        if not self.is_connected:
+            if not self.connect(): return {"status": "error", "msg": "not_connected"}
+            
+        try:
+            if price is None:
+                err_msg = "卖出失败: 未提供价格。GUI 自动化建议提供具体价格（如跌停价或最新价）。"
+                logger.error(err_msg)
+                return {"status": "error", "msg": err_msg}
+
+            res = self.user.sell(stock_code, price=price, amount=amount)
+            logger.info(f"卖出响应: {res}")
+            return res
+        except Exception as e:
+            logger.error(f"卖出执行失败: {e}")
+            return {"status": "error", "msg": str(e)}
+
+    def sell_all(self, stock_code: str, price: Optional[float] = None) -> Dict:
+        """全仓卖出某只股票"""
+        positions = self.get_positions()
+        # 匹配代码 (部分券商代码带后缀，部分不带)
+        target = None
+        for p in positions:
+            p_code = p.get('证券代码', p.get('stock_code', ''))
+            if stock_code in p_code or p_code in stock_code:
+                target = p
+                break
+        
+        if target:
+            # 优先使用传入价格，若无则尝试从持仓中获取当前价
+            sell_price = price or target.get('当前价', target.get('last_price', target.get('现价')))
+            try:
+                if sell_price: sell_price = float(sell_price)
+            except:
+                sell_price = None
+
+            amount = int(target.get('可用余额', target.get('可卖数量', 0)))
+            if amount > 0:
+                return self.sell(stock_code, amount, price=sell_price)
+            else:
+                logger.warning(f"{stock_code} 可用持仓为 0，无法卖出。")
+                return {"status": "skipped", "msg": "zero_balance"}
+        else:
+            logger.warning(f"未找到 {stock_code} 的持仓记录。")
+            return {"status": "skipped", "msg": "no_position"}
+
+if __name__ == "__main__":
+    # 简单的冒烟测试
+    trader = AutoTrader()
+    # 如果不是模拟模式，请谨慎运行以下代码
+    if trader.dry_run:
+        print("Dry Run 模式测试:")
+        print("Balance:", trader.get_balance())
+        print("Positions:", trader.get_positions())
+        trader.buy("002397", 200, price=4.5)
+    else:
+        logger.info("准备进行真实交易测试...")
+        if trader.connect():
+            # 尝试先获取资金，验证连接质量
+            balance = trader.get_balance()
+            logger.info(f"当前资金状况: {balance}")
+            print("Positions:", trader.get_positions())
+
+            # 执行买入测试 (使用一个较远的价格避免成交，或者使用当前价测试逻辑)
+            # 注意：002397 梦洁股份
+            # res = trader.buy("002397", 100, price=4.30)
+            # logger.info(f"最终买入执行结果: {res}")
+            
+            # # 如果成功，等待一下看是否有单号
+            # if res.get('entrust_no'):
+            #     logger.info(f"成功获取到委托单号: {res['entrust_no']}")
+            # else:
+            #     logger.warning("未获取到委托单号，可能未成交或逻辑异常")
+        else:
+            logger.error("连接测试失败")

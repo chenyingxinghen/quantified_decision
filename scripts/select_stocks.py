@@ -95,8 +95,7 @@ def find_latest_model(base_dir: str) -> Optional[str]:
 def load_smart_model(model_path: str):
     """
     智能加载模型：
-    1. 如果是一个包含 xgboost 和 lightgbm pkl 的目录，自动创建 Ensemble
-    2. 如果是一个 pkl 文件，根据内容加载为 MLFactorModel 或 EnsembleFactorModel
+    1. 如果是一个 pkl 文件，根据内容加载为 MLFactorModel 或 EnsembleFactorModel
     """
     from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
     
@@ -123,14 +122,9 @@ def load_smart_model(model_path: str):
     if not os.path.exists(model_path):
         return None
         
-    try:
-        # 尝试作为集成模型加载
-        return EnsembleFactorModel.load_model(model_path)
-    except Exception:
-        # 作为普通模型加载
-        m = MLFactorModel()
-        m.load_model(model_path)
-        return m
+    m = MLFactorModel()
+    m.load_model(model_path)
+    return m
 
 # ============================================================================
 # 数据库辅助

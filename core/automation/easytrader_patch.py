@@ -226,6 +226,8 @@ class RobustClientTrader(ClientTrader):
     def connect(self, exe_path=None, **kwargs):
         import pywinauto
         connect_path = exe_path or self._config.DEFAULT_EXE_PATH
+        os.startfile(connect_path)
+        time.sleep(5)
         logger.info(f"尝试连接: {connect_path}")
         
         try:

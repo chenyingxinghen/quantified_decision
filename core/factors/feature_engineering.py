@@ -11,28 +11,11 @@ import psutil
 
 
 class FeatureEngineer:
-    """特征工程器 - 生成交叉因子和衍生因子（单例模式）"""
-    
-    _instance = None
-    _initialized = False
-    
-    def __new__(cls):
-        """实现单例模式"""
-        if cls._instance is None:
-            cls._instance = super(FeatureEngineer, cls).__new__(cls)
-        return cls._instance
+    """特征工程器 - 生成交叉因子和衍生因子"""
     
     def __init__(self):
-        """初始化特征工程器（仅初始化一次）"""
-        if not FeatureEngineer._initialized:
-            self.generated_features = []
-            FeatureEngineer._initialized = True
-    
-    @classmethod
-    def reset(cls):
-        """重置单例实例"""
-        cls._instance = None
-        cls._initialized = False
+        """初始化特征工程器"""
+        self.generated_features = []
     
     def create_ratio_features(self, df: pd.DataFrame, 
                              numerator_cols: List[str], 
@@ -552,11 +535,12 @@ class FeatureEngineer:
         return df
     
     def apply_all_transformations(self, df: pd.DataFrame,
-                                  config: Optional[Dict] = None) -> pd.DataFrame:
+                                  config: Optional[Dict] = None,
+                                  verbose: bool = False) -> pd.DataFrame:
         """
-        应用所有特征工程变换，并输出详细的统计报告
+        应用所有特征工程变换，根据 verbose 控制输出
         """
-        self.reset()
+        self.generated_features = [] # 每次转换重置结果列表，确保实例内逻辑干净
         if config is None:
             config = {
                 'ratio': True, 'product': True, 'difference': True,
@@ -631,15 +615,16 @@ class FeatureEngineer:
             result = self.create_interaction_features(result, tech_indicators[:4], fundamental_factors[:3])
             stats['交互特征 (Tech*Fund)'] = len(self.generated_features) - pre_count
 
-        # 输出统计报告
-        print("\n" + "-"*40)
-        print("特征工程报告:")
-        print(f"  识别到: {len(tech_indicators)} 个技术指标, {len(fundamental_factors)} 个基本面因子")
-        for name, count in stats.items():
-            if count > 0:
-                print(f"  - {name}: +{count} 个")
-        print(f"  总计: 原始 {initial_count} -> 现计 {len(result.columns)} (新增 {len(self.generated_features)})")
-        print("-"*40 + "\n")
+        # 仅在 verbose 为 True 时输出统计报告
+        if verbose:
+            print("\n" + "-"*40)
+            print("特征工程报告:")
+            print(f"  识别到: {len(tech_indicators)} 个技术指标, {len(fundamental_factors)} 个基本面因子")
+            for name, count in stats.items():
+                if count > 0:
+                    print(f"  - {name}: +{count} 个")
+            print(f"  总计: 原始 {initial_count} -> 现计 {len(result.columns)} (新增 {len(self.generated_features)})")
+            print("-"*40 + "\n")
         
         return result
     

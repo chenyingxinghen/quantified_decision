@@ -275,7 +275,6 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
                     top_n=req.top_n,
                     apply_filter=user_filters.get("apply_filter", req.apply_filter),
                     workers=4,
-                    only_cache=True, 
                     save_csv=False,
                     min_market_cap=user_filters.get("min_market_cap"),
                     max_pe=user_filters.get("max_pe"),

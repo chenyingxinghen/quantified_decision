@@ -329,19 +329,38 @@ def get_factors_for_single_stock(
             return None
 
         factors = None
+        cache_file = None
+        last_db_date = str(data['date'].iloc[-1])
         
-        # 2. 尝试从缓存加载因子
+        # 2. 尝试从缓存加载因子并验证时效性
         if cache_dir:
             cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
             if os.path.exists(cache_file):
                 try:
-                    factors = pd.read_parquet(cache_file)
+                    df_cache = pd.read_parquet(cache_file)
+                    if not df_cache.empty and 'date' in df_cache.columns:
+                        last_cache_date = str(df_cache['date'].iloc[-1])
+                        # 如果缓存的最新日期与数据库一致，则认为缓存有效
+                        if last_cache_date >= last_db_date:
+                            factors = df_cache
                 except:
                     pass
 
-        # 3. 如果没缓存且允许计算，则计算因子
+        # 3. 如果无有效缓存且允许计算，则重新计算因子并保存
         if factors is None and not only_cache:
             factors = factor_calculator.calculate_all_factors(code, data)
+            if factors is not None and not factors.empty:
+                # 记录日期以支持下次对比 (与 train_ml_model 逻辑对齐)
+                factors = factors.copy()
+                factors['date'] = data['date'].values
+                
+                # 保存到缓存，以便下次提速
+                if cache_file:
+                    try:
+                        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                        factors.to_parquet(cache_file, index=False)
+                    except Exception as e:
+                        pass
 
         if factors is None or factors.empty:
             return None
@@ -379,7 +398,7 @@ def select_stocks(
     apply_filter: bool = False,
     workers: int = DEFAULT_WORKERS,
     cache_dir: str = DEFAULT_CACHE_DIR,
-    only_cache: bool = True,
+    only_cache: bool = False,
     save_csv: bool = True,
     # 新增过滤参数，用于从后端动态传入
     min_market_cap: Optional[float] = None,
@@ -507,10 +526,11 @@ def select_stocks(
     done_count = 0
     total = len(candidate_codes)
 
+    # 初始化计算器 (单例复用以减少内存和连接压力)
+    factor_calculator = ComprehensiveFactorCalculator(db_path=DATABASE_PATH)
+    
     def _worker(code: str) -> Optional[Dict]:
-        # 每个线程创建独立的 calculator 避免 sqlite 线程安全问题
-        calc = ComprehensiveFactorCalculator(db_path=DATABASE_PATH)
-        return get_factors_for_single_stock(code, DATABASE_PATH, calc, cache_dir=cache_dir, only_cache=only_cache)
+        return get_factors_for_single_stock(code, DATABASE_PATH, factor_calculator, cache_dir=cache_dir, only_cache=only_cache)
 
     print(f"   正在多线程获取因子数据...")
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -755,8 +775,8 @@ def parse_args():
         help=f'因子缓存目录 (默认: {DEFAULT_CACHE_DIR})',
     )
     parser.add_argument(
-        '--only-cache', action='store_true', default=True,
-        help='只从缓存中读取因子 (默认: True)',
+        '--only-cache', action='store_true', default=False,
+        help='强制只从缓存中读取因子 (忽略数据库更新)',
     )
     parser.add_argument(
         '--no-only-cache', action='store_false', dest='only_cache',

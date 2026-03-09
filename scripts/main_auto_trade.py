@@ -131,10 +131,10 @@ def main_loop():
     logger.info("自动交易主调度开始运行 (基于 APScheduler 任务中断模式)")
     logger.info("=" * 60)
 
-    # 启动时先获取一下今日信号作为兜底
-    signals = get_latest_signals()
-    if signals:
-        controller.set_buy_signals(signals)
+    # # 启动时先获取一下今日信号作为兜底
+    # signals = get_latest_signals()
+    # if signals:
+    #     controller.set_buy_signals(signals)
 
     scheduler = BlockingScheduler()
 

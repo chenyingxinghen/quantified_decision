@@ -172,23 +172,20 @@ class ComprehensiveFactorCalculator:
     def _apply_feature_engineering(self, base_factors: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
         """应用特征工程变换"""
         try:
-            # 临时重置或配置 feature_engineer
+            # 识别特征工程配置
             config = {
                 'ratio': True, 'product': True, 'difference': True,
                 'log': True, 'sqrt': True, 'rank': True,
                 'interaction': True, 'categorical': True,
             }
             
-            if not verbose:
-                # 抑制冗余输出
-                old_stdout = sys.stdout
-                sys.stdout = io.StringIO()
-                try:
-                    engineered = self.feature_engineer.apply_all_transformations(base_factors, config=config)
-                finally:
-                    sys.stdout = old_stdout
-            else:
-                engineered = self.feature_engineer.apply_all_transformations(base_factors, config=config)
+            # 直接调用特征工程，不再使用强行拦截 stdout 的方式（线程不安全）
+            # 特征工程内部已根据性能优化减少了日志输出
+            engineered = self.feature_engineer.apply_all_transformations(
+                base_factors, 
+                config=config,
+                verbose=verbose # 新增：透传 verbose 参数
+            )
                 
             return engineered
         except Exception as e:

@@ -73,6 +73,7 @@ def update_multiple_stocks(symbols, prefer_source='yfinance', incremental=True):
                 print(f"\n[{i}/{len(symbols)}]")
             try:
                 fetcher.update_daily_data(symbol, incremental=incremental)
+                time.sleep(0.2)
                 success_count += 1
             except Exception as e:
                 print(f"✗ 更新{symbol}失败: {e}")

@@ -255,7 +255,7 @@ class DataFetcher:
             # 使用代理重试机制获取股票列表
             # 尝试从数据库获取股票列表，如果不存在则从API获取
             cursor = self.conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM stock_info")
+            cursor.execute("SELECT COUNT(*) FROM stock_info_extended")
             count_info = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM daily_data")
             count_data = cursor.fetchone()[0]
@@ -462,14 +462,6 @@ class DataFetcher:
         result = cursor.fetchone()
         return result[0] if result[0] else None
     
-    def get_last_update_time(self, symbol):
-        """获取股票最后更新时间戳（用于判断是否需要更新当天数据）"""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT update_time FROM stock_info_extended WHERE code = ?
-        ''', (symbol,))
-        result = cursor.fetchone()
-        return result[0] if result and result[0] else None
     
     def get_first_update_date(self, symbol):
         """获取股票最早更新日期"""
@@ -810,7 +802,7 @@ class DataFetcher:
                                         # 更新stock_info的update_time
                                         update_time = datetime.now()
                                         cursor.execute('''
-                                            UPDATE stock_info SET update_time = ? WHERE code = ?
+                                            UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                                         ''', (update_time, stock_code))
                                         
                                         conn.commit()
@@ -845,7 +837,7 @@ class DataFetcher:
                                     # 更新stock_info的update_time
                                     update_time = datetime.now()
                                     cursor.execute('''
-                                        UPDATE stock_info SET update_time = ? WHERE code = ?
+                                        UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                                     ''', (update_time, stock_code))
                                     
                                     conn.commit()
@@ -877,7 +869,7 @@ class DataFetcher:
                                 # 更新stock_info的update_time
                                 update_time = datetime.now()
                                 cursor.execute('''
-                                    UPDATE stock_info SET update_time = ? WHERE code = ?
+                                    UPDATE stock_info_extended SET update_time = ? WHERE code = ?
                                 ''', (update_time, stock_code))
                                 
                                 conn.commit()

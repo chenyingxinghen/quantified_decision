@@ -66,3 +66,5 @@ quantification-system/frontend/dist
 quantification-system/frontend/.*
 quantification-system/backend/log
 logs
+new_data/*
+A股股票列表.csv

@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, USER_DB_PATH, DATABASE_DIR
 from config.strategy_config import ML_FACTOR_MODEL_PATH
 
 
@@ -33,7 +33,7 @@ def get_project_root() -> str:
 
 
 # ── User 专用数据库 (包含配置、会话、模拟盘持仓) ──────────────────────────
-USER_DB_PATH = os.path.join(PROJECT_ROOT, "data", "user_data.db")
+# 路径已由 config.USER_DB_PATH 统一管理
 
 
 def get_user_db():
@@ -103,14 +103,25 @@ def get_paper_db():
 
 def init_user_db():
     """初始化 user_data 数据库表"""
-    # 如果旧的 paper_trading.db 存在且 user_data.db 不存在，则进行更名
-    旧路径 = os.path.join(PROJECT_ROOT, "data", "paper_trading.db")
+    # 如果库不存在，尝试从旧 data 目录迁移（仅用于初次更名/搬家）
+    old_data_dir = os.path.join(PROJECT_ROOT, "data")
+    old_user_db = os.path.join(old_data_dir, "user_data.db")
+    旧路径 = os.path.join(old_data_dir, "paper_trading.db")
     if os.path.exists(旧路径) and not os.path.exists(USER_DB_PATH):
         try:
             os.rename(旧路径, USER_DB_PATH)
             print(f"✅ 已将 {旧路径} 重命名为 {USER_DB_PATH}")
         except Exception as e:
             print(f"⚠️ 重命名数据库失败: {e}")
+            
+    if os.path.exists(old_user_db) and not os.path.exists(USER_DB_PATH):
+        try:
+            os.makedirs(DATABASE_DIR, exist_ok=True)
+            import shutil
+            shutil.move(old_user_db, USER_DB_PATH)
+            print(f"✅ 已将 {old_user_db} 移动至 {USER_DB_PATH}")
+        except Exception as e:
+            print(f"⚠️ 移动数据库失败: {e}")
 
     conn = get_user_db()
     try:

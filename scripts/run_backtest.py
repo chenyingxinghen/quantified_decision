@@ -9,7 +9,7 @@ import sys
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from core.data.data_fetcher import DataFetcher
 from core.backtest import BacktestEngine, DataHandler, PerformanceAnalyzer
 from core.backtest.strategies import MLFactorBacktestStrategy
 from config import DATABASE_PATH,TrainingConfig
@@ -18,7 +18,8 @@ from config.strategy_config import (
     ML_FACTOR_MODEL_PATH,
     INITIAL_CAPITAL,
     COMMISSION_RATE,
-    MAX_POSITIONS
+    MAX_POSITIONS,
+    SELECTOR_MARKETS
 )
 import pandas as pd
 import sqlite3
@@ -91,13 +92,10 @@ def main():
     # 提前获取股票代码
     stock_codes = None # 这里可以指定，不指定则从DB获取
     if stock_codes is None:
-        conn = sqlite3.connect(DATABASE_PATH)
-        stock_codes_df = pd.read_sql_query(
-            f"SELECT DISTINCT code FROM daily_data LIMIT {TrainingConfig.STOCK_NUM}", 
-            conn
-        )
-        conn.close()
-        stock_codes = stock_codes_df['code'].tolist()
+        df = DataFetcher()
+        df = df.get_stock_list(markets=SELECTOR_MARKETS)
+        stock_codes = df['code'].tolist()
+
 
     # 为了让第1个交易日就有足够的历史数据（DataHandler要求至少30天），
     # 我们加载比回测开始日期更早的数据

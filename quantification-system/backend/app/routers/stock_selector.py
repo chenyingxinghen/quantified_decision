@@ -174,6 +174,8 @@ class RunSelectionRequest(BaseModel):
     model_path: Optional[str] = None
     model_types: List[str] = ["lgbm", "xgboost"]
     guest_config: Optional[str] = None  # 游客本地配置 JSON 字符串，用于基础筛选条件
+    markets: Optional[List[str]] = None
+    max_zcfzl: Optional[float] = None
 
 
 @router.post("/run")
@@ -227,8 +229,10 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
                             "max_pe":         user_conf.get("MAX_PE"),
                             "min_price":      user_conf.get("MIN_PRICE"),
                             "max_price":      user_conf.get("MAX_PRICE"),
+                            "max_zcfzl":      user_conf.get("MAX_ZCFZL"),
                             "include_st":     user_conf.get("INCLUDE_ST"),
                             "apply_filter":   user_conf.get("ENABLE_FUNDAMENTAL_FILTER"),
+                            "markets":        user_conf.get("SELECTOR_MARKETS"),
                         }
                         user_filters = {k: v for k, v in user_filters.items() if v is not None}
                 else:
@@ -241,8 +245,10 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
                                 "max_pe":         guest_conf.get("MAX_PE"),
                                 "min_price":      guest_conf.get("MIN_PRICE"),
                                 "max_price":      guest_conf.get("MAX_PRICE"),
+                                "max_zcfzl":      guest_conf.get("MAX_ZCFZL"),
                                 "include_st":     guest_conf.get("INCLUDE_ST"),
                                 "apply_filter":   guest_conf.get("ENABLE_FUNDAMENTAL_FILTER"),
+                                "markets":        guest_conf.get("SELECTOR_MARKETS"),
                             }
                             user_filters = {k: v for k, v in user_filters.items() if v is not None}
                         except Exception as ge:
@@ -278,9 +284,11 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
                     save_csv=False,
                     min_market_cap=user_filters.get("min_market_cap"),
                     max_pe=user_filters.get("max_pe"),
+                    max_zcfzl=req.max_zcfzl or user_filters.get("max_zcfzl"),
                     min_price=user_filters.get("min_price"),
                     max_price=user_filters.get("max_price"),
                     include_st=user_filters.get("include_st"),
+                    markets=req.markets or user_filters.get("markets"),
                 )
                 
                 for r in results:
@@ -441,3 +449,6 @@ async def get_candlestick_signals(code: str, days: int = Query(default=100, ge=1
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+# ── 股票检索 (已迁移至 /api/fundamental/search) ──────────────────────────────────────────
+# search 与 fundamental 端点已统一迁移至 app/routers/fundamentals.py

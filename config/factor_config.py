@@ -21,11 +21,12 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 4,              # 增加深度以改善预测区分度
+        'max_depth': 5,              # 增加深度以改善预测区分度
         'min_child_weight': 5,       # 增加权重要求，防止过拟合
         'learning_rate': 0.02,       # 降低学习率
         'subsample': 1,
-        'colsample_bytree': 1,     
+        'colsample_bytree': 1, 
+        'gamma': 0.1,    
         
         'reg_alpha': 3,            
         'reg_lambda': 8,             
@@ -34,9 +35,7 @@ class ModelConfig:
         'random_state': 42,
         'n_jobs': -1,
         'early_stopping_rounds': 50,
-        # 'verbosity': 1,              # 打印训练过程
-
-        # 'device': 'cuda',                # 使用第一个GPU
+        'verbosity': 1,              # 打印训练过程
     }
     
     # LightGBM配置
@@ -44,10 +43,9 @@ class ModelConfig:
         'n_estimators': 3000,
         'max_depth': 5,
         'num_leaves': 63,
-        'learning_rate': 0.02,
+        'learning_rate': 0.04,
         'min_data_in_leaf': 150,
         'min_gain_to_split': 0.01,
-        # 'subsample_freq': 1,
 
         'reg_alpha': 3,
         'reg_lambda': 8,
@@ -60,16 +58,14 @@ class ModelConfig:
         'lambdarank_truncation_level': 100,
         'random_state': 42,
         'n_jobs': -1,
-        'verbose': 0,              # 0:不打印，1:打印
+        'verbosity': -1,
         'early_stopping_rounds': 50,
         'force_row_wise': True,    
-
-        # 'device': 'gpu',
     }
     
     
     # 默认使用的模型类型
-    DEFAULT_MODELS = ['xgboost', 'lightgbm']
+    DEFAULT_MODELS = ['xgboost']
     
     @classmethod
     def get_model_params(cls, model_type: str) -> Dict[str, Any]:
@@ -90,12 +86,12 @@ class TrainingConfig:
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
 
-    INCLUDE_FUNDAMENTALS = False  # 是否包含基本面因子
+    INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
 
     YEARS_FOR_BACKTEST=2         # 回测年数
-    YEARS_FOR_TRAINING=8         # 训练年数
-    STOCK_NUM = 5000             # 股票数量
+    YEARS_FOR_TRAINING=13         # 训练年数
+    STOCK_NUM = 6000             # 股票数量
     # 数据集划分
     TRAIN_TEST_SPLIT = 0.7
 
@@ -104,7 +100,7 @@ class TrainingConfig:
     
 
     # 缓存目录
-    CACHE_DIR = 'data/factors_cache'
+    CACHE_DIR = 'database/system_data/factors_cache'
     # 模型保存目录
     SAVE_DIR = 'models'
     
@@ -237,8 +233,6 @@ class FactorModelConfig:
         print("\n[训练配置]")
         print(f"训练集比例: {cls.training.TRAIN_TEST_SPLIT}")
         print(f"预测天数: {cls.training.FUTURE_DAYS}")
-        print(f"路径预测: {'开启' if cls.training.USE_PATH_BASED_LABEL else '关闭'}")
-        print(f"止盈/止损ATR倍数: {cls.training.ATR_TP_MULTIPLIER}x/{cls.training.ATR_SL_MULTIPLIER}x")
         
         print("\n[因子配置]")
         print(f"RSI周期: {cls.factor.RSI_PERIOD}")

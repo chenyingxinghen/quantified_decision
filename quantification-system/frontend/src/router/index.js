@@ -27,6 +27,12 @@ const routes = [
         meta: { title: '技术分析', icon: 'TrendCharts' },
     },
     {
+        path: '/fundamental',
+        name: 'Fundamental',
+        component: () => import('../views/FundamentalsView.vue'),
+        meta: { title: '基本面分析', icon: 'Histogram' },
+    },
+    {
         path: '/config',
         name: 'Config',
         component: () => import('../views/ConfigView.vue'),

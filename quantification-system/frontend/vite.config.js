@@ -19,6 +19,18 @@ export default defineConfig({
             },
         },
     },
+    build: {
+        rollupOptions: {
+            output: {
+                manualChunks: {
+                    'echarts': ['echarts'],
+                    'element-plus': ['element-plus'],
+                    'vue-core': ['vue', 'vue-router']
+                }
+            }
+        },
+        chunkSizeWarningLimit: 1500
+    }
 })
 
 

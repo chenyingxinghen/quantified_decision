@@ -93,6 +93,7 @@
         <el-table-column label="操作" min-width="220" align="right">
           <template #default="{ row }">
             <div style="display: flex; gap: 8px; justify-content: flex-end; padding-right: 12px">
+              <el-tooltip content="基本面分析" placement="top"><el-button size="small" circle type="warning" @click.stop="showFundamental(row.stock_code)"><el-icon><InfoFilled /></el-icon></el-button></el-tooltip>
               <el-tooltip content="因子快照" placement="top"><el-button size="small" circle @click.stop="showFactors(row.stock_code)"><el-icon><PieChart /></el-icon></el-button></el-tooltip>
               <el-tooltip content="形态识别" placement="top"><el-button size="small" circle @click.stop="showSignals(row.stock_code)"><el-icon><Lightning /></el-icon></el-button></el-tooltip>
               <el-tooltip content="技术分析" placement="top"><el-button size="small" circle type="primary" @click.stop="goAnalysis(row.stock_code)"><el-icon><TrendCharts /></el-icon></el-button></el-tooltip>
@@ -117,10 +118,14 @@
           <div class="tag tag-neutral">{{ factorData.latest_date ?? '最新' }}</div>
         </div>
         
-        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px">
-          <div v-for="item in factorList.slice(0, 10)" :key="item.name" class="factor-item glass">
-            <span class="factor-name">{{ item.name }}</span>
-            <span class="factor-value">{{ item.value != null ? Number(item.value).toFixed(4) : 'N/A' }}</span>
+        <div style="max-height: 500px; overflow-y: auto; padding-right: 8px">
+          <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px">
+            <div v-for="item in factorList.slice(0, 100)" :key="item.name" class="factor-item glass" :style="{ borderLeft: getFactorColor(item.name) }">
+              <el-tooltip :content="item.name" placement="top">
+                <span class="factor-name">{{ formatFactorName(item.name) }}</span>
+              </el-tooltip>
+              <span class="factor-value">{{ formatFactorValue(item.value) }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -166,6 +171,8 @@
         </div>
       </div>
     </el-dialog>
+
+
   </div>
 </template>
 
@@ -175,7 +182,7 @@ import { useRouter } from 'vue-router'
 import { stockSelector } from '../api'
 import { ElMessage } from 'element-plus'
 import { 
-  Search, Refresh, Loading, PieChart, 
+  Search, Refresh, Loading, PieChart, InfoFilled,
   TrendCharts, Lightning, CaretTop, CaretBottom, Aim
 } from '@element-plus/icons-vue'
 import { paperTrading } from '../api'
@@ -222,6 +229,8 @@ const factorList = computed(() => {
 const signalVisible = ref(false)
 const signalLoading = ref(false)
 const signalData = ref({})
+
+
 
 let pollTimer = null
 
@@ -356,6 +365,10 @@ async function showSignals(code) {
   }
 }
 
+function showFundamental(code) {
+  router.push({ path: '/fundamental', query: { code } })
+}
+
 function goAnalysis(code) {
   router.push({ path: '/analysis', query: { code } })
 }
@@ -387,6 +400,36 @@ async function addToPaperTrading(row) {
     console.error(e)
     ElMessage.error('加入实盘验证失败')
   }
+}
+
+function formatFactorName(name) {
+  // 简单翻译/美化常见因子名
+  const dict = {
+    'roe_jq': 'ROE(加权)', 'roe_kc': 'ROE(扣非)', 'xsjll': '销售净利率', 'zzcjll': '总资产收益率',
+    'rev_yoy': '营收同比', 'np_yoy': '净利润同比', 'np_kc_yoy': '扣非净利同比',
+    'dynamic_pe': '动态PE', 'dynamic_pb': '动态PB', 'peg': 'PEG',
+    'zcfzl': '资产负债率', 'qycs': '权益乘数', 'ocf_to_eps': '现金流/EPS',
+    'pv_sync_5': '量价协同(5)', 'greed_index': '贪婪指数', 'turnover_zscore': '换手率Z分',
+    'buy_vol_ratio_10': '买盘比', 'net_buy_ratio_10': '净买比', 'amount_accel': '成交额加速'
+  }
+  return dict[name] || name
+}
+
+function formatFactorValue(val) {
+  if (val == null) return 'N/A'
+  const v = Number(val)
+  if (isNaN(v)) return val
+  if (Math.abs(v) > 1000) return v.toFixed(0)
+  if (Math.abs(v) > 100) return v.toFixed(1)
+  return v.toFixed(4)
+}
+
+function getFactorColor(name) {
+  const n = name.toLowerCase()
+  if (n.includes('roe') || n.includes('rev') || n.includes('np')) return '3px solid var(--accent-red)'
+  if (n.includes('pv_') || n.includes('vol') || n.includes('sync') || n.includes('greed')) return '3px solid var(--accent-blue)'
+  if (n.includes('pe') || n.includes('pb') || n.includes('peg')) return '3px solid var(--accent-green)'
+  return '3px solid transparent'
 }
 </script>
 
@@ -439,5 +482,33 @@ async function addToPaperTrading(row) {
 .pattern-badge .score {
   font-family: var(--font-mono);
   font-weight: 800;
+}
+
+.stat-card.mini {
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  text-align: center;
+}
+
+.stat-card.mini .stat-label {
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.stat-card.mini .stat-value.small {
+  font-size: 18px;
+  font-family: var(--font-mono);
+  color: var(--accent-blue);
+}
+
+.mini-table :deep(.el-table__cell) {
+  padding: 8px 0 !important;
+}
+
+.mini-table :deep(.el-table__header-wrapper th) {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 </style>

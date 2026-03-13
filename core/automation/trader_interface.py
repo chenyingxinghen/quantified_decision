@@ -91,13 +91,13 @@ class AutoTrader:
             return []
             
         if not self.is_connected:
-            if not self.connect(): return []
+            if not self.connect(): return None
             
         try:
             return self.user.position
         except Exception as e:
             logger.error(f"获取持仓失败: {e}")
-            return []
+            return None
 
     def buy(self, stock_code: str, amount: int, price: Optional[float] = None) -> Dict:
         """执行买入指令"""
@@ -160,6 +160,10 @@ class AutoTrader:
     def sell_all(self, stock_code: str, price: Optional[float] = None) -> Dict:
         """全仓卖出某只股票"""
         positions = self.get_positions()
+        if positions is None:
+            logger.error(f"  获取持仓失败，无法执行 {stock_code} 的全仓卖出。")
+            return {"status": "error", "msg": "fetch_positions_failed"}
+            
         # 匹配代码 (部分券商代码带后缀，部分不带)
         target = None
         for p in positions:
@@ -186,6 +190,35 @@ class AutoTrader:
             logger.warning(f"未找到 {stock_code} 的持仓记录。")
             return {"status": "skipped", "msg": "no_position"}
 
+    def test_captcha(self) -> bool:
+        """测试验证码识别填写"""
+        logger.info("开始测试验证码识别填写流程...")
+        if self.dry_run:
+            logger.info("模拟模式下不测试真实验证码。")
+            return True
+            
+        if not self.is_connected:
+            if not self.connect(): return False
+            
+        try:
+            logger.info("尝试触发持仓查询以测试验证码识别...")
+            # 为保证在同花顺中真正激活持仓页并选中所有内容进行复制测试，先主动调用一下撤单或者其他然后切回来
+            try:
+                self.user._switch_left_menus(['撤单[F3]']) # 先切走
+                time.sleep(0.5)
+            except: pass
+            
+            pos = self.get_positions()
+            if pos is not None:
+                logger.info("获取持仓成功！(如遇到验证码，应已自动填好)")
+                return True
+            else:
+                logger.error("验证码测试失败：未能获取到持仓。")
+                return False
+        except Exception as e:
+            logger.error(f"验证码测试异常: {e}")
+            return False
+
 if __name__ == "__main__":
     # 简单的冒烟测试
     trader = AutoTrader()
@@ -201,17 +234,10 @@ if __name__ == "__main__":
             # 尝试先获取资金，验证连接质量
             balance = trader.get_balance()
             logger.info(f"当前资金状况: {balance}")
-            print("Positions:", trader.get_positions())
-
-            # 执行买入测试 (使用一个较远的价格避免成交，或者使用当前价测试逻辑)
-            # 注意：002397 梦洁股份
-            # res = trader.buy("002397", 100, price=4.30)
-            # logger.info(f"最终买入执行结果: {res}")
             
-            # # 如果成功，等待一下看是否有单号
-            # if res.get('entrust_no'):
-            #     logger.info(f"成功获取到委托单号: {res['entrust_no']}")
-            # else:
-            #     logger.warning("未获取到委托单号，可能未成交或逻辑异常")
+            # 测试验证码识别
+            # trader.test_captcha()
+
+            print(trader.get_positions())
         else:
             logger.error("连接测试失败")

@@ -6,7 +6,7 @@ import os, sys, json, traceback
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
-from app.deps import get_db_path, get_db_connection
+from ..deps import get_db_connection
 
 router = APIRouter(prefix="/api/analysis", tags=["技术分析"])
 
@@ -146,27 +146,11 @@ async def get_patterns(code: str, days: int = Query(default=100, ge=10, le=1000)
         from core.analysis.candlestick_patterns import CandlestickPatterns
         cp = CandlestickPatterns()
         
-        bullish_history = []
-        bearish_history = []
-        
-        # 扫描范围：最近 90 天（或 df 长度）
+        # 使用高效的向量化历史扫描
         scan_len = min(len(df), 90)
-        for i in range(len(df) - scan_len, len(df)):
-            if i < 3: continue # 晨星等形态需要至少3根
-            sub_df = df.iloc[:i+1]
-            # 获取日期字符串
-            current_date = df['date'].iloc[i]
-            date_str = current_date.strftime('%Y-%m-%d') if hasattr(current_date, 'strftime') else str(current_date).split('T')[0]
-            
-            day_bullish = cp.detect_all_bullish_patterns(sub_df)
-            for p in day_bullish:
-                p['date'] = date_str
-                bullish_history.append(p)
-                
-            day_bearish = cp.detect_all_bearish_patterns(sub_df)
-            for p in day_bearish:
-                p['date'] = date_str
-                bearish_history.append(p)
+        history = cp.scan_patterns_history(df, scan_len=scan_len)
+        bullish_history = history['bullish']
+        bearish_history = history['bearish']
 
         # PA 市场结构 (针对全量数据)
         from core.analysis.price_action_analyzer import PriceActionAnalyzer

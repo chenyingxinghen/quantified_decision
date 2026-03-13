@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 from core.factors.quantitative_factors import QuantitativeFactors
 from core.factors.candlestick_pattern_factors import CandlestickPatternFactors
-from core.factors.fundamental_factors import FundamentalFactors
+from core.factors.fundamental_factors import FundamentalFactors, MarketSentimentFactors
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.feature_engineering import FeatureEngineer
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
@@ -43,7 +43,7 @@ class ComprehensiveFactorCalculator:
         
         参数:
             code: 股票代码
-            data: 股票数据 (OHLCV)
+            data: 股票数据 (OHLCV), 必须含 date/open/high/low/close/volume 列
             apply_feature_engineering: 是否应用特征工程 (比率、乘积等变换)
             target_features: 目标特征列表 (如果提供，将确保输出包含这些特征)
             verbose: 是否打印详细日志
@@ -106,25 +106,32 @@ class ComprehensiveFactorCalculator:
             # B. K线形态
             candlestick_factors = self.candlestick_calculator.calculate_all_candlestick_patterns(data)
             
-            # C. 基本面因子 (PE, ROE等)
+            # C. 市场情绪因子 (基于量价数据, 无前视偏差)
+            try:
+                sentiment_factors = MarketSentimentFactors.calculate_all_sentiment_factors(data, db_path=self.db_path)
+            except Exception as e:
+                if True:  # 始终捕获，避免影响主流程
+                    print(f"  警告: 计算市场情绪因子失败: {e}")
+                sentiment_factors = pd.DataFrame(index=data.index)
+
+            # D. 基本面因子 (PIT 对齐版本，消除前视偏差)
             fundamental_factors = pd.DataFrame(index=data.index)
-            if include_fundamentals:
-                # 严重警告: 这里的 fundamental_calculator 目前仅返回实时快照数据。
-                # 在历史数据上广播这些快照会导致严重的未来信息泄露（Look-ahead Bias）。
-                # 只有在进行实盘/盘后实时预测，且 data 只有最新一行时，才允许使用。
-                is_realtime_prediction = len(data) <= 5 # 启发式判断：如果是实时预测，行数通常很少
+            if include_fundamentals and 'date' in data.columns:
+                try:
+                    # 新的 PIT 时间序列对齐方式:
+                    # 无论是训练模式还是实盘模式，均按日期找最近过去的财报
+                    # 这彻底消除了前视偏差，同时在选股时也能得到正确结果
+                    fundamental_factors = self.fundamental_calculator.calculate_fundamental_series(
+                        code, data
+                    )
+                    # 对齐索引
+                    if not fundamental_factors.empty:
+                        fundamental_factors.index = data.index
+                except Exception as e:
+                    print(f"  警告: 计算基本面因子失败 ({code}): {e}")
+                    fundamental_factors = pd.DataFrame(index=data.index)
                 
-                if is_realtime_prediction:
-                    fundamental_dict = self.fundamental_calculator.calculate_all_fundamental_factors(code)
-                    if fundamental_dict:
-                        fundamental_factors = pd.DataFrame([fundamental_dict] * len(data), index=data.index)
-                        fundamental_factors = fundamental_factors.apply(pd.to_numeric, errors='coerce')
-                else:
-                    # 在历史回测或训练模式下，除非有 PIT 数据库，否则强行跳过基本面因子
-                    # 这能防止模型通过“预知”未来的 PE 或市值来作弊
-                    pass
-                
-            # D. 高级特征 (时间序列、风险) - 现在返回的是 Rolling DataFrames
+            # E. 高级特征 (时间序列、风险) - 现在返回的是 Rolling DataFrames
             try:
                 ts_price = TimeSeriesFactors.calculate_price_series_features(data)
                 ts_vol = TimeSeriesFactors.calculate_volume_series_features(data)
@@ -137,26 +144,30 @@ class ComprehensiveFactorCalculator:
                 print(f"  警告: 计算高级因子失败: {e}")
                 adv_factors = pd.DataFrame(index=data.index)
                 
-            # E. 交易状态因子 (涨停/停牌)
+            # F. 交易状态因子 (涨停/停牌)
             status_factors = pd.DataFrame(index=data.index)
             # 获取 ST 标签：如果在 data 中存在则直接使用，否则通过 fundamental_calculator 查询数据库
             is_st = False
             if 'is_st' in data.columns:
                 is_st = data['is_st'].iloc[0] == 1
             else:
-                info = self.fundamental_calculator.get_stock_info(code)
-                if info is not None:
-                    is_st = info.get('is_st') == 1
+                try:
+                    info = self.fundamental_calculator.get_stock_info(code)
+                    if info is not None:
+                        is_st = info.get('is_st') == 1
+                except Exception:
+                    pass
             
             # ST 股涨停阈值取 4.5% (对应 5% 限制)，普通股取 9.3% (对应 10% 限制)
             limit_threshold = 0.045 if is_st else 0.093
             
+            # 重要：此处仅生成状态特征，is_st 本身不作为特征输出，以防数据泄露
             status_factors['is_limit_up'] = ((data['close'] == data['high']) & (data['close'].pct_change() > limit_threshold)).astype(int)
             # 停牌检测：成交量为 0
             status_factors['is_suspended'] = (data['volume'] == 0).astype(int)
 
             # 合并所有
-            factors_list = [tech_factors, candlestick_factors, status_factors]
+            factors_list = [tech_factors, candlestick_factors, sentiment_factors, status_factors]
             if not fundamental_factors.empty:
                 factors_list.append(fundamental_factors)
             if not adv_factors.empty:

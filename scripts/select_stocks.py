@@ -38,7 +38,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from config import DATABASE_PATH
 from config.factor_config import TrainingConfig
-from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST
+from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST, SELECTOR_MARKETS
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
 
@@ -97,7 +97,7 @@ def load_smart_model(model_path: str):
     智能加载模型：
     1. 如果是一个 pkl 文件，根据内容加载为 MLFactorModel 或 EnsembleFactorModel
     """
-    from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
+    from core.factors.ml_factor_model import MLFactorModel
     
     # 情况 1: 目录
     if os.path.isdir(model_path):
@@ -130,9 +130,21 @@ def load_smart_model(model_path: str):
 # 数据库辅助
 # ============================================================================
 
+def get_db_conn(db_path: str):
+    """获取带有关联库的连接 (meta + finance)"""
+    conn = sqlite3.connect(db_path)
+    db_dir = os.path.dirname(db_path)
+    meta_db = os.path.join(db_dir, 'stock_meta.db')
+    finance_db = os.path.join(db_dir, 'stock_finance.db')
+    if os.path.exists(meta_db):
+        conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+    if os.path.exists(finance_db):
+        conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
+    return conn
+
 def get_all_stock_codes(db_path: str) -> List[str]:
     """从数据库获取所有有行情数据的股票代码"""
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT code FROM daily_data ORDER BY code")
     codes = [row[0] for row in cursor.fetchall()]
@@ -142,42 +154,114 @@ def get_all_stock_codes(db_path: str) -> List[str]:
 
 def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
     """
-    从 stock_info_extended 表获取股票基本信息
+    获取股票基本信息:
+    - 名称/ST标记: 来自 meta.stock_info_extended
+    - PE/PB (动态): 用最新收盘价 / finance_reports 最新期 EPS/BPS 计算
+      这样 PE/PB 是 PIT 的，避免使用快照静态数据
     """
     def safe_float(val):
         try:
             if val is None or val == '' or str(val).lower() == 'none':
                 return None
-            return float(val)
+            v = float(val)
+            return v if np.isfinite(v) else None
         except (ValueError, TypeError):
             return None
 
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn(db_path)
+
+    # 1. 从 meta 读取基础信息
     try:
-        # 全部使用 extended 表
-        df = pd.read_sql_query("SELECT * FROM stock_info_extended", conn)
+        meta_df = pd.read_sql_query(
+            "SELECT code, name, is_st FROM meta.stock_info_extended", conn
+        )
     except Exception:
-        df = pd.DataFrame()
+        meta_df = pd.DataFrame(columns=['code', 'name', 'is_st'])
+
+    # 2. 从 finance_reports 读取最新一期 EPS/BPS (按 code + 最大 REPORT_DATE)
+    try:
+        finance_df = pd.read_sql_query(
+            """
+            SELECT f.code, f.EPSJB, f.BPS, f.ZCFZL
+            FROM finance.finance_reports f
+            INNER JOIN (
+                SELECT code, MAX(REPORT_DATE) AS max_date
+                FROM finance.finance_reports
+                GROUP BY code
+            ) latest ON f.code = latest.code AND f.REPORT_DATE = latest.max_date
+            """,
+            conn
+        )
+    except Exception:
+        finance_df = pd.DataFrame(columns=['code', 'EPSJB', 'BPS', 'ZCFZL'])
+
+    # 3. 获取每只股票最新价格
+    try:
+        price_df = pd.read_sql_query(
+            """
+            SELECT code, close
+            FROM daily_data
+            WHERE (code, date) IN (
+                SELECT code, MAX(date) FROM daily_data GROUP BY code
+            )
+            """,
+            conn
+        )
+    except Exception:
+        price_df = pd.DataFrame(columns=['code', 'close'])
+
     conn.close()
 
+    # 构建映射
+    finance_map = {}
+    if not finance_df.empty:
+        for _, row in finance_df.iterrows():
+            finance_map[str(row.get('code', ''))] = {
+                'eps': safe_float(row.get('EPSJB')),
+                'bps': safe_float(row.get('BPS')),
+                'zcfzl': safe_float(row.get('ZCFZL')),
+            }
+
+    price_map = {}
+    if not price_df.empty:
+        for _, row in price_df.iterrows():
+            price_map[str(row.get('code', ''))] = safe_float(row.get('close'))
+
     info_map = {}
-    if not df.empty:
-        for _, row in df.iterrows():
-            info_map[row['code']] = {
-                'name': row.get('name', ''),
-                'market_cap': safe_float(row.get('market_cap')),
-                'pe_ratio': safe_float(row.get('pe_ratio')),
-                'pb_ratio': safe_float(row.get('pb_ratio')),
-                'sector': row.get('sector', '-'),
-                'industry': row.get('industry', '-'),
-                'is_st': row.get('is_st', 0),
+    if not meta_df.empty:
+        for _, row in meta_df.iterrows():
+            code = str(row.get('code', ''))
+            fin = finance_map.get(code, {})
+            close = price_map.get(code)
+
+            # 动态 PE = 价格 / EPS; 动态 PB = 价格 / BPS
+            eps = fin.get('eps')
+            bps = fin.get('bps')
+            dynamic_pe = None
+            dynamic_pb = None
+            if close and close > 0:
+                if eps and eps > 0:
+                    dynamic_pe = close / eps
+                if bps and bps > 0:
+                    dynamic_pb = close / bps
+
+            info_map[code] = {
+                'name':          row.get('name', ''),
+                'market_cap':    None,  # market_cap 不在 meta 表中，留 None
+                'pe_ratio':      dynamic_pe,
+                'pb_ratio':      dynamic_pb,
+                'zcfzl':         fin.get('zcfzl'),
+                'current_price': close,  # 最新收盘价，供价格筛选使用
+                'sector':        '-',
+                'industry':      '-',
+                'is_st':         int(row.get('is_st', 0) or 0),
             }
     return info_map
 
 
 def get_latest_price(db_path: str, code: str) -> Optional[float]:
     """获取股票最新收盘价"""
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn(db_path)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT close FROM daily_data WHERE code = ? ORDER BY date DESC LIMIT 1",
@@ -192,7 +276,7 @@ def get_stock_data(db_path: str, code: str, days: int = DEFAULT_LOOKBACK_DAYS) -
     """
     从数据库中获取指定股票最近 N 天的行情数据
     """
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn(db_path)
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
@@ -209,11 +293,6 @@ def get_stock_data(db_path: str, code: str, days: int = DEFAULT_LOOKBACK_DAYS) -
         return None
     return df
 
-
-# ============================================================================
-# 基础条件预筛选
-# ============================================================================
-
 def pre_filter_stocks(
     all_codes: List[str],
     info_map: Dict[str, Dict],
@@ -226,6 +305,7 @@ def pre_filter_stocks(
     - max_pe：最大市盈率
     - min_price / max_price：股价范围
     - include_st: 是否包含 ST 股
+    - markets: 市场类型过滤 (e.g., 'sh', 'sz_main', 'sz_gem', 'bj')
 
     criteria 为动态筛选准则（覆盖全局常量），如果不传则使用 strategy_config 中的默认值。
     """
@@ -246,57 +326,76 @@ def pre_filter_stocks(
     min_price      = try_float(criteria.get('min_price', MIN_PRICE)) or 0
     max_price      = try_float(criteria.get('max_price', MAX_PRICE)) or float('inf')
     include_st     = bool(criteria.get('include_st', INCLUDE_ST))
+    markets_filter = criteria.get('markets', None) # Renamed to avoid conflict with 'markets' in pref_map
 
-    # 批量获取最新价格（单次 SQL，避免 N+1 查询）
-    conn = sqlite3.connect(db_path)
-    price_query = '''
-        SELECT code, close
-        FROM daily_data
-        WHERE (code, date) IN (
-            SELECT code, MAX(date)
-            FROM daily_data
-            GROUP BY code
-        )
-    '''
-    try:
-        price_df = pd.read_sql_query(price_query, conn)
-        price_map = dict(zip(price_df['code'], price_df['close']))
-    except Exception:
-        price_map = {}
-    conn.close()
+    # 市场前缀映射
+    pref_map = {
+        'sh': ('60'),
+        'sz_main': ('00'),
+        'sz_gem': ('30'),
+        'bj': ('8', '4', '9') # Beijing Stock Exchange codes start with 8, 4, 9
+    }
+    allowed_prefixes = None
+    if markets_filter:
+        allowed_prefixes = []
+        for m in markets_filter:
+            p = pref_map.get(m)
+            if isinstance(p, tuple):
+                allowed_prefixes.extend(p)
+            elif p:
+                allowed_prefixes.append(p)
+        allowed_prefixes = tuple(allowed_prefixes) # Convert to tuple for efficient startswith check
 
     passed = []
-    skipped_reasons = {'market_cap': 0, 'pe': 0, 'price': 0, 'no_info': 0, 'st': 0}
+    skipped_reasons = {
+        'market_cap': 0, 'pe': 0, 'price': 0, 'no_info': 0,
+        'st': 0, 'market': 0, 'zcfzl': 0
+    }
 
     for code in all_codes:
-        info = info_map.get(code, {})
+        info = info_map.get(code)
+        if not info:
+            skipped_reasons['no_info'] += 1
+            continue
+
         name = str(info.get('name', '') or '')
 
-        # 1. 排除 ST / *ST / 退市 (除非 include_st=True)
+        # 1. 市场类型筛选
+        if allowed_prefixes and not code.startswith(allowed_prefixes):
+            skipped_reasons['market'] += 1
+            continue
+
+        # 2. 排除 ST / *ST / 退市 (除非 include_st=True)
         if not include_st:
-            # 优先根据数据库 is_st 标签，同时也保留“退”字检查作为补充（针对退市股）
-            # 注意：不再单纯根据 'ST' 字符串匹配，因为英文名中 contains 'st' 的单词太多 (如 Industries, Mustang)
             is_st_flag = info.get('is_st', 0)
             if is_st_flag == 1 or (name and '退' in name):
                 skipped_reasons['st'] += 1
                 continue
 
-        # 2. 市值筛选
-        market_cap = try_float(info.get('market_cap'))
-        if market_cap is not None:
-            if market_cap < min_market_cap:
+        # 3. 市值筛选 (仅在 min_market_cap > 0 且有效时生效; 当前 market_cap 为 None 则跳过)
+        if min_market_cap > 0:
+            market_cap = try_float(info.get('market_cap'))
+            if market_cap is not None and market_cap < min_market_cap:
                 skipped_reasons['market_cap'] += 1
                 continue
 
-        # 3. 市盈率筛选
+        # 4. 动态 PE 筛选 (价格/EPS, 由 get_stock_info_map 计算)
         pe = try_float(info.get('pe_ratio'))
         if pe is not None:
             if pe <= 0 or pe > max_pe:
                 skipped_reasons['pe'] += 1
                 continue
 
-        # 4. 股价筛选
-        price = try_float(price_map.get(code))
+        # 5. 资产负债率筛选（金融行业慎用）
+        max_zcfzl = try_float(criteria.get('max_zcfzl', None))
+        if max_zcfzl is not None:
+            zcfzl = try_float(info.get('zcfzl'))
+            if zcfzl is not None and zcfzl > max_zcfzl:
+                skipped_reasons['zcfzl'] += 1
+                continue
+
+        # 6. 股价筛选 (使用 info_map 中的 current_price)
+        price = try_float(info.get('current_price'))
         if price is not None:
             if price < min_price or price > max_price:
                 skipped_reasons['price'] += 1
@@ -306,10 +405,6 @@ def pre_filter_stocks(
 
     return passed, skipped_reasons
 
-
-# ============================================================================
-# 模型打分
-# ============================================================================
 
 def get_factors_for_single_stock(
     code: str,
@@ -403,9 +498,11 @@ def select_stocks(
     # 新增过滤参数，用于从后端动态传入
     min_market_cap: Optional[float] = None,
     max_pe: Optional[float] = None,
+    max_zcfzl: Optional[float] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     include_st: Optional[bool] = None,
+    markets: Optional[List[str]] = None,
 ) -> List[Dict]:
     """
     执行完整的选股流程。
@@ -421,6 +518,7 @@ def select_stocks(
         save_csv:         是否将结果保存为 CSV
         min_market_cap:   (动态) 最小市值
         max_pe:           (动态) 最大市盈率
+        max_zcfzl:        (动态) 最大资产负债率 (%)
         min_price:        (动态) 最小价格
         max_price:        (动态) 最大价格
         include_st:       (动态) 是否包含 ST
@@ -484,17 +582,21 @@ def select_stocks(
         current_criteria: Dict[str, Any] = {}
         if min_market_cap is not None: current_criteria['min_market_cap'] = min_market_cap
         if max_pe is not None:         current_criteria['max_pe'] = max_pe
+        if max_zcfzl is not None:      current_criteria['max_zcfzl'] = max_zcfzl
         if min_price is not None:      current_criteria['min_price'] = min_price
         if max_price is not None:      current_criteria['max_price'] = max_price
         if include_st is not None:     current_criteria['include_st'] = include_st
+        if markets is not None:        current_criteria['markets'] = markets
 
         # 打印最终生效的准则（已合并默认值）
         effective = {
             'min_market_cap': current_criteria.get('min_market_cap', MIN_MARKET_CAP),
             'max_pe':         current_criteria.get('max_pe', MAX_PE),
+            'max_zcfzl':      current_criteria.get('max_zcfzl', 100.0),
             'min_price':      current_criteria.get('min_price', MIN_PRICE),
             'max_price':      current_criteria.get('max_price', MAX_PRICE),
             'include_st':     current_criteria.get('include_st', INCLUDE_ST),
+            'markets':        current_criteria.get('markets', SELECTOR_MARKETS),
         }
         for k, v in effective.items():
             print(f"   {k} = {v}")
@@ -504,6 +606,7 @@ def select_stocks(
         )
         print(f"\n   通过筛选: {len(candidate_codes)} 只")
         print(f"   排除 ST/退市: {skip_reasons['st']}")
+        print(f"   排除 市场不符: {skip_reasons['market']}")
         print(f"   排除 市值不足: {skip_reasons['market_cap']}")
         print(f"   排除 PE 不合规: {skip_reasons['pe']}")
         print(f"   排除 股价不在范围: {skip_reasons['price']}")

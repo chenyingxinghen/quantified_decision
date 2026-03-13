@@ -19,7 +19,7 @@ import os
 
 from app.scheduler import start_scheduler, stop_scheduler
 
-from app.routers import stock_selector, paper_trading, data_center, analysis, config_center, auth
+from app.routers import stock_selector, paper_trading, analysis, config_center, auth, fundamentals
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -80,9 +80,9 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(stock_selector.router) 
 app.include_router(paper_trading.router)
-app.include_router(data_center.router)
 app.include_router(analysis.router)
 app.include_router(config_center.router)
+app.include_router(fundamentals.router)
 
 # 托管前端静态文件
 FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))

@@ -10,6 +10,8 @@ import os
 # 1. 基础设置
 # ==============================================================================
 
+from config.strategy_config import TIME_STOP_DAYS, TIME_STOP_MIN_LOSS_PCT
+
 # 同花顺 GUI 自动化：'ths'
 TRADER_TYPE = 'ths'
 
@@ -58,7 +60,7 @@ CASH_BUFFER = 100
 # ==============================================================================
 
 # 自动化交易使用的模型路径
-AUTO_MODEL_PATH = 'models/mark/auto'  # 或者具体的 pkl 文件路径
+AUTO_MODEL_PATH = 'models/mark/automation'  # 或者具体的 pkl 文件路径
 
 # 信号生成时使用的最低置信度阈值（百分制，0.0 表示不过滤）
 AUTO_MIN_CONFIDENCE = 0.0
@@ -67,7 +69,6 @@ AUTO_MIN_CONFIDENCE = 0.0
 AUTO_TOP_N = MAX_POSITIONS_AUTO
 
 # 信号历史记录保存路径
-SIGNAL_HISTORY_PATH = 'data/automation/signals.db'
 POSITIONS_TRACKING_PATH = 'data/automation/positions.json'
 
 
@@ -87,13 +88,13 @@ AUTO_MIN_MARKET_CAP = None       # 至少 20 亿市值
 AUTO_MAX_PE = None              # PE 不高于 150 倍
 
 # 股价区间（元），过滤极低价或高价股。None = 不限制
-AUTO_MIN_PRICE = 1.0             # 最低 2 元
-AUTO_MAX_PRICE = 20.0           # 最高 300 元
+AUTO_MIN_PRICE = 1.0             # 最低 1 元
+AUTO_MAX_PRICE = 20.0           # 最高 20 元
 
 # 是否包含 ST / *ST 股票。实盘建议设为 False 规避退市风险
 AUTO_INCLUDE_ST = True
 
 # 时间止损专属参数（与回测 TIME_STOP_DAYS / TIME_STOP_MIN_LOSS_PCT 对齐）
 # 若持有 >= AUTO_TIME_STOP_DAYS 个交易日，且浮亏 >= AUTO_TIME_STOP_MIN_LOSS_PCT，则尾盘清仓
-AUTO_TIME_STOP_DAYS = 10          # 时间止损天数（交易日）
-AUTO_TIME_STOP_MIN_LOSS_PCT = -0.02  # 时间止损最小亏损比例（-2%）
+AUTO_TIME_STOP_DAYS = TIME_STOP_DAYS          # 时间止损天数（交易日）
+AUTO_TIME_STOP_MIN_LOSS_PCT = TIME_STOP_MIN_LOSS_PCT  # 时间止损最小亏损比例

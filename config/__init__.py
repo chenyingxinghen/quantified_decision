@@ -11,7 +11,7 @@ from .factor_config import (
 
 __all__ = [
     # 从config.py导出
-    'DATABASE_PATH', 'YEARS', 'SELECTION_CRITERIA',
+    'DATABASE_PATH', 'YEARS'
     # 从strategy_config.py导出
     'TECHNICAL_PARAMS',
     # 从factor_config.py导出

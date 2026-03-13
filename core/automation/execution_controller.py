@@ -26,12 +26,11 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 # 添加项目根目录
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, PROJECT_ROOT)
+from config.config import PROJECT_ROOT, DATABASE_PATH, SYSTEM_DATA_DIR
 
 from core.automation.trader_interface import AutoTrader
 from config.automation_config import (
-    MAX_POSITIONS_AUTO, SINGLE_BUY_RATIO, CASH_BUFFER,
+    SINGLE_BUY_RATIO, CASH_BUFFER,
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
     AUTO_TIME_STOP_DAYS, AUTO_TIME_STOP_MIN_LOSS_PCT,
 )
@@ -115,11 +114,10 @@ class ExecutionController:
         self.signals_cache = []  # 存储待执行的买入信号
 
         # 本地状态追踪
-        self.tracking_file = os.path.join(PROJECT_ROOT, "data", "automation", "tracking.json")
+        self.tracking_file = os.path.join(SYSTEM_DATA_DIR, "automation", "tracking.json")
         self.tracking_data = self._load_tracking()
 
         # 数据库路径（用于交易日计算）
-        from config import DATABASE_PATH
         self._db_path = DATABASE_PATH
 
     def _load_tracking(self):
@@ -136,6 +134,7 @@ class ExecutionController:
         return {"current_day": "", "pending_buys": [], "processed_today": [], "positions": {}}
 
     def _save_tracking(self):
+        os.makedirs(os.path.dirname(self.tracking_file), exist_ok=True)
         with open(self.tracking_file, 'w', encoding='utf-8') as f:
             json.dump(self.tracking_data, f, ensure_ascii=False, indent=4)
 
@@ -176,6 +175,10 @@ class ExecutionController:
 
         # 检查当前持仓
         positions = self.trader.get_positions()
+        if positions is None:
+            logger.error("  获取持仓失败，为确保安全，取消本次买入执行。")
+            return
+        
         holding_codes = [p.get('证券代码', p.get('stock_code', '')) for p in positions]
 
         # 过滤已处理或已持有的信号
@@ -257,8 +260,12 @@ class ExecutionController:
         )
 
         positions = self.trader.get_positions()
+        if positions is None:
+            logger.error("  ❌ 未获取到持仓信息（可能OCR识别失败或连接超时），为防止意外清仓，已禁止尾盘兜底逻辑。")
+            return
+            
         if not positions:
-            logger.info("当前无持仓。")
+            logger.info("  当前确认为无持仓，无需执行卖出。")
             return
 
         today_str = datetime.now().strftime("%Y-%m-%d")

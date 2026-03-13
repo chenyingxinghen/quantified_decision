@@ -7,76 +7,66 @@
 import sys
 import os
 
+
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.data.hybrid_fetcher import HybridDataFetcher
+from core.data import DataFetcher
 import config
 from datetime import datetime
 import argparse
+import time
+from tqdm import tqdm
 
 
-def update_single_stock(symbol, prefer_source='yfinance', incremental=True):
+def update_single_stock(symbol, incremental=True):
     """
     更新单只股票数据
     
     Args:
         symbol: 股票代码
-        prefer_source: 优先数据源，'akshare' 或 'yfinance'
         incremental: 是否增量更新
     """
     print(f"\n{'='*60}")
     print(f"开始更新股票 {symbol} 的数据")
-    print(f"优先数据源: {prefer_source}")
     print(f"更新模式: {'增量' if incremental else '全量'}")
     print(f"{'='*60}\n")
     
-    fetcher = HybridDataFetcher(
-        use_proxy=config.USE_PROXY,
-        prefer_source=prefer_source
-    )
+    fetcher = DataFetcher()
     
     try:
         fetcher.update_daily_data(symbol, incremental=incremental)
-        fetcher.print_stats()
     finally:
         fetcher.close()
 
 
-def update_multiple_stocks(symbols, prefer_source='yfinance', incremental=True):
+def update_multiple_stocks(symbols, incremental=True):
     """
     批量更新多只股票数据
     
     Args:
         symbols: 股票代码列表
-        prefer_source: 优先数据源
         incremental: 是否增量更新
     """
     print(f"\n{'='*60}")
     print(f"开始批量更新 {len(symbols)} 只股票的数据")
-    print(f"优先数据源: {prefer_source}")
     print(f"更新模式: {'增量' if incremental else '全量'}")
     print(f"{'='*60}\n")
     
-    fetcher = HybridDataFetcher(
-        use_proxy=config.USE_PROXY,
-        prefer_source=prefer_source
-    )
-    
+    fetcher = DataFetcher()
+
     success_count = 0
     fail_count = 0
     
     try:
-        for i, symbol in enumerate(symbols, 1):
-            # print(f"\n[{i}/{len(symbols)}] 正在更新 {symbol}...")
-            if i % 100 == 0:
-                print(f"\n[{i}/{len(symbols)}]")
+        pbar = tqdm(symbols, desc="更新进度", unit="只")
+        for symbol in pbar:
             try:
                 fetcher.update_daily_data(symbol, incremental=incremental)
-                time.sleep(0.2)
+                time.sleep(config.QUEST_INTERVAL)
                 success_count += 1
             except Exception as e:
-                print(f"✗ 更新{symbol}失败: {e}")
+                tqdm.write(f"✗ 更新{symbol}失败: {e}")
                 fail_count += 1
         
         print(f"\n{'='*60}")
@@ -84,32 +74,25 @@ def update_multiple_stocks(symbols, prefer_source='yfinance', incremental=True):
         print(f"  成功: {success_count} 只")
         print(f"  失败: {fail_count} 只")
         print(f"{'='*60}\n")
-        
-        fetcher.print_stats()
     finally:
         fetcher.close()
 
 
-def update_all_stocks(markets=['sh', 'sz_main'], prefer_source='yfinance', incremental=True):
+def update_all_stocks(markets=config.DEFAULT_MARKETS, incremental=True):
     """
     更新所有股票数据
     
     Args:
         markets: 市场列表
-        prefer_source: 优先数据源
         incremental: 是否增量更新
     """
     print(f"\n{'='*60}")
     print(f"开始更新所有股票数据")
     print(f"市场: {', '.join(markets)}")
-    print(f"优先数据源: {prefer_source}")
     print(f"更新模式: {'增量' if incremental else '全量'}")
     print(f"{'='*60}\n")
-    
-    fetcher = HybridDataFetcher(
-        use_proxy=config.USE_PROXY,
-        prefer_source=prefer_source
-    )
+
+    fetcher = DataFetcher()
     
     try:
         # 获取股票列表
@@ -124,76 +107,28 @@ def update_all_stocks(markets=['sh', 'sz_main'], prefer_source='yfinance', incre
         
         # 批量更新
         symbols = stock_list['code'].tolist()
-        update_multiple_stocks(symbols, prefer_source=prefer_source, incremental=incremental)
+        update_multiple_stocks(symbols, incremental=incremental)
         
     finally:
         fetcher.close()
 
 
-def test_data_sources():
-    """
-    测试两个数据源的可用性
-    """
-    print(f"\n{'='*60}")
-    print("测试数据源可用性")
-    print(f"{'='*60}\n")
-    
-    test_symbol = "600000"  # 浦发银行
-    test_start = "20240101"
-    test_end = "20240131"
-    
-    # 测试akshare
-    print("1. 测试akshare数据源...")
-    fetcher_ak = HybridDataFetcher(prefer_source='akshare')
-    try:
-        data_ak = fetcher_ak.get_historical_data(
-            test_symbol, 
-            start_date=test_start, 
-            end_date=test_end,
-            fallback=False
-        )
-        if not data_ak.empty:
-            print(f"   ✓ akshare可用，获取到{len(data_ak)}条数据")
-        else:
-            print(f"   ✗ akshare不可用或无数据")
-    except Exception as e:
-        print(f"   ✗ akshare测试失败: {e}")
-    finally:
-        fetcher_ak.close()
-    
-    # 测试yfinance
-    print("\n2. 测试yfinance数据源...")
-    fetcher_yf = HybridDataFetcher(prefer_source='yfinance')
-    try:
-        data_yf = fetcher_yf.get_historical_data(
-            test_symbol, 
-            start_date=test_start, 
-            end_date=test_end,
-            fallback=False
-        )
-        if not data_yf.empty:
-            print(f"   ✓ yfinance可用，获取到{len(data_yf)}条数据")
-        else:
-            print(f"   ✗ yfinance不可用或无数据")
-    except Exception as e:
-        print(f"   ✗ yfinance测试失败: {e}")
-    finally:
-        fetcher_yf.close()
-    
-    print(f"\n{'='*60}\n")
-
-
 def main():
     """主函数"""
+    # print(f"当前时间: {datetime.now()}")
+    # if datetime.now().time() < datetime.strptime("15:30", "%H:%M").time():
+    #     print("规定: 数据获取脚本只能在新一日当天 15:30 以后执行请求接口。")
+    #     return
+
     parser = argparse.ArgumentParser(
-        description='使用混合数据源更新股票数据（支持akshare和yfinance自动切换）'
+        description='使用统一数据源更新股票数据（Yahoo K线 + 东财指标）'
     )
     
     parser.add_argument(
         '--mode',
-        choices=['single', 'multiple', 'all', 'test'],
+        choices=['single', 'multiple', 'all'],
         default='all',
-        help='运行模式: single(单只股票), multiple(多只股票), all(所有股票), test(测试数据源)'
+        help='运行模式: single(单只股票), multiple(多只股票), all(所有股票)'
     )
     
     parser.add_argument(
@@ -213,15 +148,8 @@ def main():
         '--markets',
         type=str,
         nargs='+',
-        default=['sh', 'sz_main'],
+        default=config.DEFAULT_MARKETS,
         help='市场列表（mode=all时使用），可选: sh, sz_main, sz_gem, bj'
-    )
-    
-    parser.add_argument(
-        '--source',
-        choices=['akshare', 'yfinance'],
-        default='yfinance',
-        help='优先使用的数据源'
     )
     
     parser.add_argument(
@@ -232,25 +160,23 @@ def main():
     
     args = parser.parse_args()
     
-    incremental = not args.full
+    # 默认增量更新，除非指定了 full，或者 config.INCREMENTAL_UPDATE 被设为 False 且没指定增量模式
+    incremental = config.INCREMENTAL_UPDATE if not args.full else False
     
-    if args.mode == 'test':
-        test_data_sources()
-    
-    elif args.mode == 'single':
+    if args.mode == 'single':
         if not args.symbol:
             print("错误: 单只股票模式需要指定 --symbol 参数")
             return
-        update_single_stock(args.symbol, prefer_source=args.source, incremental=incremental)
+        update_single_stock(args.symbol, incremental=incremental)
     
     elif args.mode == 'multiple':
         if not args.symbols:
             print("错误: 多只股票模式需要指定 --symbols 参数")
             return
-        update_multiple_stocks(args.symbols, prefer_source=args.source, incremental=incremental)
+        update_multiple_stocks(args.symbols, incremental=incremental)
     
     elif args.mode == 'all':
-        update_all_stocks(markets=args.markets, prefer_source=args.source, incremental=incremental)
+        update_all_stocks(markets=args.markets, incremental=incremental)
 
 
 if __name__ == "__main__":

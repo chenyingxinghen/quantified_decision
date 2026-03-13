@@ -31,10 +31,30 @@
           <span class="card-title">新增持仓监控</span>
         </div>
         <el-form layout="vertical" :model="buyForm" @submit.prevent="handleBuy" style="overflow: hidden">
-          <el-form-item label="股票信息">
+          <el-form-item label="股票检索 (代码/中文名)">
+            <el-select
+              v-model="searchQuery"
+              filterable
+              remote
+              reserve-keyword
+              placeholder="输入代码或名称搜索"
+              :remote-method="queryStock"
+              :loading="searchLoading"
+              style="width: 100%"
+              @change="onStockSelect"
+            >
+              <el-option
+                v-for="item in searchResults"
+                :key="item.code"
+                :label="item.code + ' ' + item.name"
+                :value="item"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="已选股票">
             <div style="display: flex; gap: 10px; flex-wrap: wrap">
-              <el-input v-model="buyForm.code" placeholder="代码" style="flex: 1; min-width: 100px" />
-              <el-input v-model="buyForm.name" placeholder="名称" style="flex: 1.5; min-width: 120px" />
+              <el-input v-model="buyForm.code" placeholder="代码" style="flex: 1; min-width: 100px" readonly />
+              <el-input v-model="buyForm.name" placeholder="名称" style="flex: 1.5; min-width: 120px" readonly />
             </div>
           </el-form-item>
           <div style="display: flex; flex-direction: column; gap: 0">
@@ -187,7 +207,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { paperTrading, authApi } from '../api'
+import { paperTrading, authApi, stockSelector } from '../api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, Loading, TrendCharts, Aim, Sell, Delete, SuccessFilled, InfoFilled } from '@element-plus/icons-vue'
 
@@ -207,6 +227,9 @@ const winRate = computed(() => {
 
 // 买入表单
 const buyForm = ref({ code: '', name: '', buy_date: '', buy_price: null, quantity: 1 })
+const searchQuery = ref('')
+const searchLoading = ref(false)
+const searchResults = ref([])
 
 const userConfig = ref(null)
 const analysisMap = ref({}) // { position_id: exitData }
@@ -278,6 +301,31 @@ async function loadHistory() {
     ElMessage.error('加载历史交易失败')
   } finally {
     historyLoading.value = false
+  }
+}
+
+async function queryStock(query) {
+  if (query) {
+    searchLoading.value = true
+    try {
+      const { data } = await stockSelector.search(query)
+      searchResults.value = data.items
+    } catch (e) {
+      console.error(e)
+    } finally {
+      searchLoading.value = false
+    }
+  } else {
+    searchResults.value = []
+  }
+}
+
+function onStockSelect(item) {
+  if (item) {
+    buyForm.value.code = item.code
+    buyForm.value.name = item.name
+    // 默认买入日期为今天
+    buyForm.value.buy_date = getTodayStr()
   }
 }
 

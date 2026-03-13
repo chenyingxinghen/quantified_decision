@@ -3,7 +3,7 @@
 
 负责数据加载、预处理和缓存
 """
-
+import os
 import sqlite3
 import pandas as pd
 from typing import Dict, List, Optional
@@ -15,13 +15,20 @@ def _load_stock_batch(args):
     """多进程加载股票数据"""
     db_path, stock_codes, start_date, end_date = args
     
+    
     conn = sqlite3.connect(db_path)
+    # 优化: 关联其他数据库
+    db_dir = os.path.dirname(db_path)
+    meta_db = os.path.join(db_dir, 'stock_meta.db')
+    if os.path.exists(meta_db):
+        conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+    
     placeholders = ','.join(['?' for _ in stock_codes])
     query = f'''
         SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount, d.turnover_rate,
                IFNULL(s.is_st, 0) as is_st
         FROM daily_data d
-        LEFT JOIN stock_info_extended s ON d.code = s.code
+        LEFT JOIN meta.stock_info_extended s ON d.code = s.code
         WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
         ORDER BY d.code, d.date
     '''
@@ -53,6 +60,17 @@ class DataHandler:
         """
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
+        
+        # 优化: 关联其他数据库
+        db_dir = os.path.dirname(db_path)
+        meta_db = os.path.join(db_dir, 'stock_meta.db')
+        finance_db = os.path.join(db_dir, 'stock_finance.db')
+        
+        if os.path.exists(meta_db):
+            self.conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+        if os.path.exists(finance_db):
+            self.conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
+            
         self._data_cache: Dict[str, pd.DataFrame] = {}
         self._date_index: Dict[str, Dict[str, int]] = {}
         self._daily_bars: Dict[str, Dict[str, pd.Series]] = {} # 每日行情快照: date -> {code -> Series}
@@ -121,7 +139,7 @@ class DataHandler:
             SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount, d.turnover_rate,
                    IFNULL(s.is_st, 0) as is_st
             FROM daily_data d
-            LEFT JOIN stock_info_extended s ON d.code = s.code
+            LEFT JOIN meta.stock_info_extended s ON d.code = s.code
             WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
             ORDER BY d.code, d.date
         '''

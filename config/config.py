@@ -1,31 +1,40 @@
 # 配置文件
 import os
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # 数据库配置
-DATABASE_PATH = "G:/ai_proj/quantified_decision/data/stock_data.db"
-YEARS=10
+DATABASE_DIR = "G:/ai_proj/quantified_decision/database"
+DATABASE_PATH = os.path.join(DATABASE_DIR, "stock_daily.db")
+USER_DB_PATH = os.path.join(DATABASE_DIR, "user_data.db")
+SYSTEM_DATA_DIR = os.path.join(DATABASE_DIR, "system_data")
+YEARS = 15
 
 # 市场配置
-DEFAULT_MARKETS = ['sh', 'sz_main']  # 默认只初始化上证和深圳主板
+DEFAULT_MARKETS = []  # 初始化所有
 # 'sh' - 上海证券交易所 (60xxxx)
 # 'sz_main' - 深圳主板 (00xxxx)
 # 'sz_gem' - 创业板 (30xxxx)
 # 'bj' - 北京证券交易所 (8xxxxx, 4xxxxx)
 
+# 市场涨跌幅限制阈值
+MARKET_LIMITS = {
+    'st': 0.045,        # ST 股票 (5%)
+    'gem_star': 0.195,  # 创业板/科创板 (20%)
+    'bj': 0.295,        # 北交所 (30%)
+    'main': 0.095       # 主板 (10%)
+}
+
+# 股票代码前缀映射
+MARKET_PREFIXES = {
+    'sh': '60',
+    'sz_main': '00',
+    'sz_gem': '30',
+    'star': '688',
+    'bj': ('8', '4')
+}
+
 # 数据更新配置
-USE_PROXY = False  # 是否使用代理
-PROXY_URL = "https://dps.kdlapi.com/api/getdps/?secret_id=o7pz3us9m7b2j7uktfek&signature=08umtmh5irm6geunoul9gt6i7i8lv07b&num={num}&format=json&sep=1&f_auth=1&generateType=1"
-UPDATE_INTERVAL = 300  # 5分钟更新一次
-# 临时断点
-TEMP_ORDER=0
-UPDATE_TODAY_ONLY= False
-#是否补充历史数据
-BACKDATE=False
-
-MARKET_OPEN_TIME = "09:30"
-MARKET_CLOSE_TIME = "15:00"
 INCREMENTAL_UPDATE = True  # 默认使用增量更新
-WORKERS_NUM = 1
-QUEST_INTERVAL = 3 # 接口请求间隔
-RETRY_DELAYS = []  # 重试延迟时间（秒）10分钟,30分钟, 60分钟
-
+WORKERS_NUM = 5
+QUEST_INTERVAL = 0.5 # 接口请求间隔

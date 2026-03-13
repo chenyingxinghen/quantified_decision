@@ -396,52 +396,41 @@ class EnsembleOptimizer:
         
         predictions = np.array(predictions)
         
+        # 准备权重候选集
+        resolution = OptimizationConfig.ENSEMBLE_GRID_RESOLUTION if hasattr(OptimizationConfig, 'ENSEMBLE_GRID_RESOLUTION') else 11
+        steps = np.linspace(0, 1, resolution)
+        
+        # 递归生成权重组合 (和为1)
+        def generate_weights(n, current_sum=0):
+            if n == 1:
+                yield [1.0 - current_sum]
+            else:
+                for w in steps[steps <= 1.0 - current_sum + 1e-9]:
+                    for rest in generate_weights(n - 1, current_sum + w):
+                        yield [w] + rest
+
+        # 如果模型较多，限制组合数量
+        if n_models > 3:
+            print(f"模型数量({n_models})较多，限制搜索粒度...")
+            steps = np.linspace(0, 1, 6) # 降级粒度
+            
         # 网格搜索权重
         best_score = -np.inf
         best_weights = None
         
-        if n_models == 2:
-            # 两个模型：搜索 w1 从 0 到 1
-            for w1 in np.linspace(0, 1, 21):
-                weights = [w1, 1 - w1]
-                ensemble_pred = np.average(predictions, axis=0, weights=weights)
-                score = roc_auc_score(y_val, ensemble_pred)
-                
-                if score > best_score:
-                    best_score = score
-                    best_weights = weights
-                
-                self.optimization_history.append({
-                    'weights': weights,
-                    'auc': score
-                })
-        
-        elif n_models == 3:
-            # 三个模型：搜索 w1, w2（w3 = 1 - w1 - w2）
-            for w1 in np.linspace(0, 1, 11):
-                for w2 in np.linspace(0, 1 - w1, 11):
-                    w3 = 1 - w1 - w2
-                    weights = [w1, w2, w3]
-                    ensemble_pred = np.average(predictions, axis=0, weights=weights)
-                    score = roc_auc_score(y_val, ensemble_pred)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_weights = weights
-                    
-                    self.optimization_history.append({
-                        'weights': weights,
-                        'auc': score
-                    })
-        
-        else:
-            # 多个模型：使用简化的搜索
-            print("模型数量较多，使用简化搜索...")
-            # 平均权重作为基准
-            weights = [1.0 / n_models] * n_models
+        print(f"开始搜索权重组合...")
+        for weights in generate_weights(n_models):
             ensemble_pred = np.average(predictions, axis=0, weights=weights)
-            best_score = roc_auc_score(y_val, ensemble_pred)
-            best_weights = weights
+            score = roc_auc_score(y_val, ensemble_pred)
+            
+            if score > best_score:
+                best_score = score
+                best_weights = weights
+            
+            self.optimization_history.append({
+                'weights': weights,
+                'auc': score
+            })
         
         self.best_weights = best_weights
         print(f"\n最优权重: {[f'{w:.3f}' for w in best_weights]}")

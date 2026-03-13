@@ -7,6 +7,8 @@ import os
 import sys
 from datetime import datetime, timedelta
 
+# 添加项目根目录到路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.deps import get_db_connection, get_paper_db
 
 logger = logging.getLogger("quant_scheduler")
@@ -113,8 +115,7 @@ async def check_yfinance_update():
 
 async def daily_data_update_job():
     """
-    工作日 19:00 执行的更新任务。
-    如果 yfinance 尚未更新，则 30 分钟后重试。
+    工作日 17:30 执行的更新任务。
     """
     logger.info("Executing scheduled daily data update...")
     
@@ -134,7 +135,7 @@ async def daily_data_update_job():
         from scripts.update_daily_data import update_all_stocks
         # 执行增量更新
         logger.info("Requirement check passed. Starting full incremental update...")
-        await asyncio.get_event_loop().run_in_executor(None, lambda: update_all_stocks(prefer_source="yfinance", incremental=True))
+        await asyncio.get_event_loop().run_in_executor(None, lambda: update_all_stocks(incremental=True))
         
         logger.info("Daily data update finished. Triggering paper trading price auto-fill...")
         await asyncio.get_event_loop().run_in_executor(None, auto_fill_paper_trading_prices)
@@ -150,7 +151,7 @@ def start_scheduler():
     trigger = CronTrigger(day_of_week="mon-fri", hour=17, minute=30, timezone="Asia/Shanghai")
     scheduler.add_job(daily_data_update_job, trigger, id="daily_data_update", replace_existing=True)
     scheduler.start()
-    logger.info("APScheduler started: Daily data update scheduled for Mon-Fri at 19:00.")
+    logger.info("APScheduler started: Daily data update scheduled for Mon-Fri at 17:30.")
 
 def stop_scheduler():
     scheduler.shutdown()

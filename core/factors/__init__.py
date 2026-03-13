@@ -6,14 +6,13 @@
 
 from .quantitative_factors import QuantitativeFactors
 from .candlestick_pattern_factors import CandlestickPatternFactors
-from .ml_factor_model import MLFactorModel, EnsembleFactorModel
+from .ml_factor_model import MLFactorModel
 from .ml_strategy import MLFactorStrategy, HybridStrategy
 
 __all__ = [
     'QuantitativeFactors',
     'CandlestickPatternFactors',
     'MLFactorModel',
-    'EnsembleFactorModel',
     'MLFactorStrategy',
     'HybridStrategy'
 ]

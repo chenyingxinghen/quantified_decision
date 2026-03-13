@@ -15,7 +15,7 @@ from typing import Dict, Optional
 
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
 from core.factors.ml_factor_model import MLFactorModel
-from core.data.hybrid_fetcher import HybridDataFetcher
+from core.data.data_fetcher import DataFetcher
 from config.factor_config import FactorConfig, TrainingConfig
 
 
@@ -30,7 +30,7 @@ class MLFactorStrategy:
             model_path: 模型文件路径
         """
         self.factor_calculator = ComprehensiveFactorCalculator()
-        self.data_fetcher = HybridDataFetcher()
+        self.data_fetcher = DataFetcher()
         self.model = None
         
         # 如果没有提供模型路径，使用默认路径
@@ -187,7 +187,8 @@ class MLFactorStrategy:
     def _calculate_atr(self, data: pd.DataFrame, period: int = None) -> float:
         """计算ATR"""
         if period is None:
-            period = FactorConfig.ATR_PERIOD
+            from config.strategy_config import ATR_PERIOD
+            period = ATR_PERIOD
         
         high = data['high']
         low = data['low']

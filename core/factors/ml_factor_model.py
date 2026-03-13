@@ -1,6 +1,6 @@
 """
 机器学习因子模型
-使用机器学习算法学习量化因子与未来价格走势的关系
+使用机器学习算法 learn 量化因子与未来价格走势的关系
 """
 
 import pandas as pd
@@ -101,7 +101,9 @@ class MLFactorModel:
         训练模型
         """
         # 1. 预处理
-        X = np.nan_to_num(X.astype(np.float64), nan=0.0)
+        # 优化：由 float64 改为 float32，避免内存翻倍。且预先在 prepare_dataset 中已完成填充，此处仅做校验。
+        if not X.flags.c_contiguous: X = np.ascontiguousarray(X)
+        X = np.nan_to_num(X.astype(np.float32), copy=False, nan=0.0)
         
         # 标签清理：确保没有 NaN 或 Inf (针对 XGBoost 报错)
         if np.isnan(y).any() or np.isinf(y).any():
@@ -215,9 +217,6 @@ class MLFactorModel:
                 # 排序任务：打印训练进度
                 callbacks.append(log_evaluation(period=50))
                 # 严重 BUG 修复: LGBM lambdarank 的 sample_weight 会被解析为 group 权重。
-                # 由于我们的数据内每个日期是按日期排的，但某股票某日是在组内的随机位置，
-                # 若传入 num_samples 长度的一维 sample_weight，LightGBM 其实只会提取每个 group 首元素的权重，完全是随机的！
-                # 因此必须针对 ranking 任务删掉 sample_weight。
                 if 'sample_weight' in fit_params:
                     del fit_params['sample_weight']
 
@@ -230,8 +229,8 @@ class MLFactorModel:
         
         # 5. 评估
         return {
-            'train_metrics': self._evaluate(X_train, y_train, "训练集", returns=r_train, dates=dates_train),
-            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val)
+            'train_metrics': self._evaluate(X_train, y_train, "训练集", returns=r_train, dates=dates_train, sample_ratio=0.1),
+            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val, sample_ratio=0.5)
         }
 
     def _get_predict_proba(self, X: Any) -> np.ndarray:
@@ -259,7 +258,8 @@ class MLFactorModel:
         
         return preds
 
-    def _evaluate(self, X: Any, y: np.ndarray, dataset_name: str, returns: np.ndarray = None, dates: np.ndarray = None) -> Dict:
+    def _evaluate(self, X: Any, y: np.ndarray, dataset_name: str, returns: np.ndarray = None, 
+                 dates: np.ndarray = None, sample_ratio: float = 1.0) -> Dict:
         y_prob = self._get_predict_proba(X)
         
         # 1. 基础指标计算 (针对类别/回归)
@@ -280,12 +280,20 @@ class MLFactorModel:
         reference = returns if returns is not None else y.astype(float)
         
         if dates is not None:
-            # 按日期分组计算指标，然后取平均
+            # 获取日期分组
             unique_dates = np.unique(dates)
+            
+            # 抽样逻辑：减少非验证集的计算开销
+            if sample_ratio < 1.0:
+                n_sample = max(1, int(len(unique_dates) * sample_ratio))
+                unique_dates = np.random.choice(unique_dates, size=n_sample, replace=False)
+                eval_type = f"随机抽样 {sample_ratio:.0%}"
+            else:
+                eval_type = "全量"
+
             rank_ics = []
             top1_hits = []
             top5_hits = []
-            ndcg5_list = []
             
             for d in unique_dates:
                 mask = dates == d
@@ -294,7 +302,6 @@ class MLFactorModel:
                 
                 g_prob = y_prob[mask]
                 g_ref = reference[mask]
-                g_y = y[mask]
                 
                 # A. 组内 Rank IC
                 if len(np.unique(g_ref)) > 1:
@@ -314,57 +321,26 @@ class MLFactorModel:
                     top20pct_threshold = np.percentile(g_ref, 80)
                     top5_precision = np.mean(g_ref[top5_idx] >= top20pct_threshold)
                     top5_hits.append(top5_precision)
-                
-                # D. NDCG@5 (利用配置中的 label_gain 计算)
-                if len(g_y) >= 5:
-                    # 动态适配分档数量：优先使用配置中 label_gain 的长度
-                    cfg_gains = ModelConfig.LIGHTGBM_PARAMS.get('label_gain', [i**1.5 for i in range(21)])
-                    n_bins = len(cfg_gains)
-                    thresholds = np.linspace(1.0/n_bins, 1.0 - 1.0/n_bins, n_bins - 1)
-                    
-                    # 如果 y 已经是离散等级，且范围在这个 bins 内，直接用
-                    # 否则，对 ref 进行百分位分档模拟相关度等级，以便计算 NDCG
-                    if len(np.unique(g_y)) > 5:
-                        pct_rank = rankdata(g_ref, method='average') / len(g_ref)
-                        g_y_binned = np.zeros(len(g_ref), dtype=np.int32)
-                        for i, thresh in enumerate(thresholds):
-                            g_y_binned[pct_rank > thresh] = i + 1
-                    else:
-                        g_y_binned = g_y.astype(int)
-                        
-                    top5_pred = np.argsort(g_prob)[-5:][::-1]
-                    top5_ideal = np.argsort(g_y_binned)[-5:][::-1]
-                    
-                    # 获取配置中的 gains，并确保索引不越界
-                    gains = np.array(cfg_gains)
-                    max_gain_idx = len(gains) - 1
-                    
-                    dcg = sum(gains[min(int(g_y_binned[top5_pred[i]]), max_gain_idx)] / np.log2(i + 2) for i in range(min(5, len(top5_pred))))
-                    idcg = sum(gains[min(int(g_y_binned[top5_ideal[i]]), max_gain_idx)] / np.log2(i + 2) for i in range(min(5, len(top5_ideal))))
-                    ndcg5_list.append(dcg / idcg if idcg > 0 else 0.0)
             
             metrics['rank_ic'] = np.mean(rank_ics) if rank_ics else 0.0
             metrics['rank_ic_std'] = np.std(rank_ics) if rank_ics else 0.0
             metrics['top1_precision'] = np.mean(top1_hits) if top1_hits else 0.0
             metrics['top5_precision'] = np.mean(top5_hits) if top5_hits else 0.0
-            metrics['ndcg@5'] = np.mean(ndcg5_list) if ndcg5_list else 0.0
             
             # 辅助统计：预测区分度
             prob_std = np.std(y_prob)
             unique_probs = len(np.unique(np.round(y_prob, 6)))
             
-            print(f"  [{dataset_name}] 按组评估 ({len(unique_dates)} 个交易日):")
+            print(f"  [{dataset_name}] {eval_type}评估 ({len(unique_dates)} 个交易日):")
             print(f"    预测区分度: Std={prob_std:.4f}, Unique={unique_probs}")
             print(f"    Rank IC: {metrics['rank_ic']:.4f} ± {metrics['rank_ic_std']:.4f}")
             print(f"    Top-1 精度(命中前5%): {metrics['top1_precision']:.2%}")
             print(f"    Top-5 精度(命中前20%): {metrics['top5_precision']:.2%}")
-            print(f"    NDCG@5: {metrics['ndcg@5']:.4f}")
         else:
             # 没有日期信息，退化为全局计算
             metrics['rank_ic'], _ = spearmanr(y_prob, reference)
             metrics['top1_precision'] = 0.0
             metrics['top5_precision'] = 0.0
-            metrics['ndcg@5'] = 0.0
             
             prob_std = np.std(y_prob)
             unique_probs = len(np.unique(np.round(y_prob, 6)))
@@ -374,7 +350,6 @@ class MLFactorModel:
             print(f"    全局 Rank IC: {metrics['rank_ic']:.4f}")
         
         return metrics
-
 
     def _calculate_feature_importance(self):
         if hasattr(self.model, 'feature_importances_'):
@@ -406,7 +381,6 @@ class MLFactorModel:
     def load_model(self, filepath: str):
         with open(filepath, 'rb') as f: self.__dict__.update(pickle.load(f))
 
-
 class EnsembleFactorModel:
     """
     集成因子模型
@@ -436,9 +410,6 @@ class EnsembleFactorModel:
             
         all_predictions = []
         for model in self.models:
-            # 确保传入的 factors DataFrame 包含子模型训练时使用的特征
-            # 这里简化处理，假设所有模型的 feature_names 都是一致的或兼容的
-            # 实际应用中可能需要更复杂的特征对齐逻辑
             model_factors = factors[model.feature_names] if hasattr(model, 'feature_names') and model.feature_names else factors
             all_predictions.append(model.predict(model_factors))
             
@@ -471,14 +442,9 @@ class EnsembleFactorModel:
         # 从保存的状态中重构子模型
         models = []
         for model_state in ensemble_state['model_states']:
-            # 需要知道原始模型的类型和任务才能正确重建
-            # 这里假设保存的状态中包含了足够的信息来重建 MLFactorModel
-            # 实际中可能需要根据 model_state['model_type'] 和 model_state['task'] 来调用不同的构造函数
-            
-            # 简单重建 MLFactorModel 实例
             reconstructed_model = MLFactorModel(
-                model_type=model_state.get('model_type', 'xgboost'), # 假设默认是 xgboost
-                task=model_state.get('task', 'classification') # 假设默认是 classification
+                model_type=model_state.get('model_type', 'xgboost'),
+                task=model_state.get('task', 'classification')
             )
             reconstructed_model.__dict__.update(model_state)
             models.append(reconstructed_model)

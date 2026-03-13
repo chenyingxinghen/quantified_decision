@@ -10,8 +10,35 @@
       <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap">
         <div style="display: flex; align-items: center; gap: 12px">
           <span style="font-size: 13px; font-weight: 700; color: var(--text-secondary)">标的代码</span>
-          <el-input v-model="stockCode" placeholder="600000" style="width: 140px"
-                    @keyup.enter="loadChart" clearable />
+          <el-select
+            v-model="stockCode"
+            filterable
+            remote
+            reserve-keyword
+            placeholder="代码/名称"
+            :remote-method="queryStock"
+            :loading="searchLoading"
+            style="width: 180px"
+            @change="loadChart"
+          >
+            <el-option
+              v-for="item in searchResults"
+              :key="item.code"
+              :label="item.code + ' ' + item.name"
+              :value="item.code"
+            />
+          </el-select>
+          <el-tooltip content="基本面分析" placement="top">
+            <el-button 
+              v-if="stockCode" 
+              circle 
+              size="small" 
+              type="warning" 
+              @click="$router.push({ path: '/fundamental', query: { code: stockCode } })"
+            >
+              <el-icon><Histogram /></el-icon>
+            </el-button>
+          </el-tooltip>
         </div>
         <div style="display: flex; align-items: center; gap: 12px">
           <span style="font-size: 13px; font-weight: 700; color: var(--text-secondary)">历史范围</span>
@@ -118,9 +145,9 @@
 <script setup>
 import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { analysis } from '../api'
+import { analysis, stockSelector } from '../api'
 import { ElMessage } from 'element-plus'
-import { TrendCharts, Loading, Monitor } from '@element-plus/icons-vue'
+import { TrendCharts, Loading, Monitor, Histogram } from '@element-plus/icons-vue'
 import * as echarts from 'echarts'
 
 const route = useRoute()
@@ -136,6 +163,9 @@ const showPatterns = ref(true)
 const klineData = ref(null)
 const trendlineData = ref(null)
 const patterns = ref(null)
+
+const searchLoading = ref(false)
+const searchResults = ref([])
 
 let chartInstance = null
 
@@ -160,6 +190,22 @@ watch(() => route.query.code, (code) => {
 watch([days, longPeriod, shortPeriod], () => {
   if (stockCode.value) loadChart()
 })
+
+async function queryStock(query) {
+  if (query) {
+    searchLoading.value = true
+    try {
+      const { data } = await stockSelector.search(query)
+      searchResults.value = data.items
+    } catch (e) {
+      console.error(e)
+    } finally {
+      searchLoading.value = false
+    }
+  } else {
+    searchResults.value = []
+  }
+}
 
 async function loadChart() {
   if (!stockCode.value) { ElMessage.warning('请输入标的代码'); return }

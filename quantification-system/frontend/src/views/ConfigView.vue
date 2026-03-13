@@ -37,6 +37,21 @@
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">过滤高价股</div>
           <el-input-number v-model="config.MAX_PRICE" :min="1" :max="5000" :step="10" style="width: 100%" />
         </div>
+        <div class="config-item glass">
+          <label>最大资产负债率 (%)</label>
+          <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">剔除财务风险较高的公司</div>
+          <el-input-number v-model="config.MAX_ZCFZL" :min="0" :max="100" :step="5" style="width: 100%" />
+        </div>
+        <div class="config-item glass">
+          <label>股票市场</label>
+          <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">选择要扫描的市场</div>
+          <el-select v-model="config.SELECTOR_MARKETS" multiple collapse-tags placeholder="全选" style="width: 100%">
+            <el-option label="沪市主板" value="sh" />
+            <el-option label="深市主板" value="sz_main" />
+            <el-option label="创业板" value="sz_gem" />
+            <el-option label="北交所" value="bj" />
+          </el-select>
+        </div>
         <div class="config-item glass" style="grid-column: span 2">
           <label>ST 股过滤</label>
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">是否在选股池中包含 ST 股票</div>
@@ -122,10 +137,12 @@ const config = ref({
    
    ENABLE_FUNDAMENTAL_FILTER: false,
    MIN_MARKET_CAP: 80,
-   MAX_PE: 80,
-   MIN_PRICE: 1,
-   MAX_PRICE: 20,
-   INCLUDE_ST: false
+    MAX_PE: 80,
+    MAX_ZCFZL: 70,
+    MIN_PRICE: 1,
+    MAX_PRICE: 200,
+    INCLUDE_ST: false,
+    SELECTOR_MARKETS: ['sh', 'sz_main', 'sz_gem']
 })
 
 onMounted(async () => {

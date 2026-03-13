@@ -36,7 +36,8 @@ from core.factors.ml_factor_model import MLFactorModel
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller, fill_factors_with_defaults
-from config import DATABASE_PATH, TrainingConfig, FactorConfig, YEARS
+from core.data.market_sentiment_calculator import MarketSentimentCalculator
+from config import DATABASE_PATH, TrainingConfig, FactorConfig, YEARS, MARKET_LIMITS, MARKET_PREFIXES
 
 class MLModelTrainer:
     """机器学习模型训练器"""
@@ -99,7 +100,13 @@ class MLModelTrainer:
         
         stocks_data = {}
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row  # 提高查询效率
+        # 挂载元数据库以支持 is_st 查询
+        db_dir = os.path.dirname(self.db_path)
+        meta_db = os.path.join(db_dir, 'stock_meta.db')
+        if os.path.exists(meta_db):
+            conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+        
+        conn.row_factory = sqlite3.Row
         
         # 分批加载，避免 IN 子句过长
         for i in range(0, len(stock_codes), batch_size):
@@ -110,13 +117,14 @@ class MLModelTrainer:
                 SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount,
                        IFNULL(s.is_st, 0) as is_st
                 FROM daily_data d
-                LEFT JOIN stock_info_extended s ON d.code = s.code
+                LEFT JOIN meta.stock_info_extended s ON d.code = s.code
                 WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
                 ORDER BY d.code, d.date ASC
             '''
             
-            params = batch_codes + [start_date, end_date]
-            df = pd.read_sql_query(query, conn, params=params)
+            params = list(batch_codes) + [str(start_date), str(end_date)]
+            # print(f"Executing query with {len(params)} params for {len(batch_codes)} stocks")
+            df = pd.read_sql_query(query, conn, params=tuple(params))
             
             # 按股票分组
             for code in df['code'].unique():
@@ -289,37 +297,41 @@ class MLModelTrainer:
                     dates = data['date'][valid_idx].values
                     
                     # 最终使用的标签和收益率
-                    # 修复：确保 final_y 是 Series 以支持 prepare_dataset 中的 pd.concat
                     y_val = y[valid_idx] if isinstance(y, pd.Series) else y[valid_idx]
                     final_y = pd.Series(y_val) if not isinstance(y_val, pd.Series) else y_val
                     
                     final_returns = target_returns[valid_idx] if isinstance(target_returns, pd.Series) else target_returns[valid_idx]
                     
-                    # 封板/停牌检测
-                    # 获取 ST 标签：如果在 data 中存在则使用，否则默认为非 ST
+                    # 涨跌停判定增强：兼容主板(10%)、创业板/科创板(20%)、北交所(30%)
                     is_st = data['is_st'].iloc[0] == 1 if 'is_st' in data.columns else False
-                    # ST 股涨停阈值取 4.5% (对应 5% 限制)，普通股取 9.3% (对应 10% 限制)
-                    limit_threshold = 0.045 if is_st else 0.093
-                    
+                    if is_st:
+                        limit_threshold = MARKET_LIMITS['st']
+                    elif code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
+                        limit_threshold = MARKET_LIMITS['gem_star']
+                    elif code.startswith(MARKET_PREFIXES['bj']):
+                        limit_threshold = MARKET_LIMITS['bj']
+                    else:
+                        limit_threshold = MARKET_LIMITS['main']
+                        
                     is_limit_up = (data['close'] == data['high']) & (data['close'].pct_change() > limit_threshold)
                     is_suspended = data['volume'] == 0
                     unbuyable_mask = (is_limit_up | is_suspended)[valid_idx].values
                     
-                    if 'date' in X_df.columns:
-                        X_df = X_df.drop(columns=['date'])
-                        
-                    X_df = X_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+                    # 5. 显式剔除元数据列 (确保 is_st, date 不进入模型)
+                    drop_cols = ['date', 'is_st', 'code', 'ORG_TYPE']
+                    X_df = X_df.drop(columns=[c for c in drop_cols if c in X_df.columns], errors='ignore')
                     
                     if len(X_df) > 0:
-                        return X_df, final_y, final_returns, dates, unbuyable_mask
+                        limit_groups = np.full(len(X_df), limit_threshold, dtype=np.float32)
+                        return X_df, final_y, final_returns, dates, unbuyable_mask, limit_groups
             
-            return None, None, None, None, None
+            return None, None, None, None, None, None
         
         except Exception as e:
             import traceback
             print(f"  警告: 处理股票 {code} 失败: {e}")
             print(traceback.format_exc())
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
     def _validate_and_filter_stocks(self, stocks_data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
         """
@@ -403,7 +415,6 @@ class MLModelTrainer:
     def prepare_dataset(self, stocks_data: Dict[str, pd.DataFrame],
                        forward_days: int = None,
                        n_jobs: int = 15, 
-                       enable_feature_engineering: bool = False,
                        cache_engineered_features: bool = True,
                        filter_incomplete_cache: bool = True,
                        train_start_date: str = None,
@@ -416,25 +427,22 @@ class MLModelTrainer:
             stocks_data: 股票数据字典（应包含全量日期以生成缓存）
             forward_days: 预测未来N天
             n_jobs: 并行任务数
-            enable_feature_engineering: 是否启用特征工程
             cache_engineered_features: 是否缓存特征工程结果
             filter_incomplete_cache: 是否过滤不完整缓存
             train_start_date: 训练样本开始日期
             train_end_date: 训练样本结束日期
-            include_fundamentals: 是否包含基本面因子（注意：当前数据库仅含实时基本面，在历史训练中使用会导致数据泄露）
+            include_fundamentals: 是否包含基本面因子
         
         返回:
-            (X, y, returns, factor_names, dates)
+            (X, y, returns, factor_names, dates, unbuyable, limit_groups)
         """
-        # if include_fundamentals:
-        #     print("\n" + "!"*80)
-        #     print("警告: 正在使用基本面因子进行训练。")
-        #     print("注意: 当前数据库 (stock_info_extended) 仅包含股票的实时基本面数据。")
-        #     print("在历史数据上训练时，使用实时基本面会导致严重的数据泄露（Look-ahead Bias）。")
-        #     print("建议: 如果是纯粹为了验证模型逻辑，可以继续；如果是为了回测实战，请考虑禁用基本面因子。")
-        #     print("!"*80 + "\n")
 
         # print("\n正在计算量化因子（技术指标 + K线形态 + 基本面）...")
+        
+        # 0. 自动更新市场情绪数据 (全局性指标，只需计算一次)
+        print("\n正在检查并更新全市场情绪指标...")
+        sentiment_calc = MarketSentimentCalculator(self.db_path)
+        sentiment_calc.check_and_update()
         
         # 使用配置中的默认值
         if forward_days is None:
@@ -501,113 +509,198 @@ class MLModelTrainer:
         all_returns = []
         all_dates = []
         all_unbuyable = []
+        all_limit_groups = []
         
         for result in results:
             if result[0] is not None:
-                # 兼容旧版本或失败情况（如果是4个返回值）
-                if len(result) == 5:
+                # 兼容旧版本或失败情况
+                if len(result) == 6:
+                    X, y, r, d, u, l = result
+                elif len(result) == 5:
                     X, y, r, d, u = result
+                    l = np.full(len(X), 0.1, dtype=np.float32) # 默认 10% 限制
                 else:
-                    X, y, r, d = result[:4]
-                    u = np.zeros(len(y), dtype=bool) if y is not None else None
-                
+                    raise ValueError("因子计算失败，返回值不正确")                
                 if X is not None:
                     all_factors.append(X)
                     all_labels.append(y)
                     all_returns.append(r)
                     all_dates.append(d)
                     all_unbuyable.append(u)
+                    all_limit_groups.append(l)
         
         # 合并所有数据
-        X_combined = pd.concat(all_factors, axis=0, ignore_index=True)
-        y_combined = pd.concat(all_labels, axis=0, ignore_index=True)
-        returns_combined = np.concatenate(all_returns)
-        dates_combined = np.concatenate(all_dates)
-        unbuyable_combined = np.concatenate(all_unbuyable)
+        # 优化点 1：使用 float32 预分配 numpy 数组，彻底消除 pd.concat 和 iloc 带来的内存副本
+        total_rows = sum(len(f) for f in all_factors)
+        num_features = all_factors[0].shape[1]
+        col_names = all_factors[0].columns.tolist()
         
-        # 关键修复：按时间排序（解决全局数据泄露问题）
-        # 确保训练集完全在验证集之前，而不是按照股票列表的顺序
-        sort_idx = np.argsort(dates_combined)
-        X_combined = X_combined.iloc[sort_idx].reset_index(drop=True)
-        y_combined = y_combined.iloc[sort_idx].reset_index(drop=True)
-        returns_combined = returns_combined[sort_idx]
-        dates_combined = dates_combined[sort_idx]
-        unbuyable_combined = unbuyable_combined[sort_idx]
+        print(f"  合并数据: 总行数 {total_rows}, 特征数 {num_features}, 预计占用内存: {total_rows * num_features * 4 / 1024 / 1024:.2f} MB (float32)")
+        
+        # 预分配连续内存空间
+        X_arr = np.empty((total_rows, num_features), dtype=np.float32)
+        y_arr = np.empty(total_rows, dtype=np.float32)
+        returns_arr = np.empty(total_rows, dtype=np.float32)
+        dates_arr = np.empty(total_rows, dtype=object)  # 日期列保持 object 方便后续处理
+        unbuyable_arr = np.empty(total_rows, dtype=bool)
+        limit_groups_arr = np.empty(total_rows, dtype=np.float32)
+        
+        # 依次填充数据块
+        cursor = 0
+        for X, y, r, d, u, l in zip(all_factors, all_labels, all_returns, all_dates, all_unbuyable, all_limit_groups):
+            n = len(X)
+            # 转换过程使用视图或 in-place 以减少临时变量
+            X_arr[cursor:cursor+n] = X.values.astype(np.float32)
+            y_arr[cursor:cursor+n] = y.values.astype(np.float32)
+            returns_arr[cursor:cursor+n] = r.astype(np.float32)
+            dates_arr[cursor:cursor+n] = d
+            unbuyable_arr[cursor:cursor+n] = u
+            limit_groups_arr[cursor:cursor+n] = l
+            cursor += n
+            
+        # 关键优化：填充完立即释放列表原始引用，给操作系统回收空间的机会
+        del all_factors, all_labels, all_returns, all_dates, all_unbuyable, all_limit_groups
+        import gc
+        gc.collect()
+        
+        # 优化点 2：按时间排序。直接在 numpy 数组上操作，避免 DataFrame.iloc 的昂贵拷贝
+        print("  - 正在进行全局时间排序 (消除数据泄露)...")
+        sort_idx = np.argsort(dates_arr)
+        X_arr = X_arr[sort_idx]
+        y_arr = y_arr[sort_idx]
+        returns_arr = returns_arr[sort_idx]
+        dates_arr = dates_arr[sort_idx]
+        unbuyable_arr = unbuyable_arr[sort_idx]
+        limit_groups_arr = limit_groups_arr[sort_idx]
         
         # 应用：按日横向归一化 (Cross-sectional Normalization)
-        # 彻底消除市场整体涨跌（Beta）对因子和标签的影响，强制模型学习选股（Alpha）
-        unique_dates = np.unique(dates_combined)
-        print(f"\n应用：进行每日横向处理 (共 {len(unique_dates)} 个交易日)...")
-        
-        # 1. 因子归一化 (Z-Score)
-        print("  - 因子横向 Z-Score 归一化 (向量化优化)...")
-        # 暂时将日期加入以利用 groupby 性能
-        X_combined['temp_date'] = dates_combined
-        # 转换为 float64 确保计算精度，并计算分组统计量
-        X_combined_float = X_combined.drop(columns=['temp_date']).astype(np.float64)
-        grouped = X_combined_float.groupby(dates_combined)
-        
-        # 批量执行 Z-Score：减去组内均值并除以组内标准差
-        # 使用 transform('mean') 和 transform('std') 是经过优化的内置路径
-        X_combined = (X_combined_float - grouped.transform('mean')) / grouped.transform('std').replace(0, 1.0)
-        X_combined = X_combined.fillna(0)
-        
-        # 2. 标签横向百分位排名归一化 (针对 XGBoost 回归任务)
-        print("  - 标签横向百分位排名归一化 (向量化优化)...")
-        # 使用同样的 groupby 逻辑处理标签
-        y_df = pd.DataFrame({'y': y_combined.values, 'date': dates_combined})
-        y_norm = y_df.groupby('date')['y'].transform(
-            lambda x: (x.rank(method='average', pct=True) - (0.5 / len(x))) if len(x) > 0 else 0.5
+        # 获取日期分组索引（排序后日期是连续的）
+        _, date_group_start, date_group_counts = np.unique(
+            dates_arr, return_index=True, return_counts=True
         )
-        y_combined = pd.Series(y_norm.values)
         
+        print(f"\n应用：进行每日横向处理 (共 {len(date_group_start)} 个交易日)...")
+        
+        # 优化点 3：多线程并行处理 Cross-sectional 归一化
+        # 既然是在同一个大数组上做切片操作，且 numpy 在数值运算时释放 GIL，
+        # 使用 ThreadPoolExecutor 可以充分利用 CPU，且没有 Multiprocessing 的进程间拷贝开销。
+        print("  - 因子横向 Z-Score 归一化 (多线程并行化优化)...")
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def process_day_zscore(start, count):
+            end = start + count
+            grp = X_arr[start:end]
+            mu = grp.mean(axis=0)
+            sd = grp.std(axis=0, ddof=0)
+            sd[sd == 0] = 1.0
+            X_arr[start:end] = (grp - mu) / sd
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            for start, count in zip(date_group_start, date_group_counts):
+                executor.submit(process_day_zscore, start, count)
+        
+        # 最后的无效值填充 (in-place)
+        np.nan_to_num(X_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        # 构建轻量级包装 DataFrame 用于后续的 Audit Report 分析
+        # 注意：这里会关联 X_arr，尽量避免不必要的拷贝
+        X_combined = pd.DataFrame(X_arr, columns=col_names)
+        
+        # 2. 标签横向百分位排名归一化 (优化：按市场限制分层排名，增强跨市场泛化)
+        print("  - 标签横向百分位排名归一化 (按市场限制分组优化)...")
+        from scipy.stats import rankdata
+        def process_day_market_rank(start, count):
+            end = start + count
+            day_limits = limit_groups_arr[start:end]
+            
+            # 在同一天内，按涨跌幅限制 groups 进一步划分
+            unique_limits = np.unique(day_limits)
+            for lim in unique_limits:
+                mask = day_limits == lim
+                idx_in_day = np.where(mask)[0]
+                if len(idx_in_day) > 0:
+                    # 仅在每个限制市场内部进行排名
+                    target_idx = start + idx_in_day
+                    grp_y = y_arr[target_idx]
+                    ranks = rankdata(grp_y, method='average')
+                    y_arr[target_idx] = (ranks - 0.5) / len(idx_in_day)
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            for start, count in zip(date_group_start, date_group_counts):
+                executor.submit(process_day_market_rank, start, count)
+
+
         # 3. 惩罚不可买入样本 (涨停/停牌)
         # 将无法买入的标的标签强制设为最低值 (0.0)，迫使模型主动降低对其的预测打分
         # 否则模型容易被高动量特征吸引，给出高分导致假高准确率但无法实盘
-        if unbuyable_combined is not None:
-            penalty_count = np.sum(unbuyable_combined)
+        if unbuyable_arr is not None:
+            penalty_count = np.sum(unbuyable_arr)
             if penalty_count > 0:
                 print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.1")
-                y_combined.loc[unbuyable_combined] = 0.1
+                y_arr[unbuyable_arr] = 0.1
 
         
         # 统计因子分类详情 (Factor Audit Report)
         all_cols = X_combined.columns.tolist()
+        remaining_all = set(all_cols)
         
-        tech_cols = [c for c in all_cols if any(x in c.lower() for x in self.tech_calculator.get_factor_names())]
-        candle_cols = [c for c in all_cols if any(x in c.lower() for x in self.candlestick_calculator.get_pattern_names())]
-        engineered_cols = [c for c in all_cols if c in self.feature_engineer.get_generated_features()]
+        # 1. 状态因子
+        status_cols = [c for c in all_cols if c in ['is_limit_up', 'is_suspended']]
+        remaining_all -= set(status_cols)
         
-        # 排除已识别的分类，剩下的通常是基础基本面因子或高级特征
-        remaining_cols = set(all_cols) - set(tech_cols) - set(candle_cols) - set(engineered_cols)
+        # 2. 市场情绪因子 (全市场维度)
+        # 匹配 market_sentiment 表中的字段名
+        sentiment_keywords = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'total_volume', 'sentiment_', 'mkt_']
+        sentiment_cols = [c for c in all_cols if c in remaining_all and any(k in c.lower() for k in sentiment_keywords)]
+        remaining_all -= set(sentiment_cols)
         
-        # 识别高级/风险特征
+        # 3. 特征工程 (衍生的复合因子)
+        engineered_cols = [c for c in all_cols if c in remaining_all and c in self.feature_engineer.get_generated_features()]
+        remaining_all -= set(engineered_cols)
+        
+        # 4. K线形态
+        candle_names = [x.lower() for x in self.candlestick_calculator.get_pattern_names()]
+        candle_cols = [c for c in all_cols if c in remaining_all and any(x == c.lower() or f"cdl_{x}" in c.lower() for x in candle_names)]
+        remaining_all -= set(candle_cols)
+        
+        # 5. 技术指标 (基础量价指标)
+        tech_names = [x.lower() for x in self.tech_calculator.get_factor_names()]
+        tech_cols = [c for c in all_cols if c in remaining_all and any(x in c.lower() for x in tech_names)]
+        remaining_all -= set(tech_cols)
+        
+        # 6. 基础基本面
+        fund_keywords = ['roe', 'xsjll', 'zzcjll', 'rev_yoy', 'np_yoy', 'pe', 'pb', 'eps', 'bps', 'ocf', 'zcfzl', 'qycs', 'bank_', 'org_type', 'peg', 'sue', 'eav']
+        fund_cols = [c for c in all_cols if c in remaining_all and any(k in c.lower() for k in fund_keywords)]
+        remaining_all -= set(fund_cols)
+        
+        # 7. 高级时序/风险特征
         adv_keywords = ['volatility', 'return_', 'momentum_', 'sharpe', 'drawdown', 'skewness', 'kurtosis', 'acceleration', 'position']
-        adv_cols = [c for c in remaining_cols if any(k in c.lower() for k in adv_keywords)]
+        adv_cols = [c for c in all_cols if c in remaining_all and any(k in c.lower() for k in adv_keywords)]
+        remaining_all -= set(adv_cols)
         
-        # 剩下的就是纯基本面或状态因子
-        fund_cols = list(remaining_cols - set(adv_cols))
+        # 8. 其它
+        other_cols = list(remaining_all)
 
         print("\n" + "="*50)
         print("数据集审计报告 (Factor Audit Report)")
         print("="*50)
-        print(f"总样本数: {len(X_combined):<10} | 正样本率: {y_combined.mean():.2%}")
-        print(f"总特征数: {len(all_cols):<10} | 无法买入: {np.mean(unbuyable_combined):.2%}")
-        print("-" * 50)
         print(f"1. 技术指标 (Technical):    {len(tech_cols):>4} 个")
         print(f"2. K线形态 (Candlestick):   {len(candle_cols):>4} 个")
         print(f"3. 基础基本面 (Fundamental): {len(fund_cols):>4} 个")
-        print(f"4. 高级时序 (Advanced):     {len(adv_cols):>4} 个")
-        print(f"5. 特征工程 (Engineered):   {len(engineered_cols):>4} 个")
+        print(f"4. 市场情绪 (Sentiment):   {len(sentiment_cols):>4} 个")
+        print(f"5. 高级时序 (Advanced):     {len(adv_cols):>4} 个")
+        print(f"6. 特征工程 (Engineered):   {len(engineered_cols):>4} 个")
+        print(f"7. 其它状态 (Others):       {len(status_cols) + len(other_cols):>4} 个")
         print("="*50 + "\n")
         
-        return X_combined.values.astype(np.float64), y_combined.values, returns_combined, all_cols, dates_combined, unbuyable_combined
+        # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
+        return X_arr, y_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr
     
     def train_models(self, X: np.ndarray, y: np.ndarray, 
                     returns: np.ndarray,
                     factor_names: List[str],
                     dates: np.ndarray,
                     unbuyable_mask: np.ndarray = None,
+                    limit_groups: np.ndarray = None,
                     model_types: List[str] = ['xgboost', 'lightgbm']) -> Dict:
         """
         训练多个模型
@@ -632,7 +725,7 @@ class MLModelTrainer:
             X = X.values
         
         # 确保数据类型正确
-        X = X.astype(np.float64)
+        X = X.astype(np.float32)
         y = y.astype(np.float32)  # 支持软标签，不能强制转 int32
         
         # 最后一次NaN/inf检查和替换
@@ -651,10 +744,16 @@ class MLModelTrainer:
         # 准备样本权重
         sample_weight = None
         if self.punish_unbuyable:
-            print(f"\n样本权重: weight = abs(returns)")
-            sample_weight = np.abs(returns)
+            # 优化：使用相对涨跌幅 (returns / limit_threshold) 作为权重
+            # 这样一来，10% 市场涨 8% 的样本与 20% 市场涨 16% 的样本具有同等重要性
+            if limit_groups is not None:
+                print(f"\n样本权重: weight = abs(returns / limit_groups)")
+                sample_weight = np.abs(returns / np.clip(limit_groups, 0.04, 0.3))
+            else:
+                print(f"\n样本权重: weight = abs(returns)")
+                sample_weight = np.abs(returns)
             
-            # 由于在预处理中已经将 unbuyable_mask 对应的标签强设为 0.0，
+            # 由于在预处理中已经将 unbuyable_mask 对应的标签强设为 0.1，
             # 我们希望模型充分学习这次负向惩罚，因此这里**不再**降低它们的权重。
             # 缩放权重，避免数值过大
             sample_weight = sample_weight / sample_weight.mean()
@@ -688,15 +787,9 @@ class MLModelTrainer:
                 
                 extra_params['dates'] = dates  # 传递日期用于按组评估
                 extra_params['split_idx'] = split_idx  # 传递对齐后的 split 点
-                
-                if task == 'ranking':
-                    extra_params['group'] = train_group
-                    extra_params['eval_group'] = val_group
-                    print(f"  排序任务: 分割点对齐 - 原始={raw_split_idx}, 对齐后={split_idx} (日期边界: {split_date})")
-                    print(f"  排序任务: 分组数量 - 训练集 {len(train_group)}, 验证集 {len(val_group)}")
-                else:
-                    print(f"  {task}任务评估准备: 分割点对齐于日期 {split_date}")
-                
+                extra_params['group'] = train_group
+                extra_params['eval_group'] = val_group
+                            
                 # 训练模型
                 train_result = model.train(X, y, validation_split=0.2, 
                                           use_time_series_split=True,
@@ -742,10 +835,8 @@ class MLModelTrainer:
             
             # 补充任务特有指标
             if model_type == 'lightgbm':
-                row['NDCG@5'] = f"{val_metrics.get('ndcg@5', 0.0):.4f}"
                 row['辅助指标'] = f"IC_Std: {val_metrics.get('rank_ic_std', 0.0):.4f}"
             else:
-                row['NDCG@5'] = "N/A"
                 row['辅助指标'] = f"AUC: {val_metrics.get('auc', 0.0):.4f}"
             
             comparison.append(row)
@@ -847,10 +938,7 @@ class MLModelTrainer:
         import json
         filepath = os.path.join(save_dir, 'factor_summary.json')
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n因子汇总已保存: {filepath}")
-    
+            json.dump(summary, f, indent=2, ensure_ascii=False)    
     def clear_factors_cache(self):
         """清理因子缓存"""
         import shutil
@@ -932,7 +1020,7 @@ def main():
 
     
     # 5. 准备数据集
-    X, y, returns, factor_names, dates, unbuyable = trainer.prepare_dataset(
+    X, y, returns, factor_names, dates, unbuyable, limit_groups = trainer.prepare_dataset(
         stocks_data,
         cache_engineered_features=args.cache_engineered,
         train_start_date=train_start_date,
@@ -942,7 +1030,7 @@ def main():
     
     # 6. 训练模型
     model_types = ['xgboost', 'lightgbm']
-    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, model_types)
+    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, limit_groups, model_types)
     
     # 7. 对比模型
     best_model_type = trainer.compare_models(results)
@@ -976,11 +1064,9 @@ def main():
     if args.cache_engineered:
         print(f"\n✓ 缓存包含完整特征")
         print(f"  回测时可以直接使用缓存，无需特征工程")
-        print(f"  建议: 回测时设置 enable_feature_engineering=False")
     else:
         print(f"\n✓ 缓存仅包含基础因子（方案A）")
         print(f"  回测时需要启用特征工程")
-        print(f"  建议: 回测时设置 enable_feature_engineering=True")
     
     print(f"\n提示: 使用 trainer.clear_factors_cache() 可清理缓存")
 

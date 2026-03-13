@@ -92,6 +92,8 @@ export const stockSelector = {
     getSelectionStatus: () => api.get('/stock-selector/run-status'),
     getFactors: (code, days = 250) => cachedGet(`/stock-selector/factors/${code}`, { params: { days } }),
     getSignals: (code, days = 100) => cachedGet(`/stock-selector/signals/${code}`, { params: { days } }),
+    search: (query) => api.get('/fundamental/search', { params: { query } }),
+    getFundamental: (code) => cachedGet(`/fundamental/${code}`),
 }
 
 // ── 实盘验证 (支持游客本地存储) ────────────────────────────────

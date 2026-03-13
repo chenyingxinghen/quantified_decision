@@ -53,8 +53,6 @@ Thumbs.db
 .kiro/steerin/design.md
 .kiro/steerin/requirements.md
 
-#data
-data/
 
 # 模型
 models/
@@ -67,4 +65,5 @@ quantification-system/frontend/.*
 quantification-system/backend/log
 logs
 new_data/*
-A股股票列表.csv
+
+database/*

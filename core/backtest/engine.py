@@ -11,7 +11,7 @@ from .portfolio import Portfolio, Trade
 from .data_handler import DataHandler
 from .performance import PerformanceAnalyzer
 import sqlite3
-from config import DATABASE_PATH, TrainingConfig
+from config import DATABASE_PATH, TrainingConfig, MARKET_LIMITS, MARKET_PREFIXES
 from config.strategy_config import (
     TIME_STOP_DAYS,
     TIME_STOP_MIN_LOSS_PCT,
@@ -313,21 +313,15 @@ class BacktestEngine:
         
         # 止损检查
         if position.stop_loss and ENABLE_STOP_LOSS_EXIT:
-            if open_price <= position.stop_loss:
-                # 优化 3: 如果开盘即跌破止损，以开盘价成交（更真实，且避免跳空低开导致的亏损被低估）
-                return True, open_price, 'stop_loss'
             if low <= position.stop_loss:
-                # 日内触及止损价
-                return True, position.close, 'stop_loss'
+                # 日内触及止损价，以止损价成交
+                return True, close, 'stop_loss'
         
         # 止盈检查
         if ENABLE_TAKE_PROFIT_EXIT and position.take_profit:
-            if open_price >= position.take_profit:
-                # 如果开盘即突破止盈，以开盘价成交
-                return True, open_price, 'take_profit'
             if high >= position.take_profit:
                 # 日内触及止盈价
-                return True, position.take_profit, 'take_profit'
+                return True, close, 'take_profit'
         
         # 时间止损（持仓超过阙值且亏损超过阙值）
         if (ENABLE_TIME_STOP_EXIT and 
@@ -389,8 +383,16 @@ class BacktestEngine:
         if bar['open'] == bar['high'] == bar['low'] == bar['close']:
             # 获取 ST 标签：优先从行情 bar 中获取，否则设为非 ST
             is_st = bar.get('is_st', 0) == 1
-            # ST 股涨停阈值取 1.045, 普通股取 1.095
-            limit_threshold = 1.045 if is_st else 1.095
+            
+            # 兼容主板(10%)、创业板/科创板(20%)、北交所(30%)
+            if is_st:
+                limit_threshold = 1.0 + MARKET_LIMITS['st']
+            elif stock_code.startswith(MARKET_PREFIXES['sz_gem']) or stock_code.startswith(MARKET_PREFIXES['star']):
+                limit_threshold = 1.0 + MARKET_LIMITS['gem_star']
+            elif stock_code.startswith(MARKET_PREFIXES['bj']):
+                limit_threshold = 1.0 + MARKET_LIMITS['bj']
+            else:
+                limit_threshold = 1.0 + MARKET_LIMITS['main']
             
             if bar['open'] > signal_price * limit_threshold:
                 return None, None

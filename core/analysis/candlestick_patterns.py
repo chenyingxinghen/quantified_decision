@@ -20,526 +20,488 @@ class CandlestickPatterns:
         """初始化K线形态检测器"""
         pass
     
-    # ==================== 单根K线形态 ====================
-    
-    def detect_hammer(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测锤子线形态（看涨反转）
-        
-        特征：
-        - 下影线至少是实体的2倍
-        - 上影线很小（<实体的10%）
-        - 出现在下跌趋势底部
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 1:
-            return None
-        
-        last = data.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        lower_shadow = min(last['open'], last['close']) - last['low']
-        upper_shadow = last['high'] - max(last['open'], last['close'])
-        
-        if body == 0:
-            return None
-        
-        if lower_shadow >= 1.8 * body and upper_shadow <= 0.15 * body:
-            return {
-                'detected': True,
-                'score': 20,
-                'description': '锤子线',
-                'type': 'bullish_reversal',
-                'reliability': 75
-            }
-        return None
-    
-    def detect_shooting_star(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测射击之星形态（看跌反转）
-        
-        特征：
-        - 上影线至少是实体的2倍
-        - 出现在上涨趋势顶部
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 1:
-            return None
-        
-        last = data.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        lower_shadow = min(last['open'], last['close']) - last['low']
-        upper_shadow = last['high'] - max(last['open'], last['close'])
-        
-        if body == 0:
-            return None
-        
-        if upper_shadow > body * 2:
-            return {
-                'detected': True,
-                'score': min(35, int(upper_shadow / body * 10)),
-                'description': '射击之星',
-                'type': 'bearish_reversal',
-                'reliability': 70
-            }
-        return None
-    
-    def detect_doji(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测十字星形态（犹豫信号）
-        
-        特征：
-        - 实体很小（<总区间的5%）
-        - 开盘价和收盘价几乎相等
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 1:
-            return None
-        
-        last = data.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        total_range = last['high'] - last['low']
-        
-        if total_range == 0:
-            return None
-        
-        if body <= 0.05 * total_range:
-            return {
-                'detected': True,
-                'score': 10,
-                'description': '十字星',
-                'type': 'indecision',
-                'reliability': 60
-            }
-        return None
-    
-    def detect_spinning_top(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测陀螺线形态（犹豫信号）
-        
-        特征：
-        - 实体较小
-        - 上下影线都较长
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 1:
-            return None
-        
-        last = data.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        lower_shadow = min(last['open'], last['close']) - last['low']
-        upper_shadow = last['high'] - max(last['open'], last['close'])
-        
-        if body == 0:
-            return None
-        
-        if (lower_shadow > body and upper_shadow > body and
-            lower_shadow < body * 3 and upper_shadow < body * 3):
-            return {
-                'detected': True,
-                'score': 8,
-                'description': '陀螺线',
-                'type': 'indecision',
-                'reliability': 50
-            }
-        return None
-    
-    # ==================== 双根K线形态 ====================
-    
-    def detect_bullish_engulfing(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测看涨吞没形态
-        
-        特征：
-        - 前一根是阴线
-        - 当前是阳线
-        - 当前K线完全吞没前一根
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 2:
-            return None
-        
-        prev = data.iloc[-2]
-        curr = data.iloc[-1]
-        
-        prev_body = abs(prev['close'] - prev['open'])
-        curr_body = abs(curr['close'] - curr['open'])
-        
-        if (prev['close'] < prev['open'] and  # 前一根是阴线
-            curr['close'] > curr['open'] and  # 当前是阳线
-            curr['open'] < prev['close'] and  # 当前开盘低于前一收盘
-            curr['close'] > prev['open'] and  # 当前收盘高于前一开盘
-            curr_body > prev_body):           # 当前实体更大
-            
-            return {
-                'detected': True,
-                'score': 25,
-                'description': '看涨吞没',
-                'type': 'bullish_reversal',
-                'reliability': 78
-            }
-        return None
-    
-    def detect_bearish_engulfing(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测看跌吞没形态
-        
-        特征：
-        - 前一根是阳线
-        - 当前是阴线
-        - 当前K线完全吞没前一根
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 2:
-            return None
-        
-        prev = data.iloc[-2]
-        curr = data.iloc[-1]
-        
-        prev_body = abs(prev['close'] - prev['open'])
-        curr_body = abs(curr['close'] - curr['open'])
-        
-        if (prev['close'] > prev['open'] and  # 前一根是阳线
-            curr['close'] < curr['open'] and  # 当前是阴线
-            curr['open'] > prev['close'] and  # 当前开盘高于前一收盘
-            curr['close'] < prev['open'] and  # 当前收盘低于前一开盘
-            curr_body > prev_body):           # 当前实体更大
-            
-            return {
-                'detected': True,
-                'score': 25,
-                'description': '看跌吞没',
-                'type': 'bearish_reversal',
-                'reliability': 78
-            }
-        return None
-    
-    def detect_dark_cloud_cover(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测乌云盖顶形态（看跌反转）
-        
-        特征：
-        - 前一根是大阳线
-        - 当前是阴线
-        - 跳空高开
-        - 收盘在前一根中点下方
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 2:
-            return None
-        
-        prev = data.iloc[-2]
-        curr = data.iloc[-1]
-        
-        if (prev['close'] > prev['open'] and  # 前一根是阳线
-            curr['close'] < curr['open'] and  # 当前是阴线
-            curr['open'] > prev['high'] and  # 跳空高开
-            curr['close'] < (prev['open'] + prev['close']) / 2):  # 收盘在前一根中点下方
-            
-            return {
-                'detected': True,
-                'score': 25,
-                'description': '乌云盖顶',
-                'type': 'bearish_reversal',
-                'reliability': 75
-            }
-        return None
-    
-    def detect_piercing_pattern(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测刺透形态（看涨反转）
-        
-        特征：
-        - 前一根是大阴线
-        - 当前是阳线
-        - 跳空低开
-        - 收盘在前一根中点上方
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 2:
-            return None
-        
-        prev = data.iloc[-2]
-        curr = data.iloc[-1]
-        
-        if (prev['close'] < prev['open'] and  # 前一根是阴线
-            curr['close'] > curr['open'] and  # 当前是阳线
-            curr['open'] < prev['low'] and  # 跳空低开
-            curr['close'] > (prev['open'] + prev['close']) / 2):  # 收盘在前一根中点上方
-            
-            return {
-                'detected': True,
-                'score': 25,
-                'description': '刺透形态',
-                'type': 'bullish_reversal',
-                'reliability': 75
-            }
-        return None
-    
-    # ==================== 三根K线形态 ====================
-    
-    def detect_three_black_crows(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测三只乌鸦形态（强烈看跌）
-        
-        特征：
-        - 三根连续阴线
-        - 收盘价逐渐走低
-        - 每根开盘在前一根实体内
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 3:
-            return None
-        
-        last_three = data.tail(3)
-        
-        # 检查是否都是阴线且逐渐走低
-        all_bearish = all(row['close'] < row['open'] for _, row in last_three.iterrows())
-        descending = (last_three.iloc[0]['close'] > last_three.iloc[1]['close'] > 
-                     last_three.iloc[2]['close'])
-        
-        if all_bearish and descending:
-            return {
-                'detected': True,
-                'score': 30,
-                'description': '三只乌鸦',
-                'type': 'bearish_reversal',
-                'reliability': 78
-            }
-        return None
-    
-    def detect_three_white_soldiers(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测三个白兵形态（强烈看涨）
-        
-        特征：
-        - 三根连续阳线
-        - 收盘价逐渐走高
-        - 每根开盘在前一根实体内
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 3:
-            return None
-        
-        last_three = data.tail(3)
-        
-        # 检查是否都是阳线且逐渐走高
-        all_bullish = all(row['close'] > row['open'] for _, row in last_three.iterrows())
-        ascending = (last_three.iloc[0]['close'] < last_three.iloc[1]['close'] < 
-                    last_three.iloc[2]['close'])
-        
-        if all_bullish and ascending:
-            return {
-                'detected': True,
-                'score': 30,
-                'description': '三个白兵',
-                'type': 'bullish_reversal',
-                'reliability': 78
-            }
-        return None
-    
-    def detect_morning_star(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测晨星形态（看涨反转）
-        
-        特征：
-        - 第一根：大阴线
-        - 第二根：小实体（十字星或小K线）
-        - 第三根：大阳线，深入第一根实体
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 3:
-            return None
-        
-        bar1 = data.iloc[-3]
-        bar2 = data.iloc[-2]
-        bar3 = data.iloc[-1]
-        
-        # 第一根：大阴线
-        bar1_open = float(bar1['open'])
-        bar1_close = float(bar1['close'])
-        is_bearish_1 = bar1_close < bar1_open and bar1_open > 0 and (bar1_open - bar1_close) / bar1_open > 0.02
-        # 第二根：小实体
-        bar2_open = float(bar2['open'])
-        bar2_close = float(bar2['close'])
-        is_small_2 = bar2_open > 0 and abs(bar2_close - bar2_open) / bar2_open < 0.01
-        # 第三根：大阳线
-        bar3_open = float(bar3['open'])
-        bar3_close = float(bar3['close'])
-        is_bullish_3 = bar3_close > bar3_open and bar3_open > 0 and (bar3_close - bar3_open) / bar3_open > 0.02
-        # 第三根深入第一根
-        penetration = bar3_close > (bar1_open + bar1_close) / 2
-        
-        if is_bearish_1 and is_small_2 and is_bullish_3 and penetration:
-            return {
-                'detected': True,
-                'score': 25,
-                'description': '晨星',
-                'type': 'bullish_reversal',
-                'reliability': 68
-            }
-        return None
-    
-    def detect_evening_star(self, data: pd.DataFrame) -> Optional[Dict]:
-        """
-        检测黄昏之星/暮星形态（看跌反转）
-        
-        特征：
-        - 第一根：大阳线
-        - 第二根：小实体（十字星或小K线）
-        - 第三根：大阴线，深入第一根实体
-        
-        返回: {'detected': bool, 'score': int, 'description': str}
-        """
-        if len(data) < 3:
-            return None
-        
-        bar1 = data.iloc[-3]
-        bar2 = data.iloc[-2]
-        bar3 = data.iloc[-1]
-        
-        # 第一根：大阳线
-        bar1_open = float(bar1['open'])
-        bar1_close = float(bar1['close'])
-        is_bullish_1 = bar1_close > bar1_open and bar1_open > 0 and (bar1_close - bar1_open) / bar1_open > 0.02
-        # 第二根：小实体
-        bar2_open = float(bar2['open'])
-        bar2_close = float(bar2['close'])
-        is_small_2 = bar2_open > 0 and abs(bar2_close - bar2_open) / bar2_open < 0.01
-        # 第三根：大阴线
-        bar3_open = float(bar3['open'])
-        bar3_close = float(bar3['close'])
-        is_bearish_3 = bar3_close < bar3_open and bar3_open > 0 and (bar3_open - bar3_close) / bar3_open > 0.02
-        # 第三根深入第一根
-        penetration = bar3_close < (bar1_open + bar1_close) / 2
-        
-        if is_bullish_1 and is_small_2 and is_bearish_3 and penetration:
-            return {
-                'detected': True,
-                'score': 25,
-                'description': '黄昏之星',
-                'type': 'bearish_reversal',
-                'reliability': 68
-            }
-        return None
-    
-    # ==================== 综合检测方法 ====================
-    
+    # ==================== 统一检测接口 (基于向量化逻辑) ====================
+
+    def _get_pattern_metadata(self) -> Dict[str, Dict]:
+        """获取所有形态的属性映射"""
+        return {
+            'white_candle': {'description': '阳线', 'score': 2, 'type': 'bullish', 'reliability': 40},
+            'black_candle': {'description': '阴线', 'score': 2, 'type': 'bearish', 'reliability': 40},
+            'doji': {'description': '十字星', 'score': 10, 'type': 'indecision', 'reliability': 60},
+            'hammer': {'description': '锤子线', 'score': 20, 'type': 'bullish_reversal', 'reliability': 75},
+            'hanging_man': {'description': '上吊线', 'score': 20, 'type': 'bearish_reversal', 'reliability': 70},
+            'shooting_star': {'description': '射击之星', 'score': 35, 'type': 'bearish_reversal', 'reliability': 70},
+            'inverted_hammer': {'description': '倒锤线', 'score': 15, 'type': 'bullish_reversal', 'reliability': 65},
+            'marubozu': {'description': '光头光脚线', 'score': 15, 'type': 'trend', 'reliability': 65},
+            'spinning_top': {'description': '纺锤线', 'score': 8, 'type': 'indecision', 'reliability': 50},
+            'bullish_engulfing': {'description': '看涨吞没', 'score': 25, 'type': 'bullish_reversal', 'reliability': 78},
+            'bearish_engulfing': {'description': '看跌吞没', 'score': 25, 'type': 'bearish_reversal', 'reliability': 78},
+            'piercing_line': {'description': '刺穿线', 'score': 25, 'type': 'bullish_reversal', 'reliability': 75},
+            'dark_cloud_cover': {'description': '乌云盖顶', 'score': 25, 'type': 'bearish_reversal', 'reliability': 75},
+            'morning_star': {'description': '晨星', 'score': 25, 'type': 'bullish_reversal', 'reliability': 68},
+            'evening_star': {'description': '暮星', 'score': 25, 'type': 'bearish_reversal', 'reliability': 68},
+            'three_white_soldiers': {'description': '三个白兵', 'score': 30, 'type': 'bullish_reversal', 'reliability': 78},
+            'three_black_crows': {'description': '三只乌鸦', 'score': 30, 'type': 'bearish_reversal', 'reliability': 78},
+            'harami': {'description': '孕线', 'score': 15, 'type': 'reversal', 'reliability': 60}
+        }
+
+    def identify_three_white_soldiers(self, data: pd.DataFrame) -> np.ndarray:
+        """识别三个白兵"""
+        is_white = data['close'] > data['open']
+        c0 = is_white.shift(2)
+        c1 = is_white.shift(1)
+        c2 = is_white
+        ascending = (data['close'].shift(1) > data['close'].shift(2)) & (data['close'] > data['close'].shift(1))
+        return (c0 & c1 & c2 & ascending).fillna(False).astype(float).values
+
+    def identify_three_black_crows(self, data: pd.DataFrame) -> np.ndarray:
+        """识别三只乌鸦"""
+        is_black = data['open'] > data['close']
+        c0 = is_black.shift(2)
+        c1 = is_black.shift(1)
+        c2 = is_black
+        descending = (data['close'].shift(1) < data['close'].shift(2)) & (data['close'] < data['close'].shift(1))
+        return (c0 & c1 & c2 & descending).fillna(False).astype(float).values
+
     def detect_all_bullish_patterns(self, data: pd.DataFrame) -> List[Dict]:
-        """
-        检测所有看涨形态
-        
-        返回: 检测到的形态列表
-        """
-        patterns = []
-        
-        # 单根K线形态
-        hammer = self.detect_hammer(data)
-        if hammer:
-            patterns.append(hammer)
-        
-        # 双根K线形态
-        bullish_engulfing = self.detect_bullish_engulfing(data)
-        if bullish_engulfing:
-            patterns.append(bullish_engulfing)
-        
-        piercing = self.detect_piercing_pattern(data)
-        if piercing:
-            patterns.append(piercing)
-        
-        # 三根K线形态
-        three_soldiers = self.detect_three_white_soldiers(data)
-        if three_soldiers:
-            patterns.append(three_soldiers)
-        
-        morning_star = self.detect_morning_star(data)
-        if morning_star:
-            patterns.append(morning_star)
-        
-        return patterns
-    
+        """检测当前（最后一行）的所有看涨形态"""
+        return self._detect_patterns_at_index(data, -1, 'bullish')
+
     def detect_all_bearish_patterns(self, data: pd.DataFrame) -> List[Dict]:
-        """
-        检测所有看跌形态
-        
-        返回: 检测到的形态列表
-        """
-        patterns = []
-        
-        # 单根K线形态
-        shooting_star = self.detect_shooting_star(data)
-        if shooting_star:
-            patterns.append(shooting_star)
-        
-        # 双根K线形态
-        bearish_engulfing = self.detect_bearish_engulfing(data)
-        if bearish_engulfing:
-            patterns.append(bearish_engulfing)
-        
-        dark_cloud = self.detect_dark_cloud_cover(data)
-        if dark_cloud:
-            patterns.append(dark_cloud)
-        
-        # 三根K线形态
-        three_crows = self.detect_three_black_crows(data)
-        if three_crows:
-            patterns.append(three_crows)
-        
-        evening_star = self.detect_evening_star(data)
-        if evening_star:
-            patterns.append(evening_star)
-        
-        return patterns
-    
+        """检测当前（最后一行）的所有看跌形态"""
+        return self._detect_patterns_at_index(data, -1, 'bearish')
+
     def detect_all_patterns(self, data: pd.DataFrame) -> Dict[str, List[Dict]]:
+        """检测当前（最后一行）的所有形态"""
+        return {
+            'bullish': self.detect_all_bullish_patterns(data),
+            'bearish': self.detect_all_bearish_patterns(data),
+            'neutral': self._detect_patterns_at_index(data, -1, 'indecision')
+        }
+
+    def _detect_patterns_at_index(self, data: pd.DataFrame, idx: int, filter_type: str) -> List[Dict]:
+        """在指定索引处检测特定类型的形态"""
+        if len(data) < 3: return []
+        
+        context = self.calculate_context(data)
+        meta_all = self._get_pattern_metadata()
+        results = []
+        
+        # 定义需要检查的方法名列表
+        pattern_ids = [
+            'hammer', 'inverted_hammer', 'bullish_engulfing', 'piercing_line', 
+            'morning_star', 'three_white_soldiers', 'harami', # Bullish
+            'shooting_star', 'hanging_man', 'bearish_engulfing', 'dark_cloud_cover', 
+            'evening_star', 'three_black_crows', # Bearish
+            'doji', 'spinning_top' # Neutral/Indecision
+        ]
+        
+        for pid in pattern_ids:
+            meta = meta_all.get(pid, {})
+            # 根据类型过滤
+            p_type = meta.get('type', '')
+            if filter_type == 'bullish' and 'bullish' not in p_type: continue
+            if filter_type == 'bearish' and 'bearish' not in p_type: continue
+            if filter_type == 'indecision' and p_type != 'indecision': continue
+
+            method = getattr(self, f"identify_{pid}", None)
+            if not method: continue
+            
+            # 部分方法需要 context
+            if pid in ['hammer', 'hanging_man', 'shooting_star', 'inverted_hammer', 
+                      'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']:
+                signal_arr = method(data, context)
+            else:
+                signal_arr = method(data)
+            
+            if signal_arr[idx] > 0:
+                res = meta.copy()
+                res['detected'] = True
+                results.append(res)
+        
+        return results
+
+    def scan_patterns_history(self, data: pd.DataFrame, scan_len: int = 90) -> Dict[str, List[Dict]]:
         """
-        检测所有K线形态
+        全量扫描历史形态信号 (高效向量化实现)
         
-        返回: {'bullish': [...], 'bearish': [...], 'neutral': [...]}
+        Args:
+            data: 包含OHLC数据和date列的DataFrame
+            scan_len: 扫描最近的天数
         """
-        bullish = self.detect_all_bullish_patterns(data)
-        bearish = self.detect_all_bearish_patterns(data)
+        if len(data) < 3: return {'bullish': [], 'bearish': []}
         
-        # 检测中性形态
-        neutral = []
-        doji = self.detect_doji(data)
-        if doji:
-            neutral.append(doji)
+        context = self.calculate_context(data)
+        meta_all = self._get_pattern_metadata()
+        bullish_history = []
+        bearish_history = []
         
-        spinning_top = self.detect_spinning_top(data)
-        if spinning_top:
-            neutral.append(spinning_top)
+        # 需要扫描的核心形态
+        pattern_ids = [
+            'hammer', 'inverted_hammer', 'bullish_engulfing', 'piercing_line', 
+            'morning_star', 'three_white_soldiers', 'harami',
+            'shooting_star', 'hanging_man', 'bearish_engulfing', 'dark_cloud_cover', 
+            'evening_star', 'three_black_crows'
+        ]
+        
+        # 预先计算所有信号矩阵（向量化，只需算一次）
+        signals = {}
+        for pid in pattern_ids:
+            method = getattr(self, f"identify_{pid}", None)
+            if not method: continue
+            if pid in ['hammer', 'hanging_man', 'shooting_star', 'inverted_hammer', 
+                      'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']:
+                signals[pid] = method(data, context)
+            else:
+                signals[pid] = method(data)
+        
+        # 扫描最后 scan_len 条记录
+        start_idx = max(0, len(data) - scan_len)
+        # 获取日期序列
+        dates = data['date'].values
+        
+        for i in range(start_idx, len(data)):
+            date_val = dates[i]
+            date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val).split('T')[0]
+            
+            for pid, sig_arr in signals.items():
+                if sig_arr[i] > 0:
+                    item = meta_all[pid].copy()
+                    item['date'] = date_str
+                    item['detected'] = True
+                    if 'bullish' in item['type']:
+                        bullish_history.append(item)
+                    elif 'bearish' in item['type']:
+                        bearish_history.append(item)
         
         return {
-            'bullish': bullish,
-            'bearish': bearish,
-            'neutral': neutral
+            'bullish': bullish_history,
+            'bearish': bearish_history
         }
     
-    def get_total_bearish_score(self, data: pd.DataFrame) -> int:
+    # ==================== 向量化识别逻辑 (精细识别) ====================
+    
+    def calculate_context(self, data: pd.DataFrame, window: int = 20) -> pd.DataFrame:
         """
-        获取看跌形态的总分
+        计算价格位置和趋势强度 (向量化)
         
-        用于策略中的看空信号评分
+        返回:
+            DataFrame 包含 price_pos(0-1), is_uptrend, is_downtrend, is_sideways
         """
+        close = data['close']
+        high = data['high']
+        low = data['low']
+        
+        # 1. 价格位置 (0-1: 0=低位, 1=高位)
+        low_min = low.rolling(window).min()
+        high_max = high.rolling(window).max()
+        # 避免除以零
+        denominator = (high_max - low_min).replace(0, 1e-6)
+        price_pos = (close - low_min) / denominator
+        
+        # 2. 趋势方向 (简单 MA 关系)
+        ma_win = close.rolling(window).mean()
+        is_uptrend = close > ma_win
+        is_downtrend = close < ma_win
+        
+        # 3. 波动幅度 (判断是否横盘/窄幅震荡)
+        # 如果 window 日内最高价和最低价的差距小于 5%, 则认为震荡区间过小，形态可靠度降低
+        diff_pct = (high_max - low_min) / low_min.replace(0, 1)
+        is_sideways = diff_pct < 0.05
+        
+        return pd.DataFrame({
+            'price_pos': price_pos,
+            'is_uptrend': is_uptrend,
+            'is_downtrend': is_downtrend,
+            'is_sideways': is_sideways
+        }, index=data.index)
+
+    def identify_white_candle(self, data: pd.DataFrame) -> np.ndarray:
+        """识别阳线"""
+        return (data['close'] > data['open']).astype(float)
+    
+    def identify_black_candle(self, data: pd.DataFrame) -> np.ndarray:
+        """识别阴线"""
+        return (data['open'] > data['close']).astype(float)
+    
+    def identify_doji(self, data: pd.DataFrame, threshold: float = 0.003) -> np.ndarray:
+        """识别十字星"""
+        body_size = np.abs(data['close'] - data['open'])
+        price_scaled_threshold = data['close'] * threshold
+        return (body_size < price_scaled_threshold).astype(float)
+    
+    def identify_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
+                        lower_ratio: float = 2.0, upper_ratio: float = 1.0) -> np.ndarray:
+        """识别锤子线 ( refined logic )"""
+        body = np.abs(data['close'] - data['open'])
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        
+        body = np.where(body == 0, 0.001, body)
+        
+        is_hammer = (
+            (lower_shadow > body * lower_ratio) &
+            (upper_shadow < body * upper_ratio) &
+            (data['close'] > data['open']) &
+            (context['price_pos'] < 0.3) & (~context['is_sideways'])
+        )
+        return is_hammer.astype(float)
+    
+    def identify_hanging_man(self, data: pd.DataFrame, context: pd.DataFrame, 
+                            lower_ratio: float = 2.0, upper_ratio: float = 1.0) -> np.ndarray:
+        """识别上吊线"""
+        body = np.abs(data['close'] - data['open'])
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        
+        body = np.where(body == 0, 0.001, body)
+        
+        is_hanging_man = (
+            (lower_shadow > body * lower_ratio) &
+            (upper_shadow < body * upper_ratio) &
+            (data['close'] < data['open']) &
+            (context['price_pos'] > 0.7) & (~context['is_sideways'])
+        )
+        return is_hanging_man.astype(float)
+    
+    def identify_shooting_star(self, data: pd.DataFrame, context: pd.DataFrame, 
+                              upper_ratio: float = 2.0, lower_ratio: float = 1.0) -> np.ndarray:
+        """识别射击之星"""
+        body = np.abs(data['close'] - data['open'])
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        
+        body = np.where(body == 0, 0.001, body)
+        
+        is_shooting_star = (
+            (upper_shadow > body * upper_ratio) &
+            (lower_shadow < body * lower_ratio) &
+            (data['close'] < data['open']) &
+            (context['price_pos'] > 0.7) & (~context['is_sideways'])
+        )
+        return is_shooting_star.astype(float)
+    
+    def identify_inverted_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
+                                upper_ratio: float = 2.0, lower_ratio: float = 1.0) -> np.ndarray:
+        """识别倒锤线"""
+        body = np.abs(data['close'] - data['open'])
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        
+        body = np.where(body == 0, 0.001, body)
+        
+        is_inverted_hammer = (
+            (upper_shadow > body * upper_ratio) &
+            (lower_shadow < body * lower_ratio) &
+            (data['close'] > data['open']) &
+            (context['price_pos'] < 0.3) & (~context['is_sideways'])
+        )
+        return is_inverted_hammer.astype(float)
+    
+    def identify_marubozu(self, data: pd.DataFrame, threshold_ratio: float = 0.003) -> np.ndarray:
+        """识别光头光脚线"""
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        threshold = data['close'] * threshold_ratio
+        is_marubozu = (lower_shadow < threshold) & (upper_shadow < threshold)
+        return is_marubozu.astype(float)
+    
+    def identify_spinning_top(self, data: pd.DataFrame) -> np.ndarray:
+        """识别纺锤线"""
+        body = np.abs(data['close'] - data['open'])
+        candle_range = data['high'] - data['low']
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        
+        candle_range = np.where(candle_range == 0, 1, candle_range)
+        
+        is_spinning_top = (
+            (body / candle_range < 0.1) &
+            (np.abs(lower_shadow - upper_shadow) / candle_range < 0.3)
+        )
+        return is_spinning_top.astype(float)
+    
+    def identify_bullish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+        """识别看涨吞没"""
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
+        
+        prev_is_black = prev_open > prev_close
+        curr_is_white = curr_close > curr_open
+        
+        engulfed = (
+            prev_is_black & curr_is_white &
+            (curr_close > prev_open) &
+            (curr_open < prev_close) &
+            (context['price_pos'] < 0.4) & (~context['is_sideways'])
+        )
+        return engulfed.fillna(False).astype(float).values
+    
+    def identify_bearish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+        """识别看跌吞没"""
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
+        
+        prev_is_white = prev_close > prev_open
+        curr_is_black = curr_open > curr_close
+        
+        engulfed = (
+            prev_is_white & curr_is_black &
+            (curr_close < prev_open) &
+            (curr_open > prev_close) &
+            (context['price_pos'] > 0.6) & (~context['is_sideways'])
+        )
+        return engulfed.fillna(False).astype(float).values
+    
+    def identify_piercing_line(self, data: pd.DataFrame) -> np.ndarray:
+        """识别刺穿线"""
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
+        
+        prev_is_black = prev_open > prev_close
+        curr_is_white = curr_close > curr_open
+        midpoint = (prev_open + prev_close) / 2
+        
+        piercing = (
+            prev_is_black & curr_is_white &
+            (curr_close > midpoint) &
+            (curr_close < prev_open)
+        )
+        return piercing.fillna(False).astype(float).values
+    
+    def identify_dark_cloud_cover(self, data: pd.DataFrame) -> np.ndarray:
+        """识别乌云盖顶"""
+        prev_open = data['open'].shift(1)
+        prev_close = data['close'].shift(1)
+        curr_open = data['open']
+        curr_close = data['close']
+        
+        prev_is_white = prev_close > prev_open
+        curr_is_black = curr_open > curr_close
+        midpoint = (prev_open + prev_close) / 2
+        
+        dark_cloud = (
+            prev_is_white & curr_is_black &
+            (curr_close < midpoint) &
+            (curr_close > prev_open)
+        )
+        return dark_cloud.fillna(False).astype(float).values
+    
+    def identify_morning_star(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+        """识别晨星"""
+        open0 = data['open'].shift(2)
+        close0 = data['close'].shift(2)
+        open1 = data['open'].shift(1)
+        close1 = data['close'].shift(1)
+        open2 = data['open']
+        close2 = data['close']
+        
+        first_is_black = open0 > close0
+        second_body = np.abs(close1 - open1)
+        first_body = np.abs(close0 - open0)
+        second_is_small = second_body < first_body * 0.5
+        third_is_white = close2 > open2
+        midpoint = (open0 + close0) / 2
+        
+        morning_star = (
+            first_is_black & second_is_small & third_is_white & 
+            (close2 > midpoint) & (context['price_pos'] < 0.3)
+        )
+        return morning_star.fillna(False).astype(float).values
+    
+    def identify_evening_star(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+        """识别暮星"""
+        open0 = data['open'].shift(2)
+        close0 = data['close'].shift(2)
+        open1 = data['open'].shift(1)
+        close1 = data['close'].shift(1)
+        open2 = data['open']
+        close2 = data['close']
+        
+        first_is_white = close0 > open0
+        second_body = np.abs(close1 - open1)
+        first_body = np.abs(close0 - open0)
+        second_is_small = second_body < first_body * 0.5
+        third_is_black = open2 > close2
+        midpoint = (open0 + close0) / 2
+        
+        evening_star = (
+            first_is_white & second_is_small & third_is_black & 
+            (close2 < midpoint) & (context['price_pos'] > 0.7)
+        )
+        return evening_star.fillna(False).astype(float).values
+    
+    def identify_harami(self, data: pd.DataFrame) -> np.ndarray:
+        """识别孕线"""
+        open0 = data['open'].shift(1)
+        close0 = data['close'].shift(1)
+        open1 = data['open']
+        close1 = data['close']
+        
+        body0 = np.abs(close0 - open0)
+        body1 = np.abs(close1 - open1)
+        high0 = np.maximum(open0, close0)
+        low0 = np.minimum(open0, close0)
+        high1 = np.maximum(open1, close1)
+        low1 = np.minimum(open1, close1)
+        
+        harami = (body0 > body1 * 2) & (high1 < high0) & (low1 > low0)
+        return harami.fillna(False).astype(float).values
+    
+    # --- 强度与确认度计算 ---
+    
+    def get_candle_body_ratio(self, data: pd.DataFrame) -> np.ndarray:
+        """计算实体比率"""
+        body = np.abs(data['close'] - data['open'])
+        candle_range = data['high'] - data['low']
+        candle_range = np.where(candle_range == 0, 1, candle_range)
+        return body / candle_range
+    
+    def get_upper_shadow_ratio(self, data: pd.DataFrame) -> np.ndarray:
+        """计算上影线比率"""
+        upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
+        candle_range = data['high'] - data['low']
+        candle_range = np.where(candle_range == 0, 1, candle_range)
+        return upper_shadow / candle_range
+    
+    def get_lower_shadow_ratio(self, data: pd.DataFrame) -> np.ndarray:
+        """计算下影线比率"""
+        lower_shadow = np.minimum(data['open'], data['close']) - data['low']
+        candle_range = data['high'] - data['low']
+        candle_range = np.where(candle_range == 0, 1, candle_range)
+        return lower_shadow / candle_range
+    
+    def get_pattern_strength(self, data: pd.DataFrame, window: int = 5) -> np.ndarray:
+        """计算形态强度 (rolling consistent direction)"""
+        is_white = (data['close'] > data['open']).astype(int)
+        is_black = (data['open'] > data['close']).astype(int)
+        white_count = is_white.rolling(window=window).sum()
+        black_count = is_black.rolling(window=window).sum()
+        strength = np.maximum(white_count, black_count) / window
+        return strength.fillna(0).values
+    
+    def get_pattern_confirmation(self, data: pd.DataFrame, window: int = 3) -> np.ndarray:
+        """计算形态确认度 (future direction alignment)"""
+        direction = np.where(data['close'] > data['open'], 1, -1)
+        direction_ser = pd.Series(direction, index=data.index)
+        confirm_count = pd.Series(0.0, index=data.index)
+        for i in range(1, window):
+            next_direction = direction_ser.shift(-i)
+            confirm_count += (next_direction == direction_ser).astype(int)
+        return (confirm_count / (window - 1)).fillna(0).values
+
+    def get_total_bearish_score(self, data: pd.DataFrame) -> int:
+        """获取看跌形态的总分"""
         bearish_patterns = self.detect_all_bearish_patterns(data)
         return sum(pattern['score'] for pattern in bearish_patterns)
     
     def get_total_bullish_score(self, data: pd.DataFrame) -> int:
-        """
-        获取看涨形态的总分
-        
-        用于策略中的看多信号评分
-        """
+        """获取看涨形态的总分"""
         bullish_patterns = self.detect_all_bullish_patterns(data)
         return sum(pattern['score'] for pattern in bullish_patterns)

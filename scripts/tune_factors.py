@@ -3,7 +3,7 @@
 
 功能：
 1. 并行评估所有因子计算参数（周期、阈值等）
-2. 使用 Rank IC (Spearman 相关系数) 作为优化目标
+2. 使用 Cross-Sectional Rank IC (横截面斯皮尔曼相关系数) 作为优化目标
 3. 采用贪婪坐标下降算法 (Greedy Coordinate Descent) 进行多轮优化
 4. 自动更新 config/factor_config.py 文件
 """
@@ -43,61 +43,61 @@ warnings.filterwarnings('ignore')
 
 SEARCH_SPACE = {
     # 动量类因子
-    'RSI_PERIOD': [6, 9, 14, 21, 28, 35],
-    'ROC_PERIOD': [5, 10, 12, 20, 30, 40],
-    'MTM_PERIOD': [5, 10, 12, 20, 30, 40],
-    'CMO_PERIOD': [9, 14, 21, 28, 35],
+    'RSI_PERIOD': [6, 9, 14, 21, 28, 35, 42],
+    'ROC_PERIOD': [5, 10, 12, 20, 30, 40, 60],
+    'MTM_PERIOD': [5, 10, 12, 20, 30, 40, 60],
+    'CMO_PERIOD': [9, 14, 21, 28, 35, 42],
     'STOCHRSI_PERIOD': [9, 14, 21, 28, 35],
     'RVI_PERIOD': [5, 10, 14, 20, 30],
     
     # 趋势类因子
-    'MACD_FAST': [5, 10, 12, 15, 20],
-    'MACD_SLOW': [20, 26, 30, 40, 60],
-    'MACD_SIGNAL': [5, 7, 9, 12, 15],
-    'ADX_PERIOD': [7, 10, 14, 21, 28],
-    'DMI_PERIOD': [7, 10, 14, 21, 28],
-    'AROON_PERIOD': [14, 20, 25, 30, 50],
-    'TRIX_PERIOD': [15, 20, 30, 45, 60],
-    'MA_RATIO_PERIOD': [5, 10, 20, 30, 60],
+    'MACD_FAST': [5, 10, 12, 15, 20, 25],
+    'MACD_SLOW': [20, 26, 30, 40, 60, 90],
+    'MACD_SIGNAL': [5, 7, 9, 12, 15, 20],
+    'ADX_PERIOD': [7, 10, 14, 21, 28, 35],
+    'DMI_PERIOD': [7, 10, 14, 21, 28, 35],
+    'AROON_PERIOD': [14, 20, 25, 30, 50, 75],
+    'TRIX_PERIOD': [15, 20, 30, 45, 60, 90],
+    'MA_RATIO_PERIOD': [5, 10, 20, 30, 60, 120],
     'MA_SLOPE_PERIOD': [5, 10, 20, 30, 60],
     
     # 波动率因子
-    'ATR_PERIOD': [5, 10, 14, 20, 30],
-    'NATR_PERIOD': [5, 7, 10, 14, 21],
-    'BB_PERIOD': [10, 15, 20, 25, 30, 50],
+    'ATR_PERIOD': [5, 10, 14, 20, 30, 40],
+    'NATR_PERIOD': [5, 7, 10, 14, 21, 28],
+    'BB_PERIOD': [10, 15, 20, 25, 30, 50, 100],
     'BB_STD': [1.0, 1.5, 2.0, 2.5, 3.0],
-    'CCI_PERIOD': [7, 10, 14, 21, 28],
-    'ULCER_PERIOD': [7, 10, 14, 21, 28],
-    'PRICE_VAR_PERIOD': [10, 20, 30, 60],
+    'CCI_PERIOD': [7, 10, 14, 21, 28, 35],
+    'ULCER_PERIOD': [7, 10, 14, 21, 28, 35],
+    'PRICE_VAR_PERIOD': [10, 20, 30, 60, 120],
     
     # 成交量因子
-    'VOLUME_MA_PERIOD': [5, 10, 20, 30, 60],
+    'VOLUME_MA_PERIOD': [5, 10, 20, 30, 60, 120],
     'VOLUME_STD_PERIOD': [5, 10, 20, 30, 60],
-    'AMOUNT_MA_PERIOD': [5, 10, 20, 30, 60],
+    'AMOUNT_MA_PERIOD': [5, 10, 20, 30, 60, 120],
     'AMOUNT_STD_PERIOD': [5, 10, 20, 30, 60],
-    'MFI_PERIOD': [7, 10, 14, 21, 28],
-    'VR_PERIOD': [13, 20, 26, 39],
-    'VROC_PERIOD': [6, 12, 18, 24],
-    'VRSI_PERIOD': [3, 6, 9, 12, 15],
-    'VMACD_FAST': [6, 12, 15, 20],
-    'VMACD_SLOW': [13, 26, 30, 45],
-    'VMACD_SIGNAL': [5, 7, 9, 12, 15],
-    'ADOSC_FAST': [2, 3, 5, 7],
-    'ADOSC_SLOW': [7, 10, 15, 20],
+    'MFI_PERIOD': [7, 10, 14, 21, 28, 35],
+    'VR_PERIOD': [13, 20, 26, 39, 52],
+    'VROC_PERIOD': [6, 12, 18, 24, 36],
+    'VRSI_PERIOD': [3, 6, 9, 12, 15, 21],
+    'VMACD_FAST': [6, 12, 15, 20, 25],
+    'VMACD_SLOW': [13, 26, 30, 45, 60],
+    'VMACD_SIGNAL': [5, 7, 9, 12, 15, 20],
+    'ADOSC_FAST': [2, 3, 5, 7, 10],
+    'ADOSC_SLOW': [7, 10, 15, 20, 30],
     
     # 摆动指标参数
-    'KDJ_N': [5, 9, 14, 21],
-    'WILLR_PERIOD': [7, 10, 14, 21, 28],
-    'BIAS_PERIOD': [3, 6, 12, 24],
-    'PSY_PERIOD': [6, 12, 18, 24],
-    'AR_BR_PERIOD': [13, 20, 26, 39],
-    'CR_PERIOD': [13, 20, 26, 39],
+    'KDJ_N': [5, 9, 14, 21, 28],
+    'WILLR_PERIOD': [7, 10, 14, 21, 28, 35],
+    'BIAS_PERIOD': [3, 6, 12, 24, 36],
+    'PSY_PERIOD': [6, 12, 18, 24, 30],
+    'AR_BR_PERIOD': [13, 20, 26, 39, 52],
+    'CR_PERIOD': [13, 20, 26, 39, 52],
     
     # K线形态参数
-    'BODY_SIZE_THRESHOLD_LARGE': [0.01, 0.015, 0.02, 0.03],
-    'BODY_SIZE_THRESHOLD_SMALL': [0.002, 0.003, 0.005, 0.008],
-    'HAMMER_LOWER_SHADOW_RATIO': [1.5, 2.0, 2.5, 3.0],
-    'HAMMER_UPPER_SHADOW_RATIO': [0.5, 0.8, 1.0, 1.5]
+    'BODY_SIZE_THRESHOLD_LARGE': [0.01, 0.015, 0.02, 0.03, 0.04],
+    'BODY_SIZE_THRESHOLD_SMALL': [0.002, 0.003, 0.005, 0.008, 0.01],
+    'HAMMER_LOWER_SHADOW_RATIO': [1.5, 2.0, 2.5, 3.0, 4.0],
+    'HAMMER_UPPER_SHADOW_RATIO': [0.3, 0.5, 0.8, 1.0, 1.5]
 }
 
 # 形态因子对参数的映射
@@ -159,7 +159,7 @@ class FactorTuner:
         self.db_path = DATABASE_PATH
         self.current_config = self._load_current_config()
         self.stocks_data = {}
-        self.forward_returns = {}
+        self.all_merged_df = None # 存储所有股票合并后的长格式数据
         
     def _load_current_config(self) -> Dict[str, Any]:
         """从 FactorConfig 类中获取当前参数值"""
@@ -214,15 +214,24 @@ class FactorTuner:
             # N日未来收益率
             df['target'] = df['close'].pct_change(TrainingConfig.FUTURE_DAYS).shift(-TrainingConfig.FUTURE_DAYS)
             
-            # 移除 NaN 目标行，但保留原始数据用于因子计算
-            # 我们需要完整的序列来计算因子，但在计算 IC 时只取有 target 的行
             self.stocks_data[code] = df
-            self.forward_returns[code] = df['target']
                 
-        print(f"成功加载 {len(self.stocks_data)} 只股票的数据")
+        # 构建长格式 DataFrame 以便进行横截面 IC 计算
+        dfs = []
+        for code, df in self.stocks_data.items():
+            # 只保留有 target 的行用于计算 IC，节省内存
+            tmp = df[['date', 'code', 'target']].dropna().copy()
+            dfs.append(tmp)
+        
+        if not dfs:
+             print("错误: 未能生成有效的训练目标，请检查数据库数据和 FUTURE_DAYS 设置")
+             return
+
+        self.all_merged_df = pd.concat(dfs, axis=0).sort_values(['date', 'code'])
+        print(f"成功加载 {len(self.stocks_data)} 只股票的数据，有效样本共 {len(self.all_merged_df)} 条记录")
 
     def evaluate_parameter(self, param_name: str, value: Any) -> float:
-        """评估特定参数值的平均 Rank IC"""
+        """评估特定参数值的平均 Cross-Sectional Rank IC"""
         
         # 创建临时配置对象
         class TempConfig(FactorConfig):
@@ -253,8 +262,6 @@ class FactorTuner:
                 
                 # 执行计算
                 if calc_type == 'tech':
-                    # 大多数方法只需要 data，有些可能需要额外参数
-                    # 检查参数数量
                     import inspect
                     sig = inspect.signature(method)
                     if 'period' in sig.parameters:
@@ -266,50 +273,60 @@ class FactorTuner:
                 else:
                     res = method(data)
                 
-                # 处理返回结果（可能是单个 array 或 tuple）
-                factor_results = []
+                # 统一转为 DataFrame 格式
+                factor_df = pd.DataFrame(index=data.index)
                 if isinstance(res, tuple):
-                    for item in res:
-                        if isinstance(item, np.ndarray) or isinstance(item, pd.Series):
-                            factor_results.append(item)
+                    # 如果返回多个值（如 MACD, Signal, Hist），只取核心项或全部
+                    # 这里简化处理：如果是元组，取第一个作为代表，或者对于 KDJ/MACD 这种，可以拼名字
+                    for i, item in enumerate(res):
+                        factor_df[f'f_{i}'] = item
                 else:
-                    factor_results.append(res)
+                    factor_df['f_0'] = res
                 
-                v_target = self.forward_returns[code].values
-                stock_ics = []
-                
-                for factor_values in factor_results:
-                    # 确保是 array 且长度一致
-                    if isinstance(factor_values, pd.Series):
-                        v_factor = factor_values.values
-                    else:
-                        v_factor = factor_values
-                        
-                    if len(v_factor) != len(v_target):
-                        continue
-                        
-                    # 移除无效值
-                    mask = np.isfinite(v_factor) & np.isfinite(v_target)
-                    if np.sum(mask) > 100:
-                        v_f = v_factor[mask]
-                        v_t = v_target[mask]
-                        if np.ptp(v_f) > 0 and np.ptp(v_t) > 0:
-                            ic, _ = stats.spearmanr(v_f, v_t)
-                            if np.isfinite(ic):
-                                stock_ics.append(abs(ic))
-                
-                return stock_ics
-            except Exception as e:
-                return []
+                factor_df['date'] = data['date'].values
+                factor_df['code'] = code
+                return factor_df
+            except Exception:
+                return None
 
-        # 并行计算
+        # 并行计算每只股票的因子
         results = Parallel(n_jobs=self.n_jobs)(
             delayed(process_stock)(code, data) 
             for code, data in self.stocks_data.items()
         )
         
-        all_ics = [ic for sublist in results for ic in sublist]
-        return np.mean(all_ics) if all_ics else 0.0
+        valid_results = [r for r in results if r is not None]
+        if not valid_results:
+            return 0.0
+            
+        # 合并所有股票的因子数据
+        all_factors = pd.concat(valid_results, axis=0)
+        
+        # merge 目标收益率
+        eval_df = pd.merge(self.all_merged_df, all_factors, on=['date', 'code'], how='inner')
+        
+        # 计算每一天的 Rank IC
+        daily_ics = []
+        
+        factor_cols = [c for c in eval_df.columns if c.startswith('f_')]
+        
+        # 对每一天计算横截面相关性
+        for date, group in eval_df.groupby('date'):
+            if len(group) < 20: continue
+            
+            y_true = group['target'].values
+            mask = np.isfinite(y_true)
+            if np.sum(mask) < 20: continue
+            
+            for f_col in factor_cols:
+                f_val = group[f_col].values
+                m = mask & np.isfinite(f_val)
+                if np.sum(m) > 20 and np.ptp(f_val[m]) > 0:
+                    ic, _ = stats.spearmanr(f_val[m], y_true[m])
+                    if np.isfinite(ic):
+                        daily_ics.append(abs(ic)) # 使用绝对值评价因子的预测强度
+        
+        return np.mean(daily_ics) if daily_ics else 0.0
 
     def optimize(self, max_rounds: int = 1):
         """采用贪婪坐标下降进行优化"""
@@ -404,10 +421,10 @@ class FactorTuner:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='因子计算超参数并行调优')
-    parser.add_argument('--stocks', type=int, default=200, help='使用的股票数量')
-    parser.add_argument('--years', type=int, default=1, help='历史数据年数')
+    parser.add_argument('--stocks', type=int, default=3000, help='使用的股票数量')
+    parser.add_argument('--years', type=int, default=5, help='历史数据年数')
     parser.add_argument('--rounds', type=int, default=1, help='优化轮数')
-    parser.add_argument('--n-jobs', type=int, default=-1, help='并行任务数')
+    parser.add_argument('--n-jobs', type=int, default=12, help='并行任务数')
     
     args = parser.parse_args()
     

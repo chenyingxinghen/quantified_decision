@@ -38,7 +38,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(PROJECT_ROOT,'logs', "main.log")),
+        logging.FileHandler(os.path.join(PROJECT_ROOT,'database','system_data','automation','logs', "main.log")),
         logging.StreamHandler()
     ]
 )
@@ -140,7 +140,8 @@ def main_loop():
 
     def job_get_signals():
         """定时任务：收盘后或盘前获取最新信号"""
-        logger.info("=== 触发定时任务：获取并刷新交易信号 ===")
+        logger.info("=== 触发定时任务：同步实盘并获取最新信号 ===")
+        controller.sync_positions()
         sigs = get_latest_signals()
         if sigs:
             controller.set_buy_signals(sigs)

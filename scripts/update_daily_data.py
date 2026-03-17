@@ -63,7 +63,6 @@ def update_multiple_stocks(symbols, incremental=True):
         for symbol in pbar:
             try:
                 fetcher.update_daily_data(symbol, incremental=incremental)
-                time.sleep(config.QUEST_INTERVAL)
                 success_count += 1
             except Exception as e:
                 tqdm.write(f"✗ 更新{symbol}失败: {e}")

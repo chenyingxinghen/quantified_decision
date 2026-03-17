@@ -37,8 +37,7 @@ from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalc
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller, fill_factors_with_defaults
 from core.data.market_sentiment_calculator import MarketSentimentCalculator
-from config import DATABASE_PATH, TrainingConfig, FactorConfig, YEARS, MARKET_LIMITS, MARKET_PREFIXES
-
+from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, MARKET_PREFIXES
 class MLModelTrainer:
     """机器学习模型训练器"""
     
@@ -114,7 +113,7 @@ class MLModelTrainer:
             placeholders = ','.join(['?' for _ in batch_codes])
             
             query = f'''
-                SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount,
+                SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount, d.turnover_rate,
                        IFNULL(s.is_st, 0) as is_st
                 FROM daily_data d
                 LEFT JOIN meta.stock_info_extended s ON d.code = s.code
@@ -151,9 +150,12 @@ class MLModelTrainer:
         """
         计算并保存单只股票的因子（使用统一分发的综合计算器）
         
+        支持增量更新：如果缓存中已有历史因子，只计算新增日期的因子并追加，
+        而不是重新计算所有历史数据。
+        
         参数:
             code: 股票代码
-            data: 股票数据
+            data: 股票数据（应包含全量日期）
             apply_feature_engineering: 是否应用特征工程
             target_features: 目标特征列表
             verbose: 是否输出详细日志
@@ -164,51 +166,127 @@ class MLModelTrainer:
         """
         cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
         
-        # 检查缓存
+        # 确保 data 中的 date 列为字符串（方便比较）
+        if 'date' in data.columns and not pd.api.types.is_string_dtype(data['date']):
+            data = data.copy()
+            data['date'] = data['date'].astype(str)
+        
+        # ── 1. 尝试从缓存加载 ──────────────────────────────────────────────
+        cached_factors = None
         if os.path.exists(cache_file):
             try:
                 cached_factors = pd.read_parquet(cache_file)
-                # 如果提供了target_features，检查缓存是否包含所有特征
-                if target_features:
-                    missing = [f for f in target_features if f not in cached_factors.columns]
-                    if not missing and len(cached_factors) == len(data):
-                        return cached_factors[target_features]
-                elif len(cached_factors) == len(data):
-                    return cached_factors
-            except:
-                pass
+                if 'date' in cached_factors.columns and not pd.api.types.is_string_dtype(cached_factors['date']):
+                    cached_factors['date'] = cached_factors['date'].astype(str)
+            except Exception:
+                cached_factors = None
         
-        # 使用统一的综合计算器
+        # ── 2. 判断是否需要更新 ────────────────────────────────────────────
+        need_full_recompute = False
+        new_data_rows = None
+
+        if cached_factors is not None and 'date' in cached_factors.columns and 'date' in data.columns:
+            # 特征不匹配时必须全量重算
+            if target_features:
+                missing_feats = [f for f in target_features if f not in cached_factors.columns]
+                if missing_feats:
+                    if verbose:
+                        print(f"  {code}: 缓存缺少 {len(missing_feats)} 个特征，触发全量重算")
+                    need_full_recompute = True
+            
+            if not need_full_recompute:
+                cache_last_date = cached_factors['date'].max()
+                data_last_date  = data['date'].max()
+                cache_first_date = cached_factors['date'].min()
+                data_first_date = data['date'].min()
+                
+                if cache_first_date > data_first_date:
+                    if verbose:
+                        print(f"  {code}: 缓存起始日期 {cache_first_date} 晚于数据起始日期 {data_first_date}，触发全量重算")
+                    need_full_recompute = True
+                
+                elif cache_last_date >= data_last_date:
+                    # 缓存已是最新，直接命中
+                    if target_features:
+                        available = [f for f in target_features if f in cached_factors.columns]
+                        if 'date' in cached_factors.columns and 'date' not in available:
+                            available.append('date')
+                        return cached_factors[available] if available else cached_factors
+                    return cached_factors
+                else:
+                    # 有新数据：记录需要增量计算的新行
+                    new_data_rows = data[data['date'] > cache_last_date].copy()
+                    if verbose:
+                        print(f"  {code}: 增量更新 {len(new_data_rows)} 行 "
+                              f"({cache_last_date} -> {data_last_date})")
+        elif cached_factors is not None and len(cached_factors) == len(data):
+            # 无 date 列但行数一致，视为已是最新
+            if target_features:
+                available = [f for f in target_features if f in cached_factors.columns]
+                if 'date' in cached_factors.columns and 'date' not in available:
+                    available.append('date')
+                return cached_factors[available] if available else cached_factors
+            return cached_factors
+        else:
+            need_full_recompute = True
+
+        # ── 3. 计算因子 ─────────────────────────────────────────────────────
+        # 无论增量还是全量，都必须传入完整 data（技术指标需要历史 lookback 窗口）
         all_factors = self.factor_calculator.calculate_all_factors(
-            code=code, 
-            data=data, 
+            code=code,
+            data=data,
             apply_feature_engineering=apply_feature_engineering,
             target_features=target_features,
             verbose=verbose,
             include_fundamentals=include_fundamentals
         )
-        
-        if all_factors.empty:
+
+        if all_factors is None or all_factors.empty:
             return None
-            
-        # 在保存前确保包含日期列，以便回测时能正确对齐
+
+        # ── 4. 附加日期列 ──────────────────────────────────────────────────
         if 'date' in data.columns:
             all_factors = all_factors.copy()
-            # 确保日期列不是 index，而是普通列
             all_factors['date'] = data['date'].values
-            
-        # 保存到缓存
+
+        # ── 5. 拼接缓存（增量模式）────────────────────────────────────────
+        if not need_full_recompute and cached_factors is not None and new_data_rows is not None:
+            new_date_set = set(new_data_rows['date'].astype(str).tolist())
+            if 'date' in all_factors.columns:
+                new_factor_rows = all_factors[all_factors['date'].astype(str).isin(new_date_set)].copy()
+            else:
+                new_factor_rows = all_factors.tail(len(new_data_rows)).copy()
+
+            if new_factor_rows.empty:
+                # 增量行全为 NaN，无法追加，仍返回旧缓存
+                if target_features:
+                    available = [f for f in target_features if f in cached_factors.columns]
+                    if 'date' in cached_factors.columns and 'date' not in available:
+                        available.append('date')
+                    return cached_factors[available] if available else cached_factors
+                return cached_factors
+
+            # 列对齐：新行缺少的列补 NaN，多余列丢弃
+            for col in cached_factors.columns:
+                if col not in new_factor_rows.columns:
+                    new_factor_rows[col] = np.nan
+            new_factor_rows = new_factor_rows[cached_factors.columns]
+
+            all_factors = pd.concat([cached_factors, new_factor_rows], ignore_index=True)
+
+        # ── 6. 保存到缓存 ──────────────────────────────────────────────────
         try:
             all_factors.to_parquet(cache_file, index=False)
             if verbose:
-                print(f"  ✓ {code} 因子已缓存 ({len(all_factors.columns)} 个因子)")
+                mode = '增量' if (not need_full_recompute and cached_factors is not None) else '全量'
+                print(f"  {code} 因子{mode}缓存 ({len(all_factors)} 行, {len(all_factors.columns)} 列)")
         except Exception as e:
             if verbose:
-                print(f"  ✗ 保存因子缓存失败 ({code}): {e}")
-        
+                print(f"  保存因子缓存失败 ({code}): {e}")
+
         return all_factors
     
-    
+
     def _load_or_compute_factors(self, code: str, data: pd.DataFrame, 
                                 apply_feature_engineering: bool = True,
                                 target_features: Optional[List[str]] = None,
@@ -245,6 +323,12 @@ class MLModelTrainer:
             # 1. 加载或计算因子
             factors = self._load_or_compute_factors(code, data, apply_feature_engineering, target_features, verbose, include_fundamentals)
             
+            if factors is not None:
+                if 'date' in factors.columns and 'date' in data.columns:
+                    factors = pd.merge(data[['date']], factors, on='date', how='left')
+                elif len(factors) != len(data):
+                    factors = factors.iloc[-len(data):].reset_index(drop=True)
+
             if factors is not None and len(factors) > forward_days:
 
                 # 获取价格序列
@@ -319,6 +403,8 @@ class MLModelTrainer:
                     
                     # 5. 显式剔除元数据列 (确保 is_st, date 不进入模型)
                     drop_cols = ['date', 'is_st', 'code', 'ORG_TYPE']
+                    if not getattr(TrainingConfig, 'USE_AMOUNT_TURNOVER', False):
+                        drop_cols.extend(['amount', 'turnover_rate'])
                     X_df = X_df.drop(columns=[c for c in drop_cols if c in X_df.columns], errors='ignore')
                     
                     if len(X_df) > 0:
@@ -414,7 +500,7 @@ class MLModelTrainer:
     
     def prepare_dataset(self, stocks_data: Dict[str, pd.DataFrame],
                        forward_days: int = None,
-                       n_jobs: int = 15, 
+                       n_jobs: int = 12, 
                        cache_engineered_features: bool = True,
                        filter_incomplete_cache: bool = True,
                        train_start_date: str = None,
@@ -529,49 +615,67 @@ class MLModelTrainer:
                     all_unbuyable.append(u)
                     all_limit_groups.append(l)
         
-        # 合并所有数据
-        # 优化点 1：使用 float32 预分配 numpy 数组，彻底消除 pd.concat 和 iloc 带来的内存副本
+        # 优化方案：分发直填模式 (Scatter Fill)
+        # 核心改进：先只合并日期，计算排序索引映射，最后直接分配有序数组并填入。
+        # 避免了 X_arr = X_arr[sort_idx] 导致的内存瞬间翻倍（旧方案中会同时存在两个巨大的特征矩阵副本）。
+        
         total_rows = sum(len(f) for f in all_factors)
         num_features = all_factors[0].shape[1]
         col_names = all_factors[0].columns.tolist()
         
         print(f"  合并数据: 总行数 {total_rows}, 特征数 {num_features}, 预计占用内存: {total_rows * num_features * 4 / 1024 / 1024:.2f} MB (float32)")
         
-        # 预分配连续内存空间
+        # 1. 预计算有序索引 (极省内存，因为只操作日期列)
+        print("  - 预计算全局时间排序索引...")
+        temp_dates = np.empty(total_rows, dtype=object)
+        cursor = 0
+        for d in all_dates:
+            n = len(d)
+            temp_dates[cursor:cursor+n] = d
+            cursor += n
+        
+        sort_idx = np.argsort(temp_dates)
+        # 构建逆映射：原始数据的 cursor+i 行，应该放在有序数组的哪个位置
+        inverse_sort_idx = np.empty(total_rows, dtype=np.int32)
+        inverse_sort_idx[sort_idx] = np.arange(total_rows, dtype=np.int32)
+        del temp_dates # 立即释放
+        
+        # 2. 预分配最终的有序内存空间
         X_arr = np.empty((total_rows, num_features), dtype=np.float32)
         y_arr = np.empty(total_rows, dtype=np.float32)
         returns_arr = np.empty(total_rows, dtype=np.float32)
-        dates_arr = np.empty(total_rows, dtype=object)  # 日期列保持 object 方便后续处理
+        dates_arr = np.empty(total_rows, dtype=object)
         unbuyable_arr = np.empty(total_rows, dtype=bool)
         limit_groups_arr = np.empty(total_rows, dtype=np.float32)
         
-        # 依次填充数据块
+        # 3. 循环填充并即时释放块内存
+        print("  - 正在直接按时间顺序填充数据 (Scatter Fill)...")
         cursor = 0
-        for X, y, r, d, u, l in zip(all_factors, all_labels, all_returns, all_dates, all_unbuyable, all_limit_groups):
-            n = len(X)
-            # 转换过程使用视图或 in-place 以减少临时变量
-            X_arr[cursor:cursor+n] = X.values.astype(np.float32)
-            y_arr[cursor:cursor+n] = y.values.astype(np.float32)
-            returns_arr[cursor:cursor+n] = r.astype(np.float32)
-            dates_arr[cursor:cursor+n] = d
-            unbuyable_arr[cursor:cursor+n] = u
-            limit_groups_arr[cursor:cursor+n] = l
+        for i in range(len(all_factors)):
+            n = len(all_factors[i])
+            target_pos = inverse_sort_idx[cursor : cursor + n]
+            
+            # 使用 target_pos 离散填充，保证 X_arr 从创建起就是有序的
+            X_arr[target_pos] = all_factors[i].values.astype(np.float32)
+            y_arr[target_pos] = all_labels[i].values.astype(np.float32)
+            returns_arr[target_pos] = all_returns[i].astype(np.float32)
+            dates_arr[target_pos] = all_dates[i]
+            unbuyable_arr[target_pos] = all_unbuyable[i]
+            limit_groups_arr[target_pos] = all_limit_groups[i]
+            
+            # 手动释放已处理的列表元素，最大程度压低峰值内存
+            all_factors[i] = None
+            all_labels[i] = None
+            all_returns[i] = None
+            all_dates[i] = None
+            all_unbuyable[i] = None
+            all_limit_groups[i] = None
             cursor += n
             
-        # 关键优化：填充完立即释放列表原始引用，给操作系统回收空间的机会
-        del all_factors, all_labels, all_returns, all_dates, all_unbuyable, all_limit_groups
+        # 彻底清理中间变量
+        del all_factors, all_labels, all_returns, all_dates, all_unbuyable, all_limit_groups, inverse_sort_idx, sort_idx
         import gc
         gc.collect()
-        
-        # 优化点 2：按时间排序。直接在 numpy 数组上操作，避免 DataFrame.iloc 的昂贵拷贝
-        print("  - 正在进行全局时间排序 (消除数据泄露)...")
-        sort_idx = np.argsort(dates_arr)
-        X_arr = X_arr[sort_idx]
-        y_arr = y_arr[sort_idx]
-        returns_arr = returns_arr[sort_idx]
-        dates_arr = dates_arr[sort_idx]
-        unbuyable_arr = unbuyable_arr[sort_idx]
-        limit_groups_arr = limit_groups_arr[sort_idx]
         
         # 应用：按日横向归一化 (Cross-sectional Normalization)
         # 获取日期分组索引（排序后日期是连续的）
@@ -581,70 +685,37 @@ class MLModelTrainer:
         
         print(f"\n应用：进行每日横向处理 (共 {len(date_group_start)} 个交易日)...")
         
-        # 优化点 3：多线程并行处理 Cross-sectional 归一化
-        # 既然是在同一个大数组上做切片操作，且 numpy 在数值运算时释放 GIL，
-        # 使用 ThreadPoolExecutor 可以充分利用 CPU，且没有 Multiprocessing 的进程间拷贝开销。
-        print("  - 因子横向 Z-Score 归一化 (多线程并行化优化)...")
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def process_day_zscore(start, count):
-            end = start + count
-            grp = X_arr[start:end]
-            mu = grp.mean(axis=0)
-            sd = grp.std(axis=0, ddof=0)
-            sd[sd == 0] = 1.0
-            X_arr[start:end] = (grp - mu) / sd
-
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            for start, count in zip(date_group_start, date_group_counts):
-                executor.submit(process_day_zscore, start, count)
+        # [已移除] 因子横向 Z-Score 归一化
+        # 移除原因：用户要求移除归一化步骤，以支持单只股票的绝对值预测
+        # print("  - 跳过因子横向 Z-Score 归一化 (使用因子原始值)...")
         
         # 最后的无效值填充 (in-place)
         np.nan_to_num(X_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        # 构建轻量级包装 DataFrame 用于后续的 Audit Report 分析
-        # 注意：这里会关联 X_arr，尽量避免不必要的拷贝
-        X_combined = pd.DataFrame(X_arr, columns=col_names)
         
-        # 2. 标签横向百分位排名归一化 (优化：按市场限制分层排名，增强跨市场泛化)
-        print("  - 标签横向百分位排名归一化 (按市场限制分组优化)...")
-        from scipy.stats import rankdata
-        def process_day_market_rank(start, count):
-            end = start + count
-            day_limits = limit_groups_arr[start:end]
-            
-            # 在同一天内，按涨跌幅限制 groups 进一步划分
-            unique_limits = np.unique(day_limits)
-            for lim in unique_limits:
-                mask = day_limits == lim
-                idx_in_day = np.where(mask)[0]
-                if len(idx_in_day) > 0:
-                    # 仅在每个限制市场内部进行排名
-                    target_idx = start + idx_in_day
-                    grp_y = y_arr[target_idx]
-                    ranks = rankdata(grp_y, method='average')
-                    y_arr[target_idx] = (ranks - 0.5) / len(idx_in_day)
-
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            for start, count in zip(date_group_start, date_group_counts):
-                executor.submit(process_day_market_rank, start, count)
-
+        # 构建轻量级包装，仅用于审计报告分析，不进行大内存拷贝
+        all_cols = col_names
+        
+        # 2. 标签值映射 (Squashing)
+        # 即使移除了每日排名归一化，我们仍需确保标签在 [0, 1] 区间内，以满足 reg:logistic 损失函数的要求。
+        # 采用固定的 Sigmoid 映射：P = 1 / (1 + exp(-20 * y))。
+        # 这样处理保持了单兵打分的独立性（不耦合其他股票），且让 0% 涨幅对应 0.5，5% 涨幅对应约 0.73，符合“信心分”直觉。
+        print("  - 正在通过固定 Sigmoid 将路径质量分映射至 [0, 1] 置信度空间...")
+        y_arr = 1.0 / (1.0 + np.exp(-20.0 * y_arr))
 
         # 3. 惩罚不可买入样本 (涨停/停牌)
-        # 将无法买入的标的标签强制设为最低值 (0.0)，迫使模型主动降低对其的预测打分
-        # 否则模型容易被高动量特征吸引，给出高分导致假高准确率但无法实盘
+        # 将无法买入的标的标签强制设为极低值 (0.05)，迫使模型学习避开这些标的。
         if unbuyable_arr is not None:
             penalty_count = np.sum(unbuyable_arr)
             if penalty_count > 0:
-                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.1")
-                y_arr[unbuyable_arr] = 0.1
+                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.05")
+                y_arr[unbuyable_arr] = 0.05
 
         
         # 统计因子分类详情 (Factor Audit Report)
-        all_cols = X_combined.columns.tolist()
         remaining_all = set(all_cols)
         
         # 1. 状态因子
-        status_cols = [c for c in all_cols if c in ['is_limit_up', 'is_suspended']]
+        status_cols = [c for c in all_cols if c in ['is_limit_up', 'is_suspended', 'market_type']]
         remaining_all -= set(status_cols)
         
         # 2. 市场情绪因子 (全市场维度)
@@ -724,9 +795,9 @@ class MLModelTrainer:
         if isinstance(X, pd.DataFrame):
             X = X.values
         
-        # 确保数据类型正确
-        X = X.astype(np.float32)
-        y = y.astype(np.float32)  # 支持软标签，不能强制转 int32
+        # 确保数据类型正确 (copy=False 避免不必要的内存复制)
+        X = X.astype(np.float32, copy=False)
+        y = y.astype(np.float32, copy=False)  # 支持软标签，不能强制转 int32
         
         # 最后一次NaN/inf检查和替换
         if np.isnan(X).any():
@@ -1003,8 +1074,8 @@ def main():
     stock_codes = stock_codes_df['code'].tolist()
     
     # 3. 设置训练时间范围（用于过滤训练样本，但不限制数据加载）
-    train_start_date = (datetime.now() - timedelta(365*YEARS)).strftime('%Y-%m-%d')
-    train_end_date = ((datetime.now() - timedelta(365*YEARS)) + timedelta(365*TrainingConfig.YEARS_FOR_TRAINING)).strftime('%Y-%m-%d')
+    train_start_date = (datetime.now() - timedelta(365*TrainingConfig.YEARS)).strftime('%Y-%m-%d')
+    train_end_date = ((datetime.now() - timedelta(365*TrainingConfig.YEARS)) + timedelta(365*TrainingConfig.YEARS_FOR_TRAINING)).strftime('%Y-%m-%d')
 
     # 3.5 设置数据加载/缓存的时间范围（加载全量以支持回测）
     all_data_start = "2016-01-01" 

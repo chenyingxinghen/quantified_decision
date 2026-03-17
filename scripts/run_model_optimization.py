@@ -13,6 +13,7 @@ import sys
 import os
 import logging
 import json
+import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
@@ -20,13 +21,19 @@ import pandas as pd
 import sqlite3
 from typing import Dict, List, Any, Optional
 
+# ---------------------------------------------------------
+# 全局优化设置：防止异常情况下大数据矩阵刷屏
+# ---------------------------------------------------------
+np.set_printoptions(threshold=1000, edgeitems=3, precision=6, suppress=True)
+
+
 # 设置项目根目录
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 from core.factors.train_ml_model import MLModelTrainer
 from core.factors.model_optimizer import ModelOptimizer
-from core.factors.ml_factor_model import EnsembleFactorModel
+from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
 from config import DATABASE_PATH, TrainingConfig, FactorConfig, OptimizationConfig
 
 # 配置日志
@@ -65,11 +72,18 @@ def get_stock_codes(db_path: str, limit: int, start_date: str) -> List[str]:
         logger.error(f"获取股票列表失败: {e}")
         return []
 
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='深度模型优化脚本')
+    parser.add_argument('--models', type=str, nargs='+', help='要加载的模型文件路径 (可选)，格式: name=path')
+    return parser.parse_args()
+
 def main():
     """主逻辑"""
+    args = parse_args()
     start_time = datetime.now()
     logger.info("=" * 80)
-    logger.info("🚀 启动自动化模型优化流程")
+    logger.info("🚀 启动自动化模型优化流程 (增强版)")
     logger.info("=" * 80)
     
     setup_directories()
@@ -82,24 +96,24 @@ def main():
     trainer = MLModelTrainer(db_path=DATABASE_PATH, punish_unbuyable=TrainingConfig.PUNISH_UNBUYABLE)
     
     end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=365 * TrainingConfig.YEARS_FOR_TRAINING)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=365 * 3)).strftime('%Y-%m-%d')
     
-    stock_codes = get_stock_codes(DATABASE_PATH, TrainingConfig.STOCK_NUM, start_date)
+    stock_codes = get_stock_codes(DATABASE_PATH, 1000, start_date)
     if not stock_codes:
         logger.error("未能找到符合条件的股票，流程终止")
         return
 
     logger.info(f"股票池规模: {len(stock_codes)} 只")
-    logger.info(f"历史回溯期: {start_date} 至 {end_date} (约 {TrainingConfig.YEARS_FOR_TRAINING} 年)")
+    logger.info(f"历史回溯期: {start_date} 至 {end_date}")
     
     # 加载原始行情 (带 ST 过滤)
     stocks_data = trainer.load_training_data(stock_codes, start_date, end_date)
     if not stocks_data:
         logger.error("数据加载失败，请检查数据库连接及 daily_data 表内容")
         return
-    
+        
     # 计算并准备特征集 (含缓存逻辑)
-    # 使用所有 CPU 核心并行加速
+    # 使用所有 CPU 核心并行加速 (n_jobs=-1)
     X, y, returns, factor_names, dates, unbuyable, limit_groups = trainer.prepare_dataset(
         stocks_data,
         n_jobs=-1,
@@ -110,19 +124,71 @@ def main():
     logger.info(f"正样本率: {np.mean(y >= 0.5):.2%} (软标签均值: {np.mean(y):.4f})")
     
     # ---------------------------------------------------------
-    # 步骤 2: 基础模型训练
+    # 步骤 2: 模型获取 (训练或加载)
     # ---------------------------------------------------------
-    logger.info("\n[步骤 2/6] 训练全量特征基础模型")
-    
-    # 评估默认模型，通常包括 XGBoost 和 LightGBM
     model_types = ['xgboost', 'lightgbm']
-    train_results = trainer.train_models(
-        X, y, returns, factor_names, dates, unbuyable, limit_groups, 
-        model_types=model_types
-    )
+    train_results = {}
+
+    if args.models:
+        logger.info("\n[步骤 2/6] 检测到本地模型，正在处理加载路径...")
+        for m_arg in args.models:
+            try:
+                # 解析参数 name=path
+                if '=' in m_arg:
+                    name_hint, path_str = m_arg.split('=')
+                    paths_to_check = [(name_hint, Path(path_str))]
+                else:
+                    input_path = Path(m_arg)
+                    if input_path.is_dir():
+                        # 如果是目录，自动探测内部模型文件
+                        paths_to_check = []
+                        potential_files = {
+                            'xgboost': ['xgboost_factor_model.pkl', 'xgb_model.pkl', 'xgboost.pkl'],
+                            'lightgbm': ['lightgbm_factor_model.pkl', 'lgbm_model.pkl', 'lightgbm.pkl']
+                        }
+                        for m_type, filenames in potential_files.items():
+                            for fname in filenames:
+                                fpath = input_path / fname
+                                if fpath.exists():
+                                    paths_to_check.append((m_type, fpath))
+                                    break
+                        if not paths_to_check:
+                            logger.error(f"❌ 目录 {m_arg} 下未找到已知的模型文件")
+                            continue
+                    else:
+                        # 是文件，自动识别类型
+                        name = 'xgboost' if 'xgb' in m_arg.lower() else 'lightgbm'
+                        paths_to_check = [(name, input_path)]
+
+                # 执行加载
+                for name, path in paths_to_check:
+                    try:
+                        task = 'ranking' if name == 'lightgbm' else 'regression'
+                        model_obj = MLFactorModel(model_type=name, task=task)
+                        model_obj.load_model(str(path))
+                        
+                        trainer.models[name] = model_obj
+                        logger.info(f"✓ 成功加载模型: {name} (路径: {path})")
+                        
+                        # 简单验证获取指标
+                        train_results[name] = {
+                            'val_metrics': model_obj._evaluate(X, y, "加载验证", returns=returns, dates=dates, sample_ratio=0.1)
+                        }
+                    except Exception as inner_e:
+                        logger.error(f"❌ 加载模型文件 {path} 失败: {inner_e}")
+
+            except Exception as e:
+                logger.error(f"❌ 处理路径 {m_arg} 失败: {e}")
+        
+    if not trainer.models:
+        logger.info("\n[步骤 2/6] 未提供本地模型，执行全量特征训练...")
+        train_results = trainer.train_models(
+            X, y, returns, factor_names, dates, unbuyable, limit_groups, 
+            model_types=model_types
+        )
     
-    if not train_results:
-        logger.error("基础模型训练异常，流程终止")
+    if not trainer.models:
+        logger.error("模型获取异常，流程终止")
         return
 
     # ---------------------------------------------------------
@@ -133,13 +199,13 @@ def main():
     optimizer = ModelOptimizer()
     
     # 运行全流程优化
-    # 注意: 如果需要优化因子计算周期 (Step 2)，请在 config 中开启 OPTIMIZE_FACTOR_PERIODS
-    # 此处我们重点关注特征选择和集成权重
     optimization_results = optimizer.run_full_optimization(
         models=trainer.models,
         X=X,
         y=y,
-        feature_names=factor_names
+        feature_names=factor_names,
+        dates=dates,       # 传递日期以支持排序任务分组
+        returns=returns    # 传递收益率以支持评估
     )
     
     # ---------------------------------------------------------

@@ -41,6 +41,7 @@ from config.factor_config import TrainingConfig
 from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST, SELECTOR_MARKETS
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
+from core.factors.train_ml_model import MLModelTrainer
 
 warnings.filterwarnings('ignore')
 
@@ -281,7 +282,7 @@ def get_stock_data(db_path: str, code: str, days: int = DEFAULT_LOOKBACK_DAYS) -
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
     query = '''
-        SELECT date, open, high, low, close, volume, amount
+        SELECT date, open, high, low, close, volume, amount, turnover_rate
         FROM daily_data
         WHERE code = ? AND date >= ? AND date <= ?
         ORDER BY date ASC
@@ -326,7 +327,7 @@ def pre_filter_stocks(
     min_price      = try_float(criteria.get('min_price', MIN_PRICE)) or 0
     max_price      = try_float(criteria.get('max_price', MAX_PRICE)) or float('inf')
     include_st     = bool(criteria.get('include_st', INCLUDE_ST))
-    markets_filter = criteria.get('markets', None) # Renamed to avoid conflict with 'markets' in pref_map
+    markets_filter = criteria.get('markets', SELECTOR_MARKETS) # Renamed to avoid conflict with 'markets' in pref_map
 
     # 市场前缀映射
     pref_map = {
@@ -483,6 +484,119 @@ def get_factors_for_single_stock(
 
 
 # ============================================================================
+# 增量缓存更新辅助函数
+# ============================================================================
+
+def _update_factor_cache_incremental(
+    codes: List[str],
+    cache_dir: str,
+    db_path: str,
+    workers: int = 8,
+    lookback_days: int = 365 * 16,  # 加载足够长的历史，确保技术指标的 lookback 窗口足够
+) -> None:
+    """
+    利用 MLModelTrainer.calculate_and_save_factors 的增量逻辑，
+    将各股票的因子缓存补齐到当前数据库最新日期。
+    
+    流程:
+    1. 建立一个临时 MLModelTrainer（仅用于调用其因子计算器）
+    2. 对每只股票，加载其完整行情历史
+    3. 调用增量缓存方法追加新行
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import sqlite3
+
+    trainer = MLModelTrainer(db_path=db_path)
+    end_date   = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+
+    # 检查哪些股票缓存已是最新（快速预检）
+    conn = sqlite3.connect(db_path)
+    try:
+        latest_dates = pd.read_sql_query(
+            "SELECT code, MAX(date) AS last_date FROM daily_data WHERE code IN ({}) GROUP BY code".format(
+                ','.join(['?' for _ in codes])
+            ), conn, params=codes
+        )
+    except Exception:
+        latest_dates = pd.DataFrame(columns=['code', 'last_date'])
+    finally:
+        conn.close()
+    
+    db_latest = dict(zip(latest_dates['code'], latest_dates['last_date']))
+
+    # 过滤出真正需要更新的股票（缓存最新日期 < 数据库最新日期）
+    need_update = []
+    for code in codes:
+        db_last = db_latest.get(code)
+        if db_last is None:
+            continue
+        cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
+        if not os.path.exists(cache_file):
+            need_update.append(code)
+            continue
+        try:
+            cf = pd.read_parquet(cache_file, columns=['date'])
+            cache_last = str(cf['date'].max())[:10] if 'date' in cf.columns else ''
+            if cache_last < str(db_last)[:10]:
+                need_update.append(code)
+        except Exception:
+            need_update.append(code)
+
+    if not need_update:
+        print(f"   全部 {len(codes)} 只股票缓存已是最新，无需更新")
+        return
+
+    print(f"   需要增量更新: {len(need_update)}/{len(codes)} 只股票")
+
+    ok_count  = 0
+    err_count = 0
+    t0 = time.time()
+
+    def _worker_update(code: str):
+        try:
+            # 加载完整行情历史（技术指标需要足够长的 lookback）
+            conn2 = sqlite3.connect(db_path)
+            df = pd.read_sql_query(
+                "SELECT date, open, high, low, close, volume, amount, turnover_rate FROM daily_data "
+                "WHERE code = ? AND date >= ? AND date <= ? ORDER BY date ASC",
+                conn2, params=(code, start_date, end_date)
+            )
+            conn2.close()
+            if df.empty or len(df) < 50:
+                return 'skip'
+            trainer.calculate_and_save_factors(
+                code=code, data=df,
+                apply_feature_engineering=True,
+                verbose=False,
+                include_fundamentals=True,
+            )
+            return 'ok'
+        except Exception as e:
+            return f'err:{e}'
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker_update, c): c for c in need_update}
+        for fut in as_completed(futures):
+            done += 1
+            res = fut.result()
+            if res == 'ok':
+                ok_count += 1
+            elif res == 'skip':
+                pass
+            else:
+                err_count += 1
+            if done % 200 == 0 or done == len(need_update):
+                elapsed = time.time() - t0
+                speed = done / elapsed if elapsed > 0 else 0
+                print(f"   增量更新进度: {done}/{len(need_update)} "
+                      f"(成功 {ok_count}, 失败 {err_count}) | {speed:.1f} 只/s")
+
+    print(f"   增量缓存更新完成: {ok_count} 只成功, {err_count} 只失败")
+
+
+# ============================================================================
 # 主流程
 # ============================================================================
 
@@ -495,7 +609,8 @@ def select_stocks(
     cache_dir: str = DEFAULT_CACHE_DIR,
     only_cache: bool = False,
     save_csv: bool = True,
-    # 新增过滤参数，用于从后端动态传入
+    skip_cache_update: bool = False,   # 新增: 跳过增量缓存更新
+    # 动态过滤参数
     min_market_cap: Optional[float] = None,
     max_pe: Optional[float] = None,
     max_zcfzl: Optional[float] = None,
@@ -529,310 +644,203 @@ def select_stocks(
     t_start = time.time()
 
     # ------------------------------------------------------------------
-    # Step 0: 解析模型路径 & 缓存目录
+    # Step 0: 环境准备 & 模型加载
     # ------------------------------------------------------------------
     if not os.path.isabs(model_path):
         model_path = os.path.join(PROJECT_ROOT, model_path)
-
     if not os.path.exists(model_path):
-        print(f"❌ 模型文件或目录不存在: {model_path}")
+        print(f"❌ 模型文件不存在: {model_path}")
         return []
-    
-    if cache_dir and not os.path.isabs(cache_dir):
-        cache_dir = os.path.join(PROJECT_ROOT, cache_dir)
-
-    # ------------------------------------------------------------------
-    # Step 1: 加载模型 (智能加载)
-    # ------------------------------------------------------------------
-    print("=" * 80)
-    print("📊 量化因子选股系统")
-    print("=" * 80)
-    print(f"\n🕐 运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📈 目标模型路径: {model_path}")
-    print(f"📋 最低置信度: {min_confidence:.1f}%")
-    print(f"🔝 输出前: {top_n} 只")
-    print(f"🔧 并行线程: {workers}")
-    if cache_dir:
-        print(f"📂 因子缓存: {cache_dir}")
-
+        
     model = load_smart_model(model_path)
     if model is None:
         print(f"❌ 无法从 {model_path} 加载模型。")
         return []
-        
-    m_type = "Ensemble" if hasattr(model, 'models') else getattr(model, 'model_type', 'unknown')
-    f_count = len(model.feature_names) if hasattr(model, 'feature_names') else "unknown"
-    print(f"✅ 模型加载成功 (类型={m_type}, 特征数={f_count})")
+
+    print("=" * 80)
+    print("📊 量化因子选股系统 (绝对值打分模式)")
+    print("=" * 80)
+    print(f"\n🕐 运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📈 模型类型: {getattr(model, 'model_type', 'unknown')} | 特征数: {len(getattr(model, 'feature_names', []))}")
+    print(f"📋 最低置信度: {min_confidence:.1f}% | 并行线程: {workers}")
 
     # ------------------------------------------------------------------
-    # Step 2: 获取股票列表 & 基本信息
+    # Step 1: 获取全市场股票池 & 基本信息
     # ------------------------------------------------------------------
     print("\n" + "-" * 60)
-    print("📂 加载股票列表 & 基本信息 ...")
+    print("📂 加载基础数据 ...")
     all_codes = get_all_stock_codes(DATABASE_PATH)
     info_map = get_stock_info_map(DATABASE_PATH)
-    print(f"   数据库中共 {len(all_codes)} 只股票，stock_info_extended 记录 {len(info_map)} 条")
+    print(f"   数据库中行情覆盖 {len(all_codes)} 只，基本面覆盖 {len(info_map)} 只")
 
     # ------------------------------------------------------------------
-    # Step 3: 基础条件预筛选
-    # ------------------------------------------------------------------
-    if apply_filter:
-        print("\n📋 应用基础筛选条件:")
-        # 构造动态筛选准则，仅使用非 None 的参数覆盖全局默认值
-        current_criteria: Dict[str, Any] = {}
-        if min_market_cap is not None: current_criteria['min_market_cap'] = min_market_cap
-        if max_pe is not None:         current_criteria['max_pe'] = max_pe
-        if max_zcfzl is not None:      current_criteria['max_zcfzl'] = max_zcfzl
-        if min_price is not None:      current_criteria['min_price'] = min_price
-        if max_price is not None:      current_criteria['max_price'] = max_price
-        if include_st is not None:     current_criteria['include_st'] = include_st
-        if markets is not None:        current_criteria['markets'] = markets
-
-        # 打印最终生效的准则（已合并默认值）
-        effective = {
-            'min_market_cap': current_criteria.get('min_market_cap', MIN_MARKET_CAP),
-            'max_pe':         current_criteria.get('max_pe', MAX_PE),
-            'max_zcfzl':      current_criteria.get('max_zcfzl', 100.0),
-            'min_price':      current_criteria.get('min_price', MIN_PRICE),
-            'max_price':      current_criteria.get('max_price', MAX_PRICE),
-            'include_st':     current_criteria.get('include_st', INCLUDE_ST),
-            'markets':        current_criteria.get('markets', SELECTOR_MARKETS),
-        }
-        for k, v in effective.items():
-            print(f"   {k} = {v}")
-
-        candidate_codes, skip_reasons = pre_filter_stocks(
-            all_codes, info_map, DATABASE_PATH, current_criteria
-        )
-        print(f"\n   通过筛选: {len(candidate_codes)} 只")
-        print(f"   排除 ST/退市: {skip_reasons['st']}")
-        print(f"   排除 市场不符: {skip_reasons['market']}")
-        print(f"   排除 市值不足: {skip_reasons['market_cap']}")
-        print(f"   排除 PE 不合规: {skip_reasons['pe']}")
-        print(f"   排除 股价不在范围: {skip_reasons['price']}")
-    else:
-        candidate_codes = all_codes
-        print(f"\n⚠️  跳过基础筛选，将扫描全部 {len(candidate_codes)} 只股票")
-
-    if not candidate_codes:
-        print("❌ 无候选股票，请检查筛选条件或数据库数据。")
-        return []
-
-    # ------------------------------------------------------------------
-    # Step 4: 多线程计算因子 & 模型打分
+    # Step 2: 基础条件提前过滤 (针对单只股票独立预测，可大幅减负)
     # ------------------------------------------------------------------
     print("\n" + "-" * 60)
-    print(f"🔄 开始计算因子并打分（共 {len(candidate_codes)} 只）...")
+    print("📋 执行条件筛选 (PE/市值/价格/ST/市场) ...")
+    
+    predict_codes = all_codes
+    if apply_filter:
+        criteria = {
+            'min_market_cap': min_market_cap, 'max_pe': max_pe, 
+            'max_zcfzl': max_zcfzl, 'min_price': min_price, 
+            'max_price': max_price, 'include_st': include_st,
+            'markets': markets
+        }
+        passed_codes, skipped_stats = pre_filter_stocks(all_codes, info_map, DATABASE_PATH)
+        predict_codes = passed_codes
+        print(f"   筛选完成: 满足条件 {len(predict_codes)} 只 (已过滤 {sum(skipped_stats.values())} 只)")
+        if not predict_codes:
+            print("❌ 无符合条件的股票进入下一步。")
+            return []
+    else:
+        print(f"   未开启筛选，全量预测")
 
-    # 每个线程需要自己的 ComprehensiveFactorCalculator 实例（内含 DB 连接）
+    # ------------------------------------------------------------------
+    # Step 2.5: 增量更新因子缓存（补齐到最新行情日期）
+    # ------------------------------------------------------------------
+    if not skip_cache_update:
+        print("\n" + "-" * 60)
+        print("🔄 增量更新因子缓存 (将缓存补齐到最新行情日期) ...")
+        try:
+            _update_factor_cache_incremental(
+                codes=predict_codes,
+                cache_dir=cache_dir,
+                db_path=DATABASE_PATH,
+                workers=workers,
+            )
+        except Exception as _e:
+            print(f"  [警告] 增量缓存更新失败，将直接使用旧缓存: {_e}")
+    else:
+        print("\n跳过增量缓存更新 (--skip-cache-update)")
+
+    # ------------------------------------------------------------------
+    # Step 3: 并行计算因子 (仅针对通过筛选的股票)
+    # ------------------------------------------------------------------
+    print("\n" + "-" * 60)
+    print(f"🔄 加载/计算因子数据 (目标: {len(predict_codes)} 只) ...")
+
     raw_results: List[Dict] = []
     done_count = 0
-    total = len(candidate_codes)
-
-    # 初始化计算器 (单例复用以减少内存和连接压力)
+    total = len(predict_codes)
     factor_calculator = ComprehensiveFactorCalculator(db_path=DATABASE_PATH)
     
     def _worker(code: str) -> Optional[Dict]:
         return get_factors_for_single_stock(code, DATABASE_PATH, factor_calculator, cache_dir=cache_dir, only_cache=only_cache)
 
-    print(f"   正在多线程获取因子数据...")
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {executor.submit(_worker, code): code for code in candidate_codes}
-
+        future_map = {executor.submit(_worker, code): code for code in predict_codes}
         for future in as_completed(future_map):
             done_count += 1
             if done_count % 100 == 0 or done_count == total:
-                elapsed = time.time() - t_start
-                speed = done_count / elapsed if elapsed > 0 else 0
-                print(f"   进度: {done_count}/{total}  "
-                      f"({done_count / total * 100:.1f}%)  "
-                      f"已获取: {len(raw_results)}  "
-                      f"速度: {speed:.1f} 只/秒")
-
+                print(f"   进度: {done_count}/{total} ({done_count/total*100:.1f}%) | "
+                      f"有效: {len(raw_results)} | 速度: {done_count/(time.time()-t_start):.1f} 只/秒")
             res = future.result()
-            if res:
-                raw_results.append(res)
+            if res: raw_results.append(res)
 
     if not raw_results:
         print("❌ 未获取到任何有效的因子数据。")
         return []
 
     # ------------------------------------------------------------------
-    # Step 5: 批量归一化 & 模型打分 (核心：横截面 normalization)
+    # Step 4: 批量模型打分 (解耦后的单兵评分)
     # ------------------------------------------------------------------
     print("\n" + "-" * 60)
-    print(f"⚖️  执行横截面 Z-Score 归一化并批量打分...")
+    print(f"⚖️  正在通过模型打分 (样本: {len(raw_results)}) ...")
     
-    # 构造批量特征矩阵
+    # 构建特征矩阵
     all_X = pd.concat([r['factors'] for r in raw_results], axis=0, ignore_index=True)
-    
-    # 移除可能存在的非特征列 (如 date)
     if 'date' in all_X.columns:
         all_X = all_X.drop(columns=['date'])
     
-    # 转换为 float64 进行计算
-    all_X = all_X.astype(np.float64)
+    # 输入对齐 & 缺失值填充
+    all_X_input = all_X.astype(np.float64).fillna(0)
     
-    # 执行 Z-Score 归一化 (与 train_ml_model.py L545 & ml_factor_strategy.py L180 一致)
-    if len(all_X) > 1:
-        # 减去均值，除以标准差。如果标准差为0则替换为1以避免除零，最后填充NaN为0
-        all_X_norm = (all_X - all_X.mean()) / all_X.std().replace(0, 1.0)
-        all_X_norm = all_X_norm.fillna(0)
-    else:
-        # 如果只有一只样本，直接设为 0（代表均值水平）
-        all_X_norm = all_X * 0
-        all_X_norm = all_X_norm.fillna(0)
-
-    # 批量预测
     try:
-        probs = model.predict(all_X_norm)
+        probs = model.predict(all_X_input)
     except Exception as e:
         print(f"❌ 批量预测失败: {e}")
-        import traceback
-        traceback.print_exc()
         return []
 
-    # 构造最终结果并应用过滤
+    # ------------------------------------------------------------------
+    # Step 5: 结果汇总、置信度二次过滤 & 排序
+    # ------------------------------------------------------------------
     results = []
+    low_confidence_count = 0
+    
     for i, r in enumerate(raw_results):
-        prob = probs[i]
-        confidence = float(prob * 100)
+        prob = float(probs[i])
+        confidence = prob * 100
         
-        # 1. 基础置信度过滤
+        # 1. 置信度过滤
         if confidence < min_confidence:
+            low_confidence_count += 1
             continue
             
-        # 2. 策略一致性过滤：如果是回归类模型，应用 optimal_threshold
-        # (模仿 ml_factor_strategy.py L201)
+        # 2. 策略一致性过滤 (Optimal Threshold)
         if hasattr(model, 'task') and model.task != 'ranking':
             if prob < getattr(model, 'optimal_threshold', 0.5):
+                low_confidence_count += 1
                 continue
         
-        # 3. 构造结果项
         results.append({
             'stock_code': r['stock_code'],
             'confidence': confidence,
-            'prediction': float(prob),
+            'prediction': prob,
             'current_price': r['current_price'],
             'latest_date': r['latest_date'],
         })
 
-    # ------------------------------------------------------------------
-    # Step 6: 排序 & 合并基本信息
-    # ------------------------------------------------------------------
-    # 引入确定性随机扰动作为平局决胜 (与 ml_factor_strategy.py L229 一致)
+    print(f"   打分完成: 置信度低于 {min_confidence}% 已排除 {low_confidence_count} 只")
+
+    # 增加哈希扰动作为平局決胜
     import hashlib
     def get_tie_breaker(code):
         return int(hashlib.md5(str(code).encode()).hexdigest(), 16) % 1000 / 100000.0
 
-    # 1. 排序：置信度降序 + 哈希扰动
+    # 排序：置信度降序
     results.sort(key=lambda x: (-(x['confidence'] + get_tie_breaker(x['stock_code']))))
-
-    # 2. 截断到 top_n
     results = results[:top_n]
 
-    # 3. 合并 stock_info 信息
+    # 合并股票名称等信息
     for r in results:
         info = info_map.get(r['stock_code'], {})
         r['name'] = info.get('name', '-')
         r['market_cap'] = info.get('market_cap', None)
         r['pe_ratio'] = info.get('pe_ratio', None)
         r['pb_ratio'] = info.get('pb_ratio', None)
-        
-        # 4. 优化：信号标签判定
-        # 如果是 Ranking 模型，且已经通过了 top_n 筛选，在这里一律标记为 buy (或根据分数是否 > 均值来判定)
-        is_ranking = hasattr(model, 'task') and model.task == 'ranking'
-        if is_ranking:
-            # Ranking 模型下，只要进入了 TopN 且置信度不为 0，即标记为买入信号
-            r['signal'] = 'buy' if r['confidence'] > 0 else 'hold'
-        else:
-            # 回归模型继续使用 optimal_threshold
-            r['signal'] = 'buy' if r['prediction'] >= getattr(model, 'optimal_threshold', 0.5) else 'hold'
+        r['signal'] = 'buy' if r['confidence'] > 50 else 'hold'  # 50% 为中平点，超过即为买入信号
 
     # ------------------------------------------------------------------
-    # Step 6: 展示结果
+    # Step 6: 结果展示与保存
     # ------------------------------------------------------------------
-    elapsed_total = time.time() - t_start
+    elapsed = time.time() - t_start
     print("\n" + "=" * 80)
-    print(f"🏆 选股结果 (共 {len(results)} 只, 耗时 {elapsed_total:.1f}s)")
+    print(f"🏆 选股完成! 共 {len(results)} 只 | 耗时 {elapsed:.1f}s")
     print("=" * 80)
 
     if not results:
-        print("   本次未筛选到符合条件的股票。")
-        return results
+        return []
 
-    # 表头
-    header_fmt = (
-        "{:>4}  {:<8}  {:<6}  {:<10}  {:<10}  {:>7}  {:>8}  {:>8}  {:>8}  {:>8}  {:<10}"
-    )
-    row_fmt = (
-        "{:>4}  {:<8}  {:<6}  {:<10}  {:<10}  {:>7.1f}%  {:>8.2f}  {:>8}  {:>8}  {:>8}  {:<10}"
-    )
-    print(header_fmt.format(
-        "排名", "代码", "名称", "板块", "行业", "置信度", "现价",
-        "市值(亿)", "PE", "PB", "最新日期"
-    ))
-    print("-" * 110)
-
+    # 表头打印 (简化展示)
+    print(f"{'排名':>2} {'代码':<8} {'名称':<6} {'置信度':>6} {'现价':>7} {'最新日期':<10}")
+    print("-" * 60)
     for i, r in enumerate(results, 1):
-        mc_str = f"{r['market_cap']:.0f}" if r['market_cap'] else '-'
-        pe_str = f"{r['pe_ratio']:.1f}" if r['pe_ratio'] else '-'
-        pb_str = f"{r['pb_ratio']:.2f}" if r['pb_ratio'] else '-'
-        
-        # 确保名称、板块、行业均为字符串，防止 NaN (float) 导致 upper() 或切片出错
-        name_str = str(r.get('name', '-') or '-')
-        sector = str(r.get('sector', '-') or '-')[:10]
-        industry = str(r.get('industry', '-') or '-')[:10]
-        
-        print(row_fmt.format(
-            i,
-            r['stock_code'],
-            name_str[:6],
-            sector,
-            industry,
-            r['confidence'],
-            r['current_price'],
-            mc_str,
-            pe_str,
-            pb_str,
-            str(r['latest_date'])[:10],
-        ))
+        print(f"{i:>2}. {r['stock_code']:<8} {str(r['name'])[:6]:<6} {r['confidence']:>6.2f}% {r['current_price']:>7.2f} {str(r['latest_date'])[:10]}")
 
-    # ------------------------------------------------------------------
-    # Step 7: 保存为 CSV
-    # ------------------------------------------------------------------
-    if save_csv and results:
+    if save_csv:
         output_dir = os.path.join(PROJECT_ROOT, 'backtest_result')
         os.makedirs(output_dir, exist_ok=True)
-        csv_path = os.path.join(
-            output_dir,
-            f"selected_stocks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
+        csv_path = os.path.join(output_dir, f"selected_stocks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        pd.DataFrame(results).to_csv(csv_path, index=False, encoding='utf-8-sig')
+        print(f"\n💾 结果 CSV 已保存: {csv_path}")
 
-        df_out = pd.DataFrame(results)
-        col_order = [
-            'stock_code', 'name', 'confidence', 'prediction',
-            'current_price', 'market_cap', 'pe_ratio', 'pb_ratio',
-            'signal', 'latest_date',
-        ]
-        df_out = df_out[[c for c in col_order if c in df_out.columns]]
-        df_out.to_csv(csv_path, index=False, encoding='utf-8-sig')
-        print(f"\n💾 结果已保存: {csv_path}")
-
-    # ------------------------------------------------------------------
-    # Step 8: 输出 Top 因子重要性
-    # ------------------------------------------------------------------
-    top_factors = model.get_top_factors(n=15)
+    # 显示因子重要性
+    top_factors = model.get_top_factors(n=10)
     if top_factors:
-        print("\n" + "-" * 60)
-        print("🔑 模型 Top-15 重要因子:")
-        for rank, (fname, imp) in enumerate(top_factors, 1):
-            bar = '█' * int(imp / top_factors[0][1] * 30)
-            print(f"   {rank:>2}. {fname:<35} {imp:.4f}  {bar}")
-
-    print("\n" + "=" * 80)
-    print(f"✅ 选股完成，耗时 {elapsed_total:.1f} 秒")
-    print("=" * 80)
+        print(f"\n🔑 决策核心因子 Top-10:")
+        for rank, (name, val) in enumerate(top_factors, 1):
+            print(f"   {rank:>2}. {name:<30} {val:.4f}")
 
     return results
 
@@ -889,20 +897,25 @@ def parse_args():
         '--no-save', action='store_true',
         help='不保存 CSV 文件',
     )
+    parser.add_argument(
+        '--skip-cache-update', action='store_true', default=False,
+        help='跳过增量缓存更新步骤，直接使用已有缓存（速度更快，但因子可能非最新）',
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     select_stocks(
-        model_path=args.model,
+        model_path='models/mark/automation/lightgbm_factor_model.pkl',
         min_confidence=args.min_confidence,
         top_n=args.top,
-        apply_filter=args.filter,
+        apply_filter=True,
         workers=args.workers,
         cache_dir=args.cache_dir,
         only_cache=args.only_cache,
         save_csv=not args.no_save,
+        skip_cache_update=args.skip_cache_update,
     )
 
 

@@ -26,16 +26,15 @@ class ModelConfig:
         'learning_rate': 0.02,       # 降低学习率
         'subsample': 1,
         'colsample_bytree': 1, 
-        'gamma': 0.1,    
+        'gamma': 0.12,    
         
         'reg_alpha': 3,            
-        'reg_lambda': 8,             
+        'reg_lambda': 11,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
-        'random_state': 42,
-        'n_jobs': -1,
-        'early_stopping_rounds': 50,
-        'verbosity': 1,              # 打印训练过程
+        'n_jobs': 12,
+        'early_stopping_rounds': 20,
+        'verbosity': 0,              # 打印训练过程
     }
     
     # LightGBM配置
@@ -43,9 +42,9 @@ class ModelConfig:
         'n_estimators': 3000,
         'max_depth': 5,
         'num_leaves': 63,
-        'learning_rate': 0.04,
-        'min_data_in_leaf': 150,
-        'min_gain_to_split': 0.01,
+        'learning_rate': 0.02,
+        'min_data_in_leaf': 100,
+        'min_gain_to_split': 0.1,
 
         'reg_alpha': 3,
         'reg_lambda': 8,
@@ -56,16 +55,28 @@ class ModelConfig:
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 100,
-        'random_state': 42,
-        'n_jobs': -1,
+        'n_jobs': 12,
         'verbosity': -1,
         'early_stopping_rounds': 50,
         'force_row_wise': True,    
+        'histogram_pool_size': 4096, # 限制显存使用的直方图缓存 (MB)，针对 6G 显存优化
     }
     
+    # 针对 6G 显存优化的分批训练参数
+    BATCH_SIZE = 1000000  # 默认分批大小 (样本数)
     
-    # 默认使用的模型类型
-    DEFAULT_MODELS = ['xgboost']
+    # GPU 专用配置增量 (如果 USE_GPU = True)
+    GPU_PARAMS_XGB = {
+        'tree_method': 'hist',      # XGBoost 2.0+ 推荐使用 hist + device=cuda
+        'device': 'cuda',           # 显式指定使用 CUDA
+    }
+    
+    GPU_PARAMS_LGB = {
+        'device': 'gpu',
+        'gpu_platform_id': 0,
+        'gpu_device_id': 0
+    }
+    
     
     @classmethod
     def get_model_params(cls, model_type: str) -> Dict[str, Any]:
@@ -74,7 +85,16 @@ class ModelConfig:
             'xgboost': cls.XGBOOST_PARAMS,
             'lightgbm': cls.LIGHTGBM_PARAMS,
         }
-        return params_map.get(model_type, {}).copy()
+        params = params_map.get(model_type, {}).copy()
+        
+        # 如果启用了 GPU 加速
+        if TrainingConfig.USE_GPU:
+            if model_type == 'xgboost':
+                params.update(cls.GPU_PARAMS_XGB)
+            elif model_type == 'lightgbm':
+                params.update(cls.GPU_PARAMS_LGB)
+                
+        return params
 
 
 # ============================================================================
@@ -88,12 +108,19 @@ class TrainingConfig:
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
+    USE_GPU = True               # 是否启用 GPU 加速
+    USE_AMOUNT_TURNOVER = False  # 是否使用amount和turnover_rate的特征
 
+    YEARS=16
     YEARS_FOR_BACKTEST=2         # 回测年数
     YEARS_FOR_TRAINING=13         # 训练年数
     STOCK_NUM = 6000             # 股票数量
     # 数据集划分
-    TRAIN_TEST_SPLIT = 0.7
+    TRAIN_TEST_SPLIT = 0.8
+    
+    # 显存优化参数
+    GPU_BATCH_SIZE = 1000000     # GPU 分批训练样本量 (针对 6G 显存)
+    MEMORY_EFFICIENT = True      # 是否启用内存优化模式
 
     # 预测天数 (用于分类、回归和排序任务)
     FUTURE_DAYS = 5
@@ -114,59 +141,59 @@ class FactorConfig:
     """因子计算参数配置"""
     
     # 动量因子参数
-    RSI_PERIOD = 35
-    ROC_PERIOD = 20
-    MTM_PERIOD = 20
-    CMO_PERIOD = 35
-    STOCHRSI_PERIOD = 21
+    RSI_PERIOD = 42
+    ROC_PERIOD = 60
+    MTM_PERIOD = 40
+    CMO_PERIOD = 42
+    STOCHRSI_PERIOD = 28
     RVI_PERIOD = 14
     
     # 趋势因子参数
-    MACD_FAST = 20
-    MACD_SLOW = 60
-    MACD_SIGNAL = 15
-    ADX_PERIOD = 7
-    DMI_PERIOD = 14
-    AROON_PERIOD = 30
+    MACD_FAST = 25
+    MACD_SLOW = 90
+    MACD_SIGNAL = 20
+    ADX_PERIOD = 35
+    DMI_PERIOD = 35
+    AROON_PERIOD = 50
     TRIX_PERIOD = 30
     
     # 均线参数
-    MA_RATIO_PERIOD = 30
-    MA_SLOPE_PERIOD = 10
+    MA_RATIO_PERIOD = 120
+    MA_SLOPE_PERIOD = 30
     
     # 波动率因子参数
-    ATR_PERIOD = 10
-    NATR_PERIOD = 5
-    BB_PERIOD = 50
+    ATR_PERIOD = 30
+    NATR_PERIOD = 28
+    BB_PERIOD = 100
     BB_STD = 1.5
-    CCI_PERIOD = 28
-    ULCER_PERIOD = 21
-    PRICE_VAR_PERIOD = 10
+    CCI_PERIOD = 35
+    ULCER_PERIOD = 35
+    PRICE_VAR_PERIOD = 30
     
     # 成交量因子参数
-    VOLUME_MA_PERIOD = 10
+    VOLUME_MA_PERIOD = 5
     VOLUME_STD_PERIOD = 10
     VOLUME_MA_SHORT = 5
     VOLUME_MA_LONG = 10
-    AMOUNT_MA_PERIOD = 10
+    AMOUNT_MA_PERIOD = 5
     AMOUNT_STD_PERIOD = 10
-    MFI_PERIOD = 28
-    VR_PERIOD = 20
-    VROC_PERIOD = 24
-    VRSI_PERIOD = 15
-    VMACD_FAST = 15
-    VMACD_SLOW = 45
-    VMACD_SIGNAL = 12
-    ADOSC_FAST = 7
-    ADOSC_SLOW = 20
+    MFI_PERIOD = 35
+    VR_PERIOD = 52
+    VROC_PERIOD = 36
+    VRSI_PERIOD = 21
+    VMACD_FAST = 25
+    VMACD_SLOW = 60
+    VMACD_SIGNAL = 20
+    ADOSC_FAST = 3
+    ADOSC_SLOW = 7
     
     # 摆动指标参数
-    KDJ_N = 21
-    WILLR_PERIOD = 28
-    BIAS_PERIOD = 24
-    PSY_PERIOD = 12
-    AR_BR_PERIOD = 20
-    CR_PERIOD = 20
+    KDJ_N = 28
+    WILLR_PERIOD = 35
+    BIAS_PERIOD = 36
+    PSY_PERIOD = 30
+    AR_BR_PERIOD = 52
+    CR_PERIOD = 52
     
     # K线形态参数
     BODY_SIZE_THRESHOLD_LARGE = 0.015  # 大实体阈值（2%）
@@ -226,7 +253,6 @@ class FactorModelConfig:
         print("=" * 80)
         
         print("\n[模型配置]")
-        print(f"默认模型: {cls.model.DEFAULT_MODELS}")
         print(f"XGBoost树数量: {cls.model.XGBOOST_PARAMS['n_estimators']}")
         print(f"学习率: {cls.model.XGBOOST_PARAMS['learning_rate']}")
         

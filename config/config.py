@@ -37,4 +37,4 @@ MARKET_PREFIXES = {
 # 数据更新配置
 INCREMENTAL_UPDATE = True  # 默认使用增量更新
 WORKERS_NUM = 5
-QUEST_INTERVAL = 0.5 # 接口请求间隔
+QUEST_INTERVAL = 0.1 # 接口请求间隔

@@ -24,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(PROJECT_ROOT,'logs', "trader.log"), encoding='utf-8'),
+        logging.FileHandler(os.path.join(PROJECT_ROOT,'database','system_data','automation','logs', "trader.log"), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -128,10 +128,16 @@ class AutoTrader:
                 
             res = self.user.buy(stock_code, price=price, amount=amount)
             logger.info(f"买入响应: {res}")
-            return res
+            if not res:
+                return {"status": "error", "message": "trader returned empty result"}
+            if isinstance(res, dict):
+                if 'entrust_no' in res or res.get('status') == 'success':
+                    return res
+                return {"status": "error", "message": res.get('message', res.get('msg', 'unknown_fail'))}
+            return {"status": "unknown", "message": str(res)}
         except Exception as e:
             logger.error(f"买入执行失败: {e}")
-            return {"status": "error", "msg": str(e)}
+            return {"status": "error", "message": str(e)}
 
     def sell(self, stock_code: str, amount: int, price: Optional[float] = None) -> Dict:
         """执行卖出指令"""
@@ -152,10 +158,16 @@ class AutoTrader:
 
             res = self.user.sell(stock_code, price=price, amount=amount)
             logger.info(f"卖出响应: {res}")
-            return res
+            if not res:
+                return {"status": "error", "message": "trader returned empty result"}
+            if isinstance(res, dict):
+                if 'entrust_no' in res or res.get('status') == 'success':
+                    return res
+                return {"status": "error", "message": res.get('message', res.get('msg', 'unknown_fail'))}
+            return {"status": "unknown", "message": str(res)}
         except Exception as e:
             logger.error(f"卖出执行失败: {e}")
-            return {"status": "error", "msg": str(e)}
+            return {"status": "error", "message": str(e)}
 
     def sell_all(self, stock_code: str, price: Optional[float] = None) -> Dict:
         """全仓卖出某只股票"""
@@ -189,6 +201,21 @@ class AutoTrader:
         else:
             logger.warning(f"未找到 {stock_code} 的持仓记录。")
             return {"status": "skipped", "msg": "no_position"}
+
+    def cancel_all(self):
+        """撤销所有未成交委托"""
+        if self.dry_run:
+            logger.info("模拟模式：已模拟撤单。")
+            return {"status": "success"}
+        if not self.is_connected:
+            if not self.connect(): return {"status": "error", "msg": "not_connected"}
+        try:
+            res = self.user.cancel_all()
+            logger.info(f"撤单响应: {res}")
+            return res
+        except Exception as e:
+            logger.error(f"撤单失败: {e}")
+            return {"status": "error", "message": str(e)}
 
     def test_captcha(self) -> bool:
         """测试验证码识别填写"""

@@ -12,12 +12,22 @@ import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from sklearn.feature_selection import (
     SelectKBest, f_classif, mutual_info_classif,
+    f_regression, mutual_info_regression,
     RFE, RFECV
 )
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import roc_auc_score, f1_score
 import warnings
+from joblib import Parallel, delayed
+import multiprocessing
 warnings.filterwarnings('ignore')
+from config.factor_config import TrainingConfig
+
+# ---------------------------------------------------------
+# 全局优化设置：防止异常情况下大数据矩阵刷屏
+# ---------------------------------------------------------
+np.set_printoptions(threshold=1000, edgeitems=3, precision=6, suppress=True)
+
 
 try:
     from scipy.optimize import minimize, differential_evolution
@@ -26,7 +36,7 @@ except ImportError:
     HAS_SCIPY = False
     print("警告: scipy未安装，部分优化功能不可用")
 
-from config.factor_config import OptimizationConfig
+from config.factor_config import OptimizationConfig, TrainingConfig
 
 
 class FeatureSelector:
@@ -72,14 +82,25 @@ class FeatureSelector:
     def select_by_correlation(self, X: np.ndarray, y: np.ndarray,
                              feature_names: List[str],
                              threshold: float = None) -> List[str]:
-        """基于与目标的相关性选择"""
+        """基于与目标的相关性选择 (向量化)"""
         if threshold is None:
             threshold = OptimizationConfig.CORRELATION_THRESHOLD_LOW
         
-        correlations = []
-        for i in range(X.shape[1]):
-            corr = np.corrcoef(X[:, i], y)[0, 1]
-            correlations.append(abs(corr))
+        # 向量化计算相关性
+        X_centered = X - np.mean(X, axis=0)
+        y_centered = y - np.mean(y)
+        
+        # 避免除以 0
+        std_x = np.std(X, axis=0)
+        std_y = np.std(y)
+        
+        if std_y < 1e-8:
+            print("警告: 目标变量 y 几乎没有变化，相关性选择可能无效")
+            return feature_names
+            
+        # 并行/向量化计算相关系数
+        # corr = Cov(X, Y) / (std(X) * std(Y))
+        correlations = np.abs(np.dot(X_centered.T, y_centered) / (len(y) * std_x * std_y + 1e-8))
         
         self.feature_scores = dict(zip(feature_names, correlations))
         
@@ -95,8 +116,11 @@ class FeatureSelector:
     def select_by_mutual_info(self, X: np.ndarray, y: np.ndarray,
                               feature_names: List[str],
                               n_features: int = 30) -> List[str]:
-        """基于互信息选择"""
-        mi_scores = mutual_info_classif(X, y, random_state=42)
+        """基于互信息选择 (并行优化版)"""
+        print(f"执行并行互信息计算 (样本量: {len(y)}, 特征数: {len(feature_names)})...")
+        
+        # 使用统一的并行 MI 计算逻辑
+        mi_scores = self._compute_mi_parallel(X, y, feature_names)
         self.feature_scores = dict(zip(feature_names, mi_scores))
         
         # 选择Top N特征
@@ -109,6 +133,32 @@ class FeatureSelector:
         
         print(f"基于互信息选择: {len(selected)}/{len(feature_names)} 个特征")
         return selected
+
+    def _compute_mi_parallel(self, X: np.ndarray, y: np.ndarray, 
+                            feature_names: List[str]) -> np.ndarray:
+        """内部通用并行互信息计算逻辑"""
+        n_jobs = multiprocessing.cpu_count()
+        
+        # 数据量过大时科学抽样 (10k-100k 是互信息的黄金平衡点)
+        X_mi, y_mi = X, y
+        if len(y) > 100000:
+            np.random.seed(42)
+            indices = np.random.choice(len(y), 100000, replace=False)
+            X_mi, y_mi = X[indices], y[indices]
+            print(f"  采样计算: 样本量由 {len(y)} 压缩至 100,000 以激活多核高性能计算")
+
+        def compute_mi_chunk(chunk_indices):
+            # discrete_features=False 显式声明连续值以加速
+            return mutual_info_regression(X_mi[:, chunk_indices], y_mi, discrete_features=False, random_state=42)
+        
+        # 分块数建议为核心数的 2-4 倍，保证负载均衡
+        n_chunks = min(len(feature_names), n_jobs * 2)
+        indices_chunks = np.array_split(np.arange(len(feature_names)), n_chunks)
+        
+        results = Parallel(n_jobs=n_jobs, verbose=5)(
+            delayed(compute_mi_chunk)(chunk) for chunk in indices_chunks
+        )
+        return np.concatenate(results)
     
     def select_by_rfe(self, model, X: np.ndarray, y: np.ndarray,
                      feature_names: List[str],
@@ -131,70 +181,90 @@ class FeatureSelector:
     def select_hybrid(self, model, X: np.ndarray, y: np.ndarray,
                      feature_names: List[str],
                      n_features: int = 30) -> List[str]:
-        """混合方法 - 综合多种方法的结果"""
-        print("使用混合方法进行特征选择...")
+        """混合方法 - 并行化综合多种方法的结果 (深度重构)"""
+        n_cores = multiprocessing.cpu_count()
+        print(f"启动混合特征选择引擎 (分配核心: {n_cores}, 算法: Importance + Correlation + MutualInfo)")
         
-        # 方法1: 特征重要性
-        if hasattr(model, 'feature_importances_'):
-            imp_scores = model.feature_importances_
-            imp_rank = np.argsort(imp_scores)[::-1]
-        else:
-            imp_rank = np.arange(len(feature_names))
+        def get_importance():
+            if hasattr(model, 'feature_importances_'):
+                return model.feature_importances_
+            return np.zeros(len(feature_names))
+
+        def get_correlation():
+            # 向量化矩阵运算充分利用 CPU 指令集
+            X_centered = X - np.mean(X, axis=0)
+            y_centered = y - np.mean(y)
+            std_x = np.std(X, axis=0)
+            std_y = np.std(y)
+            return np.abs(np.dot(X_centered.T, y_centered) / (len(y) * std_x * std_y + 1e-8))
+
+        # 1. 首先并行获取三种独立得分
+        # 注意：MI 内部已高度并行，这里外层用 Threading 触发以防 MI 内部 Loky 递归锁定
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_imp = executor.submit(get_importance)
+            future_corr = executor.submit(get_correlation)
+            future_mi = executor.submit(self._compute_mi_parallel, X, y, feature_names)
+            
+            imp_scores = future_imp.result()
+            correlations = future_corr.result()
+            mi_scores = future_mi.result()
         
-        # 方法2: 互信息
-        mi_scores = mutual_info_classif(X, y, random_state=42)
+        # 2. 计算各维度排名并实施 Borda 投票
+        imp_rank = np.argsort(imp_scores)[::-1]
         mi_rank = np.argsort(mi_scores)[::-1]
-        
-        # 方法3: 相关性
-        correlations = []
-        for i in range(X.shape[1]):
-            corr = abs(np.corrcoef(X[:, i], y)[0, 1])
-            correlations.append(corr)
         corr_rank = np.argsort(correlations)[::-1]
         
-        # 综合排名（Borda count）
         combined_rank = np.zeros(len(feature_names))
-        for i, idx in enumerate(imp_rank):
-            combined_rank[idx] += i
-        for i, idx in enumerate(mi_rank):
-            combined_rank[idx] += i
-        for i, idx in enumerate(corr_rank):
-            combined_rank[idx] += i
+        for i, idx in enumerate(imp_rank): combined_rank[idx] += i
+        for i, idx in enumerate(mi_rank): combined_rank[idx] += i
+        for i, idx in enumerate(corr_rank): combined_rank[idx] += i
         
         # 选择综合排名最高的特征
         top_indices = np.argsort(combined_rank)[:n_features]
         selected = [feature_names[i] for i in top_indices]
         
-        # 记录综合得分
+        # 记录得分
         self.feature_scores = dict(zip(feature_names, -combined_rank))
         
-        print(f"混合方法选择: {len(selected)}/{len(feature_names)} 个特征")
+        print(f"混合方法优化完成: 共分析 {len(feature_names)} 个维度，最终精选出 {len(selected)} 个核心因子")
         return selected
     
     def remove_correlated_features(self, X: np.ndarray, feature_names: List[str],
                                    threshold: float = None) -> List[str]:
-        """移除高度相关的特征"""
+        """移除高度相关的特征 (向量化优化)"""
         if threshold is None:
             threshold = OptimizationConfig.CORRELATION_THRESHOLD
         
-        corr_matrix = np.corrcoef(X.T)
+        # 计算相关系数矩阵
+        corr_matrix = np.abs(np.corrcoef(X.T))
+        
+        # 找到高度相关的特征对
+        # 只取上三角矩阵，避免重复比较和自比较
+        upper = np.triu(corr_matrix, k=1)
+        
+        # 找到所有大于阈值的索引
+        rows, cols = np.where(upper > threshold)
         
         to_remove = set()
-        for i in range(len(feature_names)):
-            for j in range(i + 1, len(feature_names)):
-                if abs(corr_matrix[i, j]) > threshold:
-                    # 保留重要性更高的特征
-                    if feature_names[i] in self.feature_scores and \
-                       feature_names[j] in self.feature_scores:
-                        if self.feature_scores[feature_names[i]] < self.feature_scores[feature_names[j]]:
-                            to_remove.add(feature_names[i])
-                        else:
-                            to_remove.add(feature_names[j])
-                    else:
-                        to_remove.add(feature_names[j])
+        for row, col in zip(rows, cols):
+            # 对于每一对高度相关的特征，移除一个
+            f1, f2 = feature_names[row], feature_names[col]
+            
+            if f1 in to_remove or f2 in to_remove:
+                continue
+                
+            # 如果有分数，保留分数高的（已经在 self.feature_scores 中计算过）
+            s1 = self.feature_scores.get(f1, -np.inf)
+            s2 = self.feature_scores.get(f2, -np.inf)
+            
+            if s1 < s2:
+                to_remove.add(f1)
+            else:
+                to_remove.add(f2)
         
         selected = [f for f in feature_names if f not in to_remove]
-        print(f"移除高度相关特征: {len(to_remove)} 个")
+        print(f"移除高度相关特征: 完成。共移除 {len(to_remove)} 个，保留 {len(selected)} 个")
         return selected
     
     def select(self, model, X: np.ndarray, y: np.ndarray,
@@ -388,9 +458,8 @@ class EnsembleOptimizer:
         # 获取每个模型的预测
         predictions = []
         for i, model in enumerate(models):
-            # 创建DataFrame，使用模型的特征名称
-            X_val_df = pd.DataFrame(X_val, columns=model.feature_names)
-            pred = model.predict(X_val_df)
+            # 内存优化：直接使用 numpy 数组进行预测，由 model 内部处理
+            pred = model.predict(X_val)
             predictions.append(pred)
             print(f"模型 {i+1} 预测范围: [{pred.min():.4f}, {pred.max():.4f}]")
         
@@ -414,21 +483,30 @@ class EnsembleOptimizer:
             print(f"模型数量({n_models})较多，限制搜索粒度...")
             steps = np.linspace(0, 1, 6) # 降级粒度
             
-        # 网格搜索权重
-        best_score = -np.inf
-        best_weights = None
+        # 准备权重组合列表
+        all_weights = list(generate_weights(n_models))
+        print(f"开始权重网格搜索 (组合总数: {len(all_weights)}, 验证集: {X_val.shape[0]} 样本)...")
         
-        print(f"开始搜索权重组合...")
-        for weights in generate_weights(n_models):
-            ensemble_pred = np.average(predictions, axis=0, weights=weights)
-            score = roc_auc_score(y_val, ensemble_pred)
-            
+        from tqdm import tqdm
+        
+        # 定义评估函数供并行调用
+        def eval_weight(w):
+            ensemble_pred = np.average(predictions, axis=0, weights=w)
+            return roc_auc_score(y_val, ensemble_pred)
+        
+        # 使用多核并行加速 (倾向于使用 threading 后端，因为 predictions 很大且 numpy 操作释放 GIL)
+        scores = Parallel(n_jobs=-1, backend="threading")(
+            delayed(eval_weight)(w) for w in tqdm(all_weights, desc="权重优化进度")
+        )
+        
+        # 记录结果
+        for w, score in zip(all_weights, scores):
             if score > best_score:
                 best_score = score
-                best_weights = weights
+                best_weights = w
             
             self.optimization_history.append({
-                'weights': weights,
+                'weights': w,
                 'auc': score
             })
         
@@ -464,9 +542,8 @@ class EnsembleOptimizer:
         # 获取每个模型的预测
         predictions = []
         for model in models:
-            # 创建DataFrame，使用模型的特征名称
-            X_val_df = pd.DataFrame(X_val, columns=model.feature_names)
-            pred = model.predict(X_val_df)
+            # 内存优化：直接使用 numpy 数组
+            pred = model.predict(X_val)
             predictions.append(pred)
         
         predictions = np.array(predictions)
@@ -535,12 +612,9 @@ class EnsembleOptimizer:
         meta_features_val = []
         
         for i, model in enumerate(models):
-            # 创建DataFrame，使用模型的特征名称
-            X_train_df = pd.DataFrame(X_train, columns=model.feature_names)
-            X_val_df = pd.DataFrame(X_val, columns=model.feature_names)
-            
-            pred_train = model.predict(X_train_df)
-            pred_val = model.predict(X_val_df)
+            # 内存优化：直接使用 numpy 数组
+            pred_train = model.predict(X_train)
+            pred_val = model.predict(X_val)
             
             meta_features_train.append(pred_train)
             meta_features_val.append(pred_val)
@@ -579,45 +653,85 @@ class ModelOptimizer:
     def run_full_optimization(self, models: Dict, X: np.ndarray, y: np.ndarray,
                              feature_names: List[str],
                              X_val: np.ndarray = None,
-                             y_val: np.ndarray = None) -> Dict:
+                             y_val: np.ndarray = None,
+                             dates: np.ndarray = None,
+                             returns: np.ndarray = None) -> Dict:
         """
         运行完整优化流程
         
         参数:
             models: 模型字典 {'xgboost': model1, 'lightgbm': model2, ...}
-            X: 训练集特征
+            X: 训练集特征 (或全量特征，取决于是否传了 X_val)
             y: 训练集标签
             feature_names: 特征名称列表
             X_val: 验证集特征（可选）
             y_val: 验证集标签（可选）
+            dates: 日期序列 (用于时间序列分割和排序分组)
+            returns: 收益率序列 (用于精准评估)
         
         返回:
             优化结果字典
         """
         print("\n" + "=" * 80)
-        print("开始模型优化流程")
+        print("开始深度模型优化流程")
         print("=" * 80)
         
-        # 如果没有验证集，从训练集中分割
+        # 0. 统一数据集划分：优先使用时间序列分割
         if X_val is None or y_val is None:
-            from sklearn.model_selection import train_test_split
-            X, X_val, y, y_val = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
-            print(f"训练集: {len(X)}, 验证集: {len(X_val)}")
-        
-        # 1. 特征选择
-        print("\n[步骤 1/3] 特征选择")
+            if dates is not None:
+                # 遵循 TrainingConfig 比例进行时间序列切分
+                split_idx = int(len(X) * TrainingConfig.TRAIN_TEST_SPLIT)
+                # 寻找日期边界，防止同一天的样本被切分到不同集合
+                split_date = dates[split_idx]
+                actual_split_idx = np.searchsorted(dates, split_date, side='left')
+                
+                print(f"执行时间序列分割: 训练集截止 {dates[actual_split_idx-1]}, 验证集起始 {dates[actual_split_idx]}")
+                X_train, X_val = X[:actual_split_idx], X[actual_split_idx:]
+                y_train, y_val = y[:actual_split_idx], y[actual_split_idx:]
+                
+                # 同步切分辅助变量
+                dates_val = dates[actual_split_idx:]
+                returns_val = returns[actual_split_idx:] if returns is not None else None
+            else:
+                from sklearn.model_selection import train_test_split
+                X_train, X_val, y_train, y_val = train_test_split(
+                    X, y, test_size=0.2, random_state=42
+                )
+                dates_val = None
+                returns_val = None
+            
+            print(f"数据划分完成: 训练样本 {len(X_train)}, 验证样本 {len(X_val)}")
+        else:
+            X_train, X_val = X, X_val
+            y_train, y_val = y, y_val
+            dates_val = None
+            returns_val = None
+
+        # 1. 特征选择 (在训练集或全量数据上执行)
+        print("\n[步骤 1/3] 执行核心特征精选")
         print("-" * 80)
         
-        # 使用混合方法
         self.feature_selector = FeatureSelector(method='hybrid')
         
-        # 使用第一个模型进行特征选择
-        first_model = list(models.values())[0]
+        # 【关键修复】确保加载模型的重要性分值能正确对应到当前的 factor_names
+        # 即使加载的模型特征顺序不同，通过此映射逻辑可以精准提取贡献度
+        base_model_wrapper = list(models.values())[-1] # 使用最后一个模型(通常是LightGBM)作为基准
+        
+        if hasattr(base_model_wrapper, 'feature_importance') and base_model_wrapper.feature_importance:
+            print(f"  正在从基准模型 {base_model_wrapper.model_type} 提取并对齐特征贡献度...")
+            scores_dict = base_model_wrapper.feature_importance
+            aligned_scores = np.array([scores_dict.get(name, 0.0) for name in feature_names])
+            
+            # 创建模拟模型对象传递分值
+            class MockModel:
+                def __init__(self, imp): self.feature_importances_ = imp
+            eval_model = MockModel(aligned_scores)
+        else:
+            eval_model = base_model_wrapper.model
+
         selected_features = self.feature_selector.select(
-            first_model.model, X, y, feature_names,
-            n_features=30,
+            eval_model, X_train, y_train, feature_names,
+            n_features=OptimizationConfig.N_FEATURES_TO_SELECT,
             remove_correlated=True,
             corr_threshold=0.95
         )
@@ -625,36 +739,57 @@ class ModelOptimizer:
         self.optimization_results['selected_features'] = selected_features
         self.optimization_results['feature_scores'] = self.feature_selector.feature_scores
         
-        # 使用选择的特征重新训练模型
+        # 2. 模型重定义与全量训练
+        print(f"\n[步骤 2/3] 使用精选的 {len(selected_features)} 个特征重塑模型")
+        print("-" * 80)
+        
         selected_indices = [feature_names.index(f) for f in selected_features]
+        # 注意：此处我们需要通过全量 X, y 重新训练，因为模型内部会处理 validation_split
         X_selected = X[:, selected_indices]
         X_val_selected = X_val[:, selected_indices]
         
-        print(f"\n使用选择的 {len(selected_features)} 个特征重新训练模型...")
-        
         retrained_models = {}
         for name, model in models.items():
-            print(f"\n重新训练 {name}...")
-            # 重新训练模型使用选择的特征
-            model.train(X_selected, y, feature_names=selected_features)
+            print(f"\n正在重构并训练 {name.upper()}...")
+            
+            # 为训练准备必要的 Kwargs
+            train_kwargs = {
+                'validation_split': 1.0 - TrainingConfig.TRAIN_TEST_SPLIT,
+                'feature_names': selected_features,
+                'returns': returns,
+                'dates': dates,
+                'split_idx': actual_split_idx # 强制对齐分割索引
+            }
+            
+            # 【关键修复】针对 Ranking 任务通过 dates 动态还原分组信息
+            if getattr(model, 'task', '') == 'ranking' and dates is not None:
+                # 重新计算分组 (Query Counts)
+                train_dates_sub = dates[:actual_split_idx]
+                val_dates_sub = dates[actual_split_idx:]
+                
+                _, group_train = np.unique(train_dates_sub, return_counts=True)
+                _, group_val = np.unique(val_dates_sub, return_counts=True)
+                
+                train_kwargs['group'] = group_train
+                train_kwargs['eval_group'] = group_val
+                print(f"  ✓ 已同步排序任务分组信息 (Train Groups: {len(group_train)}, Val Groups: {len(group_val)})")
+
+            # 执行重新训练
+            model.train(X_selected, y, **train_kwargs)
             retrained_models[name] = model
         
-        # 2. 特征工程超参数优化（可选，耗时较长）
-        print("\n[步骤 2/3] 特征工程超参数优化")
-        print("-" * 80)
-        print("跳过（需要重新计算因子，耗时较长）")
-        # best_fe_params = self.fe_optimizer.optimize_factor_periods(...)
-        # self.optimization_results['best_fe_params'] = best_fe_params
-        
         # 3. 集成学习权重优化
-        print("\n[步骤 3/3] 集成学习权重优化")
+        print("\n[步骤 3/3] 集成学习权重深度搜索")
         print("-" * 80)
         
         model_list = list(retrained_models.values())
         
-        # 方法1: 网格搜索
+        # 【关键修复】predict 接口需要 DataFrame 类型以进行特征过滤，解决 IndexError
+        X_val_df = pd.DataFrame(X_val_selected, columns=selected_features)
+        
+        # 方法1: 网格搜索 (使用更新后的验证集指标)
         best_weights_grid = self.ensemble_optimizer.optimize_weights_grid_search(
-            model_list, X_val_selected, y_val
+            model_list, X_val_df, y_val
         )
         
         # 方法2: scipy优化（如果可用）

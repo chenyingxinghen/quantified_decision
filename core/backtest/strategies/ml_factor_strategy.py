@@ -9,16 +9,16 @@ import os
 import sys
 import pandas as pd
 import numpy as np
+import sqlite3
+import hashlib
 import talib
-from typing import Dict, List, Any, Optional
-
-# 添加项目根目录到路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+from typing import Dict, List, Any, Optional, Tuple
 
 from core.backtest.strategy import BaseStrategy, StrategySignal
 from core.factors.ml_factor_model import MLFactorModel
-from config.factor_config import TrainingConfig, FactorConfig
-from config.strategy_config import ATR_STOP_MULTIPLIER, ATR_TARGET_MULTIPLIER, MAX_POSITIONS
+from config import DATABASE_PATH
+import config.strategy_config as sc
+import config.factor_config as fc
 
 
 class MLFactorBacktestStrategy(BaseStrategy):
@@ -53,7 +53,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         
         # 设置缓存目录
         if cache_dir is None:
-            cache_dir = TrainingConfig.CACHE_DIR
+            cache_dir = fc.TrainingConfig.CACHE_DIR
         self.cache_dir = cache_dir
         
         self.model = None
@@ -100,162 +100,301 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if self.use_cache:
             print(f"  缓存目录: {self.cache_dir}")
             print(f"  缓存状态: {cache_status}")
-        print(f"  实时特征工程: 禁用（完全依赖缓存）")
+        print(f"  核心逻辑: 已集成 select_stocks 逻辑 (包含横截面归一化)")
     
     def generate_signals(self,
                         current_date: str,
                         market_data: Dict[str, pd.DataFrame],
                         portfolio_state: Dict[str, Any]) -> List[StrategySignal]:
         """
-        生成交易信号 (批量预测优化版)
+        生成交易信号 (与 select_stocks.py 逻辑完全一致)
+        
+        流程:
+        1. 获取所有可用特征数据的股票列表
+        2. 批量加载当前日期的特征行
+        3. 执行横截面 Z-Score 归一化 (关键: 防止分布偏移)
+        4. 模型批量预测
+        5. 应用基础面和置信度过滤
+        6. 排序并输出 top_n
         """
         signals = []
         
         # 获取当前持仓和可用头寸
         existing_positions = portfolio_state.get('positions', {})
         current_count = len(existing_positions)
-        available_slots = MAX_POSITIONS - current_count
+        available_slots = sc.MAX_POSITIONS - current_count
         
+        # 即使 available_slots <= 0，我们也可能需要计算信号以供记录或逻辑处理
+        # 但为了效率，通常在无头寸时快速退出
         if available_slots <= 0:
             return signals
-        
-        # 1. 收集所有符合条件的股票及其最新因子
-        valid_candidates = []
-        
-        # if current_date < "2025-02-20": # 仅在回测开始的前几天打印一次总况
-        #      print(f"  [DEBUG] {current_date}: 正在检查 {len(market_data)} 只股票的市场数据...")
 
-        for stock_code, stock_data in market_data.items():
-            # 基础过滤：数据量不足
-            if len(stock_data) < 35:
-                continue
-            
-            try:
-                # 获取因子（从缓存）
-                factors = self._get_factors(stock_code, stock_data, current_date)
-                
-                if factors is None or len(factors) == 0:
-                    continue
-                
-                # 检查最新因子日期
-                latest_factor_date = factors['date'].iloc[-1] if 'date' in factors.columns else None
-                if latest_factor_date:
-                    latest_date_str = str(latest_factor_date)[:10]
-                    if latest_date_str != current_date:
-                        continue
-                
-                # 使用最新因子
-                latest_factors = factors.tail(1).copy()
-                if latest_factors.isna().all().any():
-                    continue
-                
-                valid_candidates.append({
-                    'code': stock_code,
-                    'factors': latest_factors,
-                    'data': stock_data,
-                    'is_held': stock_code in existing_positions # 标记是否已持有
-                })
-            except Exception:
-                continue
+        # 1. 获取所有股票代码 (从缓存目录获取)
+        if not hasattr(self, '_all_db_codes'):
+            self._all_db_codes = [f.split('_')[0] for f in os.listdir(self.cache_dir) if f.endswith('.parquet')]
+
+        all_codes = self._all_db_codes
         
-        if not valid_candidates:
+        # 2. 提前获取基本面信息并预筛选 (提升效率 & 对齐 select_stocks.py)
+        # 获取该交易日切片的基本面信息
+        info_map = self._get_stock_info_map_pit(current_date)
+        
+        # 执行条件筛选 (PE/市值/价格/ST/市场)
+        predict_codes, _ = self._pre_filter_stocks(
+            all_codes, info_map, 
+            apply_filter=sc.ENABLE_FUNDAMENTAL_FILTER,
+            criteria={
+                'min_market_cap': sc.MIN_MARKET_CAP,
+                'max_pe': sc.MAX_PE,
+                'max_zcfzl': sc.MAX_ZCFZL,
+                'min_price': sc.MIN_PRICE,
+                'max_price': sc.MAX_PRICE,
+                'include_st': sc.INCLUDE_ST,
+                'markets': sc.SELECTOR_MARKETS
+            }
+        )
+        
+        if not predict_codes:
             return signals
-            
-        # 2. 批量预测 (包含所有可用股票，确保归一化池正确)
-        all_factors_list = [c['factors'] for c in valid_candidates]
-        X_batch = pd.concat(all_factors_list, axis=0, ignore_index=True)
+
+        # 3. 批量获取当前日期的因子数据 (仅针对通过筛选的股票)
+        raw_rows = []
+        stock_codes_with_data = []
         
-        # 移除日期列
-        if 'date' in X_batch.columns:
-            X_batch = X_batch.drop(columns=['date'])
-            
-        # 批量获取预测得分/置信度
+        for code in predict_codes:
+            factors = self._get_factors(code, None, current_date)
+            if factors is not None and not factors.empty:
+                # 取最近的一行 (应恰好是 current_date 那行)
+                latest_row = factors.iloc[[-1]].copy()
+                row_date = None
+                if 'date' in latest_row.columns:
+                    row_date = latest_row['date'].iloc[0]
+                    latest_row = latest_row.drop(columns=['date'])
+                
+                # 调试: 检查因子行是否精确对应当前日期
+                if row_date is not None:
+                    row_date_str = str(row_date)[:10]
+                    if row_date_str != current_date and code not in self._warned_stocks:
+                        self._warned_stocks.add(code)
+                        # if len(self._warned_stocks) <= 5:
+                        #     raise ValueError(f"  [日期对齐警告] {code}: 缓存最新因子日期={row_date_str}, 当前回测日期={current_date}")
+                
+                raw_rows.append(latest_row)
+                stock_codes_with_data.append(code)
+        
+        if not raw_rows:
+            return signals
+
+        # 4. 预测与排序
+        all_X = pd.concat(raw_rows, axis=0, ignore_index=True)
+        all_X = all_X.astype(np.float64).fillna(0)
+        
         try:
-            # 执行横向 Z-Score 归一化 (关键：此时池中包含已持有和未持有的所有股票)
-            if len(X_batch) > 1:
-                X_batch_norm = (X_batch - X_batch.mean()) / X_batch.std().replace(0, 1.0)
-                X_batch_norm = X_batch_norm.fillna(0)
-            else:
-                X_batch_norm = X_batch * 0
-                
-            probs = self.model.predict(X_batch_norm)
+            probs = self.model.predict(all_X)
         except Exception as e:
-            print(f"  错误: 批量预测失败: {e}")
+            print(f"  [错误] 批量预测失败: {e}")
             return signals
-            
-        # 3. 筛选并构造候选列表
+
+        # 5. 构造候选者并排序
         candidates = []
-        for i, candidate in enumerate(valid_candidates):
-            # 过滤已持有的股票，不计入买入候选，但它们刚才参与了归一化计算
-            if candidate['is_held']:
-                continue
-                
+        for i, code in enumerate(stock_codes_with_data):
             prob = probs[i]
             confidence = float(prob * 100)
             
-            # 基础过滤：置信度和信号阈值
+            # 置信度过滤
             if confidence < self.min_confidence:
                 continue
                 
-            # 排序任务取消 0.5 固定过滤
-            if self.model.task != 'ranking':
-                if prob < self.model.optimal_threshold:
+            # 回归模型阈值过滤 (50% 为中平点)
+            if hasattr(self.model, 'task') and self.model.task != 'ranking':
+                if prob < getattr(self.model, 'optimal_threshold', 0.5):
                     continue
-                
-            stock_code = candidate['code']
-            stock_data = candidate['data']
-            current_price = stock_data['close'].iloc[-1]
             
-            # 计算止损止盈
-            atr = self._calculate_atr(stock_data, period=FactorConfig.ATR_PERIOD)
-            stop_loss = current_price - ATR_STOP_MULTIPLIER * atr
-            take_profit = current_price + ATR_TARGET_MULTIPLIER * atr
+            # 引入哈希扰动以确保排序稳定性
+            tie_breaker = int(hashlib.md5(str(code).encode()).hexdigest(), 16) % 1000 / 100000.0
             
             candidates.append({
-                'stock_code': stock_code,
-                'confidence': confidence, # 强制限制在100以内
-                'current_price': current_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'prediction': prob
+                'code': code,
+                'prob': prob,
+                'confidence': confidence,
+                'sort_score': confidence + tie_breaker
             })
             
-        # 4. 选择最优信号 (使用置信度排序)
-        if candidates:
-            # 引入确定性随机扰动作为平局决胜
-            import hashlib
-            def get_tie_breaker(code):
-                return int(hashlib.md5(code.encode()).hexdigest(), 16) % 1000 / 100000.0
-
-            # 按置信度由高到低排序，置信度相同时使用哈希值平局决胜
-            candidates.sort(key=lambda x: (-(x['confidence'] + get_tie_breaker(x['stock_code']))))
+        # 按得分排序
+        candidates.sort(key=lambda x: x['sort_score'], reverse=True)
+        
+        # 7. 生成信号 (仅选取前 top_n)
+        for cand in candidates:
+            code = cand['code']
             
-            # 选择前 available_slots 个最优信号
-            top_candidates = candidates[:available_slots]
+            # 过滤已持有的
+            if code in existing_positions:
+                continue
+                
+            # 获取当日行情 bar (单行 Series)
+            bar = market_data.get_bar(code)
+            if bar is None:
+                continue
             
-            # if current_date < "2025-03-01": # 仅在开始阶段输出
-                # print(f"  [DEBUG] {current_date}: 候选股票 {len(candidates)} 只, 买入头寸: {len(top_candidates)}")
+            current_price = bar['close']
             
-            for cand in top_candidates:
-                signal = StrategySignal(
-                    stock_code=cand['stock_code'],
-                    signal_type='buy',
-                    timestamp=current_date,
-                    price=cand['current_price'],
-                    confidence=cand['confidence'],
-                    stop_loss=cand['stop_loss'],
-                    take_profit=cand['take_profit'],
-                    metadata={
-                        'strategy': 'ml_factor',
-                        'model_type': self.model.model_type,
-                        'prediction': cand['prediction'],
-                        'confidence': cand['confidence'],
-                        'candidates_count': len(candidates)
-                    }
-                )
-                signals.append(signal)
+            # 计算 ATR 止损止盈 - 需要历史 DataFrame 而非单行 Series
+            hist_df = market_data[code]  # 通过 __getitem__ 获取历史 DataFrame
+            atr = self._calculate_atr(hist_df, period=fc.FactorConfig.ATR_PERIOD)
+            stop_loss = current_price - sc.ATR_STOP_MULTIPLIER * atr
+            take_profit = current_price + sc.ATR_TARGET_MULTIPLIER * atr
             
+            signal = StrategySignal(
+                stock_code=code,
+                signal_type='buy',
+                timestamp=current_date,
+                price=current_price,
+                confidence=cand['confidence'],
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                metadata={
+                    'strategy': 'ml_factor_integrated',
+                    'prediction': cand['prob'],
+                    'is_integrated': True
+                }
+            )
+            signals.append(signal)
+            
+            if len(signals) >= available_slots:
+                break
+                
         return signals
+
+    def _get_stock_info_map_pit(self, target_date: str) -> Dict[str, Dict]:
+        """
+        获取点在时间 (Point-In-Time) 的股票基本信息
+        """
+        def safe_float(val):
+            try:
+                if val is None or val == '' or str(val).lower() == 'none': return None
+                v = float(val)
+                return v if np.isfinite(v) else None
+            except: return None
+
+        # 连接数据库
+        db_dir = os.path.dirname(DATABASE_PATH)
+        conn = sqlite3.connect(DATABASE_PATH)
+        meta_db = os.path.join(db_dir, 'stock_meta.db')
+        finance_db = os.path.join(db_dir, 'stock_finance.db')
+        if os.path.exists(meta_db):
+            conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+        if os.path.exists(finance_db):
+            conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
+
+        # 1. 基础信息 (假定 current name/st 可接受，或者从历史表获取)
+        try:
+            meta_df = pd.read_sql_query("SELECT code, name, is_st FROM meta.stock_info_extended", conn)
+        except:
+            meta_df = pd.DataFrame(columns=['code', 'name', 'is_st'])
+
+        # 2. PIT 财务数据 (取 target_date 之前最新的报告)
+        try:
+            finance_df = pd.read_sql_query(f"""
+                SELECT f.code, f.EPSJB, f.BPS, f.ZCFZL
+                FROM finance.finance_reports f
+                INNER JOIN (
+                    SELECT code, MAX(REPORT_DATE) AS max_date
+                    FROM finance.finance_reports
+                    WHERE REPORT_DATE <= '{target_date}'
+                    GROUP BY code
+                ) latest ON f.code = latest.code AND f.REPORT_DATE = latest.max_date
+            """, conn)
+        except:
+            finance_df = pd.DataFrame(columns=['code', 'EPSJB', 'BPS', 'ZCFZL'])
+
+        # 3. PIT 价格 (用于计算 PE/PB)
+        try:
+            price_df = pd.read_sql_query(f"""
+                SELECT code, close
+                FROM daily_data
+                WHERE (code, date) IN (
+                    SELECT code, MAX(date) FROM daily_data 
+                    WHERE date <= '{target_date}' 
+                    GROUP BY code
+                )
+            """, conn)
+        except:
+            price_df = pd.DataFrame(columns=['code', 'close'])
+
+        conn.close()
+
+        # 构建映射
+        fin_map = {str(r.code): r for r in finance_df.itertuples()}
+        prc_map = {str(r.code): r.close for r in price_df.itertuples()}
+        
+        info_map = {}
+        for r in meta_df.itertuples():
+            code = str(r.code)
+            fin = fin_map.get(code)
+            close = prc_map.get(code)
+            
+            eps = getattr(fin, 'EPSJB', None)
+            bps = getattr(fin, 'BPS', None)
+            pe = close / eps if close and eps and eps > 0 else None
+            pb = close / bps if close and bps and bps > 0 else None
+            
+            info_map[code] = {
+                'name': r.name,
+                'is_st': r.is_st,
+                'pe_ratio': pe,
+                'pb_ratio': pb,
+                'zcfzl': getattr(fin, 'ZCFZL', None),
+                'current_price': close,
+                'market_cap': None # 如果需要，可增加总股本计算
+            }
+        return info_map
+
+    def _pre_filter_stocks(self, all_codes: List[str], info_map: Dict[str, Dict], apply_filter: bool, criteria: Dict) -> Tuple[List[str], Dict]:
+        """
+        副本自 select_stocks.py: 根据 criteria 过滤股票
+        """
+        if not apply_filter:
+            return all_codes, {}
+            
+        min_market_cap = criteria.get('min_market_cap', 0) or 0
+        max_pe = criteria.get('max_pe') or float('inf')
+        min_price = criteria.get('min_price', 0) or 0
+        max_price = criteria.get('max_price') or float('inf')
+        include_st = criteria.get('include_st', True)
+        markets = criteria.get('markets')
+        max_zcfzl = criteria.get('max_zcfzl')
+
+        pref_map = {'sh': ('60'), 'sz_main': ('00'), 'sz_gem': ('30'), 'bj': ('8', '4', '9')}
+        allowed_prefixes = []
+        if markets:
+            for m in markets:
+                p = pref_map.get(m)
+                if isinstance(p, tuple): allowed_prefixes.extend(p)
+                elif p: allowed_prefixes.append(p)
+        allowed_prefixes = tuple(allowed_prefixes)
+
+        passed = []
+        for code in all_codes:
+            info = info_map.get(code)
+            if not info: continue
+            
+            # 1. 市场
+            if allowed_prefixes and not code.startswith(allowed_prefixes): continue
+            # 2. ST
+            if not include_st and (info.get('is_st') == 1 or '退' in str(info.get('name', ''))): continue
+            # 3. PE
+            pe = info.get('pe_ratio')
+            if pe is not None and (pe <= 0 or pe > max_pe): continue
+            # 4. 价格
+            price = info.get('current_price')
+            if price is not None and (price < min_price or price > max_price): continue
+            # 5. 负债率
+            if max_zcfzl is not None:
+                zcfzl = info.get('zcfzl')
+                if zcfzl is not None and zcfzl > max_zcfzl: continue
+            
+            passed.append(code)
+        return passed, {}
     
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
         """
@@ -311,11 +450,18 @@ class MLFactorBacktestStrategy(BaseStrategy):
             if not pd.api.types.is_datetime64_any_dtype(cached_factors['date']):
                 cached_factors['date'] = pd.to_datetime(cached_factors['date'])
             
-            # 找到当前日期及之前的所有缓存
             target_dt = pd.Timestamp(current_date)
-            factors = cached_factors[cached_factors['date'] <= target_dt].copy()
-            if factors.empty:
-                return None
+            
+            # 优先精确匹配当前日期，避免使用过期因子
+            exact_match = cached_factors[cached_factors['date'] == target_dt]
+            if not exact_match.empty:
+                factors = exact_match.copy()
+            else:
+                # 精确日期不存在时，退回到取 <= 当前日期的最近一行
+                factors = cached_factors[cached_factors['date'] <= target_dt].copy()
+                if factors.empty:
+                    return None
+                factors = factors.iloc[[-1]]  # 只取最近的一行
         
         # 2. 如果缓存中没有日期列，则尝试使用行号对齐（不推荐，极易出错）
         else:

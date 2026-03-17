@@ -58,36 +58,58 @@ class MLFactorModel:
         if 'n_jobs' not in model_params: model_params['n_jobs'] = -1
             
         if self.model_type == 'xgboost' and HAS_XGB:
-            if self.task == 'regression':
-                # 回归方案优化：使用 reg:logistic 确保输出在 0-1 之间
-                if 'objective' not in model_params: model_params['objective'] = 'reg:logistic'
-                self.model = xgb.XGBRegressor(**model_params)
-            else:
-                self.model = xgb.XGBClassifier(**model_params)
+            try:
+                if self.task == 'regression':
+                    # 回归方案优化：使用 reg:logistic 确保输出在 0-1 之间
+                    if 'objective' not in model_params: model_params['objective'] = 'reg:logistic'
+                    self.model = xgb.XGBRegressor(**model_params)
+                else:
+                    self.model = xgb.XGBClassifier(**model_params)
+            except Exception as e:
+                # GPU 初始化失败回退到 CPU
+                if 'gpu' in str(model_params.get('tree_method', '')) or 'cuda' in str(model_params.get('device', '')):
+                    print(f"  [WARNING] XGBoost GPU 初始化失败: {e}，正在尝试回退到 CPU...")
+                    model_params.pop('tree_method', None)
+                    model_params.pop('device', None)
+                    model_params.pop('predictor', None)
+                    if self.task == 'regression':
+                        self.model = xgb.XGBRegressor(**model_params)
+                    else:
+                        self.model = xgb.XGBClassifier(**model_params)
+                else:
+                    raise e
         elif self.model_type == 'lightgbm' and HAS_LGB:
-            if self.task == 'ranking':
-                # 排序模式
-                # 确保使用排序相关的 objective，如果配置中没有则设为默认的 lambdarank
-                if 'objective' not in model_params:
-                    model_params['objective'] = 'lambdarank'
-                
-                # 关键Ranking参数配置 (如果配置未提供则使用默认值)
-                # label_gain: 每个相关等级的增益. 增大Top等级的权重，支持 0-9 共 10 个等级
-                if 'label_gain' not in model_params:
-                    model_params['label_gain'] = [0, 1, 3, 7, 15, 31, 63, 127, 255, 511]
-                
-                # 扩大关注的排名范围，改善整体排序质量(IC)
-                if 'lambdarank_truncation_level' not in model_params:
-                    model_params['lambdarank_truncation_level'] = 15
-                
-                # 调整 early_stopping_rounds 为更保守的值，Ranking 任务通常需要更多轮次收敛
-                self.early_stopping_rounds = model_params.pop('early_stopping_rounds', 50)
-                
-                self.model = lgb.LGBMRanker(**model_params)
-            elif self.task == 'regression':
-                self.model = lgb.LGBMRegressor(**model_params)
-            else:
-                self.model = lgb.LGBMClassifier(**model_params)
+            try:
+                if self.task == 'ranking':
+                    # 排序模式
+                    if 'objective' not in model_params:
+                        model_params['objective'] = 'lambdarank'
+                    
+                    if 'label_gain' not in model_params:
+                        model_params['label_gain'] = [0, 1, 3, 7, 15, 31, 63, 127, 255, 511]
+                    
+                    if 'lambdarank_truncation_level' not in model_params:
+                        model_params['lambdarank_truncation_level'] = 15
+                    
+                    self.early_stopping_rounds = model_params.pop('early_stopping_rounds', 50)
+                    self.model = lgb.LGBMRanker(**model_params)
+                elif self.task == 'regression':
+                    self.model = lgb.LGBMRegressor(**model_params)
+                else:
+                    self.model = lgb.LGBMClassifier(**model_params)
+            except Exception as e:
+                # GPU 初始化失败回退到 CPU
+                if model_params.get('device') == 'gpu':
+                    print(f"  [WARNING] LightGBM GPU 初始化失败: {e}，正在尝试回退到 CPU...")
+                    model_params['device'] = 'cpu'
+                    if self.task == 'ranking':
+                        self.model = lgb.LGBMRanker(**model_params)
+                    elif self.task == 'regression':
+                        self.model = lgb.LGBMRegressor(**model_params)
+                    else:
+                        self.model = lgb.LGBMClassifier(**model_params)
+                else:
+                    raise e
         else:
             raise ValueError(f"不支持的模型类型: {self.model_type}")
 
@@ -183,54 +205,173 @@ class MLFactorModel:
             dates_train = None
             dates_val = None
 
-        # 3. 标准化
-        # 已在数据准备阶段做了按日横截面 Z-Score 或者百分位处理，
-        # 此处如果再加全局 RobustScaler 会破坏横向对比信息且多余，因此移除原先的标准化步骤
-        X_train = pd.DataFrame(X_train_raw, columns=self.feature_names)
-        X_val = pd.DataFrame(X_val_raw, columns=self.feature_names)
-        
-        # 4. 模型拟合
-        # 改进：排序任务支持样本权重，有助于通过权重惩罚（如涨停、停牌）引导模型避开不可买入样本
-        fit_params = {'sample_weight': w_train}
-        
-        # 处理排序任务的分组信息
-        if self.task == 'ranking':
-            if 'group' in kwargs: fit_params['group'] = kwargs['group']
-            if 'eval_group' in kwargs: 
-                # LGBMRanker 的 eval_set 需要对应的 group
-                eval_params = {'eval_set': [(X_val, y_val)], 'eval_group': [kwargs['eval_group']]}
-                fit_params.update(eval_params)
+        # 3. 内存优化与分批训练
+        # 如果启用内存优化且在 GPU 上，使用 XGBoost 的 DataIter 或 LightGBM 的 Dataset 优化
+        use_gpu = TrainingConfig.USE_GPU
+        mem_efficient = getattr(TrainingConfig, 'MEMORY_EFFICIENT', False)
+        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 1000000)
+
+        # ---------------------------------------------------------------------
+        # 情况 A: XGBoost 分批训练 (DataIter)
+        # ---------------------------------------------------------------------
+        if self.model_type == 'xgboost' and use_gpu and mem_efficient and len(X_train_raw) > batch_size:
+            print(f"  [INFO] XGBoost 启动分批训练模式 (样本数: {len(X_train_raw)}, Batch: {batch_size})")
+            
+            # 使用更加通用的 DataIter 基类 (兼容不同版本)
+            BaseDataIter = getattr(xgb, 'DataIter', xgb.core.DataIter)
+            
+            class XGBDataIter(BaseDataIter):
+                def __init__(self, X, y, w=None, b_size=1000000):
+                    self.X = X
+                    self.y = y
+                    self.w = w
+                    self.b_size = b_size
+                    self.it = 0
+                    super().__init__(cache_prefix=None)
+
+                def next(self, input_data):
+                    if self.it >= len(self.X):
+                        return 0
+                    end = min(self.it + self.b_size, len(self.X))
+                    
+                    batch_data = self.X[self.it:end]
+                    batch_label = self.y[self.it:end]
+                    
+                    # 关键修复：不要把 None 作为 weight 传入，以免触发 XGBoost 的参数冲突检查
+                    if self.w is not None:
+                        batch_weight = self.w[self.it:end]
+                        input_data(data=batch_data, label=batch_label, weight=batch_weight)
+                    else:
+                        input_data(data=batch_data, label=batch_label)
+                    
+                    self.it = end
+                    return 1
+
+                def reset(self):
+                    self.it = 0
+
+            # 创建训练集迭代器
+            it = XGBDataIter(X_train_raw, y_train, w_train, batch_size)
+            
+            # 创建训练集和验证集的 DMatrix
+            # 为避免某些版本中 feature_names 触发 DataIter 冲突检查，在此处先不传入 feature_names
+            dtrain = xgb.QuantileDMatrix(it)
+            dval = xgb.DMatrix(X_val_raw, label=y_val)
+            
+            # 统一设置特征名
+            dtrain.feature_names = self.feature_names
+            dval.feature_names = self.feature_names
+            
+            params = ModelConfig.get_model_params('xgboost')
+            # 兼容 scikit-learn 参数名到 native 参数名
+            xgb_params = {
+                'tree_method': params.get('tree_method', 'hist'),
+                'device': params.get('device', 'cuda'),
+                'learning_rate': params.get('learning_rate', 0.02),
+                'max_depth': params.get('max_depth', 6),
+                'min_child_weight': params.get('min_child_weight', 1),
+                'subsample': params.get('subsample', 1),
+                'colsample_bytree': params.get('colsample_bytree', 1),
+                'reg_alpha': params.get('reg_alpha', 0),
+                'reg_lambda': params.get('reg_lambda', 1),
+                'objective': params.get('objective', 'reg:logistic'),
+                'eval_metric': params.get('eval_metric', 'auc'),
+                'nthread': params.get('n_jobs', -1)
+            }
+            
+            # 使用 native train 接口
+            self.model = xgb.train(
+                xgb_params,
+                dtrain,
+                num_boost_round=params.get('n_estimators', 1000),
+                evals=[(dval, 'validation')],
+                early_stopping_rounds=params.get('early_stopping_rounds', 50),
+                verbose_eval=params.get('verbosity', 1) > 0
+            )
+            
+            # 内存回收
+            del dtrain, dval
+            X_train = X_train_raw # 仅用于后续评估
+            X_val = X_val_raw
+
+        # ---------------------------------------------------------------------
+        # 情况 B: LightGBM 内存优化
+        # ---------------------------------------------------------------------
+        elif self.model_type == 'lightgbm' and mem_efficient:
+            X_train = X_train_raw
+            X_val = X_val_raw
+            
+            # LightGBM 不直接通过 DataIter 分批，但可以通过 Dataset 构造函数级优化
+            # 这里我们不再使用 scikit-learn API，而是转向更加省内存的 Native API 或优化参数
+            fit_params = {'sample_weight': w_train}
+            if self.task == 'ranking':
+                if 'group' in kwargs: fit_params['group'] = kwargs['group']
+                if 'eval_group' in kwargs: 
+                    fit_params.update({'eval_set': [(X_val, y_val)], 'eval_group': [kwargs['eval_group']]})
+                else:
+                    fit_params['eval_set'] = [(X_val, y_val)]
             else:
                 fit_params['eval_set'] = [(X_val, y_val)]
-        else:
-            fit_params['eval_set'] = [(X_val, y_val)]
 
-        if self.model_type == 'xgboost':
-            self.model.fit(X_train, y_train, verbose=False, **fit_params)
-        elif self.model_type == 'lightgbm':
             from lightgbm import early_stopping, log_evaluation
-            # 提高 Ranking 任务的早停容忍度，增加稳定性
             es_rounds = getattr(self, 'early_stopping_rounds', 100)
             callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
             
             if self.task == 'ranking':
-                # 排序任务：打印训练进度
                 callbacks.append(log_evaluation(period=50))
-                # 严重 BUG 修复: LGBM lambdarank 的 sample_weight 会被解析为 group 权重。
-                if 'sample_weight' in fit_params:
-                    del fit_params['sample_weight']
+                if 'sample_weight' in fit_params: del fit_params['sample_weight']
 
-            self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
+            # 注意：LGBM 即使是用 numpy array 训练，内部也会转 Dataset。
+            # 开启 histogram_pool_size (在 config 中已添加) 是 6G 显存的关键。
+            self.model.fit(X_train, y_train, callbacks=callbacks, feature_name=self.feature_names, **fit_params)
+
+        # ---------------------------------------------------------------------
+        # 情况 C: 标准流程 (不符合分批条件或非优化模式)
+        # ---------------------------------------------------------------------
         else:
-            self.model.fit(X_train, y_train, sample_weight=w_train)
+            # 尽量使用 numpy 直接训练，避免 DataFrame 拷贝
+            if len(X_train_raw) > 500000:
+                X_train = X_train_raw
+                X_val = X_val_raw
+                feature_name_param = self.feature_names
+            else:
+                X_train = pd.DataFrame(X_train_raw, columns=self.feature_names)
+                X_val = pd.DataFrame(X_val_raw, columns=self.feature_names)
+                feature_name_param = 'auto'
+
+            fit_params = {'sample_weight': w_train}
+            if self.task == 'ranking':
+                if 'group' in kwargs: fit_params['group'] = kwargs['group']
+                if 'eval_group' in kwargs: 
+                    fit_params.update({'eval_set': [(X_val, y_val)], 'eval_group': [kwargs['eval_group']]})
+                else:
+                    fit_params['eval_set'] = [(X_val, y_val)]
+            else:
+                fit_params['eval_set'] = [(X_val, y_val)]
+
+            if self.model_type == 'xgboost':
+                self.model.fit(X_train, y_train, verbose=False, **fit_params)
+            elif self.model_type == 'lightgbm':
+                from lightgbm import early_stopping, log_evaluation
+                es_rounds = getattr(self, 'early_stopping_rounds', 100)
+                callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
+                if self.task == 'ranking':
+                    callbacks.append(log_evaluation(period=50))
+                    if 'sample_weight' in fit_params: del fit_params['sample_weight']
+                self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
+            else:
+                self.model.fit(X_train, y_train, sample_weight=w_train)
             
+        # 4. 后处理与评估
         self._calculate_feature_importance()
         self.is_trained = True
         
-        # 5. 评估
+        import gc
+        gc.collect()
+        
         return {
-            'train_metrics': self._evaluate(X_train, y_train, "训练集", returns=r_train, dates=dates_train, sample_ratio=0.1),
-            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val, sample_ratio=0.5)
+            'train_metrics': self._evaluate(X_train, y_train, "训练集", returns=r_train, dates=dates_train, sample_ratio=0.05),
+            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val, sample_ratio=0.3)
         }
 
     def _get_predict_proba(self, X: Any) -> np.ndarray:
@@ -241,7 +382,32 @@ class MLFactorModel:
             return self.model.predict_proba(X)[:, 1]
         
         # 对于回归器或排序器，预测值即为分数/概率
-        preds = self.model.predict(X)
+        if self.model_type == 'xgboost' and HAS_XGB:
+            # 兼容原生 Booster 和 Scikit-learn 接口
+            is_booster = isinstance(self.model, xgb.Booster)
+            
+            if is_booster:
+                # 确保针对 Booster 的 DMatrix 包含正确的特征名
+                # 如果 X 是 DataFrame 且列名正确，DMatrix 会自动提取；
+                # 如果是 numpy，则显式指定。
+                if isinstance(X, pd.DataFrame):
+                    dmat = xgb.DMatrix(X)
+                else:
+                    dmat = xgb.DMatrix(X, feature_names=self.feature_names)
+                preds = self.model.predict(dmat)
+            else:
+                # scikit-learn 包装类
+                device = self.model.get_params().get('device', 'cpu')
+                is_gpu = device == 'cuda' or 'gpu' in str(self.model.get_params().get('tree_method', ''))
+                
+                if is_gpu:
+                    # GPU 模式下的预测加速与防止显存碎片
+                    dmat = xgb.DMatrix(X, feature_names=self.feature_names) if not isinstance(X, pd.DataFrame) else xgb.DMatrix(X)
+                    preds = self.model.get_booster().predict(dmat)
+                else:
+                    preds = self.model.predict(X)
+        else:
+            preds = self.model.predict(X)
             
         # 自动纠正任务类型：如果模型是 LGBMRanker 但任务标记不是 ranking，强制按 ranking 处理
         current_task = self.task
@@ -354,6 +520,25 @@ class MLFactorModel:
     def _calculate_feature_importance(self):
         if hasattr(self.model, 'feature_importances_'):
             self.feature_importance = dict(zip(self.feature_names, self.model.feature_importances_))
+        elif isinstance(self.model, xgb.Booster):
+            # 处理原生 Booster
+            score = self.model.get_score(importance_type='gain')
+            
+            # 兼容性处理：检查返回的是特征名还是默认索引 (f0, f1...)
+            if score:
+                first_key = list(score.keys())[0]
+                if first_key.startswith('f') and first_key[1:].isdigit() and first_key not in self.feature_names:
+                    # 如果返回的是 f0, f1... 则手动映射回特征名
+                    self.feature_importance = {}
+                    for k, v in score.items():
+                        idx = int(k[1:])
+                        if idx < len(self.feature_names):
+                            self.feature_importance[self.feature_names[idx]] = v
+                else:
+                    # 返回的是实际特征名
+                    self.feature_importance = {name: score.get(name, 0) for name in self.feature_names}
+            else:
+                self.feature_importance = {name: 0 for name in self.feature_names}
 
     def get_top_factors(self, n: int = 10) -> List[Tuple[str, float]]:
         """

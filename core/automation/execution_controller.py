@@ -35,16 +35,26 @@ from config.automation_config import (
     AUTO_TIME_STOP_DAYS, AUTO_TIME_STOP_MIN_LOSS_PCT,
 )
 
+from enum import Enum
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(PROJECT_ROOT, 'logs', "controller.log")),
+        logging.FileHandler(os.path.join(PROJECT_ROOT,'database','system_data','automation','logs', "controller.log"), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("ExecutionController")
+
+
+class OperationStatus(Enum):
+    SUCCESS = "SUCCESS"          # 明确委托成功
+    FAILED = "FAILED"            # 明确执行失败
+    RETRY = "RETRY"              # 可重试的失败（如OCR错误、超时）
+    SKIPPED = "SKIPPED"          # 无需执行（如已持仓、资金不足）
+    UNKNOWN = "UNKNOWN"          # 状态不明（如连接成功但未见明确回执）
 
 
 def _calc_limit_up_price(ref_price: float, is_st: bool = False) -> float:
@@ -121,22 +131,31 @@ class ExecutionController:
         self._db_path = DATABASE_PATH
 
     def _load_tracking(self):
+        """加载本地持仓追踪记录"""
         os.makedirs(os.path.dirname(self.tracking_file), exist_ok=True)
+        default_data = {"current_day": "", "pending_buys": [], "processed_today": {}, "positions": {}}
+        
         if os.path.exists(self.tracking_file):
             try:
                 with open(self.tracking_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    if "positions" not in data: data["positions"] = {}
-                    if "processed_today" not in data: data["processed_today"] = []
+                    # 补充缺失字段
+                    for k, v in default_data.items():
+                        if k not in data:
+                            data[k] = v
                     return data
             except Exception as e:
                 logger.error(f"加载 tracking 文件失败: {e}")
-        return {"current_day": "", "pending_buys": [], "processed_today": [], "positions": {}}
+        return default_data
 
     def _save_tracking(self):
+        """保存本地记录"""
         os.makedirs(os.path.dirname(self.tracking_file), exist_ok=True)
-        with open(self.tracking_file, 'w', encoding='utf-8') as f:
-            json.dump(self.tracking_data, f, ensure_ascii=False, indent=4)
+        try:
+            with open(self.tracking_file, 'w', encoding='utf-8') as f:
+                json.dump(self.tracking_data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"保存 tracking 文件出错: {e}")
 
     def set_buy_signals(self, signals: List[Dict]):
         """设置今日待执行的买入信号"""
@@ -145,22 +164,90 @@ class ExecutionController:
 
         # 如果是新的一天，重置 processed_today
         if self.tracking_data.get("current_day") != today:
+            logger.info(f"新交易日检测: {today}，重置处理记录。")
             self.tracking_data["current_day"] = today
-            self.tracking_data["processed_today"] = []
+            self.tracking_data["processed_today"] = {}
 
         self.tracking_data["pending_buys"] = [s['stock_code'] for s in signals]
         self._save_tracking()
-        logger.info(f"已加载今日买入信号: {[s['stock_code'] for s in signals]}")
+        logger.info(f"已加载今日买入信号: {self.tracking_data['pending_buys']}")
+
+    def sync_positions(self):
+        """同步本地追踪与实盘持仓，防止状态不一致"""
+        logger.info("正在同步实盘持仓状态...")
+        real_positions = self.trader.get_positions()
+        if real_positions is None:
+            logger.warning("同步持仓失败: 无法获取实盘数据。")
+            return
+
+        # 交叉验证：如果 real_positions 为空，但本地记录非空，我们需要二次确认是否真的是空仓
+        if len(real_positions) == 0 and len(self.tracking_data["positions"]) > 0:
+            balance = self.trader.get_balance()
+            if not balance:
+                logger.warning("发现实盘持仓为空，但无法同步获取资金读数(可能 GUI 交互异常/被验证码阻挡)。为防止误删本地记录，跳过持仓同步。")
+                return
+                
+            # 另外，如果总资产中明确有股票市值且 > 0，但 positions 又是空的，那肯定也是表格读取失败
+            market_value = float(balance.get('参考市值', balance.get('股票市值', balance.get('市值', 0))) or 0)
+            if market_value > 0:
+                logger.warning(f"发现实盘持仓为空，但资金表显示有股票市值 ({market_value})。持仓读取可能被干扰(如验证码弹窗)，跳过同步。")
+                return
+
+        real_codes = []
+        for p in real_positions:
+            code = p.get('证券代码', p.get('stock_code', ''))
+            base_code = code[:6] if len(code) >= 6 else code
+            real_codes.append(base_code)
+
+        # 1. 检查本地记录的持仓是否在实盘中消失（可能被手动卖出或未被记录的卖出）
+        tracking_codes = list(self.tracking_data["positions"].keys())
+        for code in tracking_codes:
+            if code not in real_codes:
+                logger.info(f"  同步记录: {code} 在实盘中已无持仓，移除本地跟踪。")
+                del self.tracking_data["positions"][code]
+
+        # 2. 检查实盘有而本地无记录的（可能是外部操作或历史遗留），这种通常由兜底卖出处理
+        for code in real_codes:
+            if code not in self.tracking_data["positions"]:
+                logger.debug(f"  同步检测: {code} 实盘有持仓但本地无元数据。")
+
+        self._save_tracking()
+        logger.info("持仓同步完成。")
+
+    def _execute_with_retry(self, action_func, max_retries=3, retry_delay=2) -> Dict:
+        """通用的重试执行逻辑，优雅处理 GUI 自动化的不确定性"""
+        last_res = {"status": "error", "msg": "execution_not_started"}
+        
+        for i in range(max_retries):
+            try:
+                res = action_func()
+                # 判定成功：entrust_no 存在，或者明确 status == success
+                if res.get('entrust_no') or res.get('status') == 'success':
+                    return {"op_status": OperationStatus.SUCCESS, "raw": res}
+                
+                # 判定重试：含有验证码错误、界面未响应等关键字
+                msg = str(res.get('message', res.get('msg', ''))).lower()
+                retry_keywords = ["验证码", "超时", "未响应", "识别", "captcha", "timeout", "failed to refresh"]
+                if any(k in msg for k in retry_keywords):
+                    logger.warning(f"  执行疑似触发界面故障 ({msg})，准备第 {i+2} 次尝试...")
+                    time.sleep(retry_delay * (i + 1))
+                    continue
+                
+                # 判定跳过：资金不足、已撤单、无效价格等
+                skip_keywords = ["资金不足", "余额不足", "insufficent", "invalid", "交易时间"]
+                if any(k in msg for k in skip_keywords):
+                    return {"op_status": OperationStatus.SKIPPED, "raw": res}
+
+                last_res = res
+            except Exception as e:
+                logger.error(f"  执行异常 (第 {i+1} 次尝试): {e}")
+                time.sleep(retry_delay)
+                last_res = {"status": "error", "msg": str(e)}
+
+        return {"op_status": OperationStatus.FAILED, "raw": last_res}
 
     def execute_buys(self):
-        """
-        执行买入任务（开盘时间窗内运行）。
-        
-        委托价格策略：挂涨停价限价委托（对应回测以开盘价成交的逻辑）。
-        涨停价 = 前收盘价 * 1.10（普通股）/ 1.05（ST股）。
-        由于 GUI 下单时客户端通常已显示当日行情，current_price 即为前一日收盘价（信号生成时的价格），
-        用其计算涨停价作为委托价上限，确保在集合竞价或开盘时以开盘实际价格成交。
-        """
+        """执行买入任务（开盘时间窗内运行）"""
         if not self.signals_cache:
             logger.info("队列中无待买入股票。")
             return
@@ -170,230 +257,218 @@ class ExecutionController:
         logger.info(f"当前可用资金: {available_cash:.2f}")
 
         if available_cash < 1000:
-            logger.warning("资金不足 1000 元，暂不执行买入。")
+            logger.warning("可用资金不足 1000 元，取消买入。")
             return
+
+        # 1. 预清空已有的未成交单，确保资金可用 (可选，但在反复重试中很有用)
+        logger.info("  正在清空现有未成交订单以准备新委托...")
+        self.trader.cancel_all()
+        time.sleep(1)
 
         # 检查当前持仓
+        self.sync_positions()
         positions = self.trader.get_positions()
         if positions is None:
-            logger.error("  获取持仓失败，为确保安全，取消本次买入执行。")
+            logger.error("  获取持仓失败，为安全起见，取消本次买入。")
             return
         
-        holding_codes = [p.get('证券代码', p.get('stock_code', '')) for p in positions]
+        holding_codes = [p.get('证券代码', p.get('stock_code', ''))[:6] for p in positions]
 
-        # 过滤已处理或已持有的信号
+        # 1. 预过滤信号
         targets = []
         for s in self.signals_cache:
             code = s['stock_code']
-            if any(code in h or h in code for h in holding_codes):
+            base_code = code[:6]
+            if base_code in holding_codes:
                 logger.info(f"  {code} 已在持仓中，跳过。")
                 continue
-            if code in self.tracking_data["processed_today"]:
-                logger.info(f"  {code} 今日已处理，跳过。")
+            
+            p_status = self.tracking_data["processed_today"].get(base_code)
+            if p_status == OperationStatus.SUCCESS.value:
+                logger.info(f"  {code} 今日已买入成功，跳过。")
                 continue
+            elif p_status == OperationStatus.SKIPPED.value:
+                logger.info(f"  {code} 今日购买曾被跳过判定为不可执行(如资金不足)，跳过。")
+                continue
+            
             targets.append(s)
 
         if not targets:
             logger.info("所有信号已处理或已在持仓中。")
             return
 
-        # 按信号数量均分预算（对齐回测等权分配：capital_per_position = total_value / max_positions）
+        # 2. 计算预算 (均分可用资金)
         budget_per_stock = min(
             available_cash / len(targets),
             available_cash * SINGLE_BUY_RATIO
         )
         budget_per_stock = max(0, budget_per_stock - CASH_BUFFER)
 
+        # 3. 循环执行买入
         for signal in targets:
             code = signal['stock_code']
+            base_code = code[:6]
             ref_price = signal.get('current_price', 0)
+            
             if ref_price <= 0:
                 logger.warning(f"  {code}: 参考价格无效 ({ref_price})，跳过。")
                 continue
 
-            # ---------------------------------------------------------------
-            # 【核心】买入委托价 = 涨停价（确保开盘成交，对齐回测 next_day_open）
-            # ---------------------------------------------------------------
+            # 委托价策略：挂涨停价
             is_st = signal.get('is_st', False)
             limit_up_price = _calc_limit_up_price(ref_price, is_st=is_st)
-
-            # 以涨停价估算可购买手数（实际成交后以开盘价计算，此处用上限做保守估算）
+            
+            # 数量估算
             volume = int((budget_per_stock / limit_up_price) / 100) * 100
 
-            if volume >= 100:
-                logger.info(f"  执行买入委托: {code} | 数量: {volume}股 | "
-                            f"委托价(涨停): {limit_up_price:.2f} | 参考价: {ref_price:.2f}")
-                res = self.trader.buy(code, amount=volume, price=limit_up_price)
+            if volume < 100:
+                logger.warning(f"  {code}: 预算不足一手 ({limit_up_price:.2f} * 100 > {budget_per_stock:.2f})")
+                continue
 
-                if res.get('status') == 'success' or res.get('entrust_no'):
-                    self.tracking_data["processed_today"].append(code)
-                    self.tracking_data["positions"][code] = {
-                        "entry_date": datetime.now().strftime("%Y-%m-%d"),
-                        # 以参考价（信号生成时的收盘价）记录，对齐回测 next_day_open 的 entry_price 记录逻辑
-                        # （实际成交价应为开盘价，但 GUI 难以实时获取，用参考价近似）
-                        "entry_price": ref_price,
-                        "stop_loss": signal.get('stop_loss'),
-                        "take_profit": signal.get('take_profit'),
-                        "confidence": signal.get('confidence'),
-                        "is_st": is_st,
-                    }
-                    self._save_tracking()
-                    logger.info(f"  {code} 买入委托成功，记录持仓跟踪。")
-                else:
-                    logger.warning(f"  {code} 买入委托失败: {res}")
+            logger.info(f"  执行买入委托: {code} | 数量: {volume} | 委托价: {limit_up_price:.2f}")
+            
+            def do_buy():
+                # 每次买入前简单刷新可用资金，防止超支
+                bal = self.trader.get_balance()
+                current_avail = float(bal.get('可用', bal.get('可用余额', 0)))
+                if current_avail < (volume * limit_up_price):
+                    return {"status": "error", "msg": "资金不足以执行下一笔下单"}
+                return self.trader.buy(code, amount=volume, price=limit_up_price)
+
+            res_report = self._execute_with_retry(do_buy)
+
+            if res_report["op_status"] == OperationStatus.SUCCESS:
+                self.tracking_data["processed_today"][base_code] = OperationStatus.SUCCESS.value
+                self.tracking_data["positions"][base_code] = {
+                    "entry_date": datetime.now().strftime("%Y-%m-%d"),
+                    "entry_price": ref_price,
+                    "stop_loss": signal.get('stop_loss'),
+                    "take_profit": signal.get('take_profit'),
+                    "confidence": signal.get('confidence'),
+                    "is_st": is_st,
+                }
+                logger.info(f"  ✅ {code} 买入成功: {res_report['raw']}")
+            elif res_report["op_status"] == OperationStatus.SKIPPED:
+                reason = res_report["raw"].get('message', res_report["raw"].get('msg', 'Unknown'))
+                logger.warning(f"  ⏭️ {code} 买入被主动跳过 ({res_report['op_status'].value}): {reason}")
+                self.tracking_data["processed_today"][base_code] = OperationStatus.SKIPPED.value
             else:
-                logger.warning(f"  {code}: 预算 {budget_per_stock:.2f} 不足一手（涨停价 {limit_up_price:.2f}），跳过。")
+                reason = res_report["raw"].get('message', res_report["raw"].get('msg', 'Unknown'))
+                logger.error(f"  ❌ {code} 买入最终失败 ({res_report['op_status'].value}): {reason}")
+                self.tracking_data["processed_today"][base_code] = OperationStatus.FAILED.value
+            
+            self._save_tracking()
+            time.sleep(1) # 下单间隔
 
     def execute_sells(self):
-        """
-        执行卖出任务（尾盘时间窗内运行）。
-        
-        退出条件（完全对齐回测 _check_exit_conditions）：
-          1. 止损：当前价 <= stop_loss
-          2. 止盈：当前价 >= take_profit
-          3. 时间止损：持有 >= AUTO_TIME_STOP_DAYS 交易日 且 亏损 >= AUTO_TIME_STOP_MIN_LOSS_PCT
-        
-        委托价格策略：挂跌停价限价卖出（确保在尾盘集合竞价前成交，对应回测以 close 成交）。
-        """
+        """执行卖出任务（尾盘时间窗内运行）"""
         from config.strategy_config import (
             ENABLE_STOP_LOSS_EXIT, ENABLE_TAKE_PROFIT_EXIT, ENABLE_TIME_STOP_EXIT
         )
 
+        self.sync_positions()
         positions = self.trader.get_positions()
         if positions is None:
-            logger.error("  ❌ 未获取到持仓信息（可能OCR识别失败或连接超时），为防止意外清仓，已禁止尾盘兜底逻辑。")
+            logger.error("  ❌ 未获取到持仓信息，为防止意外清仓，不执行。")
             return
             
         if not positions:
-            logger.info("  当前确认为无持仓，无需执行卖出。")
+            logger.info("  当前确认为无持仓。")
             return
 
         today_str = datetime.now().strftime("%Y-%m-%d")
 
         for p in positions:
             code = p.get('证券代码', p.get('stock_code', ''))
-            # 取纯6位代码（部分券商带后缀）
-            base_code = code[:6] if len(code) >= 6 else code
+            base_code = code[:6]
 
-            # T+1 保护：今日买入不能卖出
-            if base_code in self.tracking_data.get("processed_today", []):
-                logger.info(f"  {code} 今日买入（T+1 保护），跳过卖出。")
+            # T+1 保护
+            if self.tracking_data["processed_today"].get(base_code) == OperationStatus.SUCCESS.value:
+                logger.info(f"  {code} 今日买入 (T+1 保护)，跳过。")
                 continue
 
             # 获取元数据
             meta = self.tracking_data["positions"].get(base_code, {})
-            if not meta:
-                # 历史遗留无元数据持仓：尾盘清仓（兜底处理）
-                logger.info(f"  {code} 无跟踪元数据，执行兜底尾盘清仓。")
-                self._do_sell(code, ref_price=None, is_st=False)
-                continue
-
-            # 当前价格（券商返回字段因券商而异）
             current_price = float(p.get('当前价', p.get('市价', p.get('现价', 0))) or 0)
-            print(f"{'='*60}")
-            print(f"当前价格：{current_price}")
-            print(f"{'='*60}")
-            entry_price = float(meta.get('entry_price') or 0)
-            entry_date_str = meta.get('entry_date', '')
             is_st = bool(meta.get('is_st', False))
 
-            if current_price <= 0 or entry_price <= 0:
-                logger.warning(f"  {code}: 价格数据无效 (current={current_price}, entry={entry_price})，跳过。")
+            if not meta:
+                logger.warning(f"  {code} 无跟踪元数据，执行兜底卖出。")
+                self._do_sell_robust(code, ref_price=current_price, is_st=is_st)
                 continue
 
-            # ---------------------------------------------------------------
-            # 持有天数（交易日计数，对齐回测 position.holding_days）
-            # ---------------------------------------------------------------
+            entry_price = float(meta.get('entry_price') or 0)
+            entry_date_str = meta.get('entry_date', '')
+
+            if current_price <= 0 or entry_price <= 0:
+                logger.warning(f"  {code}: 价格无效 (current={current_price}, entry={entry_price})")
+                continue
+
+            # 条件检查
             holding_days = _get_trading_days_count(entry_date_str, today_str, self._db_path)
-
-            # 浮亏/浮盈比例（对齐回测 position.unrealized_pnl_pct）
-            unrealized_pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
-
+            unrealized_pnl_pct = (current_price - entry_price) / entry_price
+            
             should_exit = False
             reason = ""
 
-            # ---------------------------------------------------------------
-            # 1. 止损检查（对齐回测: low <= stop_loss → 以 stop_loss 成交）
-            # ---------------------------------------------------------------
             sl = meta.get('stop_loss')
             if ENABLE_STOP_LOSS_EXIT and sl and current_price <= float(sl):
                 should_exit = True
                 reason = "stop_loss"
 
-            # ---------------------------------------------------------------
-            # 2. 止盈检查（对齐回测: high >= take_profit → 以 take_profit 成交）
-            # ---------------------------------------------------------------
             tp = meta.get('take_profit')
             if ENABLE_TAKE_PROFIT_EXIT and tp and current_price >= float(tp):
                 should_exit = True
                 reason = "take_profit"
 
-            # ---------------------------------------------------------------
-            # 3. 时间止损（对齐回测双条件：天数 + 亏损门槛）
-            #    回测条件: holding_days >= TIME_STOP_DAYS
-            #              AND unrealized_pnl_pct <= TIME_STOP_MIN_LOSS_PCT
-            # ---------------------------------------------------------------
             if (ENABLE_TIME_STOP_EXIT
                     and holding_days >= AUTO_TIME_STOP_DAYS
                     and unrealized_pnl_pct <= AUTO_TIME_STOP_MIN_LOSS_PCT):
                 should_exit = True
                 reason = "time_stop"
 
-            # ---------------------------------------------------------------
-            # 执行卖出：挂跌停价委托（确保尾盘以收盘价附近成交）
-            # ---------------------------------------------------------------
             if should_exit:
-                logger.info(
-                    f"  卖出信号触发: {code} | 原因: {reason} | "
-                    f"当前价: {current_price:.2f} | 入场价: {entry_price:.2f} | "
-                    f"持有: {holding_days} 交易日 | 浮盈: {unrealized_pnl_pct*100:.2f}%"
-                )
-                self._do_sell(code, ref_price=current_price, is_st=is_st)
-
-                # 移除本地跟踪
-                if base_code in self.tracking_data["positions"]:
-                    del self.tracking_data["positions"][base_code]
-                self._save_tracking()
+                logger.info(f"  卖出触发: {code} | 原因: {reason} | 收益: {unrealized_pnl_pct*100:.2f}%")
+                success = self._do_sell_robust(code, ref_price=current_price, is_st=is_st)
+                if success:
+                    if base_code in self.tracking_data["positions"]:
+                        del self.tracking_data["positions"][base_code]
+                    self._save_tracking()
             else:
-                logger.info(
-                    f"  {code} | 持有 {holding_days}交易日 | 浮盈 {unrealized_pnl_pct*100:.2f}% | 未触发退出，继续持仓。"
-                )
+                logger.info(f"  {code} | 持有 {holding_days}D | 浮盈 {unrealized_pnl_pct*100:.2f}% | 继续持有。")
 
-    def _do_sell(self, code: str, ref_price: Optional[float], is_st: bool):
-        """
-        内部卖出执行：挂跌停价限价委托。
+    def _do_sell_robust(self, code: str, ref_price: Optional[float], is_st: bool) -> bool:
+        """健壮的卖出执行逻辑"""
+        base_code = code[:6]
         
-        使用跌停价而非市价，原因：
-        - 尾盘集合竞价前挂跌停价，交易所接受，保证尾盘能优先成交。
-        - 对应回测中以当日 close 成交的逻辑（尾盘挂价 = 接受任何价格成交）。
-        - 如果 ref_price 无效，退回 sell_all（让券商以市价处理）。
-        """
-        if ref_price is None or ref_price <= 0:
-            logger.warning(f"  {code}: 参考价格无效，退回全仓市价卖出。")
-            res = self.trader.sell_all(code)
-        else:
-            limit_down_price = _calc_limit_down_price(ref_price, is_st=is_st)
-            logger.info(f"  执行卖出委托: {code} | 委托价(跌停): {limit_down_price:.2f} | 参考价: {ref_price:.2f}")
-
-            # 获取可卖数量
-            positions = self.trader.get_positions()
+        def attempt_sell():
+            # 重新获取最新持仓以确认数量
+            pos_list = self.trader.get_positions()
             amount = 0
-            for pos in positions:
+            for pos in pos_list:
                 p_code = pos.get('证券代码', pos.get('stock_code', ''))
-                if code in p_code or p_code in code:
-                    amount = int(pos.get('可用余额', pos.get('可卖数量', pos.get('stock_num', 0))) or 0)
+                if base_code in p_code or p_code in base_code:
+                    amount = int(pos.get('可用余额', pos.get('可卖数量', 0)) or 0)
                     break
+            
+            if amount <= 0:
+                return {"status": "skipped", "msg": "可用余额为0（可能已下单）"}
+            
+            if ref_price is None or ref_price <= 0:
+                return self.trader.sell_all(code)
+            
+            limit_down_price = _calc_limit_down_price(ref_price, is_st=is_st)
+            return self.trader.sell(code, amount=amount, price=limit_down_price)
 
-            if amount > 0:
-                res = self.trader.sell(code, amount=amount, price=limit_down_price)
-            else:
-                logger.warning(f"  {code}: 可用余额为 0，跳过卖出（可能已委托或 T+1 限制）。")
-                return
-
-        if res.get('status') == 'success' or res.get('entrust_no'):
-            logger.info(f"  {code} 卖出委托成功。")
+        res_report = self._execute_with_retry(attempt_sell)
+        
+        if res_report["op_status"] == OperationStatus.SUCCESS:
+            logger.info(f"  ✅ {code} 卖出成功: {res_report['raw']}")
+            return True
         else:
-            logger.warning(f"  {code} 卖出委托失败或未确认: {res}")
+            logger.error(f"  ❌ {code} 卖出失败: {res_report['raw']}")
+            return False
+
 
     def is_in_buy_window(self) -> bool:
         now = datetime.now().strftime("%H:%M:%S")

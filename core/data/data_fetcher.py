@@ -89,6 +89,106 @@ class DataFetcher:
         market = 1 if code.startswith('6') else 0
         return f"{market}.{code}"
 
+    @staticmethod
+    def _generate_em_cookie(code: str = None) -> str:
+        """
+        动态生成东方财富请求所需的 Cookie 字符串。
+
+        各字段生成逻辑：
+          qgqp_b_id  : 设备 ID，基于随机 hex。
+          st_nvi     : 会话随机标识符 (alnum + 连字符)。
+          st_si      : 会话 ID，纯数字 (14 位)。
+          st_asi     : 行为链签名，格式同 st_psi（或 'delete' 表示新会话）。
+          nid18      : 浏览器指纹，随机 hex。
+          nid18_create_time : 毫秒级时间戳。
+          gviem      : 访问来源指纹 (alnum + 连字符)。
+          gviem_create_time : 毫秒级时间戳。
+          fullscreengg / fullscreengg2 : 广告展示状态，固定为 1。
+          st_pvi     : 访问次数 (14 位随机)。
+          st_sp      : 访问时间 (URL编码的 YYYY-MM-DD%20HH%3AMM%3ASS)。
+          st_inirUrl : 来源页面 (URL编码)。
+          st_sn      : 小整数计数器 (1–9)。
+          st_psi     : 行为链签名，格式: timestamp-ua_code-rand。
+        """
+        import random
+        import string
+        import time
+        from datetime import datetime
+        from urllib.parse import quote
+
+        def rand_hex(n: int) -> str:
+            return ''.join(random.choices('0123456789abcdef', k=n))
+
+        def rand_alnum_dash(n: int) -> str:
+            """alnum + 少量连字符，模拟东财会话标识符"""
+            chars = string.ascii_letters + string.digits
+            body = ''.join(random.choices(chars, k=n - 4))
+            suffix = ''.join(random.choices(string.digits, k=4))
+            return body + suffix
+
+        now_ts_ms = int(time.time() * 1000)
+        now_dt    = datetime.now()
+
+        # 1. 设备 ID
+        qgqp_b_id = rand_hex(32)
+
+        # 2. 会话标识符
+        st_nvi  = rand_alnum_dash(20)
+        st_si   = ''.join(random.choices(string.digits, k=14))
+        st_pvi  = ''.join(random.choices(string.digits, k=14))
+        st_sn   = str(random.randint(1, 9))
+
+        # 3. 浏览器指纹
+        nid18   = rand_hex(32)
+        gviem   = rand_alnum_dash(15)
+
+        # 时间戳：在当前时间前后随机偏移，模拟真实会话建立时间
+        session_offset_ms = random.randint(30_000, 300_000)   # 30s ~ 5min 前起了会话
+        create_ts = now_ts_ms - session_offset_ms
+        nid18_create_time = str(create_ts)
+        gviem_create_time = str(create_ts)
+
+        # 4. 访问时间（URL 编码）
+        sp_raw = now_dt.strftime('%Y-%m-%d %H:%M:%S')
+        st_sp  = quote(sp_raw, safe='')  # -> '2026-03-16%2023%3A10%3A39'
+
+        # 5. 来源页 URL
+        if code:
+            mkt = 'sh' if code.startswith('6') else 'sz'
+            inir_raw = f'https://quote.eastmoney.com/{mkt}{code}.html'
+        else:
+            inir_raw = 'https://www.eastmoney.com/'
+        st_inirUrl = quote(inir_raw, safe='')
+
+        # 6. 行为链签名 (st_psi / st_asi)
+        psi_ts   = now_dt.strftime('%Y%m%d%H%M%S') + ''.join(random.choices(string.digits, k=3))
+        ua_code  = '-'.join([
+            ''.join(random.choices(string.digits, k=12)),
+            ''.join(random.choices(string.digits, k=12)),
+            ''.join(random.choices(string.digits, k=10)),
+        ])
+        st_psi = f"{psi_ts}-{ua_code}"
+        st_asi = 'delete'   # 新会话开始时通常为 delete
+
+        parts = [
+            f"qgqp_b_id={qgqp_b_id}",
+            f"st_nvi={st_nvi}",
+            f"st_si={st_si}",
+            f"st_asi={st_asi}",
+            f"nid18={nid18}",
+            f"nid18_create_time={nid18_create_time}",
+            f"gviem={gviem}",
+            f"gviem_create_time={gviem_create_time}",
+            "fullscreengg=1",
+            "fullscreengg2=1",
+            f"st_pvi={st_pvi}",
+            f"st_sp={st_sp}",
+            f"st_inirUrl={st_inirUrl}",
+            f"st_sn={st_sn}",
+            f"st_psi={st_psi}",
+        ]
+        return '; '.join(parts)
+
     def update_daily_data(self, symbol: str, incremental: bool = True):
         """
         Updates daily data for a stock using:
@@ -113,8 +213,7 @@ class DataFetcher:
             end_str = end_date.strftime('%Y-%m-%d')
             # 数据库最新日：t，获取数据t+1到now+1
             if datetime.now().time()<datetime.strptime("15:30", "%H:%M").time() and datetime.now().day-start_date.day==1:
-                if start_date.strftime('%Y-%m-%d')==(datetime.now()-timedelta(days=1)).strftime('%Y-%m-%d'):
-                    return
+                return
             elif datetime.now().time()>datetime.strptime("15:30", "%H:%M").time() and datetime.now().day-start_date.day==0:
                 return
             
@@ -122,12 +221,24 @@ class DataFetcher:
             # 2. Yahoo Request (OHLCV)
             yf_symbol = self._to_yf_symbol(symbol)
             # For yfinance 1.2.0+, download might return MultiIndex
-            ohlcv = yf.download(yf_symbol, start=start_str, end=end_str, repair=True, auto_adjust=True,progress=False)
+            _suspended = False  # 停牌标记：yfinance 认为退市但实际是停牌
+            try:
+                ohlcv = yf.download(yf_symbol, start=start_str, end=end_str,
+                                    repair=True, auto_adjust=True, progress=False)
+            except Exception as yf_err:
+                raise  # 如果有直接抛出的网络层错误，交给外层重试
 
             if ohlcv.empty:
-                print(f'{start_date}-{end_date}')
-                print(f"{symbol} no records in yfinance")
-                return
+                # yfinance 对许多错误（包括停牌/查不到数据/网络错误）只打日志、返回空DF，不会抛异常
+                # 将真正的错误转为异常以触发外层「指数退避重试」，停牌/空数据则视为 _suspended 继续
+                import yfinance.shared as yf_shared
+                err_msg = str(yf_shared._ERRORS.get(yf_symbol, ''))
+                if err_msg and 'possibly delisted' not in err_msg and 'No data found' not in err_msg:
+                    raise Exception(f"YF Err: {err_msg}")  # 强制抛出，触发外层指数退避重试
+                
+                _suspended = True  # 视为停牌，继续获取 EM 换手率
+                ohlcv = pd.DataFrame()
+
             # Flatten MultiIndex if ticker is in columns
             if isinstance(ohlcv.columns, pd.MultiIndex):
                 # If single ticker, it usually has (Attribute, Ticker) structure
@@ -160,52 +271,92 @@ class DataFetcher:
             secid = self._to_em_secid(symbol)
             beg = start_str.replace('-', '')
             end_em = end_str.replace('-', '')
+
             em_url = (
                 f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
                 f"secid={secid}&klt=101&fqt=1&beg={beg}&end={end_em}&"
                 f"fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f56,f61"
             )
-            em_resp = requests.get(em_url, timeout=10).json()
-            klines = em_resp.get('data', {}).get('klines', []) if em_resp.get('data') else []
+
+            headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Cookie": 'qgqp_b_id=c91cd0d5d7ffdec45cbd87eaf3be88ab; st_nvi=H9j31DrwvRw7LCTjOKDCO7f23; p_origin=https%3A%2F%2Fpassport2.eastmoney.com; st_si=74321427112891; nid18=02a135560fe3dffacb5c7d217e719939; nid18_create_time=1773683211925; gviem=koQfjPUr4wnclZn_D2L0o88d3; gviem_create_time=1773683211925; mtp=1; ct=oTgrGil11xTUGr6RvFJOCdjSRYyKAZx6drq1PMLdff-pQuZlHREBRe9RPLOLn9F-9k_LXmsBCyCHkPWWhnh3ILBJOd9IyWk3Zw7_PFIRQ7EiTF3cNLPEXRM_ygNh3pNbIunBj3jIC1mbldtDxX-8aKSSY1tHLUcyXKtVhDQXD7g; ut=FobyicMgeV7bfas_M05TDIWd4XHjHsle4qlh_FbvNEAvkBIEwI8RbDW8eEb5qvvJ2d-zRoz9XOdvIXp3MHmt1MxCmH8VK3_xQmdPqaPoD96U-7PD1wp2N-KIKAUZVsrRQYyTvbyFC4XQIMVvlvZrXrv7dtr9DGp1IKed9k0Kc5eIqFQE1LR0LdgRYZACF2yw4TUJb1ASHPU69kuKBmKZfK2_HqMTsTvYbxegEVH1MhoCH9xFShqvQx5S1ocD7skvRU0czL_lSFhlNa7yTNubEm_QGqAKV3dU; pi=4929027679601506%3Bs4929027679601506%3B%E5%B0%98%E5%BD%B1%E6%98%9F%E7%97%95%3BqJgBeMlv%2FmFahZ6EhOxV5tKRUSKP%2FQ%2F8awj9kOI588lokJlu8ZkNrJtvRn%2Fivi9TxLPhbv7a%2Fl7rUJkT2wqtvYxhUwsHlxwWE8JzC7hj2V0Jn%2FLgQ4dRZPNgkcW5HIY8ms7zJaCiCkTM2a7HDcDhuLuQTYLABMK74c6O8dfuD495oRhL3nJ9Y8%2BRpJNr%2Bmv5739ik8Vw%3B4%2F7iTjitgX7cQpQProOey%2FUfSZSxRfb9eLzo8Ylfjwf%2B0nTa3uoHsKd5iIKv4m%2BInM%2F6b1WkRWKDM4Y4a1CIF%2BzAJ9fQ4Avc96TdVrSs8f1zU8U8rsAtpHgdWJymQq%2FB5T5E3LRmo%2Fc6gG5aTIzs9mTWTU2jvg%3D%3D; uidal=4929027679601506%e5%b0%98%e5%bd%b1%e6%98%9f%e7%97%95; sid=; vtpst=|; fullscreengg=1; fullscreengg2=1; wsc_checkuser_ok=1; st_pvi=54188038020678; st_sp=2025-11-03%2022%3A26%3A24; st_inirUrl=https%3A%2F%2Fdata.eastmoney.com%2Fxuangu%2F; st_sn=10; st_psi=20260317090016952-113200354966-7143833211; st_asi=delete',
+                "Host": "push2his.eastmoney.com",
+                "Pragma": "no-cache",
+                'Referer': f'https://quote.eastmoney.com/{"sh" if symbol.startswith("6") else "sz"}{symbol}.html',
+                'Sec-Fetch-Site': 'same-site',
+                'Sec-Fetch-Dest': 'script',
+                'Sec-Fetch-Mode': 'no-cors',
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+                "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"'
+            }
+            if not _suspended:
+                em_resp = requests.get(em_url, timeout=10,headers=headers).json()
+                klines = em_resp.get('data', {}).get('klines', []) if em_resp.get('data') else []
             
-            em_data_map = {}
-            for k in klines:
-                if ',' in k:
-                    parts = k.split(',')
-                    if len(parts) >= 3:
-                        d, amt_val, tr_val = parts[0], parts[1], parts[2]
-                        em_data_map[d] = (float(amt_val), float(tr_val))
+                em_data_map = {}
+                for k in klines:
+                    if ',' in k:
+                        parts = k.split(',')
+                        if len(parts) >= 3:
+                            d, amt_val, tr_val = parts[0], parts[1], parts[2]
+                            em_data_map[d] = (float(amt_val), float(tr_val))
+            else:
+                em_data_map = {}
+            
 
             # 4. Merge and Insert
             cursor = self.conn.cursor()
-            for _, row in ohlcv.iterrows():
+            if not ohlcv.empty:
+                for _, row in ohlcv.iterrows():
+                    try:
+                        d = str(row['date'])
+                        amt, tr = em_data_map.get(d, (0.0, 0.0))
+                        
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO daily_data 
+                            (code, date, open, high, low, close, volume, amount, turnover_rate)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (symbol, d, float(row['open']), float(row['high']), float(row['low']),
+                              float(row['close']), float(row['volume']), float(amt), float(tr)))
+                    except Exception as e:
+                        print(f'Error update daily_data: {symbol}: {e}')
+            else:
                 try:
-                    d = str(row['date'])
-                    amt, tr = em_data_map.get(d, (0.0, 0.0))
-                    if amt == 0.0:
-                        amt = float(row.get('volume', 0)) * float(row.get('close', 0))
-                    
+                    d = start_str
+                    last_close = self.get_stock_data(symbol, 1).iloc[0]['close']
+                    o, h, l, c, v, a, tr = last_close,last_close,last_close,last_close,0,0,0
                     cursor.execute('''
-                        INSERT OR REPLACE INTO daily_data 
+                        INSERT OR IGNORE INTO daily_data
                         (code, date, open, high, low, close, volume, amount, turnover_rate)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (symbol, d, float(row['open']), float(row['high']), float(row['low']),
-                          float(row['close']), float(row['volume']), float(amt), float(tr)))
+                    ''', (symbol, d, o, h, l, c, v, a, tr))
                 except Exception as e:
-                    import traceback
                     print(f'Error update daily_data: {symbol}: {e}')
-                    traceback.print_exc()
-            
+
             self.conn.commit()
             
             # 5. EastMoney Finance Request
 
-            self._update_finance_data(symbol)
+            # self._update_finance_data(symbol)
+            time.sleep(config.QUEST_INTERVAL)
 
         except Exception as e:
-            import traceback
-            print(f"Error updating {symbol}: {e}")
-            traceback.print_exc()
+            err_msg = str(e)
+            if 'possibly delisted' in err_msg or 'No data found' in err_msg:
+                # 停牌误报：静默跳过，不打印堆栈
+                print(f"Error updating {symbol}: {e}")
+            else:
+                import traceback
+                print(f"Error updating {symbol}: {e}")
+                traceback.print_exc()
+                raise   # 重新抛出，让上层重试机制捕获
 
     def _is_report_season(self) -> bool:
         """
@@ -386,27 +537,43 @@ class DataFetcher:
         return pd.DataFrame([res])
 
     def init_all_stocks_data(self, markets=['sh', 'sz_main'], incremental: bool = True, workers: int = WORKERS_NUM):
-        """Batch update for all stocks"""
+        """Batch update for all stocks with exponential-backoff retry"""
         stocks = self.get_stock_list(markets)
         if stocks.empty: return
-        
+
         codes = stocks['code'].tolist()
         print(f"Starting update for {len(codes)} stocks using {workers} workers...")
-        
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            def worker(c_symbol):
+
+        MAX_RETRIES = 3
+        BASE_DELAY  = 2.0   # seconds
+
+        def worker(c_symbol):
+            """单只股票更新，失败时指数退避重试"""
+            for attempt in range(MAX_RETRIES + 1):
                 fetcher = DataFetcher()
                 try:
                     fetcher.update_daily_data(c_symbol, incremental)
+                    return  # 成功，退出重试循环
+                except Exception as e:
+                    err_msg = str(e)
+                    # 停牌误报不重试
+                    if 'possibly delisted' in err_msg or 'No data found' in err_msg:
+                        return
+                    if attempt < MAX_RETRIES:
+                        # 指数退避 + 随机扰动: 2^(attempt+1) + rand(0,1) 秒
+                        delay = BASE_DELAY ** (attempt + 1) + random.uniform(0, 1)
+                        print(f"  [{c_symbol}] 第 {attempt+1} 次失败，{delay:.1f}s 后重试: {e}")
+                        time.sleep(delay)
+                    else:
+                        print(f"  [{c_symbol}] 已达最大重试次数 ({MAX_RETRIES})，放弃: {e}")
                 finally:
                     fetcher.close()
 
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             fut_map = {executor.submit(worker, c): c for c in codes}
             for fut in as_completed(fut_map):
                 c = fut_map[fut]
                 try:
                     fut.result()
                 except Exception as e:
-                    import traceback
                     print(f"Failed {c}: {e}")
-                    traceback.print_exc()

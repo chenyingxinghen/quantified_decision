@@ -144,9 +144,13 @@ class ComprehensiveFactorCalculator:
                 print(f"  警告: 计算高级因子失败: {e}")
                 adv_factors = pd.DataFrame(index=data.index)
                 
-            # F. 交易状态因子 (涨停/停牌)
+            # F. 交易状态因子 (涨停/停牌 + 市场分类)
             status_factors = pd.DataFrame(index=data.index)
-            # 获取 ST 标签：如果在 data 中存在则直接使用，否则通过 fundamental_calculator 查询数据库
+            
+            # 兼容多市场的涨跌停阈值判断
+            from config.config import MARKET_LIMITS, MARKET_PREFIXES
+            
+            # 获取 ST 标签
             is_st = False
             if 'is_st' in data.columns:
                 is_st = data['is_st'].iloc[0] == 1
@@ -158,8 +162,26 @@ class ComprehensiveFactorCalculator:
                 except Exception:
                     pass
             
-            # ST 股涨停阈值取 4.5% (对应 5% 限制)，普通股取 9.3% (对应 10% 限制)
-            limit_threshold = 0.045 if is_st else 0.093
+            # 确定市场类型 (1:主板, 2:创业板, 3:科创板, 4:北交所, 5:ST)
+            market_type = 1 # 默认主板
+            if is_st:
+                limit_threshold = MARKET_LIMITS['st']
+                market_type = 5
+            elif code.startswith(MARKET_PREFIXES['sz_gem']):
+                limit_threshold = MARKET_LIMITS['gem_star']
+                market_type = 2
+            elif code.startswith(MARKET_PREFIXES['star']):
+                limit_threshold = MARKET_LIMITS['gem_star']
+                market_type = 3
+            elif code.startswith(MARKET_PREFIXES['bj']):
+                limit_threshold = MARKET_LIMITS['bj']
+                market_type = 4
+            else:
+                limit_threshold = MARKET_LIMITS['main']
+                market_type = 1
+            
+            # 记录市场类型特征
+            status_factors['market_type'] = market_type
             
             # 重要：此处仅生成状态特征，is_st 本身不作为特征输出，以防数据泄露
             status_factors['is_limit_up'] = ((data['close'] == data['high']) & (data['close'].pct_change() > limit_threshold)).astype(int)

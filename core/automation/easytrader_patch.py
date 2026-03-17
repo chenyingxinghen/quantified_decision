@@ -69,7 +69,8 @@ def patched_get_clipboard_data(self):
         top = self._trader.app.top_window()
         # 增加识别“验证码”关键字的鲁棒性，使用 child_window + found_index 避免歧义
         if top.child_window(class_name="Static", title_re=".*验证码.*", found_index=0).exists(timeout=1):
-            file_path = "logs/tmp.png"
+            import tempfile
+            file_path = os.path.join(tempfile.gettempdir(), "easytrader_captcha.png")
             count = 5
             found = False
             while count > 0:
@@ -439,6 +440,30 @@ class RobustClientTrader(ClientTrader):
             elif "撤单" in first_menu: self._main.type_keys("{F3}")
             elif "查询" in first_menu: self._main.type_keys("{F4}")
             time.sleep(sleep)
+
+    def cancel_all(self):
+        """撤销所有待成交的委托单"""
+        logger.info("开始执行尝试撤销所有待成交委托...")
+        try:
+            entrusts = self.today_entrusts
+            if not entrusts:
+                logger.info("当前无今日委托记录。")
+                return {"status": "success", "msg": "no entrusts"}
+
+            cancel_count = 0
+            for ent in entrusts:
+                status = str(ent.get('状态', ent.get('status', '')))
+                # If status is unfulfilled or partially fulfilled
+                if '已报' in status or '未成交' in status or '部分成交' in status or '部分撤单' in status:
+                    ent_no = ent.get('合同编号', ent.get('entrust_no'))
+                    if ent_no:
+                        logger.info(f"正在撤销委托单: {ent_no} (状态: {status})")
+                        self.cancel_entrust(ent_no)
+                        cancel_count += 1
+            return {"status": "success", "msg": f"canceled {cancel_count} entrusts"}
+        except Exception as e:
+            logger.error(f"撤销所有委托时出错: {e}")
+            return {"status": "error", "message": str(e)}
 
 def get_patched_trader(broker='ths'):
     """工厂方法：返回打过补丁的交易对象"""

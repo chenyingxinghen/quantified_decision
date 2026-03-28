@@ -110,8 +110,10 @@ class ComprehensiveFactorCalculator:
             try:
                 sentiment_factors = MarketSentimentFactors.calculate_all_sentiment_factors(data, db_path=self.db_path)
             except Exception as e:
-                if True:  # 始终捕获，避免影响主流程
-                    print(f"  警告: 计算市场情绪因子失败: {e}")
+                # 记录详细错误，以便发现预计算数据的缺失或格式问题
+                import traceback
+                print(f"  [ERROR] 计算市场情绪因子失败: {e}")
+                traceback.print_exc()
                 sentiment_factors = pd.DataFrame(index=data.index)
 
             # D. 基本面因子 (PIT 对齐版本，消除前视偏差)
@@ -128,7 +130,9 @@ class ComprehensiveFactorCalculator:
                     if not fundamental_factors.empty:
                         fundamental_factors.index = data.index
                 except Exception as e:
-                    print(f"  警告: 计算基本面因子失败 ({code}): {e}")
+                    import traceback
+                    print(f"  [ERROR] 计算基本面因子失败 ({code}): {e}")
+                    traceback.print_exc()
                     fundamental_factors = pd.DataFrame(index=data.index)
                 
             # E. 高级特征 (时间序列、风险) - 现在返回的是 Rolling DataFrames
@@ -141,46 +145,51 @@ class ComprehensiveFactorCalculator:
                 # 直接连接这些 DataFrames
                 adv_factors = pd.concat([ts_price, ts_vol, ts_mom, risk], axis=1)
             except Exception as e:
-                print(f"  警告: 计算高级因子失败: {e}")
+                import traceback
+                print(f"  [ERROR] 计算高级因子失败: {e}")
+                traceback.print_exc()
                 adv_factors = pd.DataFrame(index=data.index)
                 
             # F. 交易状态因子 (涨停/停牌 + 市场分类)
             status_factors = pd.DataFrame(index=data.index)
             
             # 兼容多市场的涨跌停阈值判断
-            from config.config import MARKET_LIMITS, MARKET_PREFIXES
+            from config import MARKET_LIMITS, MARKET_PREFIXES
             
-            # 获取 ST 标签
-            is_st = False
+            # 确定市场类型 Series (1:主板, 2:创业板, 3:科创板, 4:北交所, 5:ST)
+            # 这是一个关键的 PIT 修复：如果 data 中有 is_st 列，我们应该按日动态识别
             if 'is_st' in data.columns:
-                is_st = data['is_st'].iloc[0] == 1
+                is_st_series = data['is_st'].fillna(0).astype(int) == 1
             else:
+                is_st_series = pd.Series(False, index=data.index)
                 try:
+                    # 只有在没有日线 ST 标记时，才回退到基础信息（非 PIT，仅作兜底）
                     info = self.fundamental_calculator.get_stock_info(code)
-                    if info is not None:
-                        is_st = info.get('is_st') == 1
+                    if info is not None and info.get('is_st') == 1:
+                        is_st_series = pd.Series(True, index=data.index)
                 except Exception:
                     pass
             
-            # 确定市场类型 (1:主板, 2:创业板, 3:科创板, 4:北交所, 5:ST)
-            market_type = 1 # 默认主板
-            if is_st:
-                limit_threshold = MARKET_LIMITS['st']
-                market_type = 5
-            elif code.startswith(MARKET_PREFIXES['sz_gem']):
-                limit_threshold = MARKET_LIMITS['gem_star']
-                market_type = 2
-            elif code.startswith(MARKET_PREFIXES['star']):
-                limit_threshold = MARKET_LIMITS['gem_star']
-                market_type = 3
-            elif code.startswith(MARKET_PREFIXES['bj']):
-                limit_threshold = MARKET_LIMITS['bj']
-                market_type = 4
-            else:
-                limit_threshold = MARKET_LIMITS['main']
-                market_type = 1
+            # 初始化市场类型 (1:主板, 2:创业板, 3:科创板, 4:北交所, 5:ST)
+            market_type = pd.Series(1, index=data.index)
+            limit_threshold = pd.Series(MARKET_LIMITS['main'], index=data.index)
+
+            # 依次覆盖更高优先级分类
+            if code.startswith(('300', '301')): # 创业板
+                market_type[:] = 2
+                limit_threshold[:] = MARKET_LIMITS['gem_star']
+            elif code.startswith(('688', '689')): # 科创板
+                market_type[:] = 3
+                limit_threshold[:] = MARKET_LIMITS['gem_star']
+            elif code.startswith(('43', '83', '87', '88')): # 北交所
+                market_type[:] = 4
+                limit_threshold[:] = MARKET_LIMITS['bj']
             
-            # 记录市场类型特征
+            # ST 具有最高优先级 (任何板块进入 ST 后，波动率限制都会变为 ST 标准)
+            market_type[is_st_series] = 5
+            limit_threshold[is_st_series] = MARKET_LIMITS['st']
+            
+            # 记录市场类型特征 (作为机器学习特征)
             status_factors['market_type'] = market_type
             
             # 重要：此处仅生成状态特征，is_st 本身不作为特征输出，以防数据泄露
@@ -222,8 +231,9 @@ class ComprehensiveFactorCalculator:
                 
             return engineered
         except Exception as e:
-            if verbose:
-                print(f"  警告: 特征工程失败: {e}")
+            import traceback
+            print(f"  [ERROR] 特征工程变换失败: {e}")
+            traceback.print_exc()
             return base_factors
 
     def get_feature_names(self, code: str, sample_data: pd.DataFrame) -> List[str]:

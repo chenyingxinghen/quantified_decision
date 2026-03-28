@@ -62,7 +62,7 @@
             </div>
             
             <div class="live-price">
-              <div class="price-val text-mono">{{ stockData.valuation?.close?.toFixed(2) }}</div>
+              <div class="price-val text-mono">{{ formatNum(stockData.valuation?.close) }}</div>
               <div class="price-date text-muted">最新收盘 ({{ stockData.valuation?.date }})</div>
             </div>
           </div>
@@ -77,8 +77,8 @@
               <div class="value text-mono">{{ stockData.valuation?.pb ?? '—' }}</div>
             </div>
             <div class="mini-stat-item">
-              <div class="label">机构类型</div>
-              <div class="value text-mono">{{ formatOrgType(stockData.finance?.current?.ORG_TYPE) }}</div>
+              <div class="label">上市状态</div>
+              <div class="value text-mono">{{ stockData.info?.status === '1' ? '上市' : (stockData.info?.status === '0' ? '退市' : '—') }}</div>
             </div>
             <div class="mini-stat-item">
               <div class="label">报表日期</div>
@@ -98,23 +98,23 @@
           <div class="card-body">
             <div class="indicator-grid">
               <div class="indicator-item">
-                <div class="label">ROE (加权)</div>
-                <div class="value text-up">{{ stockData.finance?.current?.ROEJQ?.toFixed(2) }}%</div>
-                <div class="trend" :class="getTrendClass(stockData.finance?.current?.ROEJQ, stockData.finance?.previous?.ROEJQ)">
-                  {{ formatDiff(stockData.finance?.current?.ROEJQ, stockData.finance?.previous?.ROEJQ) }}
+                <div class="label">平均 ROE</div>
+                <div class="value text-up">{{ formatPercent(stockData.finance?.current?.roeAvg) }}%</div>
+                <div class="trend" :class="getTrendClass(stockData.finance?.current?.roeAvg, stockData.finance?.previous?.roeAvg)">
+                  {{ formatDiff(stockData.finance?.current?.roeAvg, stockData.finance?.previous?.roeAvg) }}
                 </div>
               </div>
               <div class="indicator-item">
-                <div class="label">ROE (扣非)</div>
-                <div class="value text-up">{{ stockData.finance?.current?.ROEKCJQ?.toFixed(2) }}%</div>
-              </div>
-              <div class="indicator-item">
                 <div class="label">销售净利率</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.XSJLL?.toFixed(2) }}%</div>
+                <div class="value text-up">{{ formatPercent(stockData.finance?.current?.npMargin) }}%</div>
               </div>
               <div class="indicator-item">
-                <div class="label">总资产收益率</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.ZZCJLL?.toFixed(2) }}%</div>
+                <div class="label">销售毛利率</div>
+                <div class="value text-mono">{{ formatPercent(stockData.finance?.current?.gpMargin) }}%</div>
+              </div>
+              <div class="indicator-item">
+                <div class="label">净利润 (元)</div>
+                <div class="value text-mono">{{ formatBillion(stockData.finance?.current?.netProfit) }}</div>
               </div>
             </div>
           </div>
@@ -129,52 +129,28 @@
           <div class="card-body">
             <div class="indicator-grid">
               <div class="indicator-item">
-                <div class="label">营收同比</div>
-                <div class="value" :class="getValClass(stockData.finance?.current?.TOTALOPERATEREVETZ)">
-                  {{ stockData.finance?.current?.TOTALOPERATEREVETZ?.toFixed(2) }}%
+                <div class="label">归母净利同比</div>
+                <div class="value" :class="getValClass(stockData.finance?.current?.YOYPNI)">
+                  {{ formatPercent(stockData.finance?.current?.YOYPNI) }}%
                 </div>
-                <div class="sub-label">预测: {{ stockData.finance?.current?.DJD_TOI_YOY?.toFixed(1) }}%</div>
               </div>
               <div class="indicator-item">
                 <div class="label">净利润同比</div>
-                <div class="value" :class="getValClass(stockData.finance?.current?.PARENTNETPROFITTZ)">
-                  {{ stockData.finance?.current?.PARENTNETPROFITTZ?.toFixed(2) }}%
-                </div>
-                <div class="sub-label">预测: {{ stockData.finance?.current?.DJD_DPNP_YOY?.toFixed(1) }}%</div>
-              </div>
-              <div class="indicator-item">
-                <div class="label">扣非净利同比</div>
-                <div class="value" :class="getValClass(stockData.finance?.current?.KCFJCXSYJLRTZ)">
-                  {{ stockData.finance?.current?.KCFJCXSYJLRTZ?.toFixed(2) }}%
+                <div class="value" :class="getValClass(stockData.finance?.current?.YOYNI)">
+                  {{ formatPercent(stockData.finance?.current?.YOYNI) }}%
                 </div>
               </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- 现金流量 -->
-        <div class="card glass section-card">
-          <div class="card-header">
-            <el-icon color="var(--accent-blue)"><Wallet /></el-icon>
-            <span class="card-title">现金流量</span>
-          </div>
-          <div class="card-body">
-            <div class="indicator-grid">
               <div class="indicator-item">
-                <div class="label">每股经营现金流</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.MGJYXJJE?.toFixed(3) }}</div>
+                <div class="label">净资产同比</div>
+                <div class="value" :class="getValClass(stockData.finance?.current?.YOYEquity)">
+                  {{ formatPercent(stockData.finance?.current?.YOYEquity) }}%
+                </div>
               </div>
               <div class="indicator-item">
-                <div class="label">经营现金流/营收</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.JYXJLYYSR?.toFixed(2) }}%</div>
-              </div>
-              <div class="indicator-item">
-                <div class="label">每股收益 (EPS)</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.EPSJB?.toFixed(3) }}</div>
-              </div>
-              <div class="indicator-item">
-                <div class="label">每股净资产 (BPS)</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.BPS?.toFixed(2) }}</div>
+                <div class="label">总资产同比</div>
+                <div class="value" :class="getValClass(stockData.finance?.current?.YOYAsset)">
+                  {{ formatPercent(stockData.finance?.current?.YOYAsset) }}%
+                </div>
               </div>
             </div>
           </div>
@@ -184,51 +160,55 @@
         <div class="card glass section-card">
           <div class="card-header">
             <el-icon color="var(--accent-purple)"><Connection /></el-icon>
-            <span class="card-title">资本结构与风险</span>
+            <span class="card-title">偿债与资产结构</span>
           </div>
           <div class="card-body">
             <div class="indicator-grid">
               <div class="indicator-item">
                 <div class="label">资产负债率</div>
-                <div class="value" :class="stockData.finance?.current?.ZCFZL > 70 ? 'text-down' : 'text-mono'">
-                  {{ stockData.finance?.current?.ZCFZL?.toFixed(2) }}%
+                <div class="value" :class="stockData.finance?.current?.liabilityToAsset > 0.0070 ? 'text-down' : 'text-mono'">
+                  {{ stockData.finance?.current?.liabilityToAsset != null ? formatPercent(stockData.finance.current.liabilityToAsset * 100) : '—' }}%
                 </div>
               </div>
               <div class="indicator-item">
                 <div class="label">权益乘数</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.QYCS?.toFixed(2) }}</div>
+                <div class="value text-mono">{{ formatNum(stockData.finance?.current?.assetToEquity) }}</div>
+              </div>
+              <div class="indicator-item">
+                <div class="label">流动比率</div>
+                <div class="value text-mono">{{ formatNum(stockData.finance?.current?.currentRatio) }}</div>
+              </div>
+              <div class="indicator-item">
+                <div class="label">速动比率</div>
+                <div class="value text-mono">{{ formatNum(stockData.finance?.current?.quickRatio) }}</div>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- 行业专项 (银行业) -->
-        <div v-if="isBank" class="card glass section-card highlight" style="grid-column: span 2">
+        <!-- 杜邦分析 -->
+        <div class="card glass section-card">
           <div class="card-header">
-            <el-icon color="var(--accent-orange)"><OfficeBuilding /></el-icon>
-            <span class="card-title">银行业专项指标</span>
+            <el-icon color="var(--accent-blue)"><Wallet /></el-icon>
+            <span class="card-title">杜邦分析</span>
           </div>
           <div class="card-body">
-            <div class="indicator-grid cols-5">
+            <div class="indicator-grid">
               <div class="indicator-item">
-                <div class="label">不良贷款率</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.NONPERLOAN?.toFixed(2) }}%</div>
+                <div class="label">杜邦 ROE</div>
+                <div class="value text-up">{{ formatPercent(stockData.finance?.current?.dupontROE) }}%</div>
               </div>
               <div class="indicator-item">
-                <div class="label">拨备覆盖率</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.BLDKBBL?.toFixed(1) ?? '—' }}%</div>
+                <div class="label">资产周转率</div>
+                <div class="value text-mono">{{ formatNum(stockData.finance?.current?.dupontAssetTurn) }}</div>
               </div>
               <div class="indicator-item">
-                <div class="label">一级资本充足率</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.FIRST_ADEQUACY_RATIO?.toFixed(2) }}%</div>
+                <div class="label">权益乘数(杜邦)</div>
+                <div class="value text-mono">{{ formatNum(stockData.finance?.current?.dupontAssetStoEquity) }}</div>
               </div>
               <div class="indicator-item">
-                <div class="label">净息差</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.NET_INTEREST_MARGIN?.toFixed(2) }}%</div>
-              </div>
-              <div class="indicator-item">
-                <div class="label">利差</div>
-                <div class="value text-mono">{{ stockData.finance?.current?.NET_INTEREST_SPREAD?.toFixed(2) ?? '—' }}%</div>
+                <div class="label">归母净利占比</div>
+                <div class="value text-mono">{{ stockData.finance?.current?.dupontPnitoni != null ? formatPercent(stockData.finance.current.dupontPnitoni) : '—' }}%</div>
               </div>
             </div>
           </div>
@@ -275,8 +255,7 @@ const chartRef = ref(null)
 let chartInstance = null
 
 const isBank = computed(() => {
-  const type = stockData.value.finance?.current?.ORG_TYPE
-  return type === 1 || stockData.value.info?.industry?.includes('银行')
+  return false
 })
 
 onMounted(() => {
@@ -330,9 +309,9 @@ function renderChart() {
   
   const history = [...stockData.value.finance.history].reverse()
   const dates = history.map(h => h.REPORT_DATE)
-  const revenue = history.map(h => h.TOTALOPERATEREVETZ)
-  const profit = history.map(h => h.PARENTNETPROFITTZ)
-  const roe = history.map(h => h.ROEJQ)
+  const revenue = history.map(h => h.YOYAsset != null ? h.YOYAsset * 100 : null)
+  const profit = history.map(h => h.YOYPNI != null ? h.YOYPNI * 100 : null)
+  const roe = history.map(h => h.roeAvg != null ? h.roeAvg * 100 : null)
 
   const option = {
     backgroundColor: 'transparent',
@@ -344,7 +323,7 @@ function renderChart() {
       textStyle: { color: '#fff', fontSize: 12 }
     },
     legend: {
-      data: ['营收同比', '净利同比', 'ROE'],
+      data: ['总资产同比', '归母净利同比', 'ROE'],
       bottom: 0,
       textStyle: { color: '#888' }
     },
@@ -372,13 +351,13 @@ function renderChart() {
     ],
     series: [
       {
-        name: '营收同比',
+        name: '总资产同比',
         type: 'bar',
         data: revenue,
         itemStyle: { color: 'rgba(0, 242, 254, 0.6)' }
       },
       {
-        name: '净利同比',
+        name: '归母净利同比',
         type: 'bar',
         data: profit,
         itemStyle: { color: 'rgba(255, 51, 102, 0.6)' }
@@ -400,8 +379,7 @@ function renderChart() {
 }
 
 function formatOrgType(type) {
-  const dict = { 1: '银行', 2: '证券', 3: '保险', 4: '工业/通用', 5: '商业' }
-  return dict[type] || (type === 0 ? '通用' : '—')
+  return '—'
 }
 
 function getTrendClass(curr, prev) {
@@ -411,13 +389,28 @@ function getTrendClass(curr, prev) {
 
 function formatDiff(curr, prev) {
   if (curr == null || prev == null) return ''
-  const diff = curr - prev
+  const diff = (curr - prev) * 100
   return (diff >= 0 ? '+' : '') + diff.toFixed(2) + '%'
 }
 
 function getValClass(val) {
   if (val == null) return 'text-mono'
   return val >= 0 ? 'text-up' : 'text-down'
+}
+
+function formatNum(val, decimals = 2) {
+  if (val == null || isNaN(Number(val))) return '—'
+  return Number(val).toFixed(decimals)
+}
+
+function formatPercent(val) {
+  if (val == null || isNaN(Number(val))) return '—'
+  return (Number(val) * 100).toFixed(2)
+}
+
+function formatBillion(val) {
+  if (val == null || isNaN(Number(val))) return '—'
+  return (Number(val) / 100000000).toFixed(2) + '亿'
 }
 
 </script>

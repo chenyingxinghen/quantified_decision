@@ -15,7 +15,7 @@
 
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
-ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl'  # 默认模型路径
 
 
 # ==============================================================================
@@ -68,11 +68,11 @@ MIN_TOUCHES = 2                     # 趋势线最少触点数
 # 前端中基本面选股的默认过滤参数 默认不启用
 # 自动化交易
 # ==============================================================================
-ENABLE_FUNDAMENTAL_FILTER = False
+ENABLE_FUNDAMENTAL_FILTER = True
 MIN_MARKET_CAP = 0
 MAX_PE = None
 MAX_ZCFZL = None
 MIN_PRICE = 0
-MAX_PRICE = None
+MAX_PRICE = 22
 INCLUDE_ST = True
-SELECTOR_MARKETS = ['sh', 'sz_main']
+SELECTOR_MARKETS = ['sh_main', 'sz_main']

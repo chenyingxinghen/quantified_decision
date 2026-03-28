@@ -165,7 +165,7 @@ def main_loop():
 
     # 配置任务调度
     # 1. 每天上午 9:10 重新获取一次今日选股信号
-    scheduler.add_job(job_get_signals, CronTrigger(day_of_week='mon-fri', hour=9, minute=10))
+    scheduler.add_job(job_get_signals, CronTrigger(day_of_week='mon-fri', hour=9, minute=00))
 
     # 2. 从 BUY_WINDOW_START 到 BUY_WINDOW_END 期间，每隔一两分钟尝试买入
     start_buy_h, start_buy_m, _ = map(int, BUY_WINDOW_START.split(':'))

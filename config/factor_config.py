@@ -9,6 +9,7 @@
 """
 
 from typing import Dict, Any
+from config import baostock_config
 
 
 # ============================================================================
@@ -21,18 +22,19 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 5,              # 增加深度以改善预测区分度
-        'min_child_weight': 5,       # 增加权重要求，防止过拟合
-        'learning_rate': 0.02,       # 降低学习率
+        'max_depth': 6,              # 增加深度以改善预测区分度
+        'min_child_weight': 200,       # 增加权重要求，防止过拟合
+        'learning_rate': 0.05,       
         'subsample': 1,
-        'colsample_bytree': 1, 
-        'gamma': 0.12,    
+        'colsample_bytree': 0.7,
+        'colsample_bylevel': 0.7,
+        'gamma': 0.17,    
         
-        'reg_alpha': 3,            
-        'reg_lambda': 11,             
+        'reg_alpha': 11,            
+        'reg_lambda': 23,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
-        'n_jobs': 12,
+        'n_jobs': 15,
         'early_stopping_rounds': 20,
         'verbosity': 0,              # 打印训练过程
     }
@@ -40,14 +42,14 @@ class ModelConfig:
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 5,
+        'max_depth': 6,
+        'min_child_weight': 200,
         'num_leaves': 63,
-        'learning_rate': 0.02,
-        'min_data_in_leaf': 100,
+        'learning_rate': 0.05,
         'min_gain_to_split': 0.1,
 
         'reg_alpha': 3,
-        'reg_lambda': 8,
+        'reg_lambda': 7,
         'subsample': 1,
         'colsample_bytree': 1,
 
@@ -55,27 +57,18 @@ class ModelConfig:
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 100,
-        'n_jobs': 12,
+        'n_jobs': 15,
         'verbosity': -1,
         'early_stopping_rounds': 50,
-        'force_row_wise': True,    
-        'histogram_pool_size': 4096, # 限制显存使用的直方图缓存 (MB)，针对 6G 显存优化
     }
     
-    # 针对 6G 显存优化的分批训练参数
-    BATCH_SIZE = 1000000  # 默认分批大小 (样本数)
-    
+
     # GPU 专用配置增量 (如果 USE_GPU = True)
     GPU_PARAMS_XGB = {
         'tree_method': 'hist',      # XGBoost 2.0+ 推荐使用 hist + device=cuda
         'device': 'cuda',           # 显式指定使用 CUDA
     }
     
-    GPU_PARAMS_LGB = {
-        'device': 'gpu',
-        'gpu_platform_id': 0,
-        'gpu_device_id': 0
-    }
     
     
     @classmethod
@@ -88,11 +81,8 @@ class ModelConfig:
         params = params_map.get(model_type, {}).copy()
         
         # 如果启用了 GPU 加速
-        if TrainingConfig.USE_GPU:
-            if model_type == 'xgboost':
-                params.update(cls.GPU_PARAMS_XGB)
-            elif model_type == 'lightgbm':
-                params.update(cls.GPU_PARAMS_LGB)
+        if model_type == 'xgboost':
+            params.update(cls.GPU_PARAMS_XGB)
                 
         return params
 
@@ -105,22 +95,21 @@ class TrainingConfig:
     """训练参数配置"""
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
+    MODEL_TYPES = ['lightgbm']
+
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
     USE_GPU = True               # 是否启用 GPU 加速
-    USE_AMOUNT_TURNOVER = False  # 是否使用amount和turnover_rate的特征
 
-    YEARS=16
-    YEARS_FOR_BACKTEST=2         # 回测年数
-    YEARS_FOR_TRAINING=13         # 训练年数
+    YEARS=baostock_config.HISTORY_YEARS
+
+    YEARS_FOR_BACKTEST=1         # 回测年数
+    YEARS_FOR_TRAINING=15         # 训练年数
     STOCK_NUM = 6000             # 股票数量
     # 数据集划分
-    TRAIN_TEST_SPLIT = 0.8
+    TRAIN_TEST_SPLIT = 0.7
     
-    # 显存优化参数
-    GPU_BATCH_SIZE = 1000000     # GPU 分批训练样本量 (针对 6G 显存)
-    MEMORY_EFFICIENT = True      # 是否启用内存优化模式
 
     # 预测天数 (用于分类、回归和排序任务)
     FUTURE_DAYS = 5

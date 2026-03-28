@@ -56,9 +56,17 @@ class BacktestEngine:
         
         self.performance_analyzer = PerformanceAnalyzer()
         
+        # 优化点: 预定义分析器，避免在循环中重复实例化
+        try:
+            from core.analysis.trend_line_analyzer import TrendLineAnalyzer
+            self.trend_analyzer = TrendLineAnalyzer()
+        except ImportError:
+            self.trend_analyzer = None
+            
         # 回测状态
         self._current_date = None
         self._trading_dates = []
+        self._trend_break_cache = {} # (stock_code, date) -> result
     
     def run(self,
             start_date: str,
@@ -113,9 +121,6 @@ class BacktestEngine:
         if verbose:
             print(f"交易日数量: {len(self._trading_dates)}")
         
-        # 记录初始资金
-        self.portfolio.record_equity(start_date)
-        
         # 主循环
         if verbose:
             print("\n开始回测...")
@@ -123,6 +128,9 @@ class BacktestEngine:
         
         for i, date in enumerate(self._trading_dates):
             self._current_date = date
+            
+            # 清理昨天的趋势分析缓存，节省内存
+            self._trend_break_cache = {}
             
             # 获取市场快照
             market_data = self.data_handler.get_market_snapshot(date)
@@ -314,7 +322,7 @@ class BacktestEngine:
         # 止损检查
         if position.stop_loss and ENABLE_STOP_LOSS_EXIT:
             if low <= position.stop_loss:
-                # 日内触及止损价，以止损价成交
+                # 日内触及止损价
                 return True, close, 'stop_loss'
         
         # 止盈检查
@@ -336,18 +344,28 @@ class BacktestEngine:
         return False, None, None
     
     def _check_trend_break(self, stock_code: str, date: str, market_data: Dict) -> bool:
-        """检查趋势破位"""
+        """检查趋势破位（优化后的缓存版本）"""
+        if self.trend_analyzer is None:
+            return False
+            
+        # 优化点: 使用日内缓存，如果是同一日重复检查相同标的，直接返回
+        cache_key = (stock_code, date)
+        if cache_key in self._trend_break_cache:
+            return self._trend_break_cache[cache_key]
+            
         # 获取历史数据
         hist_data = self.data_handler.get_historical_data(stock_code, date, lookback_days=TREND_LINE_LONG_PERIOD)
         if hist_data is None or len(hist_data) < 30:
+            self._trend_break_cache[cache_key] = False
             return False
         
         try:
-            from core.analysis.trend_line_analyzer import TrendLineAnalyzer
-            analyzer = TrendLineAnalyzer()
-            result = analyzer.analyze(hist_data)
-            return result.get('broken_support', False)
-        except:
+            result = self.trend_analyzer.analyze(hist_data)
+            broken = result.get('broken_support', False)
+            self._trend_break_cache[cache_key] = broken
+            return broken
+        except Exception:
+            self._trend_break_cache[cache_key] = False
             return False
     
     def _get_next_entry_price(self, 

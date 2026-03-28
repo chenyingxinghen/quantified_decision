@@ -1,21 +1,24 @@
 """
-Configuration modules
+配置模块入口
 """
-from .config import *
+from .baostock_config import *
 from .strategy_config import *
 from .factor_config import (
     ModelConfig, TrainingConfig, FactorConfig, OptimizationConfig,
-    FactorModelConfig,
-
+    FactorModelConfig
 )
 
 __all__ = [
-    # 从config.py导出
-    'DATABASE_PATH', 'YEARS'
-    # 从strategy_config.py导出
-    'TECHNICAL_PARAMS',
-    # 从factor_config.py导出
+    # 从 baostock_config 导出
+    'DATABASE_PATH', 'DATABASE_DIR', 'USER_DB_PATH', 'PROJECT_ROOT',
+    'HISTORY_YEARS', 'WORKERS_NUM', 'REQUEST_INTERVAL',
+    'DEFAULT_MARKETS', 'MARKET_LIMITS', 'MARKET_PREFIXES',
+    'SUPPORTED_MARKETS',
+    
+    # 从 strategy_config.py 导出
+    'INCLUDE_ST', 'ML_FACTOR_MIN_CONFIDENCE', 'SELECTOR_MARKETS',
+    
+    # 从 factor_config.py 导出
     'ModelConfig', 'TrainingConfig', 'FactorConfig', 'OptimizationConfig',
-    'FactorModelConfig',
-
+    'FactorModelConfig'
 ]

@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional
 from sklearn.preprocessing import PolynomialFeatures
-import psutil
 
 
 class FeatureEngineer:
@@ -285,12 +284,11 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'rank_{col}'
-            # 性能优化：使用 raw=True 且利用 numpy 向量化计算排名
-            # 排名计算公式: (小于当前值的个数 + 0.5 * 等于当前值的个数) / 总数
-            new_features[feature_name] = df[col].rolling(window=window, min_periods=window//2).apply(
-                lambda x: (np.sum(x < x[-1]) + 0.5 * np.sum(x == x[-1])) / len(x) if len(x) > 0 else 0.5,
-                raw=True
-            )
+            
+            # 使用 pandas 原生的 rolling().rank(pct=True) 替代 apply(lambda)
+            # 性能提升约 50-100 倍且能够正确处理 ties
+            series = pd.to_numeric(df[col], errors='coerce')
+            new_features[feature_name] = series.rolling(window=window, min_periods=window//2).rank(pct=True)
             
             self.generated_features.append(feature_name)
         
@@ -324,12 +322,11 @@ class FeatureEngineer:
             
             feature_name = f'quantile_{col}'
             
-            # 性能优化：同样使用 raw=True 提升效率
-            rolled_rank = df[col].rolling(window=window, min_periods=window//4).apply(
-                lambda x: (np.sum(x < x[-1]) + 0.5 * np.sum(x == x[-1])) / len(x) if len(x) > 0 else 0.5,
-                raw=True
-            )
+            # 复用高效的 rolling rank 逻辑
+            series = pd.to_numeric(df[col], errors='coerce')
+            rolled_rank = series.rolling(window=window, min_periods=window//4).rank(pct=True)
             
+            # 离散化为分位数
             new_features[feature_name] = (rolled_rank * n_quantiles).fillna(0).astype(int).clip(0, n_quantiles-1)
             self.generated_features.append(feature_name)
         
@@ -477,25 +474,22 @@ class FeatureEngineer:
         """
         new_features = {}
         
-        # 定义全局板块映射（从数据库统计获得）
-        SECTOR_MAP = {
-            'Financial Services': 1, 'Real Estate': 2, 'Healthcare': 3,
-            'Consumer Cyclical': 4, 'Industrials': 5, 'Basic Materials': 6,
-            'Technology': 7, 'Consumer Defensive': 8, 'Utilities': 9,
-            'Energy': 10, 'Communication Services': 11, 'Unknown': 0
-        }
-        
-        # 常见工业映射（前20个）
-        INDUSTRY_MAP = {
-            'Semiconductors': 1, 'Software - Infrastructure': 2, 'Banks - Diversified': 3,
-            'Healthcare Plans': 4, 'Airlines': 5, 'Biotechnology': 6,
-            'Auto Manufacturers': 7, 'Communication Equipment': 8, 'Steel': 9,
-            'Aerospace & Defense': 10, 'Oil & Gas E&P': 11, 'Chemicals': 12,
-            'Electronic Components': 13, 'Medical Instruments & Supplies': 14,
-            'Internet Content & Information': 15, 'Specialty Business Services': 16,
-            'Insurance - Life': 17, 'Credit Services': 18, 'Grocery Stores': 19,
-            'Real Estate - Diversified': 20, 'Unknown': 0
-        }
+        # 1. 尝试从数据库补充分类信息 (如 industry)
+        if 'industry' not in df.columns and 'code' in df.columns:
+            try:
+                from core.data.baostock_fetcher import BaostockFetcher
+                fetcher = BaostockFetcher()
+                db_industry = fetcher._get_stock_industry_from_db()
+                fetcher.close()
+                
+                if not db_industry.empty:
+                    # 仅保留 code 和 industry
+                    db_industry = db_industry[['code', 'industry']].drop_duplicates('code')
+                    # 合并到主 DataFrame (基于 code)
+                    df = df.merge(db_industry, on='code', how='left')
+            except Exception as e:
+                # 记录但不中断，可能因为没有 code 列或数据库连接失败
+                pass
         
         if categorical_cols is None:
             # 自动检测分类列
@@ -504,28 +498,33 @@ class FeatureEngineer:
         for col in categorical_cols:
             if col not in df.columns:
                 continue
-            
-            try:
-                # 获取映射表
-                mapping = SECTOR_MAP if col == 'sector' else INDUSTRY_MAP
                 
-                # 执行映射 (未知类别设为 0)
+            try:
+                # 动态生成映射表 (基于列中的现有类别)
+                # 这比硬编码更灵活，能适应 Baostock 返回的所有行业
+                unique_categories = df[col].dropna().unique()
+                mapping = {cat: i + 1 for i, cat in enumerate(sorted(unique_categories))}
+                mapping['Unknown'] = 0
+                
+                # 执行编码
                 col_data = df[col].fillna('Unknown').astype(str)
                 encoded = col_data.map(mapping).fillna(0).astype(int)
                 
-                new_features[f'{col}_encoded'] = encoded
-                self.generated_features.append(f'{col}_encoded')
+                feature_name = f'{col}_encoded'
+                new_features[feature_name] = encoded
+                self.generated_features.append(feature_name)
                 
-                # 创建 one-hot 编码 (仅针对常用类别)
-                if col == 'sector':
-                    for cat_name, cat_id in SECTOR_MAP.items():
-                        if cat_name == 'Unknown': continue
-                        feature_name = f'{col}_{cat_name.replace(" ", "_")}'
-                        new_features[feature_name] = (col_data == cat_name).astype(int)
-                        self.generated_features.append(feature_name)
-                
+                # 如果分类列在 top 10，则进行 One-Hot 编码
+                top_cats = df[col].value_counts().head(10).index.tolist()
+                for cat in top_cats:
+                    if pd.isna(cat) or cat == 'Unknown': continue
+                    # 清理分类名称用于列名
+                    safe_cat_name = str(cat).replace(' ', '_').replace('&', 'and').replace('-', '_')
+                    oh_feature_name = f'{col}_{safe_cat_name}'
+                    new_features[oh_feature_name] = (col_data == cat).astype(int)
+                    self.generated_features.append(oh_feature_name)
+                    
             except Exception as e:
-                # 记录错误但不中断
                 pass
         
         # 一次性添加所有新列
@@ -558,61 +557,104 @@ class FeatureEngineer:
             result = self.encode_categorical_features(result)
             stats['分类特征编码'] = len(self.generated_features) - pre_count
         
-        # 识别技术指标和基本面因子 - 限制列数以防维度爆炸
-        tech_indicators = [col for col in result.columns if any(
-            indicator in col.lower() for indicator in 
-            ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 'willr', 'bias', 'psy']
-        )][:40]
+        # 识别技术指标和基本面因子 - 优化匹配逻辑以兼容多种命名风格 (如 marketCap vs market_cap)
+        def fuzzy_match(col_name, keywords):
+            # 将列名和关键词处理成统一格式（小写且无下划线）进行匹配
+            clean_col = col_name.lower().replace('_', '')
+            for kw in keywords:
+                if kw.lower().replace('_', '') in clean_col:
+                    return True
+            return False
 
-        fundamental_factors = [col for col in result.columns if any(
-            factor in col.lower() for factor in 
-            ['pe_ratio', 'pb_ratio', 'roe', 'roa', 'margin', 'growth', 'yield', 'beta', 'market_cap']
-        ) and not any(x in col.lower() for x in ['slope', 'sharpe'])][:20]
+        tech_keywords = ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 'willr', 'bias', 'psy', 'boll', 'ma', 'ema', 'vol', 'amount', 'turnover']
+        tech_indicators = [col for col in result.columns if fuzzy_match(col, tech_keywords)][:100]
+
+        fund_keywords = ['pe', 'pb', 'roe', 'roa', 'margin', 'growth', 'yield', 'beta', 'market_cap', 'marketcap', 
+                         'peg', 'sue', 'eav', 'revenue', 'share', 'ttm', 'yoy', 'ratio', 'equity', 'asset', 'profit']
+        fundamental_factors = [col for col in result.columns if fuzzy_match(col, fund_keywords) 
+                              and not any(x in col.lower() for x in ['slope', 'sharpe'])][:60]
         
         # 2. 应用变换
         if config.get('ratio') and len(fundamental_factors) > 1:
             pre_count = len(self.generated_features)
-            result = self.create_ratio_features(result, fundamental_factors[:5], fundamental_factors[:5])
+            # 比率特征：从基本面因子中随机选择 10 个，分为两组（每组 5 个）进行比率组合 (5*5=25)
+            import random
+            # 设置随机种子以保证可复现性
+            random.seed(42)
+            selected_factors = random.sample(fundamental_factors, min(10, len(fundamental_factors)))
+            numerator_factors = selected_factors[:5]
+            denominator_factors = selected_factors[5:10]
+            result = self.create_ratio_features(result, numerator_factors, denominator_factors)
             stats['比率特征 (Fund/Fund)'] = len(self.generated_features) - pre_count
         
         if config.get('product') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            important_pairs = [(tech_indicators[i], tech_indicators[j]) 
-                              for i in range(min(2, len(tech_indicators))) 
-                              for j in range(i+1, min(4, len(tech_indicators)))]
+            # 乘积特征：从技术指标中随机选择 6 个，生成两两组合 (4*3/2=6)
+            import random
+            random.seed(42)
+            selected_tech = random.sample(tech_indicators, min(4, len(tech_indicators)))
+            important_pairs = [(selected_tech[i], selected_tech[j]) 
+                              for i in range(len(selected_tech)) 
+                              for j in range(i+1, len(selected_tech))]
             result = self.create_product_features(result, important_pairs)
             stats['乘积特征 (Tech*Tech)'] = len(self.generated_features) - pre_count
         
         if config.get('difference') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            diff_pairs = [(tech_indicators[i], tech_indicators[j]) 
-                         for i in range(min(2, len(tech_indicators))) 
-                         for j in range(i+1, min(4, len(tech_indicators)))]
+            # 差分特征：从技术指标中随机选择 8 个，生成两两差值组合 (6*5/2=15)
+            import random
+            random.seed(42)
+            selected_tech = random.sample(tech_indicators, min(6, len(tech_indicators)))
+            diff_pairs = [(selected_tech[i], selected_tech[j]) 
+                         for i in range(len(selected_tech)) 
+                         for j in range(i+1, len(selected_tech))]
             result = self.create_difference_features(result, diff_pairs)
             stats['差分特征 (Tech-Tech)'] = len(self.generated_features) - pre_count
         
         if config.get('log'):
             pre_count = len(self.generated_features)
-            log_cols = [col for col in fundamental_factors if 'market_cap' in col or 'volume' in col]
+            # 对数特征：涵盖规模类因子（市值、营收、资产等）及成交量
+            log_kws = ['market_cap', 'revenue', 'equity', 'asset', 'profit', 'cash']
+            log_cols = [col for col in fundamental_factors if any(kw in col.lower() for kw in log_kws)]
+            log_cols += [col for col in tech_indicators if 'vol' in col.lower() or 'amount' in col.lower()]
+                    
             if log_cols:
-                result = self.create_log_features(result, log_cols[:3])
+                # 从符合条件的列中随机选择 8 个进行对数变换
+                import random
+                random.seed(42)
+                selected_cols = random.sample(log_cols, min(8, len(log_cols)))
+                result = self.create_log_features(result, selected_cols)
             stats['对数变换 (Log)'] = len(self.generated_features) - pre_count
         
         if config.get('sqrt'):
             pre_count = len(self.generated_features)
-            sqrt_cols = [col for col in tech_indicators if 'volatility' in col or 'atr' in col]
+            # 平方根特征：包含波动率和成交量相关指标
+            sqrt_cols = [col for col in tech_indicators if any(kw in col.lower() for kw in ['volatility', 'atr', 'vol', 'amount'])]
             if sqrt_cols:
-                result = self.create_sqrt_features(result, sqrt_cols[:3])
-            stats['平方根变换 (Price/Vol)'] = len(self.generated_features) - pre_count
+                # 从符合条件的列中随机选择 5 个进行平方根变换
+                import random
+                random.seed(42)
+                selected_cols = random.sample(sqrt_cols, min(5, len(sqrt_cols)))
+                result = self.create_sqrt_features(result, selected_cols)
+            stats['平方根变换 (Sqrt)'] = len(self.generated_features) - pre_count
         
         if config.get('rank'):
             pre_count = len(self.generated_features)
-            result = self.create_rank_features(result, fundamental_factors[:3])
+            # 排名特征：从基本面因子中随机选择 12 个进行滚动排名
+            import random
+            random.seed(42)
+            selected_factors = random.sample(fundamental_factors, min(15, len(fundamental_factors)))
+            result = self.create_rank_features(result, selected_factors)
             stats['滚动排名 (Rolling Rank)'] = len(self.generated_features) - pre_count
         
         if config.get('interaction') and len(tech_indicators) > 0 and len(fundamental_factors) > 0:
             pre_count = len(self.generated_features)
-            result = self.create_interaction_features(result, tech_indicators[:4], fundamental_factors[:3])
+            # 交互特征：从技术指标和基本面因子中各随机选择 6 个和 6 个进行交互
+            import random
+            random.seed(42)
+            selected_tech = random.sample(tech_indicators, min(6, len(tech_indicators)))
+            selected_fund = random.sample(fundamental_factors, min(5, len(fundamental_factors)))
+            result = self.create_interaction_features(result, selected_tech, selected_fund)
             stats['交互特征 (Tech*Fund)'] = len(self.generated_features) - pre_count
 
         # 仅在 verbose 为 True 时输出统计报告

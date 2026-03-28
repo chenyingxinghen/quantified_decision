@@ -19,7 +19,7 @@ import os
 
 from app.scheduler import start_scheduler, stop_scheduler
 
-from app.routers import stock_selector, paper_trading, analysis, config_center, auth, fundamentals
+from app.routers import stock_selector, paper_trading, analysis, config_center, auth, fundamentals, data_center
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,12 +45,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app):
         super().__init__(app)
         self.cache = {}
+        self.last_cleanup = time.time()
     
     async def dispatch(self, request: Request, call_next):
         # 排除静态资源和前端页面的限流，只限制 API 
         if request.url.path.startswith("/api/"):
             client_ip = request.client.host if request.client else "127.0.0.1"
             now = time.time()
+            
+            # 修复问题13：定期清理过期的 key，防止内存无限增长
+            if now - self.last_cleanup > 300:  # 每5分钟清理一次
+                expired_ips = [ip for ip, timestamps in self.cache.items() 
+                              if not timestamps or now - timestamps[-1] > 300]
+                for ip in expired_ips:
+                    del self.cache[ip]
+                self.last_cleanup = now
+            
             if client_ip not in self.cache:
                 self.cache[client_ip] = []
             
@@ -58,7 +68,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             timestamps = [ts for ts in timestamps if now - ts < 60]
             self.cache[client_ip] = timestamps
             
-            if len(timestamps) >= 120: # 稍微宽容点的 API 限制: 60秒内 300 次
+            if len(timestamps) >= 120: # 稍微宽容点的 API 限制: 60秒内 120 次
                 return JSONResponse(status_code=429, content={"detail": "API 请求过于频繁，请稍后再试"})
             
             timestamps.append(now)
@@ -83,6 +93,7 @@ app.include_router(paper_trading.router)
 app.include_router(analysis.router)
 app.include_router(config_center.router)
 app.include_router(fundamentals.router)
+app.include_router(data_center.router)
 
 # 托管前端静态文件
 FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))

@@ -23,8 +23,8 @@ async def search_stocks(query: str = Query(..., min_length=1)):
             conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
 
             sql = """
-                SELECT code, name FROM meta.stock_info_extended
-                WHERE code LIKE ? OR name LIKE ?
+                SELECT code, code_name as name FROM meta.stock_basic
+                WHERE code LIKE ? OR code_name LIKE ?
                 LIMIT 15
             """
             rows = conn.execute(sql, (f"{query}%", f"%{query}%")).fetchall()
@@ -59,7 +59,7 @@ async def get_stock_fundamental(code: str):
         # 1. 基础信息
         info = {}
         try:
-            row = conn.execute("SELECT * FROM meta.stock_info_extended WHERE code = ?", (code,)).fetchone()
+            row = conn.execute("SELECT * FROM meta.stock_basic WHERE code = ?", (code,)).fetchone()
             if row:
                 info = dict(row)
         except:
@@ -69,16 +69,22 @@ async def get_stock_fundamental(code: str):
         finance = {}
         try:
             f_rows = conn.execute("""
-                SELECT * FROM finance.finance_reports
-                WHERE code = ?
-                GROUP BY REPORT_DATE
-                ORDER BY REPORT_DATE DESC LIMIT 12
+                SELECT p.code, p.stat_date as REPORT_DATE, p.roeAvg, p.npMargin, p.gpMargin, p.netProfit, p.epsTTM, p.MBRevenue,
+                       g.YOYEquity, g.YOYAsset, g.YOYNI, g.YOYEPSBasic, g.YOYPNI,
+                       b.currentRatio, b.quickRatio, b.cashRatio, b.YOYLiability, b.liabilityToAsset, b.assetToEquity,
+                       d.dupontROE, d.dupontAssetStoEquity, d.dupontAssetTurn, d.dupontPnitoni, d.dupontNitogr, d.dupontTaxBurden, d.dupontIntburden, d.dupontEbittogr
+                FROM finance.profit_ability p
+                LEFT JOIN finance.growth_ability g ON p.code = g.code AND p.stat_date = g.stat_date
+                LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
+                LEFT JOIN finance.dupont d ON p.code = d.code AND p.stat_date = d.stat_date
+                WHERE p.code = ?
+                GROUP BY p.stat_date
+                ORDER BY p.stat_date DESC LIMIT 12
             """, (code,)).fetchall()
             if f_rows:
                 reports = []
                 for r in f_rows:
                     rd = dict(r)
-                    # 格式化日期，去时分秒
                     if rd.get("REPORT_DATE"):
                         rd["REPORT_DATE"] = str(rd["REPORT_DATE"]).split(' ')[0]
                     reports.append(rd)
@@ -105,12 +111,10 @@ async def get_stock_fundamental(code: str):
                 close = p_row["close"]
                 price_info = {"close": close, "date": p_row["date"]}
                 if finance.get("current"):
-                    eps = finance["current"].get("EPSJB")
-                    bps = finance["current"].get("BPS")
+                    eps = finance["current"].get("epsTTM")
+                    # There is no BPS in the current tables natively, we skip calculating PB for now, or just provide PE
                     if eps and eps > 0:
                         price_info["pe"] = round(close / eps, 2)
-                    if bps and bps > 0:
-                        price_info["pb"] = round(close / bps, 2)
         except:
             pass
 

@@ -9,7 +9,7 @@
     <div class="stat-grid">
       <div class="stat-card">
         <div class="stat-label">市场覆盖</div>
-        <div class="stat-value">{{ dbStatus.total_stocks ?? '—' }} <small style="font-size: 14px; color: var(--text-muted)">只标的</small></div>
+        <div class="stat-value">{{ formatNum(dbStatus.total_stocks) }} <small style="font-size: 14px; color: var(--text-muted)">只标的</small></div>
         <div class="stat-sub">最新同步: {{ dbStatus.latest_date ?? '—' }}</div>
       </div>
       
@@ -21,13 +21,13 @@
 
       <div class="stat-card" style="border-bottom: 2px solid var(--accent-purple)">
         <div class="stat-label">AI 选股池</div>
-        <div class="stat-value">{{ selectionCount }}</div>
+        <div class="stat-value">{{ formatNum(selectionCount) }}</div>
         <div class="stat-sub">{{ selectionFile ? selectionFile.slice(-15) : '暂无近期结果' }}</div>
       </div>
 
       <div class="stat-card" style="border-bottom: 2px solid var(--accent-green)">
         <div class="stat-label">实盘追踪</div>
-        <div class="stat-value">{{ activePositions }}</div>
+        <div class="stat-value">{{ formatNum(activePositions) }}</div>
         <div class="stat-sub">当前活跃监控标的</div>
       </div>
     </div>
@@ -98,7 +98,7 @@ onMounted(async () => {
       stockSelector.getLatest(),
       paperTrading.getPositions('active'),
     ]
-    if (!cachedDbStatus) promises.push(dataCenter.getStatus())
+    promises.push(dataCenter.getStatus())
 
     const results = await Promise.allSettled(promises)
     const [selRes, posRes, dbRes] = results

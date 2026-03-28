@@ -3,21 +3,19 @@
 
 数据来源: stock_finance.db -> finance_reports 表
 核心字段说明:
-  ROEJQ / ROEKCJQ  - 盈利质量核心
-  XSJLL / ZZCJLL   - 利润率/总资产收益率
-  TOTALOPERATEREVETZ / PARENTNETPROFITTZ / KCFJCXSYJLRTZ - 成长因子
-  DJD_TOI_YOY / DJD_DPNP_YOY    - 东财同比（补充口径）
-  EPSJB / BPS      - 用于构建 PE/PB
-  MGJYXJJE / JYXJLYYSR           - 现金流质量
-  ZCFZL / QYCS     - 杠杆
-  NONPERLOAN / FIRST_ADEQUACY_RATIO / NET_INTEREST_MARGIN / NET_INTEREST_SPREAD / BLDKBBL - 银行专项
-  ORG_TYPE         - 机构类型，直接用整数编码作为特征
+  roeAvg / dupontROE - 盈利核心 (ROE)
+  npMargin / gpMargin / dupontPnitoni - 利润率
+  YOYNI / YOYPNI / YOYEquity - 成长因子
+  currentRatio / quickRatio / liabilityToAsset - 偿债及杠杆
+  dupontAssetTurn / dupontNitogr - 周转与效率
+  epsTTM / totalShare / liqaShare - 每股指标
+  dupontTaxBurden / dupontIntburden - 税利负担
 
 PIT 原则:
   - 对于某个交易日 T, 只读取公告日期 NOTICE_DATE <= T 的最近一期报告
   - 这彻底消除了“先看财报结果再选股”的前视偏差 (Data Leakage)
   - 训练时按公告日期对齐, 选股/实时预测时以最新已公布报告为准
-  - 对于缺失 NOTICE_DATE 的历史数据，采用保守估算（Q1/Q3+25天, Q2+55天, Q4+110天）
+  - 对于缺失 NOTICE_DATE 的历史数据，采用保守估算（Q1/Q3+25天, Q2+55天, Q3+25天, Q4+20天）
 """
 
 import os
@@ -79,37 +77,52 @@ class FinanceReportFetcher:
         return _get_finance_conn(self.db_path)
 
     def _load_reports_for_code(self, code: str) -> pd.DataFrame:
-        """加载某只股票的全部财务报告 (按 REPORT_DATE 升序)"""
+        """加载某只股票的全部财务报告 (按 stat_date 升序)"""
         if code in self._cache:
             return self._cache[code]
 
-        # SECUCODE 格式是 "000001.SZ"; code 格式是 "000001"
         conn = self._get_conn()
         try:
-            df = pd.read_sql_query(
-                "SELECT * FROM finance.finance_reports WHERE code = ? ORDER BY REPORT_DATE ASC",
-                conn, params=(code,)
-            )
-        except Exception:
+            # 基于 stat_date 将 4 张财务表连接为一个宽表
+            query = """
+                SELECT 
+                    p.code, p.pub_date, p.stat_date,
+                    p.roeAvg, p.npMargin, p.gpMargin, p.netProfit, p.epsTTM, p.MBRevenue, p.totalShare, p.liqaShare,
+                    g.YOYEquity, g.YOYAsset, g.YOYNI, g.YOYEPSBasic, g.YOYPNI,
+                    b.currentRatio, b.quickRatio, b.cashRatio, b.YOYLiability, b.liabilityToAsset, b.assetToEquity,
+                    d.dupontROE, d.dupontAssetStoEquity, d.dupontAssetTurn, d.dupontPnitoni, d.dupontNitogr, 
+                    d.dupontTaxBurden, d.dupontIntburden, d.dupontEbittogr
+                FROM finance.profit_ability p
+                LEFT JOIN finance.growth_ability g ON p.code = g.code AND p.stat_date = g.stat_date
+                LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
+                LEFT JOIN finance.dupont d ON p.code = d.code AND p.stat_date = d.stat_date
+                WHERE p.code = ?
+                ORDER BY p.stat_date ASC
+            """
+            df = pd.read_sql_query(query, conn, params=(code,))
+        except Exception as e:
+            import traceback
+            print(f"  [ERROR] 加载股票 {code} 财务数据失败: {e}")
+            traceback.print_exc()
             df = pd.DataFrame()
         finally:
             conn.close()
 
         if not df.empty:
-            df['REPORT_DATE'] = pd.to_datetime(df['REPORT_DATE'], errors='coerce')
-            df['NOTICE_DATE'] = pd.to_datetime(df.get('NOTICE_DATE'), errors='coerce')
+            df['stat_date'] = pd.to_datetime(df['stat_date'], errors='coerce')
+            df['pub_date']  = pd.to_datetime(df['pub_date'], errors='coerce')
             
-            # 估算缺失的公告日期 (处理老数据)
+            # 估算缺失的公告日期 (pub_date 在 Baostock 中通常是准确的)
             def _fill_notice_date(row):
-                if pd.notna(row['NOTICE_DATE']):
-                    return row['NOTICE_DATE']
-                rd = row['REPORT_DATE']
+                if pd.notna(row['pub_date']):
+                    return row['pub_date']
+                rd = row['stat_date']
                 if pd.isna(rd): return pd.NaT
-                # Q1(3.31)->4.25, Q2(6.30)->8.25, Q3(9.30)->10.25, Q4(12.31)->4.20 next year
-                if rd.month == 3: return rd.replace(month=4, day=25)
-                if rd.month == 6: return rd.replace(month=8, day=25)
-                if rd.month == 9: return rd.replace(month=10, day=25)
-                if rd.month == 12: return rd.replace(year=rd.year+1, month=4, day=20)
+                # 保守预估：Q1->4.25, Q2->8.25, Q3->10.25, Q4->4.20
+                if rd.month == 3: return rd.replace(month=4, day=25).replace(year=rd.year)
+                if rd.month == 6: return rd.replace(month=8, day=25).replace(year=rd.year)
+                if rd.month == 9: return rd.replace(month=10, day=25).replace(year=rd.year)
+                if rd.month == 12: return rd.replace(month=4, day=20).replace(year=rd.year+1)
                 return rd + pd.Timedelta(days=30)
             
             df['announced_date'] = df.apply(_fill_notice_date, axis=1)
@@ -192,21 +205,14 @@ class FundamentalFactors:
       factors_dict = ff.get_latest_fundamental_factors(code)
     """
 
-    # 所有财务字段 (与数据库列名一致)
+    # 所有财务字段 (映射至 Baostock 列名)
     NUMERIC_COLS = [
-        'ROEJQ', 'ROEKCJQ', 'XSJLL', 'ZZCJLL',
-        'TOTALOPERATEREVETZ', 'PARENTNETPROFITTZ', 'KCFJCXSYJLRTZ',
-        'DJD_TOI_YOY', 'DJD_DPNP_YOY',
-        'EPSJB', 'BPS',
-        'MGJYXJJE', 'JYXJLYYSR',
-        'ZCFZL', 'QYCS',
-        'NONPERLOAN', 'BLDKBBL', 'FIRST_ADEQUACY_RATIO',
-        'NET_INTEREST_MARGIN', 'NET_INTEREST_SPREAD',
+        'roeAvg', 'npMargin', 'gpMargin', 'epsTTM', 'MBRevenue', 'totalShare', 'liqaShare',
+        'YOYEquity', 'YOYAsset', 'YOYNI', 'YOYEPSBasic', 'YOYPNI',
+        'currentRatio', 'quickRatio', 'cashRatio', 'YOYLiability', 'liabilityToAsset', 'assetToEquity',
+        'dupontROE', 'dupontAssetStoEquity', 'dupontAssetTurn', 'dupontPnitoni', 'dupontNitogr', 
+        'dupontTaxBurden', 'dupontIntburden', 'dupontEbittogr'
     ]
-
-    # ORG_TYPE: 整数编码, 直接保留, 不做 one-hot
-    #   1 = 银行, 2 = 证券, 3 = 保险, 4 = 一般工业, 5 = 商业... (东财定义)
-    BANK_ORG_TYPE = 1
 
     def __init__(self, db_path: str = DATABASE_PATH):
         self.db_path = db_path
@@ -242,70 +248,30 @@ class FundamentalFactors:
 
         # 2. 构建因子
         factors = pd.DataFrame(index=daily_data.index)
+
+        # --- 全量保留原始 Baostock 字段作为特征 ---
+        for col in self.NUMERIC_COLS:
+            factors[col] = pd.to_numeric(raw.get(col), errors='coerce')
+
         close = pd.to_numeric(daily_data['close'], errors='coerce')
 
-        # --- 机构类型 (整数, 直接使用) ---
-        factors['org_type'] = pd.to_numeric(
-            raw.get('ORG_TYPE', pd.Series(np.nan, index=raw.index)), errors='coerce'
-        ).fillna(0).astype(int)
+        # --- 衍生 (动态构建 PE/PB & 市值) ---
+        # 优先使用 daily_data 原始 pe/pb，若无则利用财务数据推导
+        if 'peTTM' in daily_data.columns:
+            factors['dynamic_pe'] = pd.to_numeric(daily_data['peTTM'], errors='coerce')
+        else:
+            factors['dynamic_pe'] = (daily_data['close'] / factors['epsTTM'])
 
-        # --- 核心盈利质量 ---
-        factors['roe_jq'] = pd.to_numeric(raw.get('ROEJQ'), errors='coerce')
-        factors['roe_kc'] = pd.to_numeric(raw.get('ROEKCJQ'), errors='coerce')
-        factors['xsjll']  = pd.to_numeric(raw.get('XSJLL'), errors='coerce')  # 销售净利率
-        factors['zzcjll'] = pd.to_numeric(raw.get('ZZCJLL'), errors='coerce') # 总资产收益率
+        if 'pbMRQ' in daily_data.columns:
+            factors['dynamic_pb'] = pd.to_numeric(daily_data['pbMRQ'], errors='coerce')
+        else:
+            factors['dynamic_pb'] = np.nan
 
-        # --- 成长因子 ---
-        factors['rev_yoy']   = pd.to_numeric(raw.get('TOTALOPERATEREVETZ'), errors='coerce')
-        factors['np_yoy']    = pd.to_numeric(raw.get('PARENTNETPROFITTZ'), errors='coerce')
-        factors['np_kc_yoy'] = pd.to_numeric(raw.get('KCFJCXSYJLRTZ'), errors='coerce')
-        factors['djd_rev_yoy'] = pd.to_numeric(raw.get('DJD_TOI_YOY'), errors='coerce')
-        factors['djd_np_yoy']  = pd.to_numeric(raw.get('DJD_DPNP_YOY'), errors='coerce')
+        factors['inv_pe'] = 1.0 / factors['dynamic_pe'].replace(0, np.nan)
+        factors['inv_pb'] = 1.0 / factors['dynamic_pb'].replace(0, np.nan)
 
-        # --- PE / PB (动态构建: 用行情收盘价 / 财报 EPS 或 BPS) ---
-        eps = pd.to_numeric(raw.get('EPSJB'), errors='coerce')
-        bps = pd.to_numeric(raw.get('BPS'), errors='coerce')
-
-        with np.errstate(divide='ignore', invalid='ignore'):
-            dynamic_pe = np.where((eps > 0), close / eps, np.nan)
-            dynamic_pb = np.where((bps > 0), close / bps, np.nan)
-
-        factors['dynamic_pe'] = pd.Series(dynamic_pe, index=daily_data.index)
-        factors['dynamic_pb'] = pd.Series(dynamic_pb, index=daily_data.index)
-        factors['eps_jb'] = eps.values if hasattr(eps, 'values') else eps
-        factors['bps']    = bps.values if hasattr(bps, 'values') else bps
-
-        # inv_pe / inv_pb (盈利收益率 / 净资产收益率 视角)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            factors['inv_pe'] = np.where(np.isfinite(dynamic_pe) & (dynamic_pe > 0),
-                                          1.0 / dynamic_pe, np.nan)
-            factors['inv_pb'] = np.where(np.isfinite(dynamic_pb) & (dynamic_pb > 0),
-                                          1.0 / dynamic_pb, np.nan)
-
-        # --- 现金流质量 ---
-        factors['ocf_per_share'] = pd.to_numeric(raw.get('MGJYXJJE'), errors='coerce')
-        factors['ocf_to_rev']    = pd.to_numeric(raw.get('JYXJLYYSR'), errors='coerce')
-
-        # 现金流 vs EPS (质量比)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            ocf = factors['ocf_per_share']
-            eps_valid = factors['eps_jb'].copy()
-            factors['ocf_to_eps'] = np.where(
-                eps_valid.notna() & (eps_valid != 0),
-                ocf / eps_valid,
-                np.nan
-            )
-
-        # --- 杠杆因子 ---
-        factors['zcfzl'] = pd.to_numeric(raw.get('ZCFZL'), errors='coerce')  # 资产负债率
-        factors['qycs']  = pd.to_numeric(raw.get('QYCS'), errors='coerce')   # 权益乘数
-
-        # --- 银行专项因子 ---
-        factors['bank_npl']       = pd.to_numeric(raw.get('NONPERLOAN'), errors='coerce')
-        factors['bank_bldk']      = pd.to_numeric(raw.get('BLDKBBL'), errors='coerce')
-        factors['bank_car']       = pd.to_numeric(raw.get('FIRST_ADEQUACY_RATIO'), errors='coerce')
-        factors['bank_nim']       = pd.to_numeric(raw.get('NET_INTEREST_MARGIN'), errors='coerce')
-        factors['bank_spread']    = pd.to_numeric(raw.get('NET_INTEREST_SPREAD'), errors='coerce')
+        # 市值计算 (单位: 亿)
+        factors['market_cap'] = (daily_data['close'] * factors['totalShare'] / 1e8)
 
         # --- 衍生交叉因子 ---
         factors = self._add_cross_factors(factors)
@@ -313,23 +279,22 @@ class FundamentalFactors:
         # 4. 新增高级复合因子 (PEG, SUE, EAV)
         # PEG = PE / (净利润增长率)
         with np.errstate(divide='ignore', invalid='ignore'):
-            # np_yoy 是百分比，如 20.0 表示 20%
+            # YOYPNI 是百分比，如 20.0 表示 20%
             factors['peg'] = np.where(
-                (factors['dynamic_pe'] > 0) & (factors['np_yoy'] > 0),
-                factors['dynamic_pe'] / factors['np_yoy'],
+                (factors['dynamic_pe'] > 0) & (factors['YOYPNI'] > 0),
+                factors['dynamic_pe'] / factors['YOYPNI'],
                 np.nan
             )
 
         # SUE (盈余惊喜) - 简易版: (当前增长 - 过去4期平均增长) / 过去4期标准差
         # 这里因为是 PIT 时间序列，可以使用 rolling
-        # 我们对原始报告的 np_yoy 进行分析
-        raw_np_yoy = factors['np_yoy']
+        raw_np_yoy = factors['YOYPNI']
         ma_np = raw_np_yoy.rolling(window=250).mean() # 约一年
         std_np = raw_np_yoy.rolling(window=250).std().replace(0, np.nan)
         factors['sue'] = (raw_np_yoy - ma_np) / std_np
 
-        # EAV (盈利加速度) - DJD_DPNP_YOY 的环比变化
-        factors['eav'] = factors['djd_np_yoy'].diff(20) # 约一月的变化加速度
+        # EAV (盈利加速度) - YOYPNI 的环比变化 (假设 YOYPNI 是季度数据, 20个交易日约1个月)
+        factors['eav'] = factors['YOYPNI'].diff(20) # 约一月的变化加速度
 
         # 3. 统一清理
         factors = factors.replace([np.inf, -np.inf], np.nan)
@@ -361,45 +326,9 @@ class FundamentalFactors:
 
         def sf(key): return _safe_float(report.get(key))
 
-        # org_type
-        org_type_raw = report.get('ORG_TYPE')
-        factors['org_type'] = int(org_type_raw) if org_type_raw is not None else 0
-
-        # 盈利质量
-        factors['roe_jq']  = sf('ROEJQ')
-        factors['roe_kc']  = sf('ROEKCJQ')
-        factors['xsjll']   = sf('XSJLL')
-        factors['zzcjll']  = sf('ZZCJLL')
-
-        # 成长
-        factors['rev_yoy']     = sf('TOTALOPERATEREVETZ')
-        factors['np_yoy']      = sf('PARENTNETPROFITTZ')
-        factors['np_kc_yoy']   = sf('KCFJCXSYJLRTZ')
-        factors['djd_rev_yoy'] = sf('DJD_TOI_YOY')
-        factors['djd_np_yoy']  = sf('DJD_DPNP_YOY')
-
-        # EPS / BPS (原始)
-        eps = sf('EPSJB')
-        bps = sf('BPS')
-        factors['eps_jb'] = eps
-        factors['bps']    = bps
-
-        # 现金流
-        ocf = sf('MGJYXJJE')
-        factors['ocf_per_share'] = ocf
-        factors['ocf_to_rev']    = sf('JYXJLYYSR')
-        factors['ocf_to_eps'] = (ocf / eps) if (np.isfinite(ocf) and np.isfinite(eps) and eps != 0) else np.nan
-
-        # 杠杆
-        factors['zcfzl'] = sf('ZCFZL')
-        factors['qycs']  = sf('QYCS')
-
-        # 银行专项
-        factors['bank_npl']    = sf('NONPERLOAN')
-        factors['bank_bldk']   = sf('BLDKBBL')
-        factors['bank_car']    = sf('FIRST_ADEQUACY_RATIO')
-        factors['bank_nim']    = sf('NET_INTEREST_MARGIN')
-        factors['bank_spread'] = sf('NET_INTEREST_SPREAD')
+        # 1. 全量 Baostock 原始字段
+        for col in self.NUMERIC_COLS:
+            factors[col] = sf(col)
 
         # 衍生 (不需要 close, PE/PB 设为 nan)
         factors['dynamic_pe'] = np.nan
@@ -428,7 +357,7 @@ class FundamentalFactors:
         if not factors:
             return factors
 
-        eps = factors.get('eps_jb', np.nan)
+        eps = factors.get('epsTTM', np.nan)
         bps = factors.get('bps', np.nan)
 
         if np.isfinite(close) and close > 0:
@@ -454,11 +383,9 @@ class FundamentalFactors:
     def _add_cross_factors(self, factors: pd.DataFrame) -> pd.DataFrame:
         """向 DataFrame 追加交叉派生因子"""
         # ROE * 营收成长 -> 成长质量
-        roe = factors.get('roe_jq', pd.Series(np.nan, index=factors.index))
-        rev = factors.get('rev_yoy', pd.Series(np.nan, index=factors.index))
-        np_yoy = factors.get('np_yoy', pd.Series(np.nan, index=factors.index))
+        roe = factors.get('roeAvg', pd.Series(np.nan, index=factors.index))
+        np_yoy = factors.get('YOYPNI', pd.Series(np.nan, index=factors.index))
 
-        factors['roe_x_rev_growth'] = roe * (rev / 100).clip(-10, 10)
         factors['roe_x_np_growth']  = roe * (np_yoy / 100).clip(-10, 10)
 
         # ROE / PB -> 内在价值效率
@@ -466,21 +393,13 @@ class FundamentalFactors:
         with np.errstate(divide='ignore', invalid='ignore'):
             factors['roe_to_pb'] = np.where((pb > 0) & roe.notna(), roe / pb, np.nan)
 
-        # 成长一致性: 营收同比 vs 净利润同比
-        factors['growth_consistency'] = (factors.get('rev_yoy', pd.Series(np.nan, index=factors.index))
-                                         - factors.get('np_yoy', pd.Series(np.nan, index=factors.index)))
-
-        # 现金流含义: OCF/share vs EPS
-        ocf_eps = factors.get('ocf_to_eps', pd.Series(np.nan, index=factors.index))
-        factors['cashflow_quality'] = ocf_eps.clip(-5, 5)
 
         return factors
 
     def _add_cross_factors_dict(self, factors: Dict) -> None:
         """向 dict 追加交叉派生因子 (in-place)"""
-        roe    = factors.get('roe_jq', np.nan)
-        rev    = factors.get('rev_yoy', np.nan)
-        np_yoy = factors.get('np_yoy', np.nan)
+        roe    = factors.get('roeAvg', np.nan)
+        np_yoy = factors.get('YOYPNI', np.nan)
         pb     = factors.get('dynamic_pb', np.nan)
 
         def safe_mul(a, b):
@@ -495,12 +414,8 @@ class FundamentalFactors:
 
         clip = lambda v, lo=-10, hi=10: max(lo, min(hi, v)) if np.isfinite(v) else np.nan
 
-        factors['roe_x_rev_growth']  = safe_mul(roe, clip(rev / 100) if np.isfinite(rev) else np.nan)
         factors['roe_x_np_growth']   = safe_mul(roe, clip(np_yoy / 100) if np.isfinite(np_yoy) else np.nan)
         factors['roe_to_pb']         = safe_div(roe, pb)
-        factors['growth_consistency'] = rev - np_yoy if (np.isfinite(rev) and np.isfinite(np_yoy)) else np.nan
-        ocf_eps = factors.get('ocf_to_eps', np.nan)
-        factors['cashflow_quality']  = clip(ocf_eps, -5, 5) if np.isfinite(ocf_eps) else np.nan
 
     # ------------------------------------------------------------------
     # 兼容老接口 (供 advanced_factors.RelativeStrengthFactors 调用)
@@ -553,7 +468,9 @@ class MarketSentimentFetcher:
                     df['date'] = pd.to_datetime(df['date'])
                 self._cache = df
             except Exception as e:
-                print(f"  警告: 读取市场情绪数据失败: {e}")
+                import traceback
+                print(f"  [ERROR] 读取市场情绪数据失败: {e}")
+                traceback.print_exc()
                 self._cache = pd.DataFrame()
             finally:
                 conn.close()

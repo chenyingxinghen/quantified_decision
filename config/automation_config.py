@@ -94,7 +94,4 @@ AUTO_MAX_PRICE = 20.0           # 最高 20 元
 # 是否包含 ST / *ST 股票。实盘建议设为 False 规避退市风险
 AUTO_INCLUDE_ST = True
 
-# 时间止损专属参数（与回测 TIME_STOP_DAYS / TIME_STOP_MIN_LOSS_PCT 对齐）
-# 若持有 >= AUTO_TIME_STOP_DAYS 个交易日，且浮亏 >= AUTO_TIME_STOP_MIN_LOSS_PCT，则尾盘清仓
-AUTO_TIME_STOP_DAYS = TIME_STOP_DAYS          # 时间止损天数（交易日）
-AUTO_TIME_STOP_MIN_LOSS_PCT = TIME_STOP_MIN_LOSS_PCT  # 时间止损最小亏损比例
+

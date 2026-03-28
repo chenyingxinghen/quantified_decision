@@ -126,13 +126,18 @@ class QuantitativeFactors:
     # ==================== 趋势类因子 ====================
     
     def calculate_macd(self, data: pd.DataFrame) -> tuple:
-        """MACD - 指数平滑异同平均线"""
+        """MACD - 指数平滑异同平均线 (相对变化版)"""
         macd, signal, hist = talib.MACD(
             data['close'].values,
             fastperiod=self.config.MACD_FAST,
             slowperiod=self.config.MACD_SLOW,
             signalperiod=self.config.MACD_SIGNAL
         )
+        close = data['close'].values
+        with np.errstate(divide='ignore', invalid='ignore'):
+            macd = np.where(close!=0, macd / close, 0)
+            signal = np.where(close!=0, signal / close, 0)
+            hist = np.where(close!=0, hist / close, 0)
         return macd, signal, hist
     
     def calculate_adx(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
@@ -196,13 +201,16 @@ class QuantitativeFactors:
     # ==================== 波动率因子 ====================
     
     def calculate_atr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
-        """ATR - 平均真实波幅"""
-        return talib.ATR(
+        """ATR - 平均真实波幅 (相对变化版)"""
+        atr = talib.ATR(
             data['high'].values,
             data['low'].values,
             data['close'].values,
             timeperiod=period
         )
+        close = data['close'].values
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.where(close!=0, atr / close, 0)
     
     def calculate_natr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """NATR - 归一化平均真实波幅"""
@@ -240,28 +248,36 @@ class QuantitativeFactors:
         )
 
     def calculate_price_variance(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
-        """价格绝对方差均值"""
-        close = pd.to_numeric(data['close'], errors='coerce').replace([np.inf, -np.inf], np.nan)
-        return close.rolling(period).var().fillna(0).values
+        """价格收益率方差 (相对变化版)"""
+        returns = data['close'].pct_change().fillna(0)
+        return returns.rolling(period).var().fillna(0).values
     
     # ==================== 成交量因子 ====================
     
     def calculate_obv(self, data: pd.DataFrame) -> np.ndarray:
-        """OBV - 能量潮"""
-        return talib.OBV(data['close'].values, data['volume'].values)
+        """OBV - 能量潮 (相对变化版：去除趋势)"""
+        obv = talib.OBV(data['close'].values, data['volume'].values)
+        vol_ma = talib.SMA(data['volume'].values, timeperiod=20)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            obv_rel = np.where(vol_ma!=0, (obv - pd.Series(obv).rolling(20).mean().values) / vol_ma, 0)
+        return np.nan_to_num(obv_rel)
     
     def calculate_ad(self, data: pd.DataFrame) -> np.ndarray:
-        """AD - 累积/派发指标"""
-        return talib.AD(
+        """AD - 累积/派发指标 (相对变化版)"""
+        ad = talib.AD(
             data['high'].values,
             data['low'].values,
             data['close'].values,
             data['volume'].values
         )
+        vol_ma = talib.SMA(data['volume'].values, timeperiod=20)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ad_rel = np.where(vol_ma!=0, (ad - pd.Series(ad).rolling(20).mean().values) / vol_ma, 0)
+        return np.nan_to_num(ad_rel)
     
     def calculate_adosc(self, data: pd.DataFrame) -> np.ndarray:
-        """Chaikin Oscillator - 佳庆指标"""
-        return talib.ADOSC(
+        """Chaikin Oscillator - 佳庆指标 (相对变化版)"""
+        adosc = talib.ADOSC(
             data['high'].values,
             data['low'].values,
             data['close'].values,
@@ -269,6 +285,9 @@ class QuantitativeFactors:
             fastperiod=self.config.ADOSC_FAST,
             slowperiod=self.config.ADOSC_SLOW
         )
+        vol_ma = talib.SMA(data['volume'].values, timeperiod=20)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.nan_to_num(np.where(vol_ma!=0, adosc / vol_ma, 0))
     
     def calculate_mfi(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """MFI - 资金流量指标"""
@@ -299,23 +318,37 @@ class QuantitativeFactors:
         return macd, signal, hist
 
     def calculate_volume_ma(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
-        """成交量移动平均"""
-        return talib.SMA(data['volume'].values, timeperiod=period)
+        """换手率(或相对成交量)移动平均 (相对变化版)"""
+        vol_ma = talib.SMA(data['volume'].values, timeperiod=period)
+        vol_base = talib.SMA(data['volume'].values, timeperiod=period*5)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.nan_to_num(np.where(vol_base!=0, vol_ma / vol_base, 1.0))
     
     def calculate_volume_std(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
+        """成交量波动率 (相对变化版)"""
         volume = pd.to_numeric(data['volume'], errors='coerce').replace([np.inf, -np.inf], np.nan)
-        return volume.rolling(period).std().fillna(0).values
+        vol_std = volume.rolling(period).std().fillna(0).values
+        vol_ma = talib.SMA(data['volume'].values, timeperiod=period)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.nan_to_num(np.where(vol_ma!=0, vol_std / vol_ma, 0.0))
     
     def calculate_amount_ma(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
-        """成交金额移动平均"""
+        """相对成交金额移动平均 (相对变化版)"""
         if 'amount' in data.columns:
-            return talib.SMA(data['amount'].values, timeperiod=period)
+            amt_ma = talib.SMA(data['amount'].values, timeperiod=period)
+            amt_base = talib.SMA(data['amount'].values, timeperiod=period*5)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return np.nan_to_num(np.where(amt_base!=0, amt_ma / amt_base, 1.0))
         return np.zeros(len(data))
     
     def calculate_amount_std(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
+        """成交金额波动率 (相对变化版)"""
         if 'amount' in data.columns:
             amount = pd.to_numeric(data['amount'], errors='coerce').replace([np.inf, -np.inf], np.nan)
-            return amount.rolling(period).std().fillna(0).values
+            amt_std = amount.rolling(period).std().fillna(0).values
+            amt_ma = talib.SMA(data['amount'].values, timeperiod=period)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return np.nan_to_num(np.where(amt_ma!=0, amt_std / amt_ma, 0.0))
         return np.zeros(len(data))
     
     # ==================== 价格形态因子 ====================

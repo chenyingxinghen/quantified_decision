@@ -8,6 +8,8 @@ seaborn
 selenium
 webdriver-manager
 yfinance
+baostock
+
 
 # 机器学习相关依赖
 xgboost

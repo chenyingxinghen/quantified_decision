@@ -144,6 +144,7 @@ async def get_patterns(code: str, days: int = Query(default=100, ge=10, le=1000)
 
         # K 线形态 - 扫描近 90 天的历史信号
         from core.analysis.candlestick_patterns import CandlestickPatterns
+        from core.factors.candlestick_pattern_factors import CandlestickPatternFactors
         cp = CandlestickPatterns()
         
         # 使用高效的向量化历史扫描

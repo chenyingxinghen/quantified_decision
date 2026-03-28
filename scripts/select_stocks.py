@@ -1,15 +1,12 @@
 """
 量化因子选股脚本
-
 基于训练好的机器学习因子模型，从数据库中筛选股票。
-
 流程：
 1. 从数据库读取股票列表及基本信息
 2. 根据基础条件预筛选（市值、市盈率、股价等）
 3. 批量获取行情数据并计算量化因子
 4. 使用 ML 模型预测置信度
 5. 按置信度降序输出推荐股票
-
 用法：
     python scripts/select_stocks.py                       # 使用默认参数
     python scripts/select_stocks.py --top 30              # 输出前 30 只
@@ -18,7 +15,6 @@
     python scripts/select_stocks.py --filter            # 开启基础条件筛选 (默认关闭)
     python scripts/select_stocks.py --workers 8            # 8 线程并行
 """
-
 import os
 import sys
 import argparse
@@ -28,41 +24,31 @@ import warnings
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import numpy as np
 import pandas as pd
-
 # 添加项目根目录到路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-
 from config import DATABASE_PATH
 from config.factor_config import TrainingConfig
 from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST, SELECTOR_MARKETS
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
 from core.factors.train_ml_model import MLModelTrainer
-
 warnings.filterwarnings('ignore')
-
-
 # ============================================================================
 # 常量 & 默认配置
 # ============================================================================
-
-DEFAULT_MODEL_PATH = 'models/mark' # 默认搜寻 mark 目录
+DEFAULT_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl' # 默认搜寻 mark 目录
 DEFAULT_MIN_CONFIDENCE = 0
 DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
 MIN_DATA_ROWS = 35                 # 最少需要的行情数据条数 (与 ml_factor_strategy.py 一致)
 DEFAULT_WORKERS = 15                # 默认并行线程数
 DEFAULT_CACHE_DIR = TrainingConfig.CACHE_DIR
-
-
 # ============================================================================
 # 辅助函数
 # ============================================================================
-
 def find_latest_model(base_dir: str) -> Optional[str]:
     """
     在指定目录下寻找最新的模型。
@@ -92,7 +78,6 @@ def find_latest_model(base_dir: str) -> Optional[str]:
             return res
             
     return None
-
 def load_smart_model(model_path: str):
     """
     智能加载模型：
@@ -118,7 +103,6 @@ def load_smart_model(model_path: str):
         if latest:
             return load_smart_model(latest)
         return None
-
     # 情况 2: pkl 文件
     if not os.path.exists(model_path):
         return None
@@ -126,11 +110,9 @@ def load_smart_model(model_path: str):
     m = MLFactorModel()
     m.load_model(model_path)
     return m
-
 # ============================================================================
 # 数据库辅助
 # ============================================================================
-
 def get_db_conn(db_path: str):
     """获取带有关联库的连接 (meta + finance)"""
     conn = sqlite3.connect(db_path)
@@ -142,7 +124,6 @@ def get_db_conn(db_path: str):
     if os.path.exists(finance_db):
         conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
     return conn
-
 def get_all_stock_codes(db_path: str) -> List[str]:
     """从数据库获取所有有行情数据的股票代码"""
     conn = get_db_conn(db_path)
@@ -151,8 +132,6 @@ def get_all_stock_codes(db_path: str) -> List[str]:
     codes = [row[0] for row in cursor.fetchall()]
     conn.close()
     return codes
-
-
 def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
     """
     获取股票基本信息:
@@ -168,39 +147,43 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
             return v if np.isfinite(v) else None
         except (ValueError, TypeError):
             return None
-
     conn = get_db_conn(db_path)
-
-    # 1. 从 meta 读取基础信息
+    # 1. 从 meta 读取基础信息 (直接使用标准的 stock_basic 表)
     try:
         meta_df = pd.read_sql_query(
-            "SELECT code, name, is_st FROM meta.stock_info_extended", conn
+            "SELECT code, code_name AS name FROM meta.stock_basic", conn
         )
-    except Exception:
-        meta_df = pd.DataFrame(columns=['code', 'name', 'is_st'])
-
-    # 2. 从 finance_reports 读取最新一期 EPS/BPS (按 code + 最大 REPORT_DATE)
+    except Exception as e:
+        import traceback
+        print(f"  [ERROR] 从 meta.stock_basic 加载元数据失败: {e}")
+        traceback.print_exc()
+        meta_df = pd.DataFrame(columns=['code', 'name'])
+    # 2. 从 finance 表读取最新一期财务数据 (按 code + 最大 pub_date)
     try:
+        # 使用 p.stat_date 关联并以 p.pub_date 对齐最新公告
         finance_df = pd.read_sql_query(
             """
-            SELECT f.code, f.EPSJB, f.BPS, f.ZCFZL
-            FROM finance.finance_reports f
+            SELECT p.code, p.epsTTM AS EPSJB, p.totalShare, b.liabilityToAsset AS ZCFZL
+            FROM finance.profit_ability p
+            LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
             INNER JOIN (
-                SELECT code, MAX(REPORT_DATE) AS max_date
-                FROM finance.finance_reports
+                SELECT code, MAX(pub_date) AS max_date
+                FROM finance.profit_ability
                 GROUP BY code
-            ) latest ON f.code = latest.code AND f.REPORT_DATE = latest.max_date
+            ) latest ON p.code = latest.code AND p.pub_date = latest.max_date
             """,
             conn
         )
-    except Exception:
-        finance_df = pd.DataFrame(columns=['code', 'EPSJB', 'BPS', 'ZCFZL'])
-
-    # 3. 获取每只股票最新价格
+    except Exception as e:
+        import traceback
+        print(f"  [ERROR] 从 finance 表加载财务数据失败: {e}")
+        traceback.print_exc()
+        finance_df = pd.DataFrame(columns=['code', 'EPSJB', 'totalShare', 'ZCFZL'])
+    # 3. 获取每只股票最新价格及动态快照 (is_st, pbMRQ)
     try:
         price_df = pd.read_sql_query(
             """
-            SELECT code, close
+            SELECT code, close, pbMRQ, is_st
             FROM daily_data
             WHERE (code, date) IN (
                 SELECT code, MAX(date) FROM daily_data GROUP BY code
@@ -208,58 +191,46 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
             """,
             conn
         )
-    except Exception:
-        price_df = pd.DataFrame(columns=['code', 'close'])
-
+    except Exception as e:
+        import traceback
+        print(f"  [ERROR] 从 daily_data 加载行情快照失败: {e}")
+        traceback.print_exc()
+        price_df = pd.DataFrame(columns=['code', 'close', 'pbMRQ', 'is_st'])
     conn.close()
-
     # 构建映射
-    finance_map = {}
-    if not finance_df.empty:
-        for _, row in finance_df.iterrows():
-            finance_map[str(row.get('code', ''))] = {
-                'eps': safe_float(row.get('EPSJB')),
-                'bps': safe_float(row.get('BPS')),
-                'zcfzl': safe_float(row.get('ZCFZL')),
-            }
-
-    price_map = {}
-    if not price_df.empty:
-        for _, row in price_df.iterrows():
-            price_map[str(row.get('code', ''))] = safe_float(row.get('close'))
-
+    fin_map = {str(r.code): r for r in finance_df.itertuples()}
+    prc_map = {str(r.code): r for r in price_df.itertuples()}
+    meta_map = {str(r.code): r for r in meta_df.itertuples()}
+    
+    # 构建最终 info_map (以 price_df 为基准)
     info_map = {}
-    if not meta_df.empty:
-        for _, row in meta_df.iterrows():
-            code = str(row.get('code', ''))
-            fin = finance_map.get(code, {})
-            close = price_map.get(code)
-
-            # 动态 PE = 价格 / EPS; 动态 PB = 价格 / BPS
-            eps = fin.get('eps')
-            bps = fin.get('bps')
-            dynamic_pe = None
-            dynamic_pb = None
-            if close and close > 0:
-                if eps and eps > 0:
-                    dynamic_pe = close / eps
-                if bps and bps > 0:
-                    dynamic_pb = close / bps
-
-            info_map[code] = {
-                'name':          row.get('name', ''),
-                'market_cap':    None,  # market_cap 不在 meta 表中，留 None
-                'pe_ratio':      dynamic_pe,
-                'pb_ratio':      dynamic_pb,
-                'zcfzl':         fin.get('zcfzl'),
-                'current_price': close,  # 最新收盘价，供价格筛选使用
-                'sector':        '-',
-                'industry':      '-',
-                'is_st':         int(row.get('is_st', 0) or 0),
-            }
+    for r in price_df.itertuples():
+        code = str(r.code)
+        fin = fin_map.get(code)
+        meta = meta_map.get(code)
+        
+        close = r.close
+        eps = getattr(fin, 'EPSJB', None)
+        total_share = getattr(fin, 'totalShare', None)
+        
+        dynamic_pe = close / eps if close and eps and eps > 0 else None
+        # market_cap 以 “亿” 为单位
+        mcap = (close * total_share / 1e8) if close and total_share else None
+        
+        # 优先使用 daily_data 中的 is_st，因为它更及时
+        is_st = getattr(r, 'is_st', 0)
+        if is_st == 0 and meta:
+            is_st = getattr(meta, 'is_st', 0)
+        info_map[code] = {
+            'name':          getattr(meta, 'name', '-'),
+            'market_cap':    mcap,
+            'pe_ratio':      dynamic_pe,
+            'pb_ratio':      getattr(r, 'pbMRQ', None), # 动态 PB
+            'zcfzl':         getattr(fin, 'ZCFZL', None),
+            'current_price': close,
+            'is_st':         int(is_st or 0),
+        }
     return info_map
-
-
 def get_latest_price(db_path: str, code: str) -> Optional[float]:
     """获取股票最新收盘价"""
     conn = get_db_conn(db_path)
@@ -271,8 +242,6 @@ def get_latest_price(db_path: str, code: str) -> Optional[float]:
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else None
-
-
 def get_stock_data(db_path: str, code: str, days: int = DEFAULT_LOOKBACK_DAYS) -> Optional[pd.DataFrame]:
     """
     从数据库中获取指定股票最近 N 天的行情数据
@@ -280,20 +249,19 @@ def get_stock_data(db_path: str, code: str, days: int = DEFAULT_LOOKBACK_DAYS) -
     conn = get_db_conn(db_path)
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-
+    # 重要改进：增加对 adjust_factor 的查询以支持动态复权
     query = '''
-        SELECT date, open, high, low, close, volume, amount, turnover_rate
-        FROM daily_data
-        WHERE code = ? AND date >= ? AND date <= ?
-        ORDER BY date ASC
+        SELECT k.date, k.open, k.high, k.low, k.close, k.volume, k.amount, k.turnover_rate, a.fore_adjust_factor
+        FROM daily_data k
+        LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
+        WHERE k.code = ? AND k.date >= ? AND k.date <= ?
+        ORDER BY k.date ASC
     '''
     df = pd.read_sql_query(query, conn, params=(code, start_date, end_date))
     conn.close()
-
     if df.empty or len(df) < MIN_DATA_ROWS:
         return None
     return df
-
 def pre_filter_stocks(
     all_codes: List[str],
     info_map: Dict[str, Dict],
@@ -307,12 +275,10 @@ def pre_filter_stocks(
     - min_price / max_price：股价范围
     - include_st: 是否包含 ST 股
     - markets: 市场类型过滤 (e.g., 'sh', 'sz_main', 'sz_gem', 'bj')
-
     criteria 为动态筛选准则（覆盖全局常量），如果不传则使用 strategy_config 中的默认值。
     """
     if criteria is None:
         criteria = {}
-
     def try_float(val):
         try:
             if val is None or val == '' or val == 'None':
@@ -320,7 +286,6 @@ def pre_filter_stocks(
             return float(val)
         except (ValueError, TypeError):
             return None
-
     # 以全局常量为基础，动态 criteria 优先覆盖
     min_market_cap = try_float(criteria.get('min_market_cap', MIN_MARKET_CAP)) or 0
     max_pe         = try_float(criteria.get('max_pe', MAX_PE)) or float('inf')
@@ -328,65 +293,48 @@ def pre_filter_stocks(
     max_price      = try_float(criteria.get('max_price', MAX_PRICE)) or float('inf')
     include_st     = bool(criteria.get('include_st', INCLUDE_ST))
     markets_filter = criteria.get('markets', SELECTOR_MARKETS) # Renamed to avoid conflict with 'markets' in pref_map
-
-    # 市场前缀映射
-    pref_map = {
-        'sh': ('60'),
-        'sz_main': ('00'),
-        'sz_gem': ('30'),
-        'bj': ('8', '4', '9') # Beijing Stock Exchange codes start with 8, 4, 9
-    }
-    allowed_prefixes = None
+    # 市场查询前缀
+    from config import SUPPORTED_MARKETS
+    allowed_prefixes = []
     if markets_filter:
-        allowed_prefixes = []
         for m in markets_filter:
-            p = pref_map.get(m)
-            if isinstance(p, tuple):
+            p = SUPPORTED_MARKETS.get(m, {}).get('prefixes')
+            if p:
                 allowed_prefixes.extend(p)
-            elif p:
-                allowed_prefixes.append(p)
-        allowed_prefixes = tuple(allowed_prefixes) # Convert to tuple for efficient startswith check
-
+        allowed_prefixes = tuple(allowed_prefixes)
     passed = []
     skipped_reasons = {
         'market_cap': 0, 'pe': 0, 'price': 0, 'no_info': 0,
         'st': 0, 'market': 0, 'zcfzl': 0
     }
-
     for code in all_codes:
         info = info_map.get(code)
         if not info:
             skipped_reasons['no_info'] += 1
             continue
-
         name = str(info.get('name', '') or '')
-
         # 1. 市场类型筛选
         if allowed_prefixes and not code.startswith(allowed_prefixes):
             skipped_reasons['market'] += 1
             continue
-
         # 2. 排除 ST / *ST / 退市 (除非 include_st=True)
         if not include_st:
             is_st_flag = info.get('is_st', 0)
             if is_st_flag == 1 or (name and '退' in name):
                 skipped_reasons['st'] += 1
                 continue
-
         # 3. 市值筛选 (仅在 min_market_cap > 0 且有效时生效; 当前 market_cap 为 None 则跳过)
         if min_market_cap > 0:
             market_cap = try_float(info.get('market_cap'))
             if market_cap is not None and market_cap < min_market_cap:
                 skipped_reasons['market_cap'] += 1
                 continue
-
         # 4. 动态 PE 筛选 (价格/EPS, 由 get_stock_info_map 计算)
         pe = try_float(info.get('pe_ratio'))
         if pe is not None:
             if pe <= 0 or pe > max_pe:
                 skipped_reasons['pe'] += 1
                 continue
-
         # 5. 资产负债率筛选（金融行业慎用）
         max_zcfzl = try_float(criteria.get('max_zcfzl', None))
         if max_zcfzl is not None:
@@ -394,25 +342,21 @@ def pre_filter_stocks(
             if zcfzl is not None and zcfzl > max_zcfzl:
                 skipped_reasons['zcfzl'] += 1
                 continue
-
         # 6. 股价筛选 (使用 info_map 中的 current_price)
         price = try_float(info.get('current_price'))
         if price is not None:
             if price < min_price or price > max_price:
                 skipped_reasons['price'] += 1
                 continue
-
         passed.append(code)
-
     return passed, skipped_reasons
-
-
 def get_factors_for_single_stock(
     code: str,
     db_path: str,
     factor_calculator: ComprehensiveFactorCalculator,
     cache_dir: Optional[str] = None,
-    only_cache: bool = False
+    only_cache: bool = False,
+    target_features: Optional[List[str]] = None
 ) -> Optional[Dict]:
     """
     对单只股票获取行情数据并计算/提取因子。
@@ -423,7 +367,6 @@ def get_factors_for_single_stock(
         data = get_stock_data(db_path, code)
         if data is None:
             return None
-
         factors = None
         cache_file = None
         last_db_date = str(data['date'].iloc[-1])
@@ -441,10 +384,9 @@ def get_factors_for_single_stock(
                             factors = df_cache
                 except:
                     pass
-
         # 3. 如果无有效缓存且允许计算，则重新计算因子并保存
         if factors is None and not only_cache:
-            factors = factor_calculator.calculate_all_factors(code, data)
+            factors = factor_calculator.calculate_all_factors(code, data, target_features=target_features)
             if factors is not None and not factors.empty:
                 # 记录日期以支持下次对比 (与 train_ml_model 逻辑对齐)
                 factors = factors.copy()
@@ -457,149 +399,55 @@ def get_factors_for_single_stock(
                         factors.to_parquet(cache_file, index=False)
                     except Exception as e:
                         pass
-
         if factors is None or factors.empty:
             return None
-
         # 4. 取最新一行因子
         latest = factors.tail(1).copy()
         if latest.isna().all(axis=1).iloc[0]:
             return None
-
         # 5. 收集元数据
         current_price = data['close'].iloc[-1]
         latest_date = data['date'].iloc[-1]
-
         return {
             'stock_code': code,
             'factors': latest, # 1-row DataFrame
             'current_price': current_price,
             'latest_date': latest_date,
         }
-
     except Exception:
         import traceback
         # traceback.print_exc()
         return None
-
-
 # ============================================================================
 # 增量缓存更新辅助函数
 # ============================================================================
-
-def _update_factor_cache_incremental(
-    codes: List[str],
-    cache_dir: str,
-    db_path: str,
-    workers: int = 8,
-    lookback_days: int = 365 * 16,  # 加载足够长的历史，确保技术指标的 lookback 窗口足够
-) -> None:
-    """
-    利用 MLModelTrainer.calculate_and_save_factors 的增量逻辑，
-    将各股票的因子缓存补齐到当前数据库最新日期。
-    
-    流程:
-    1. 建立一个临时 MLModelTrainer（仅用于调用其因子计算器）
-    2. 对每只股票，加载其完整行情历史
-    3. 调用增量缓存方法追加新行
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import sqlite3
-
+def _update_factor_cache_incremental(db_path: str, codes: List[str], cache_dir: str, workers: int = 12, lookback_days: int = 500, target_features: Optional[List[str]] = None):
+    """更清晰的增量缓存更新实现"""
     trainer = MLModelTrainer(db_path=db_path)
-    end_date   = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-
-    # 检查哪些股票缓存已是最新（快速预检）
-    conn = sqlite3.connect(db_path)
-    try:
-        latest_dates = pd.read_sql_query(
-            "SELECT code, MAX(date) AS last_date FROM daily_data WHERE code IN ({}) GROUP BY code".format(
-                ','.join(['?' for _ in codes])
-            ), conn, params=codes
-        )
-    except Exception:
-        latest_dates = pd.DataFrame(columns=['code', 'last_date'])
-    finally:
-        conn.close()
+    # 强制使 trainer 使用传入的 cache_dir
+    trainer.factors_cache_dir = DEFAULT_CACHE_DIR
+    os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
     
-    db_latest = dict(zip(latest_dates['code'], latest_dates['last_date']))
-
-    # 过滤出真正需要更新的股票（缓存最新日期 < 数据库最新日期）
-    need_update = []
-    for code in codes:
-        db_last = db_latest.get(code)
-        if db_last is None:
-            continue
-        cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
-        if not os.path.exists(cache_file):
-            need_update.append(code)
-            continue
-        try:
-            cf = pd.read_parquet(cache_file, columns=['date'])
-            cache_last = str(cf['date'].max())[:10] if 'date' in cf.columns else ''
-            if cache_last < str(db_last)[:10]:
-                need_update.append(code)
-        except Exception:
-            need_update.append(code)
-
-    if not need_update:
-        print(f"   全部 {len(codes)} 只股票缓存已是最新，无需更新")
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+    
+    print(f"   [因子同步] 正在为 {len(codes)} 只股票从数据库加载行情 (缓存: {DEFAULT_CACHE_DIR}) ...")
+    stocks_data = trainer.load_training_data(codes, start_date, end_date)
+    
+    if not stocks_data:
+        print("   ✗ 未获取到有效行情数据，同步跳过")
         return
 
-    print(f"   需要增量更新: {len(need_update)}/{len(codes)} 只股票")
-
-    ok_count  = 0
-    err_count = 0
-    t0 = time.time()
-
-    def _worker_update(code: str):
-        try:
-            # 加载完整行情历史（技术指标需要足够长的 lookback）
-            conn2 = sqlite3.connect(db_path)
-            df = pd.read_sql_query(
-                "SELECT date, open, high, low, close, volume, amount, turnover_rate FROM daily_data "
-                "WHERE code = ? AND date >= ? AND date <= ? ORDER BY date ASC",
-                conn2, params=(code, start_date, end_date)
-            )
-            conn2.close()
-            if df.empty or len(df) < 50:
-                return 'skip'
-            trainer.calculate_and_save_factors(
-                code=code, data=df,
-                apply_feature_engineering=True,
-                verbose=False,
-                include_fundamentals=True,
-            )
-            return 'ok'
-        except Exception as e:
-            return f'err:{e}'
-
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_worker_update, c): c for c in need_update}
-        for fut in as_completed(futures):
-            done += 1
-            res = fut.result()
-            if res == 'ok':
-                ok_count += 1
-            elif res == 'skip':
-                pass
-            else:
-                err_count += 1
-            if done % 200 == 0 or done == len(need_update):
-                elapsed = time.time() - t0
-                speed = done / elapsed if elapsed > 0 else 0
-                print(f"   增量更新进度: {done}/{len(need_update)} "
-                      f"(成功 {ok_count}, 失败 {err_count}) | {speed:.1f} 只/s")
-
-    print(f"   增量缓存更新完成: {ok_count} 只成功, {err_count} 只失败")
-
-
+    # 直接调用统一的批量更新方法
+    trainer.batch_update_factor_cache(
+        stocks_data=stocks_data,
+        n_jobs=workers,
+        target_features=target_features,
+        verbose=False
+    )
 # ============================================================================
 # 主流程
 # ============================================================================
-
 def select_stocks(
     model_path: str = DEFAULT_MODEL_PATH,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
@@ -621,7 +469,6 @@ def select_stocks(
 ) -> List[Dict]:
     """
     执行完整的选股流程。
-
     参数:
         model_path:      训练好的模型文件路径
         min_confidence:   最小置信度阈值（百分制）
@@ -637,12 +484,10 @@ def select_stocks(
         min_price:        (动态) 最小价格
         max_price:        (动态) 最大价格
         include_st:       (动态) 是否包含 ST
-
     返回:
         按置信度降序的候选股票列表
     """
     t_start = time.time()
-
     # ------------------------------------------------------------------
     # Step 0: 环境准备 & 模型加载
     # ------------------------------------------------------------------
@@ -656,14 +501,12 @@ def select_stocks(
     if model is None:
         print(f"❌ 无法从 {model_path} 加载模型。")
         return []
-
     print("=" * 80)
     print("📊 量化因子选股系统 (绝对值打分模式)")
     print("=" * 80)
     print(f"\n🕐 运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📈 模型类型: {getattr(model, 'model_type', 'unknown')} | 特征数: {len(getattr(model, 'feature_names', []))}")
     print(f"📋 最低置信度: {min_confidence:.1f}% | 并行线程: {workers}")
-
     # ------------------------------------------------------------------
     # Step 1: 获取全市场股票池 & 基本信息
     # ------------------------------------------------------------------
@@ -672,7 +515,6 @@ def select_stocks(
     all_codes = get_all_stock_codes(DATABASE_PATH)
     info_map = get_stock_info_map(DATABASE_PATH)
     print(f"   数据库中行情覆盖 {len(all_codes)} 只，基本面覆盖 {len(info_map)} 只")
-
     # ------------------------------------------------------------------
     # Step 2: 基础条件提前过滤 (针对单只股票独立预测，可大幅减负)
     # ------------------------------------------------------------------
@@ -686,8 +528,8 @@ def select_stocks(
             'max_zcfzl': max_zcfzl, 'min_price': min_price, 
             'max_price': max_price, 'include_st': include_st,
             'markets': markets
-        }
-        passed_codes, skipped_stats = pre_filter_stocks(all_codes, info_map, DATABASE_PATH)
+        } if markets else None
+        passed_codes, skipped_stats = pre_filter_stocks(all_codes, info_map, DATABASE_PATH, criteria=criteria)
         predict_codes = passed_codes
         print(f"   筛选完成: 满足条件 {len(predict_codes)} 只 (已过滤 {sum(skipped_stats.values())} 只)")
         if not predict_codes:
@@ -695,39 +537,46 @@ def select_stocks(
             return []
     else:
         print(f"   未开启筛选，全量预测")
-
     # ------------------------------------------------------------------
     # Step 2.5: 增量更新因子缓存（补齐到最新行情日期）
     # ------------------------------------------------------------------
     if not skip_cache_update:
         print("\n" + "-" * 60)
-        print("🔄 增量更新因子缓存 (将缓存补齐到最新行情日期) ...")
+        print(f"🔄 增量更新因子缓存 (目录: {DEFAULT_CACHE_DIR}) ...")
         try:
+            # 提取模型期望的特征列表（如有）
+            target_features = getattr(model, 'feature_names', None)
+            
             _update_factor_cache_incremental(
                 codes=predict_codes,
-                cache_dir=cache_dir,
+                cache_dir=DEFAULT_CACHE_DIR,
                 db_path=DATABASE_PATH,
                 workers=workers,
+                target_features=target_features,
             )
         except Exception as _e:
+            import traceback
             print(f"  [警告] 增量缓存更新失败，将直接使用旧缓存: {_e}")
+            traceback.print_exc()
     else:
         print("\n跳过增量缓存更新 (--skip-cache-update)")
+    # ------------------------------------------------------------------
+    # Step 3: 并行获取所有候选股的因子快照
+    # ------------------------------------------------------------------
+    # 提取模型期望的特征列表
+    target_features = getattr(model, 'feature_names', None)
 
-    # ------------------------------------------------------------------
-    # Step 3: 并行计算因子 (仅针对通过筛选的股票)
-    # ------------------------------------------------------------------
     print("\n" + "-" * 60)
     print(f"🔄 加载/计算因子数据 (目标: {len(predict_codes)} 只) ...")
-
     raw_results: List[Dict] = []
     done_count = 0
     total = len(predict_codes)
     factor_calculator = ComprehensiveFactorCalculator(db_path=DATABASE_PATH)
     
     def _worker(code: str) -> Optional[Dict]:
-        return get_factors_for_single_stock(code, DATABASE_PATH, factor_calculator, cache_dir=cache_dir, only_cache=only_cache)
-
+        return get_factors_for_single_stock(code, DATABASE_PATH, factor_calculator, 
+                                           cache_dir=DEFAULT_CACHE_DIR, only_cache=only_cache,
+                                           target_features=target_features)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {executor.submit(_worker, code): code for code in predict_codes}
         for future in as_completed(future_map):
@@ -737,11 +586,9 @@ def select_stocks(
                       f"有效: {len(raw_results)} | 速度: {done_count/(time.time()-t_start):.1f} 只/秒")
             res = future.result()
             if res: raw_results.append(res)
-
     if not raw_results:
         print("❌ 未获取到任何有效的因子数据。")
         return []
-
     # ------------------------------------------------------------------
     # Step 4: 批量模型打分 (解耦后的单兵评分)
     # ------------------------------------------------------------------
@@ -756,12 +603,35 @@ def select_stocks(
     # 输入对齐 & 缺失值填充
     all_X_input = all_X.astype(np.float64).fillna(0)
     
+    # 强制与模型特征对齐 (补 0)
+    if target_features:
+        missing = [f for f in target_features if f not in all_X_input.columns]
+        if missing:
+            print(f"  ⚠️  模型要求的 {len(missing)} 个特征在数据源中不存在，已自动填0")
+            # 批量构建缺失列的 DataFrame 以防碎片化
+            missing_df = pd.DataFrame(0.0, index=all_X_input.index, columns=missing)
+            all_X_input = pd.concat([all_X_input, missing_df], axis=1)
+        
+        # 强制特征排列顺序一致
+        all_X_input = all_X_input[target_features]
+    
+    # 因子分位数标准化 (横截面)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        
+        # 识别需要进行横截面排名的因子索引 (同步 train_ml_model 逻辑)
+        sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
+        rank_cols = [col for col in all_X_input.columns if not any(k in col.lower() for k in sentiment_keys)]
+        
+        if rank_cols:
+            all_X_input[rank_cols] = all_X_input[rank_cols].rank(pct=True).fillna(0.5)
+    
     try:
         probs = model.predict(all_X_input)
     except Exception as e:
         print(f"❌ 批量预测失败: {e}")
         return []
-
     # ------------------------------------------------------------------
     # Step 5: 结果汇总、置信度二次过滤 & 排序
     # ------------------------------------------------------------------
@@ -790,18 +660,14 @@ def select_stocks(
             'current_price': r['current_price'],
             'latest_date': r['latest_date'],
         })
-
     print(f"   打分完成: 置信度低于 {min_confidence}% 已排除 {low_confidence_count} 只")
-
     # 增加哈希扰动作为平局決胜
     import hashlib
     def get_tie_breaker(code):
         return int(hashlib.md5(str(code).encode()).hexdigest(), 16) % 1000 / 100000.0
-
     # 排序：置信度降序
     results.sort(key=lambda x: (-(x['confidence'] + get_tie_breaker(x['stock_code']))))
     results = results[:top_n]
-
     # 合并股票名称等信息
     for r in results:
         info = info_map.get(r['stock_code'], {})
@@ -810,7 +676,6 @@ def select_stocks(
         r['pe_ratio'] = info.get('pe_ratio', None)
         r['pb_ratio'] = info.get('pb_ratio', None)
         r['signal'] = 'buy' if r['confidence'] > 50 else 'hold'  # 50% 为中平点，超过即为买入信号
-
     # ------------------------------------------------------------------
     # Step 6: 结果展示与保存
     # ------------------------------------------------------------------
@@ -818,37 +683,29 @@ def select_stocks(
     print("\n" + "=" * 80)
     print(f"🏆 选股完成! 共 {len(results)} 只 | 耗时 {elapsed:.1f}s")
     print("=" * 80)
-
     if not results:
         return []
-
     # 表头打印 (简化展示)
     print(f"{'排名':>2} {'代码':<8} {'名称':<6} {'置信度':>6} {'现价':>7} {'最新日期':<10}")
     print("-" * 60)
     for i, r in enumerate(results, 1):
         print(f"{i:>2}. {r['stock_code']:<8} {str(r['name'])[:6]:<6} {r['confidence']:>6.2f}% {r['current_price']:>7.2f} {str(r['latest_date'])[:10]}")
-
     if save_csv:
         output_dir = os.path.join(PROJECT_ROOT, 'backtest_result')
         os.makedirs(output_dir, exist_ok=True)
         csv_path = os.path.join(output_dir, f"selected_stocks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         pd.DataFrame(results).to_csv(csv_path, index=False, encoding='utf-8-sig')
         print(f"\n💾 结果 CSV 已保存: {csv_path}")
-
     # 显示因子重要性
     top_factors = model.get_top_factors(n=10)
     if top_factors:
         print(f"\n🔑 决策核心因子 Top-10:")
         for rank, (name, val) in enumerate(top_factors, 1):
             print(f"   {rank:>2}. {name:<30} {val:.4f}")
-
     return results
-
-
 # ============================================================================
 # CLI 入口
 # ============================================================================
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="量化因子选股 - 基于机器学习模型筛选 A 股",
@@ -898,16 +755,17 @@ def parse_args():
         help='不保存 CSV 文件',
     )
     parser.add_argument(
-        '--skip-cache-update', action='store_true', default=False,
+        '--skip-cache-update', action='store_true', default=True,
         help='跳过增量缓存更新步骤，直接使用已有缓存（速度更快，但因子可能非最新）',
     )
     return parser.parse_args()
 
 
+
 def main():
     args = parse_args()
     select_stocks(
-        model_path='models/mark/automation/lightgbm_factor_model.pkl',
+        model_path=args.model,
         min_confidence=args.min_confidence,
         top_n=args.top,
         apply_filter=True,
@@ -917,7 +775,5 @@ def main():
         save_csv=not args.no_save,
         skip_cache_update=args.skip_cache_update,
     )
-
-
 if __name__ == '__main__':
     main()

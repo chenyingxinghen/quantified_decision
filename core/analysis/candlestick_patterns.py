@@ -45,23 +45,37 @@ class CandlestickPatterns:
             'harami': {'description': '孕线', 'score': 15, 'type': 'reversal', 'reliability': 60}
         }
 
-    def identify_three_white_soldiers(self, data: pd.DataFrame) -> np.ndarray:
-        """识别三个白兵"""
+    def identify_three_white_soldiers(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """识别三个白兵 (看涨反转)"""
         is_white = data['close'] > data['open']
         c0 = is_white.shift(2)
         c1 = is_white.shift(1)
         c2 = is_white
         ascending = (data['close'].shift(1) > data['close'].shift(2)) & (data['close'] > data['close'].shift(1))
-        return (c0 & c1 & c2 & ascending).fillna(False).astype(float).values
+        
+        signal = c0 & c1 & c2 & ascending
+        
+        if context is not None:
+            # 强化：处于下降趋势末端或低位
+            signal = signal & (context['is_downtrend'] | (context['price_pos'] < 0.3))
+            
+        return signal.fillna(False).astype(float).values
 
-    def identify_three_black_crows(self, data: pd.DataFrame) -> np.ndarray:
-        """识别三只乌鸦"""
+    def identify_three_black_crows(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """识别三只乌鸦 (看跌反转)"""
         is_black = data['open'] > data['close']
         c0 = is_black.shift(2)
         c1 = is_black.shift(1)
         c2 = is_black
         descending = (data['close'].shift(1) < data['close'].shift(2)) & (data['close'] < data['close'].shift(1))
-        return (c0 & c1 & c2 & descending).fillna(False).astype(float).values
+        
+        signal = c0 & c1 & c2 & descending
+        
+        if context is not None:
+            # 强化：处于上升趋势末端或高位
+            signal = signal & (context['is_uptrend'] | (context['price_pos'] > 0.7))
+            
+        return signal.fillna(False).astype(float).values
 
     def detect_all_bullish_patterns(self, data: pd.DataFrame) -> List[Dict]:
         """检测当前（最后一行）的所有看涨形态"""
@@ -186,7 +200,7 @@ class CandlestickPatterns:
         计算价格位置和趋势强度 (向量化)
         
         返回:
-            DataFrame 包含 price_pos(0-1), is_uptrend, is_downtrend, is_sideways
+            DataFrame 包含 price_pos(0-1), is_uptrend, is_downtrend, is_sideways, range_high, range_low
         """
         close = data['close']
         high = data['high']
@@ -199,21 +213,27 @@ class CandlestickPatterns:
         denominator = (high_max - low_min).replace(0, 1e-6)
         price_pos = (close - low_min) / denominator
         
-        # 2. 趋势方向 (简单 MA 关系)
-        ma_win = close.rolling(window).mean()
-        is_uptrend = close > ma_win
-        is_downtrend = close < ma_win
+        # 2. 趋势方向 (使用更稳健的 MA 组合或线性回归，这里使用多周期 MA 确认)
+        ma_short = close.rolling(int(window/2)).mean()
+        ma_long = close.rolling(window).mean()
+        
+        is_uptrend = (close > ma_short) & (ma_short > ma_long)
+        is_downtrend = (close < ma_short) & (ma_short < ma_long)
         
         # 3. 波动幅度 (判断是否横盘/窄幅震荡)
-        # 如果 window 日内最高价和最低价的差距小于 5%, 则认为震荡区间过小，形态可靠度降低
+        # 使用 ATR 或价格极差的百分比。这里定义：window日内波幅小于 7% 且 价格在 MA 附近波动
         diff_pct = (high_max - low_min) / low_min.replace(0, 1)
-        is_sideways = diff_pct < 0.05
+        # 辅助判断：价格是否在 ma_long 的上下 2% 范围内
+        near_ma = (close / ma_long - 1).abs() < 0.02
+        is_sideways = (diff_pct < 0.07) | ((diff_pct < 0.12) & near_ma)
         
         return pd.DataFrame({
             'price_pos': price_pos,
             'is_uptrend': is_uptrend,
             'is_downtrend': is_downtrend,
-            'is_sideways': is_sideways
+            'is_sideways': is_sideways,
+            'range_high': high_max,
+            'range_low': low_min
         }, index=data.index)
 
     def identify_white_candle(self, data: pd.DataFrame) -> np.ndarray:
@@ -231,80 +251,109 @@ class CandlestickPatterns:
         return (body_size < price_scaled_threshold).astype(float)
     
     def identify_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
-                        lower_ratio: float = 2.0, upper_ratio: float = 1.0) -> np.ndarray:
-        """识别锤子线 ( refined logic )"""
+                        lower_ratio: float = 2.0, upper_ratio: float = 0.5) -> np.ndarray:
+        """
+        识别锤子线 (看涨反转)
+        符合市场常识：下影线至少是实体的2倍，上影线极短，且处于低位（超跌或趋势末端）
+        """
         body = np.abs(data['close'] - data['open'])
         lower_shadow = np.minimum(data['open'], data['close']) - data['low']
         upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
         
-        body = np.where(body == 0, 0.001, body)
+        # 最小实体保护，避免极小实体导致比例失效
+        safe_body = np.where(body < data['close'] * 0.001, data['close'] * 0.001, body)
         
         is_hammer = (
-            (lower_shadow > body * lower_ratio) &
-            (upper_shadow < body * upper_ratio) &
-            (data['close'] > data['open']) &
+            (lower_shadow > safe_body * lower_ratio) &
+            (upper_shadow < safe_body * upper_ratio) &
             (context['price_pos'] < 0.3) & (~context['is_sideways'])
         )
         return is_hammer.astype(float)
     
     def identify_hanging_man(self, data: pd.DataFrame, context: pd.DataFrame, 
-                            lower_ratio: float = 2.0, upper_ratio: float = 1.0) -> np.ndarray:
-        """识别上吊线"""
+                            lower_ratio: float = 2.0, upper_ratio: float = 0.5) -> np.ndarray:
+        """
+        识别上吊线 (看跌反转)
+        符合市场常识：虽然形状像锤子，但出现在高位，预示买盘衰竭
+        """
         body = np.abs(data['close'] - data['open'])
         lower_shadow = np.minimum(data['open'], data['close']) - data['low']
         upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
         
-        body = np.where(body == 0, 0.001, body)
+        safe_body = np.where(body < data['close'] * 0.001, data['close'] * 0.001, body)
         
         is_hanging_man = (
-            (lower_shadow > body * lower_ratio) &
-            (upper_shadow < body * upper_ratio) &
-            (data['close'] < data['open']) &
-            (context['price_pos'] > 0.7) & (~context['is_sideways'])
+            (lower_shadow > safe_body * lower_ratio) &
+            (upper_shadow < safe_body * upper_ratio) &
+            (context['price_pos'] > 0.75) & (context['is_uptrend'])
         )
         return is_hanging_man.astype(float)
     
     def identify_shooting_star(self, data: pd.DataFrame, context: pd.DataFrame, 
-                              upper_ratio: float = 2.0, lower_ratio: float = 1.0) -> np.ndarray:
-        """识别射击之星"""
+                               upper_ratio: float = 2.0, lower_ratio: float = 0.5) -> np.ndarray:
+        """
+        识别射击之星 (看跌反转)
+        符合市场常识：长上影线（实体2倍以上），小实体，处于上涨后的高位
+        """
         body = np.abs(data['close'] - data['open'])
         lower_shadow = np.minimum(data['open'], data['close']) - data['low']
         upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
         
-        body = np.where(body == 0, 0.001, body)
+        safe_body = np.where(body < data['close'] * 0.001, data['close'] * 0.001, body)
         
         is_shooting_star = (
-            (upper_shadow > body * upper_ratio) &
-            (lower_shadow < body * lower_ratio) &
-            (data['close'] < data['open']) &
-            (context['price_pos'] > 0.7) & (~context['is_sideways'])
+            (upper_shadow > safe_body * upper_ratio) &
+            (lower_shadow < safe_body * lower_ratio) &
+            (context['price_pos'] > 0.75) & (context['is_uptrend'])
         )
         return is_shooting_star.astype(float)
     
     def identify_inverted_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
-                                upper_ratio: float = 2.0, lower_ratio: float = 1.0) -> np.ndarray:
-        """识别倒锤线"""
+                                 upper_ratio: float = 2.0, lower_ratio: float = 0.5) -> np.ndarray:
+        """
+        识别倒锤子线 (看涨反转)
+        符合市场常识：长上影线（实体2倍以上），且处于低位，预示买盘尝试反攻
+        """
         body = np.abs(data['close'] - data['open'])
         lower_shadow = np.minimum(data['open'], data['close']) - data['low']
         upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
         
-        body = np.where(body == 0, 0.001, body)
+        safe_body = np.where(body < data['close'] * 0.001, data['close'] * 0.001, body)
         
         is_inverted_hammer = (
-            (upper_shadow > body * upper_ratio) &
-            (lower_shadow < body * lower_ratio) &
-            (data['close'] > data['open']) &
-            (context['price_pos'] < 0.3) & (~context['is_sideways'])
+            (upper_shadow > safe_body * upper_ratio) &
+            (lower_shadow < safe_body * lower_ratio) &
+            (context['price_pos'] < 0.25) & (context['is_downtrend'])
         )
         return is_inverted_hammer.astype(float)
     
-    def identify_marubozu(self, data: pd.DataFrame, threshold_ratio: float = 0.003) -> np.ndarray:
-        """识别光头光脚线"""
+    def identify_marubozu(self, data: pd.DataFrame, context: pd.DataFrame = None, threshold_ratio: float = 0.002) -> np.ndarray:
+        """
+        识别光头光脚线 (趋势持续或横盘突破)
+        符合市场常识：无影线或影线极短。
+        - 逻辑：如果是横盘期间突破，指导意义极大。
+        """
         lower_shadow = np.minimum(data['open'], data['close']) - data['low']
         upper_shadow = data['high'] - np.maximum(data['open'], data['close'])
         threshold = data['close'] * threshold_ratio
-        is_marubozu = (lower_shadow < threshold) & (upper_shadow < threshold)
-        return is_marubozu.astype(float)
+        
+        body = np.abs(data['close'] - data['open'])
+        is_long_body = body > (data['close'] * 0.015) # 实体至少1.5%
+        
+        is_pure = (lower_shadow < threshold) & (upper_shadow < threshold) & is_long_body
+        
+        # 增加过滤：横盘突破或趋势中继
+        if context is not None:
+            # 横盘突破
+            is_breakout = context['is_sideways'] & (
+                (data['close'] > context['range_high'].shift(1)) | 
+                (data['close'] < context['range_low'].shift(1))
+            )
+            # 趋势中继
+            is_continuation = (~context['is_sideways'])
+            return (is_pure & (is_breakout | is_continuation)).astype(float)
+            
+        return is_pure.astype(float)
     
     def identify_spinning_top(self, data: pd.DataFrame) -> np.ndarray:
         """识别纺锤线"""
@@ -333,9 +382,12 @@ class CandlestickPatterns:
         
         engulfed = (
             prev_is_black & curr_is_white &
-            (curr_close > prev_open) &
+            (curr_close > prev_open * 1.002) & # 显著吞没
             (curr_open < prev_close) &
-            (context['price_pos'] < 0.4) & (~context['is_sideways'])
+            (
+                ((context['price_pos'] < 0.4) & (~context['is_sideways'])) | # 反转
+                (context['is_sideways'] & (curr_close > context['range_high'].shift(1))) # 横盘突破
+            )
         )
         return engulfed.fillna(False).astype(float).values
     
@@ -351,9 +403,12 @@ class CandlestickPatterns:
         
         engulfed = (
             prev_is_white & curr_is_black &
-            (curr_close < prev_open) &
+            (curr_close < prev_open * 0.998) & # 显著吞没
             (curr_open > prev_close) &
-            (context['price_pos'] > 0.6) & (~context['is_sideways'])
+            (
+                ((context['price_pos'] > 0.6) & (~context['is_sideways'])) | # 反转
+                (context['is_sideways'] & (curr_close < context['range_low'].shift(1))) # 横盘突破
+            )
         )
         return engulfed.fillna(False).astype(float).values
     

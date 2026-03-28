@@ -205,7 +205,33 @@ class MLFactorModel:
             dates_train = None
             dates_val = None
 
-        # 3. 内存优化与分批训练
+        # ---------------------------------------------------------------------
+        # 3. 特征缩放 (RobustScaler)
+        # ---------------------------------------------------------------------
+        # 修复 Bug：虽然在 __init__ 定义了 scaler，但原始代码未曾调用。
+        # 对于非排名化的绝对值因子（如 PE, 市场波动率等），缩放对模型稳定性至关重要。
+        print(f"  [INFO] 模型训练准备：正在进行特征缩放 (RobustScaler)...")
+        X_train_raw = self.scaler.fit_transform(X_train_raw).astype(np.float32)
+        X_val_raw = self.scaler.transform(X_val_raw).astype(np.float32)
+
+        # ---------------------------------------------------------------------
+        # 4. 样本打乱 (Shuffle) —— 解决分批训练导致的分布漂移关键
+        # ---------------------------------------------------------------------
+        # 风险：原始数据是按日期严格排序的，分批次训练时 Batch 0 全是旧数据。
+        # 解决：在训练集内部进行随机打乱，使每个 Batch 都能代表全量分布。
+        # 注意：仅针对回归/分类任务 (XGBoost)，排序任务 (LightGBM) 需要在 group 内部有序（这里维持现状）。
+        if self.task != 'ranking':
+            print(f"  [INFO] 正在对训练样本进行随机打乱，以消除分批训练的分布漂移...")
+            shuffle_idx = np.arange(len(X_train_raw))
+            np.random.seed(42)
+            np.random.shuffle(shuffle_idx)
+            X_train_raw = X_train_raw[shuffle_idx]
+            y_train = y_train[shuffle_idx]
+            if w_train is not None: w_train = w_train[shuffle_idx]
+            if r_train is not None: r_train = r_train[shuffle_idx]
+            if dates_train is not None: dates_train = dates_train[shuffle_idx]
+
+        # 5. 内存优化与分批训练
         # 如果启用内存优化且在 GPU 上，使用 XGBoost 的 DataIter 或 LightGBM 的 Dataset 优化
         use_gpu = TrainingConfig.USE_GPU
         mem_efficient = getattr(TrainingConfig, 'MEMORY_EFFICIENT', False)
@@ -214,7 +240,7 @@ class MLFactorModel:
         # ---------------------------------------------------------------------
         # 情况 A: XGBoost 分批训练 (DataIter)
         # ---------------------------------------------------------------------
-        if self.model_type == 'xgboost' and use_gpu and mem_efficient and len(X_train_raw) > batch_size:
+        if self.model_type == 'xgboost' and mem_efficient and len(X_train_raw) > batch_size:
             print(f"  [INFO] XGBoost 启动分批训练模式 (样本数: {len(X_train_raw)}, Batch: {batch_size})")
             
             # 使用更加通用的 DataIter 基类 (兼容不同版本)
@@ -442,8 +468,9 @@ class MLFactorModel:
         }
         
         # 2. 核心选股指标 (Top-N 精度 & 按组 Rank IC)
-        # 无论什么任务，只要提供了日期信息，都按交易日分组评估，这反映了真实的选股能力
-        reference = returns if returns is not None else y.astype(float)
+        # 核心改进：优先使用 soft label y 作为评估基准 (y 已经过板块中性化排名处理)
+        # 这样评估出的 IC 才是真实的“在同板块内选出龙头”的能力
+        reference = y if y is not None else (returns if returns is not None else y_prob)
         
         if dates is not None:
             # 获取日期分组
@@ -553,7 +580,9 @@ class MLFactorModel:
     def predict(self, factors: pd.DataFrame) -> np.ndarray:
         if not self.is_trained: raise ValueError("未训练")
         X = np.nan_to_num(factors[self.feature_names].values, nan=0.0)
-        return self._get_predict_proba(X)
+        # 预测阶段必须使用训练阶段拟合好的 scaler
+        X_scaled = self.scaler.transform(X).astype(np.float32)
+        return self._get_predict_proba(X_scaled)
 
     def predict_signal(self, factors: pd.DataFrame, threshold: float = 0.5) -> Dict:
         prob = self.predict(factors)[0]

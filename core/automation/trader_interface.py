@@ -192,7 +192,11 @@ class AutoTrader:
             except:
                 sell_price = None
 
-            amount = int(target.get('可用余额', target.get('可卖数量', 0)))
+            try:
+                amount = int(float(target.get('可用余额', target.get('可卖数量', 0)) or 0))
+            except (ValueError, TypeError):
+                amount = 0
+                
             if amount > 0:
                 return self.sell(stock_code, amount, price=sell_price)
             else:
@@ -254,17 +258,17 @@ if __name__ == "__main__":
         print("Dry Run 模式测试:")
         print("Balance:", trader.get_balance())
         print("Positions:", trader.get_positions())
-        trader.buy("002397", 200, price=4.5)
+        trader.buy("002397", 200, price=4.1)
     else:
         logger.info("准备进行真实交易测试...")
         if trader.connect():
             # 尝试先获取资金，验证连接质量
             balance = trader.get_balance()
             logger.info(f"当前资金状况: {balance}")
-            
+            trader.buy("002397", 200, price=4.1)
             # 测试验证码识别
             # trader.test_captcha()
 
-            print(trader.get_positions())
+            # print(trader.get_positions())
         else:
             logger.error("连接测试失败")

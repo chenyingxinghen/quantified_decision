@@ -83,9 +83,11 @@ class CandlestickPatternFactors:
             lower_ratio=getattr(self.config, 'HAMMER_UPPER_SHADOW_RATIO', 1.0)
         )
     
-    def calculate_marubozu(self, data: pd.DataFrame) -> np.ndarray:
+    def calculate_marubozu(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """光头光脚线"""
-        return self.analyzer.identify_marubozu(data, threshold_ratio=self.config.BODY_SIZE_THRESHOLD_SMALL)
+        if context is None:
+            context = self.analyzer.calculate_context(data)
+        return self.analyzer.identify_marubozu(data, context=context, threshold_ratio=self.config.BODY_SIZE_THRESHOLD_SMALL)
     
     def calculate_spinning_top(self, data: pd.DataFrame) -> np.ndarray:
         """纺锤线"""
@@ -128,6 +130,18 @@ class CandlestickPatternFactors:
     def calculate_harami(self, data: pd.DataFrame) -> np.ndarray:
         """孕线"""
         return self.analyzer.identify_harami(data)
+    
+    def calculate_three_white_soldiers(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """三个白兵"""
+        if context is None:
+            context = self.analyzer.calculate_context(data)
+        return self.analyzer.identify_three_white_soldiers(data, context=context)
+    
+    def calculate_three_black_crows(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """三只乌鸦"""
+        if context is None:
+            context = self.analyzer.calculate_context(data)
+        return self.analyzer.identify_three_black_crows(data, context=context)
     
     # ==================== K线形态强度指标 ====================
     
@@ -174,7 +188,7 @@ class CandlestickPatternFactors:
         factors['hanging_man'] = self.calculate_hanging_man(data, context=context)
         factors['shooting_star'] = self.calculate_shooting_star(data, context=context)
         factors['inverted_hammer'] = self.calculate_inverted_hammer(data, context=context)
-        factors['marubozu'] = self.calculate_marubozu(data)
+        factors['marubozu'] = self.calculate_marubozu(data, context=context)
         factors['spinning_top'] = self.calculate_spinning_top(data)
         
         # 多根K线形态
@@ -185,6 +199,8 @@ class CandlestickPatternFactors:
         factors['morning_star'] = self.calculate_morning_star(data, context=context)
         factors['evening_star'] = self.calculate_evening_star(data, context=context)
         factors['harami'] = self.calculate_harami(data)
+        factors['three_white_soldiers'] = self.calculate_three_white_soldiers(data, context=context)
+        factors['three_black_crows'] = self.calculate_three_black_crows(data, context=context)
         
         # K线形态强度指标
         factors['candle_body_ratio'] = self.calculate_candle_body_ratio(data)
@@ -204,6 +220,7 @@ class CandlestickPatternFactors:
             # 多根K线形态
             'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
             'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
+            'three_white_soldiers', 'three_black_crows',
             # 强度指标
             'candle_body_ratio', 'upper_shadow_ratio', 'lower_shadow_ratio',
             'pattern_strength', 'pattern_confirmation'

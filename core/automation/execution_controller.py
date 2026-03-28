@@ -32,8 +32,8 @@ from core.automation.trader_interface import AutoTrader
 from config.automation_config import (
     SINGLE_BUY_RATIO, CASH_BUFFER,
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
-    AUTO_TIME_STOP_DAYS, AUTO_TIME_STOP_MIN_LOSS_PCT,
 )
+from config.strategy_config import TIME_STOP_DAYS, TIME_STOP_MIN_LOSS_PCT
 
 from enum import Enum
 
@@ -233,9 +233,9 @@ class ExecutionController:
                     time.sleep(retry_delay * (i + 1))
                     continue
                 
-                # 判定跳过：资金不足、已撤单、无效价格等
-                skip_keywords = ["资金不足", "余额不足", "insufficent", "invalid", "交易时间"]
-                if any(k in msg for k in skip_keywords):
+                # 判定跳过：资金不足、已撤单、无效价格、可用余额等
+                skip_keywords = ["资金不足", "余额不足", "insufficent", "invalid", "交易时间", "可用余额"]
+                if any(k in msg for k in skip_keywords) or res.get("status") == "skipped":
                     return {"op_status": OperationStatus.SKIPPED, "raw": res}
 
                 last_res = res
@@ -380,11 +380,19 @@ class ExecutionController:
 
         for p in positions:
             code = p.get('证券代码', p.get('stock_code', ''))
+            if not code:
+                logger.warning(f"  获取持仓记录缺少证券代码，跳过此持仓: {p}")
+                continue
             base_code = code[:6]
 
-            # T+1 保护
+            # T+1 和 今日已操作保护
             if self.tracking_data["processed_today"].get(base_code) == OperationStatus.SUCCESS.value:
                 logger.info(f"  {code} 今日买入 (T+1 保护)，跳过。")
+                continue
+            
+            sell_status = self.tracking_data["processed_today"].get(f"sell_{base_code}")
+            if sell_status in [OperationStatus.SUCCESS.value, OperationStatus.SKIPPED.value]:
+                logger.info(f"  {code} 今日已执行卖出操作 (状态: {sell_status})，跳过防止重复下单。")
                 continue
 
             # 获取元数据
@@ -394,7 +402,10 @@ class ExecutionController:
 
             if not meta:
                 logger.warning(f"  {code} 无跟踪元数据，执行兜底卖出。")
-                self._do_sell_robust(code, ref_price=current_price, is_st=is_st)
+                success, op_status = self._do_sell_robust(code, ref_price=current_price, is_st=is_st)
+                if op_status in [OperationStatus.SUCCESS, OperationStatus.SKIPPED]:
+                    self.tracking_data["processed_today"][f"sell_{base_code}"] = op_status.value
+                    self._save_tracking()
                 continue
 
             entry_price = float(meta.get('entry_price') or 0)
@@ -422,34 +433,37 @@ class ExecutionController:
                 reason = "take_profit"
 
             if (ENABLE_TIME_STOP_EXIT
-                    and holding_days >= AUTO_TIME_STOP_DAYS
-                    and unrealized_pnl_pct <= AUTO_TIME_STOP_MIN_LOSS_PCT):
+                    and holding_days >= TIME_STOP_DAYS
+                    and unrealized_pnl_pct <= TIME_STOP_MIN_LOSS_PCT):
                 should_exit = True
                 reason = "time_stop"
 
             if should_exit:
                 logger.info(f"  卖出触发: {code} | 原因: {reason} | 收益: {unrealized_pnl_pct*100:.2f}%")
-                success = self._do_sell_robust(code, ref_price=current_price, is_st=is_st)
-                if success:
-                    if base_code in self.tracking_data["positions"]:
+                success, op_status = self._do_sell_robust(code, ref_price=current_price, is_st=is_st)
+                if op_status in [OperationStatus.SUCCESS, OperationStatus.SKIPPED]:
+                    # 标记今日已处理卖出
+                    self.tracking_data["processed_today"][f"sell_{base_code}"] = op_status.value
+                    if success and base_code in self.tracking_data["positions"]:
                         del self.tracking_data["positions"][base_code]
                     self._save_tracking()
             else:
                 logger.info(f"  {code} | 持有 {holding_days}D | 浮盈 {unrealized_pnl_pct*100:.2f}% | 继续持有。")
 
-    def _do_sell_robust(self, code: str, ref_price: Optional[float], is_st: bool) -> bool:
-        """健壮的卖出执行逻辑"""
+    def _do_sell_robust(self, code: str, ref_price: Optional[float], is_st: bool):
+        """健壮的卖出执行逻辑。返回 (success: bool, OperationStatus)"""
         base_code = code[:6]
         
         def attempt_sell():
             # 重新获取最新持仓以确认数量
             pos_list = self.trader.get_positions()
             amount = 0
-            for pos in pos_list:
-                p_code = pos.get('证券代码', pos.get('stock_code', ''))
-                if base_code in p_code or p_code in base_code:
-                    amount = int(pos.get('可用余额', pos.get('可卖数量', 0)) or 0)
-                    break
+            if pos_list:
+                for pos in pos_list:
+                    p_code = pos.get('证券代码', pos.get('stock_code', ''))
+                    if p_code and (base_code in p_code or p_code in base_code):
+                        amount = int(pos.get('可用余额', pos.get('可卖数量', 0)) or 0)
+                        break
             
             if amount <= 0:
                 return {"status": "skipped", "msg": "可用余额为0（可能已下单）"}
@@ -464,10 +478,13 @@ class ExecutionController:
         
         if res_report["op_status"] == OperationStatus.SUCCESS:
             logger.info(f"  ✅ {code} 卖出成功: {res_report['raw']}")
-            return True
+            return True, res_report["op_status"]
+        elif res_report["op_status"] == OperationStatus.SKIPPED:
+            logger.warning(f"  ⏭️ {code} 卖出跳过: {res_report['raw']}")
+            return False, res_report["op_status"]
         else:
             logger.error(f"  ❌ {code} 卖出失败: {res_report['raw']}")
-            return False
+            return False, res_report["op_status"]
 
 
     def is_in_buy_window(self) -> bool:

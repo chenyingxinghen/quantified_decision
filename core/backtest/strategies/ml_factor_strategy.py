@@ -1,10 +1,8 @@
 """
 ML因子策略（回测版本）
-
 将ML因子模型集成到新的回测框架
 回测时完全依赖训练阶段生成的因子缓存，不再实时计算特征工程
 """
-
 import os
 import sys
 import pandas as pd
@@ -13,14 +11,11 @@ import sqlite3
 import hashlib
 import talib
 from typing import Dict, List, Any, Optional, Tuple
-
 from core.backtest.strategy import BaseStrategy, StrategySignal
 from core.factors.ml_factor_model import MLFactorModel
-from config import DATABASE_PATH
 import config.strategy_config as sc
 import config.factor_config as fc
-
-
+from config import DATABASE_PATH, SUPPORTED_MARKETS
 class MLFactorBacktestStrategy(BaseStrategy):
     """ML因子回测策略
     
@@ -32,7 +27,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
     
     def __init__(self,
                  model_path: str,
-                 min_confidence: float = 0.0,
+                 min_confidence: float = sc.ML_FACTOR_MIN_CONFIDENCE,
                  use_cache: bool = True,
                  cache_dir: str = None,
                  name: str = "ML因子策略"):
@@ -64,15 +59,50 @@ class MLFactorBacktestStrategy(BaseStrategy):
         """初始化策略"""
         super().initialize(**kwargs)
         
-        # 加载模型
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"模型文件不存在: {self.model_path}")
+        # 智能加载模型 (支持单模型和集成模型)
+        def _load_smart_model(target_path):
+            from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
+            
+            if os.path.isdir(target_path):
+                xgb_p = os.path.join(target_path, 'xgboost_factor_model.pkl')
+                lgb_p = os.path.join(target_path, 'lightgbm_factor_model.pkl')
+                if os.path.exists(xgb_p) and os.path.exists(lgb_p):
+                    m1 = MLFactorModel(model_type='xgboost'); m1.load_model(xgb_p)
+                    m2 = MLFactorModel(model_type='lightgbm'); m2.load_model(lgb_p)
+                    return EnsembleFactorModel(models=[m1, m2], weights=[0.5, 0.5])
+                
+                # 寻找目录下最新的 pkl
+                pkls = [os.path.join(target_path, f) for f in os.listdir(target_path) if f.endswith('.pkl')]
+                if pkls:
+                    latest_pkl = sorted(pkls, key=os.path.getmtime)[-1]
+                    return _load_smart_model(latest_pkl)
+                return None
+            
+            if not os.path.exists(target_path): return None
+            
+            try:
+                # 尝试加载为集成模型
+                return EnsembleFactorModel.load_model(target_path)
+            except Exception as e:
+                # 降级为单模型，但记录原因（如果不是因为结构不匹配导致的加载失败）
+                if "pickle" in str(e).lower() or "not a directory" in str(e).lower():
+                    print(f"  [DEBUG] 集成模型加载失败，将尝试加载为单模型: {e}")
+                
+                try:
+                    m = MLFactorModel()
+                    m.load_model(target_path)
+                    return m
+                except Exception as e2:
+                    print(f"  [ERROR] 单模型加载也失败: {e2}")
+                    return None
+
+        self.model = _load_smart_model(self.model_path)
         
-        self.model = MLFactorModel()
-        self.model.load_model(self.model_path)
+        if self.model is None:
+            raise ValueError(f"无法从 {self.model_path} 加载模型")
         
-        if not self.model.is_trained:
-            raise ValueError("模型未训练")
+        if not getattr(self.model, 'is_trained', False):
+            raise ValueError("加载的模型未经过训练")
         
         # 检测缓存状态
         cache_status = "未找到"
@@ -86,11 +116,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     sample = pd.read_parquet(os.path.join(self.cache_dir, cache_files[0]))
                     missing = [f for f in self.model.feature_names if f not in sample.columns]
                     if missing:
-                        print(f"  警告: 缓存缺少 {len(missing)} 个模型特征，将用0填充")
+                        print(f"  警告: 缓存缺少 {len(missing)} 个模型特征 (如 {missing[:3]})，将用0填充")
                     else:
                         print(f"  缓存特征与模型完全匹配 ✓")
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  警告: 无法验证缓存特征: {e}")
         
         print(f"策略初始化完成: {self.name}")
         print(f"  模型: {self.model_path}")
@@ -128,11 +158,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 但为了效率，通常在无头寸时快速退出
         if available_slots <= 0:
             return signals
-
         # 1. 获取所有股票代码 (从缓存目录获取)
         if not hasattr(self, '_all_db_codes'):
-            self._all_db_codes = [f.split('_')[0] for f in os.listdir(self.cache_dir) if f.endswith('.parquet')]
-
+            # 修复问题17：使用更健壮的文件名解析方式
+            suffix = '_factors.parquet'
+            self._all_db_codes = [f[:-len(suffix)] for f in os.listdir(self.cache_dir) if f.endswith(suffix)]
         all_codes = self._all_db_codes
         
         # 2. 提前获取基本面信息并预筛选 (提升效率 & 对齐 select_stocks.py)
@@ -156,7 +186,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
         
         if not predict_codes:
             return signals
-
         # 3. 批量获取当前日期的因子数据 (仅针对通过筛选的股票)
         raw_rows = []
         stock_codes_with_data = []
@@ -184,17 +213,31 @@ class MLFactorBacktestStrategy(BaseStrategy):
         
         if not raw_rows:
             return signals
-
-        # 4. 预测与排序
+        # 4. 执行横截面分位数排名 (关键修复：确保回测特征分布与训练完全对齐)
         all_X = pd.concat(raw_rows, axis=0, ignore_index=True)
-        all_X = all_X.astype(np.float64).fillna(0)
+        all_X = all_X.astype(np.float64)
+        
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            # 识别需要进行横截面排名的因子索引 (同步 train_ml_model 逻辑)
+            sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
+            rank_cols = [col for col in all_X.columns if not any(k in col.lower() for k in sentiment_keys)]
+            
+            if rank_cols and len(all_X) > 1:
+                # 仅对通过筛选的股票池进行当日排名
+                all_X[rank_cols] = all_X[rank_cols].rank(pct=True).fillna(0.5)
+        
+        # 填充剩余 NaN
+        all_X = all_X.fillna(0.5)
         
         try:
             probs = self.model.predict(all_X)
         except Exception as e:
-            print(f"  [错误] 批量预测失败: {e}")
+            import traceback
+            print(f"  [致命错误] 批量预测发生异常: {e}")
+            traceback.print_exc()
             return signals
-
         # 5. 构造候选者并排序
         candidates = []
         for i, code in enumerate(stock_codes_with_data):
@@ -204,11 +247,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
             # 置信度过滤
             if confidence < self.min_confidence:
                 continue
-                
-            # 回归模型阈值过滤 (50% 为中平点)
-            if hasattr(self.model, 'task') and self.model.task != 'ranking':
-                if prob < getattr(self.model, 'optimal_threshold', 0.5):
-                    continue
             
             # 引入哈希扰动以确保排序稳定性
             tie_breaker = int(hashlib.md5(str(code).encode()).hexdigest(), 16) % 1000 / 100000.0
@@ -264,7 +302,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 break
                 
         return signals
-
     def _get_stock_info_map_pit(self, target_date: str) -> Dict[str, Dict]:
         """
         获取点在时间 (Point-In-Time) 的股票基本信息
@@ -275,80 +312,85 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 v = float(val)
                 return v if np.isfinite(v) else None
             except: return None
+        # 确保数据库路径存在
+        if not os.path.exists(DATABASE_PATH):
+            raise FileNotFoundError(f"主数据库不存在: {DATABASE_PATH}")
 
-        # 连接数据库
+        # 利用 DataHandler 或直接连接，这里保持直接连接但优化 SQL 鲁棒性
         db_dir = os.path.dirname(DATABASE_PATH)
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(DATABASE_PATH, timeout=30)
+        
         meta_db = os.path.join(db_dir, 'stock_meta.db')
         finance_db = os.path.join(db_dir, 'stock_finance.db')
+        
         if os.path.exists(meta_db):
             conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
         if os.path.exists(finance_db):
             conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
 
-        # 1. 基础信息 (假定 current name/st 可接受，或者从历史表获取)
-        try:
-            meta_df = pd.read_sql_query("SELECT code, name, is_st FROM meta.stock_info_extended", conn)
-        except:
-            meta_df = pd.DataFrame(columns=['code', 'name', 'is_st'])
-
+        # 1. 基础信息 from meta (直接查询当前标准的 stock_basic 表)
+        meta_df = pd.read_sql_query("SELECT code, code_name AS name FROM meta.stock_basic", conn)
+        
         # 2. PIT 财务数据 (取 target_date 之前最新的报告)
-        try:
-            finance_df = pd.read_sql_query(f"""
-                SELECT f.code, f.EPSJB, f.BPS, f.ZCFZL
-                FROM finance.finance_reports f
-                INNER JOIN (
-                    SELECT code, MAX(REPORT_DATE) AS max_date
-                    FROM finance.finance_reports
-                    WHERE REPORT_DATE <= '{target_date}'
-                    GROUP BY code
-                ) latest ON f.code = latest.code AND f.REPORT_DATE = latest.max_date
-            """, conn)
-        except:
-            finance_df = pd.DataFrame(columns=['code', 'EPSJB', 'BPS', 'ZCFZL'])
-
-        # 3. PIT 价格 (用于计算 PE/PB)
-        try:
-            price_df = pd.read_sql_query(f"""
-                SELECT code, close
-                FROM daily_data
-                WHERE (code, date) IN (
-                    SELECT code, MAX(date) FROM daily_data 
-                    WHERE date <= '{target_date}' 
-                    GROUP BY code
-                )
-            """, conn)
-        except:
-            price_df = pd.DataFrame(columns=['code', 'close'])
-
+        # 精确 PIT 逻辑：必须在 target_date 之前通过 pub_date 发布
+        finance_df = pd.read_sql_query(f"""
+            SELECT p.code, p.epsTTM AS EPSJB, p.totalShare, b.liabilityToAsset AS ZCFZL
+            FROM finance.profit_ability p
+            LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
+            INNER JOIN (
+                SELECT code, MAX(pub_date) AS max_date
+                FROM finance.profit_ability
+                WHERE pub_date IS NOT NULL AND pub_date != '' AND pub_date <= '{target_date}'
+                GROUP BY code
+            ) latest ON p.code = latest.code AND p.pub_date = latest.max_date
+        """, conn)
+        
+        # 3. PIT 价格 & 动态快照 (is_st, pbMRQ)
+        price_df = pd.read_sql_query(f"""
+            SELECT code, close, pbMRQ, is_st
+            FROM daily_data
+            WHERE (code, date) IN (
+                SELECT code, MAX(date) FROM daily_data 
+                WHERE date <= '{target_date}' 
+                GROUP BY code
+            )
+        """, conn)
+        
         conn.close()
-
         # 构建映射
         fin_map = {str(r.code): r for r in finance_df.itertuples()}
-        prc_map = {str(r.code): r.close for r in price_df.itertuples()}
+        prc_map = {str(r.code): r for r in price_df.itertuples()}
         
         info_map = {}
-        for r in meta_df.itertuples():
+        # 以 price_df 为主，因为只有有行情的股票才能回测
+        for r in price_df.itertuples():
             code = str(r.code)
             fin = fin_map.get(code)
-            close = prc_map.get(code)
+            # 根据 code 获取对应名称
+            meta_rows = meta_df[meta_df['code'] == code]
+            name = meta_rows['name'].iloc[0] if not meta_rows.empty else '-'
             
+            close = r.close
             eps = getattr(fin, 'EPSJB', None)
-            bps = getattr(fin, 'BPS', None)
+            total_share = getattr(fin, 'totalShare', None)
+            
             pe = close / eps if close and eps and eps > 0 else None
-            pb = close / bps if close and bps and bps > 0 else None
+            # market_cap 以 “亿” 为单位
+            mcap = (close * total_share / 1e8) if close and total_share else None
+            
+            # 状态标记
+            is_st = getattr(r, 'is_st', 0)
             
             info_map[code] = {
-                'name': r.name,
-                'is_st': r.is_st,
+                'name': name,
+                'is_st': int(is_st or 0),
                 'pe_ratio': pe,
-                'pb_ratio': pb,
+                'pb_ratio': getattr(r, 'pbMRQ', None), # Baostock 提供的动态 PB
                 'zcfzl': getattr(fin, 'ZCFZL', None),
                 'current_price': close,
-                'market_cap': None # 如果需要，可增加总股本计算
+                'market_cap': mcap
             }
         return info_map
-
     def _pre_filter_stocks(self, all_codes: List[str], info_map: Dict[str, Dict], apply_filter: bool, criteria: Dict) -> Tuple[List[str], Dict]:
         """
         副本自 select_stocks.py: 根据 criteria 过滤股票
@@ -363,16 +405,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
         include_st = criteria.get('include_st', True)
         markets = criteria.get('markets')
         max_zcfzl = criteria.get('max_zcfzl')
-
-        pref_map = {'sh': ('60'), 'sz_main': ('00'), 'sz_gem': ('30'), 'bj': ('8', '4', '9')}
         allowed_prefixes = []
         if markets:
             for m in markets:
-                p = pref_map.get(m)
-                if isinstance(p, tuple): allowed_prefixes.extend(p)
-                elif p: allowed_prefixes.append(p)
+                p = SUPPORTED_MARKETS.get(m, {}).get('prefixes')
+                if p: allowed_prefixes.extend(p)
         allowed_prefixes = tuple(allowed_prefixes)
-
         passed = []
         for code in all_codes:
             info = info_map.get(code)
@@ -419,7 +457,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
             )
             val = atr_series[-1]
             return float(val) if np.isfinite(val) else 0.0
-        except Exception:
+        except Exception as e:
+            # 记录异常但返回默认值，避免中断整个回测
+            if len(data) > period:
+                print(f"  警告: 计算 ATR 失败 ({len(data)} 行数据): {e}")
             return 0.0
     
     def _get_factors(self, stock_code: str, stock_data: pd.DataFrame, current_date: str) -> Optional[pd.DataFrame]:
@@ -519,8 +560,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
             self._factors_cache[stock_code] = factors
             
             return factors
-        
-        except Exception:
+            
+        except Exception as e:
+            print(f"  错误: 无法加载股票 {stock_code} 的缓存文件 {cache_file}: {e}")
             return None
     
     def cleanup(self):

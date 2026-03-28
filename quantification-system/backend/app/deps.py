@@ -8,13 +8,10 @@ import sqlite3
 from functools import lru_cache
 from typing import Optional
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+from config import DATABASE_PATH, USER_DB_PATH, DATABASE_DIR, PROJECT_ROOT
+from config.strategy_config import ML_FACTOR_MODEL_PATH
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-
-from config import DATABASE_PATH, USER_DB_PATH, DATABASE_DIR
-from config.strategy_config import ML_FACTOR_MODEL_PATH
-
 
 def get_db_path() -> str:
     """返回 SQLite 数据库绝对路径"""
@@ -47,53 +44,6 @@ def get_user_db():
         pass
     return conn
 
-
-def check_and_migrate_positions_schema(conn):
-    """
-    检查并迁移 positions 表结构，确保 buy_price 允许为空。
-    """
-    try:
-        cursor = conn.execute("PRAGMA table_info(positions)")
-        cols = cursor.fetchall()
-        buy_price_col = next((c for c in cols if c[1] == 'buy_price'), None)
-        
-        if buy_price_col and buy_price_col[3] == 1: # 3 is 'notnull'
-            print("⚠️ 检测到 buy_price 为 NOT NULL，正在执行平滑迁移...")
-            # SQLite 不支持直接 ALTER COLUMN，需要重建模
-            conn.executescript("""
-                BEGIN TRANSACTION;
-                -- 1. 备份数据
-                CREATE TABLE IF NOT EXISTS positions_backup AS SELECT * FROM positions;
-                -- 2. 删除原表
-                DROP TABLE positions;
-                -- 3. 重建新表 (buy_price 允许 NULL)
-                CREATE TABLE positions (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code        TEXT NOT NULL,
-                    name        TEXT DEFAULT '',
-                    buy_date    TEXT NOT NULL,
-                    buy_price   REAL,                             -- 允许为空
-                    quantity    INTEGER NOT NULL DEFAULT 1,
-                    status      TEXT NOT NULL DEFAULT 'active',
-                    sell_date   TEXT,
-                    sell_price  REAL,
-                    sell_reason TEXT,
-                    profit_pct  REAL,
-                    notes       TEXT DEFAULT '',
-                    created_at  TEXT DEFAULT (datetime('now','localtime')),
-                    username    TEXT DEFAULT 'guest',
-                    monitoring  INTEGER DEFAULT 1
-                );
-                -- 4. 恢复数据
-                INSERT INTO positions (id, code, name, buy_date, buy_price, quantity, status, sell_date, sell_price, sell_reason, profit_pct, notes, created_at, username, monitoring)
-                SELECT id, code, name, buy_date, buy_price, quantity, status, sell_date, sell_price, sell_reason, profit_pct, notes, created_at, username, monitoring FROM positions_backup;
-                -- 5. 删除备份
-                DROP TABLE positions_backup;
-                COMMIT;
-            """)
-            print("✅ 数据库迁移完成。")
-    except Exception as e:
-        print(f"❌ 迁移失败: {e}")
 
 
 def get_paper_db():
@@ -161,20 +111,6 @@ def init_user_db():
                 created_at  TEXT DEFAULT (datetime('now','localtime'))
             );
         """)
-        
-        # 补齐缺少的列
-        try:
-            conn.execute("ALTER TABLE positions ADD COLUMN username TEXT DEFAULT 'guest'")
-        except sqlite3.OperationalError:
-            pass
-            
-        try:
-            conn.execute("ALTER TABLE positions ADD COLUMN monitoring INTEGER DEFAULT 1")
-        except sqlite3.OperationalError:
-            pass
-        
-        # 执行结构迁移（针对 buy_price）
-        check_and_migrate_positions_schema(conn)
         
         conn.commit()
     finally:

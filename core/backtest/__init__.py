@@ -7,7 +7,7 @@ Core Backtest Module - 核心回测模块
 from .engine import BacktestEngine
 from .strategy import BaseStrategy, StrategySignal
 from .portfolio import Portfolio, Position, Trade
-from .data_handler import DataHandler
+from .baostock_data_handler import BaostockDataHandler as DataHandler
 from .performance import PerformanceAnalyzer
 
 __all__ = [

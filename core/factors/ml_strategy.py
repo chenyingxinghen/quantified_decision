@@ -49,16 +49,24 @@ class MLFactorStrategy:
         else:
             print(f"警告: 模型文件不存在: {model_path}")
     
+    def _dynamic_adjust(self, df: pd.DataFrame) -> pd.DataFrame:
+        """动态复权修正价格序列跳变"""
+        if df is None or df.empty or 'fore_adjust_factor' not in df.columns:
+            return df
+        
+        valid_adj = df['fore_adjust_factor'].dropna()
+        if not valid_adj.empty:
+            base_val = float(valid_adj.iloc[-1])
+            if base_val != 0:
+                ratio = df['fore_adjust_factor'].ffill().fillna(1.0) / base_val
+                for col in ['open', 'high', 'low', 'close']:
+                    if col in df.columns:
+                        df[col] = df[col] * ratio
+        return df
+
     def _get_stock_data_from_db(self, stock_code: str, days: int = 300) -> Optional[pd.DataFrame]:
         """
-        从数据库获取股票数据
-        
-        参数:
-            stock_code: 股票代码
-            days: 获取天数
-        
-        返回:
-            DataFrame: 股票数据
+        从数据库获取股票数据 (修正：集成动态复权)
         """
         try:
             from datetime import datetime, timedelta
@@ -72,10 +80,11 @@ class MLFactorStrategy:
             # 从数据库查询
             conn = sqlite3.connect(DATABASE_PATH)
             query = '''
-                SELECT date, open, high, low, close, volume, amount, turnover_rate
-                FROM daily_data
-                WHERE code = ? AND date >= ? AND date <= ?
-                ORDER BY date ASC
+                SELECT k.date, k.open, k.high, k.low, k.close, k.volume, k.amount, k.turnover_rate, a.fore_adjust_factor
+                FROM daily_data k
+                LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
+                WHERE k.code = ? AND k.date >= ? AND k.date <= ?
+                ORDER BY k.date ASC
             '''
             
             df = pd.read_sql_query(query, conn, params=(stock_code, start_date, end_date))
@@ -84,7 +93,7 @@ class MLFactorStrategy:
             if df.empty:
                 return None
             
-            return df
+            return self._dynamic_adjust(df)
             
         except Exception as e:
             print(f"从数据库获取{stock_code}数据失败: {e}")
@@ -181,7 +190,9 @@ class MLFactorStrategy:
             }
         
         except Exception as e:
-            # 静默处理错误，不打印
+            import traceback
+            print(f"  [ERROR] 筛选股票 {stock_code} 失败: {e}")
+            traceback.print_exc()
             return None
     
     def _calculate_atr(self, data: pd.DataFrame, period: int = None) -> float:
@@ -205,30 +216,102 @@ class MLFactorStrategy:
     
     def batch_screen(self, stock_codes: list, min_confidence: float = 60.0) -> list:
         """
-        批量筛选股票
+        批量筛选股票 (修正：集成真正的横截面排名逻辑)
         
-        参数:
-            stock_codes: 股票代码列表
-            min_confidence: 最小置信度
-        
-        返回:
-            符合条件的股票列表
+        流程:
+        1. 获取所有股票的最新因子数据
+        2. 将所有因子合并为大矩阵
+        3. 执行每日横截面分位数标准化
+        4. 模型批量预测 (保证 Confidence 的准确分布)
         """
-        results = []
-        
-        print(f"开始批量筛选 {len(stock_codes)} 只股票...")
-        
-        for i, code in enumerate(stock_codes, 1):
-            if i % 50 == 0:
-                print(f"  进度: {i}/{len(stock_codes)}")
+        if self.model is None or not self.model.is_trained:
+            return []
             
-            result = self.screen_stock(code, min_confidence)
-            if result:
-                results.append(result)
+        print(f"\n开始批量筛选 {len(stock_codes)} 只股票 [集成横截面归一化]...")
+        
+        all_latest_factors = []
+        valid_codes = []
+        stock_prices = {}
+        stock_atrs = {}
+
+        # 1. 批量收集全量因子
+        for i, code in enumerate(stock_codes):
+            try:
+                data = self._get_stock_data_from_db(code, days=300)
+                if data is None or len(data) < 100: continue
+                
+                factors = self.factor_calculator.calculate_all_factors(
+                    code, data, apply_feature_engineering=True,
+                    target_features=self.model.feature_names
+                )
+                
+                if factors is not None and not factors.empty:
+                    # 取最新一行
+                    latest = factors.iloc[[-1]].copy()
+                    if not latest.isna().all().any():
+                        all_latest_factors.append(latest)
+                        valid_codes.append(code)
+                        stock_prices[code] = data['close'].iloc[-1]
+                        stock_atrs[code] = self._calculate_atr(data)
+                
+                if (i+1) % 50 == 0:
+                    print(f"  收集因子进度: {i+1}/{len(stock_codes)}")
+            except:
+                continue
+
+        if not all_latest_factors:
+            return []
+
+        # 2. 合并并进行横截面归一化
+        all_X = pd.concat(all_latest_factors, axis=0, ignore_index=True)
+        all_X = all_X.astype(np.float64)
+        
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            # 同步 train_ml_model 豁免逻辑
+            sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
+            rank_cols = [col for col in all_X.columns if not any(k in col.lower() for k in sentiment_keys)]
+            
+            if rank_cols and len(all_X) > 1:
+                all_X[rank_cols] = all_X[rank_cols].rank(pct=True).fillna(0.5)
+        
+        all_X = all_X.fillna(0.5)
+
+        # 3. 批量预测
+        print(f"  正在执行批量预测 [数量: {len(valid_codes)}]...")
+        probs = self.model.predict(all_X)
+        
+        # 4. 汇总结果
+        results = []
+        top_factor_names = self.model.get_top_factors(n=10)
+
+        for i, code in enumerate(valid_codes):
+            prob = float(probs[i])
+            confidence = prob * 100
+            
+            if confidence >= min_confidence:
+                current_price = stock_prices[code]
+                atr = stock_atrs[code]
+                
+                results.append({
+                    'stock_code': code,
+                    'signal': 'buy' if prob > 0.5 else 'hold',
+                    'confidence': confidence,
+                    'current_price': current_price,
+                    'entry_price': current_price,
+                    'stop_loss': current_price - 1.5 * atr,
+                    'target': current_price + 3.0 * atr,
+                    'prediction': prob,
+                    'top_factors': top_factor_names,
+                    'analysis': {
+                        'strategy_type': 'ml_factor_integrated',
+                        'model_type': self.model.model_type
+                    }
+                })
         
         # 按置信度排序
         results.sort(key=lambda x: x['confidence'], reverse=True)
-        
         print(f"\n筛选完成，找到 {len(results)} 只符合条件的股票")
         
         return results

@@ -28,6 +28,9 @@ from datetime import datetime, timedelta
 import sqlite3
 from typing import Dict, List, Tuple, Optional, Any
 from joblib import Parallel, delayed
+from scipy.stats import spearmanr, rankdata
+from time import time
+from tqdm import tqdm
 
 from core.factors.quantitative_factors import QuantitativeFactors
 from core.factors.candlestick_pattern_factors import CandlestickPatternFactors
@@ -82,7 +85,7 @@ class MLModelTrainer:
     
     def load_training_data(self, stock_codes: List[str], 
                           start_date: str, end_date: str,
-                          batch_size: int = 500) -> Dict[str, pd.DataFrame]:
+                          batch_size: int = 200) -> Dict[str, pd.DataFrame]:
         """
         加载训练数据（批量加载优化）
         
@@ -108,38 +111,57 @@ class MLModelTrainer:
         conn.row_factory = sqlite3.Row
         
         # 分批加载，避免 IN 子句过长
+        pbar = tqdm(total=len(stock_codes), desc="加载进度")
         for i in range(0, len(stock_codes), batch_size):
             batch_codes = stock_codes[i:i+batch_size]
             placeholders = ','.join(['?' for _ in batch_codes])
             
+            # 重要改进：增加对 adjust_factor 的关联查询，实现动态复权，消除数据库增量更新导致的跳变
             query = f'''
-                SELECT d.code, d.date, d.open, d.high, d.low, d.close, d.volume, d.amount, d.turnover_rate,
-                       IFNULL(s.is_st, 0) as is_st
-                FROM daily_data d
-                LEFT JOIN meta.stock_info_extended s ON d.code = s.code
-                WHERE d.code IN ({placeholders}) AND d.date >= ? AND d.date <= ?
-                ORDER BY d.code, d.date ASC
+                SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.preclose, k.volume, k.amount, k.turnover_rate,
+                       k.is_st, k.peTTM, k.pbMRQ, a.fore_adjust_factor
+                FROM daily_data k
+                LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
+                WHERE k.code IN ({placeholders}) AND k.date >= ? AND k.date <= ?
+                ORDER BY k.code, k.date ASC
             '''
             
             params = list(batch_codes) + [str(start_date), str(end_date)]
-            # print(f"Executing query with {len(params)} params for {len(batch_codes)} stocks")
             df = pd.read_sql_query(query, conn, params=tuple(params))
             
-            # 按股票分组
+            if df.empty:
+                continue
+
+            # 按股票分组并执行动态复权
             for code in df['code'].unique():
                 stock_df = df[df['code'] == code].copy()
                 stock_df = stock_df.sort_values('date').reset_index(drop=True)
                 
-                if len(stock_df) >= 100:  # 至少100个交易日
-                    stocks_data[code] = stock_df
+                # 动态复权处理
+                if 'fore_adjust_factor' in stock_df.columns:
+                    # 获取该段数据最后的复权因子作为基准 (最新日期的 qfq)
+                    valid_adj = stock_df['fore_adjust_factor'].dropna()
+                    if not valid_adj.empty:
+                        base_factor = float(valid_adj.iloc[-1])
+                        # 仅在基准非零时处理
+                        if base_factor != 0:
+                            ratio = stock_df['fore_adjust_factor'].ffill().fillna(1.0) / base_factor
+                            for col in ['open', 'high', 'low', 'close', 'preclose']:
+                                if col in stock_df.columns:
+                                    stock_df[col] = stock_df[col] * ratio
+                
+                if len(stock_df) < 100:
+                    continue
+                
+                stocks_data[code] = stock_df
             
             # 进度提示
-            loaded_count = min(i + batch_size, len(stock_codes))
-            print(f"  已加载: {loaded_count}/{len(stock_codes)} 只股票")
+            pbar.update(len(batch_codes))
         
+        pbar.close()
         conn.close()
         
-        print(f"成功加载 {len(stocks_data)} 只股票的数据")
+        print(f"成功加载并复权 {len(stocks_data)} 只股票的数据")
         return stocks_data
     
     def calculate_and_save_factors(self, code: str, data: pd.DataFrame, 
@@ -267,12 +289,18 @@ class MLModelTrainer:
                 return cached_factors
 
             # 列对齐：新行缺少的列补 NaN，多余列丢弃
-            for col in cached_factors.columns:
-                if col not in new_factor_rows.columns:
-                    new_factor_rows[col] = np.nan
+            missing_cols = [col for col in cached_factors.columns if col not in new_factor_rows.columns]
+            if missing_cols:
+                # 批量添加缺失列以避免 DataFrame 碎片化 (Fix PerformanceWarning)
+                nan_df = pd.DataFrame(np.nan, index=new_factor_rows.index, columns=missing_cols)
+                new_factor_rows = pd.concat([new_factor_rows, nan_df], axis=1)
+            
             new_factor_rows = new_factor_rows[cached_factors.columns]
 
+            # 修复问题8：增量合并时去重，避免日期重叠导致的重复行
             all_factors = pd.concat([cached_factors, new_factor_rows], ignore_index=True)
+            if 'date' in all_factors.columns:
+                all_factors = all_factors.drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
 
         # ── 6. 保存到缓存 ──────────────────────────────────────────────────
         try:
@@ -285,6 +313,54 @@ class MLModelTrainer:
                 print(f"  保存因子缓存失败 ({code}): {e}")
 
         return all_factors
+
+    def batch_update_factor_cache(self, stocks_data: Dict[str, pd.DataFrame], 
+                                 include_fundamentals: bool = True,
+                                 target_features: Optional[List[str]] = None,
+                                 n_jobs: int = 15,
+                                 verbose: bool = False):
+        """
+        并行批量更新因子的持久化缓存到最新行情日期。
+        
+        参数:
+            stocks_data: {code: DataFrame} (应包含到最新日期的行情)
+            include_fundamentals: 是否包含基本面
+            n_jobs: 并打数
+            verbose: 是否输出详细信息
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        print(f"\n[因子缓存同步] 正在并行更新 {len(stocks_data)} 只股票的缓存 (workers={n_jobs})...")
+        
+        start_time = time()
+        success = 0
+        failed = 0
+        
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            futures = {
+                executor.submit(
+                    self.calculate_and_save_factors, 
+                    code, data, 
+                    target_features=target_features,
+                    include_fundamentals=include_fundamentals,
+                    verbose=verbose
+                ): code 
+                for code, data in stocks_data.items()
+            }
+            
+            with tqdm(total=len(futures), desc="更新因子缓存") as pbar:
+                for future in as_completed(futures):
+                    code = futures[future]
+                    try:
+                        future.result()
+                        success += 1
+                    except Exception as e:
+                        tqdm.write(f"  ✗ {code} 缓存更新失败: {e}")
+                        failed += 1
+                    pbar.set_postfix({"成功": success, "失败": failed})
+                    pbar.update(1)
+                    
+        elapsed = time() - start_time
+        print(f"✓ 缓存同步完成: 成功 {success}, 失败 {failed} | 耗时 {elapsed:.1f}s")
     
 
     def _load_or_compute_factors(self, code: str, data: pd.DataFrame, 
@@ -335,19 +411,23 @@ class MLModelTrainer:
                 close = data['close']
                 high = data['high']
                 low = data['low']
+                next_open = data['open'].shift(-1)
                 
                 
-                # A. 收益率计算 (未来 n 日收盘涨幅)
+                # A. 收益率计算 (基于 T+1 开盘价的未来 n 日实际可得涨幅)
+                # 修正：使用下一日开盘价作为成本基础，避免夜间跳空高开导致的收益漏洞
                 f_close = close.shift(-forward_days)
-                f_returns = (f_close / close - 1)
+                f_returns = (f_close / next_open - 1)
                 
                 # 获取未来 n 日内的最大涨幅 (Max Run-up)，基于 T+1 到 T+n
+                # 修复：使用 rolling(n).max().shift(-n) 确保获取的是未来 n 天的最高价
                 f_high_max = high.rolling(window=forward_days).max().shift(-forward_days)
-                f_max_returns = (f_high_max / close - 1)
+                f_max_returns = (f_high_max / next_open - 1)
                 
                 # 获取未来 n 日内的最大跌幅 (Max Drawdown/Pain)，基于 T+1 到 T+n
+                # 修复：使用 rolling(n).min().shift(-n) 确保获取的是未来 n 天的最低价
                 f_low_min = low.rolling(window=forward_days).min().shift(-forward_days)
-                f_min_returns = (f_low_min / close - 1)
+                f_min_returns = (f_low_min / next_open - 1)
 
                 # 1. 路径质量分 (Path-aware Score)
                 # 显著惩罚回撤大、先跌后涨的标的，引导模型选择“走势稳健”的头部标的
@@ -387,28 +467,40 @@ class MLModelTrainer:
                     final_returns = target_returns[valid_idx] if isinstance(target_returns, pd.Series) else target_returns[valid_idx]
                     
                     # 涨跌停判定增强：兼容主板(10%)、创业板/科创板(20%)、北交所(30%)
-                    is_st = data['is_st'].iloc[0] == 1 if 'is_st' in data.columns else False
-                    if is_st:
-                        limit_threshold = MARKET_LIMITS['st']
-                    elif code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
-                        limit_threshold = MARKET_LIMITS['gem_star']
+                    # 修复：使用当前行的 is_st 状态而非首行，因为 ST 状态会随时间变化
+                    is_st_series = data['is_st'][valid_idx] == 1 if 'is_st' in data.columns else pd.Series(False, index=data.index[valid_idx])
+                    
+                    # 为每一行计算对应的涨停阈值
+                    limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
+                    
+                    if 'is_st' in data.columns:
+                        limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
+                    
+                    if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
+                        limit_thresholds[:] = MARKET_LIMITS['gem_star']
+                        if 'is_st' in data.columns:
+                            limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
                     elif code.startswith(MARKET_PREFIXES['bj']):
-                        limit_threshold = MARKET_LIMITS['bj']
-                    else:
-                        limit_threshold = MARKET_LIMITS['main']
-                        
-                    is_limit_up = (data['close'] == data['high']) & (data['close'].pct_change() > limit_threshold)
+                        limit_thresholds[:] = MARKET_LIMITS['bj']
+                        if 'is_st' in data.columns:
+                            limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
+                    
+                    # 使用逐行的阈值判断涨停
+                    pct_change = data['close'].pct_change()
+                    is_limit_up = (data['close'] == data['high']) & (pct_change > pd.Series(limit_thresholds, index=data.index))
                     is_suspended = data['volume'] == 0
                     unbuyable_mask = (is_limit_up | is_suspended)[valid_idx].values
                     
+                    # 提取有效行的涨停阈值用于后续分组
+                    limit_groups = limit_thresholds[valid_idx]
+                    
                     # 5. 显式剔除元数据列 (确保 is_st, date 不进入模型)
-                    drop_cols = ['date', 'is_st', 'code', 'ORG_TYPE']
+                    drop_cols = ['date', 'is_st', 'code', 'fore_adjust_factor', 'back_adjust_factor']
                     if not getattr(TrainingConfig, 'USE_AMOUNT_TURNOVER', False):
                         drop_cols.extend(['amount', 'turnover_rate'])
                     X_df = X_df.drop(columns=[c for c in drop_cols if c in X_df.columns], errors='ignore')
                     
                     if len(X_df) > 0:
-                        limit_groups = np.full(len(X_df), limit_threshold, dtype=np.float32)
                         return X_df, final_y, final_returns, dates, unbuyable_mask, limit_groups
             
             return None, None, None, None, None, None
@@ -454,7 +546,7 @@ class MLModelTrainer:
         filtered_count = 0
         recomputed_count = 0
         
-        for code, data in stocks_data.items():
+        for code, data in tqdm(stocks_data.items(), desc="验证缓存完整性"):
             # 检查缓存
             cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
             
@@ -500,9 +592,9 @@ class MLModelTrainer:
     
     def prepare_dataset(self, stocks_data: Dict[str, pd.DataFrame],
                        forward_days: int = None,
-                       n_jobs: int = 12, 
+                       n_jobs: int = 15, 
                        cache_engineered_features: bool = True,
-                       filter_incomplete_cache: bool = True,
+                       filter_incomplete_cache: bool = False,
                        train_start_date: str = None,
                        train_end_date: str = None,
                        include_fundamentals: bool = True) -> tuple:
@@ -584,7 +676,7 @@ class MLModelTrainer:
                                              cache_engineered_features, target_features, verbose,
                                              train_start_date, train_end_date, include_fundamentals)
         
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
+        results = Parallel(n_jobs=n_jobs, verbose=1)(
             delayed(process_with_logging)(i, code, data)
             for i, (code, data) in enumerate(stock_list)
         )
@@ -623,7 +715,7 @@ class MLModelTrainer:
         num_features = all_factors[0].shape[1]
         col_names = all_factors[0].columns.tolist()
         
-        print(f"  合并数据: 总行数 {total_rows}, 特征数 {num_features}, 预计占用内存: {total_rows * num_features * 4 / 1024 / 1024:.2f} MB (float32)")
+        print(f"  合并数据: 总行数 {total_rows}, 特征数 {num_features}")
         
         # 1. 预计算有序索引 (极省内存，因为只操作日期列)
         print("  - 预计算全局时间排序索引...")
@@ -685,22 +777,65 @@ class MLModelTrainer:
         
         print(f"\n应用：进行每日横向处理 (共 {len(date_group_start)} 个交易日)...")
         
-        # [已移除] 因子横向 Z-Score 归一化
-        # 移除原因：用户要求移除归一化步骤，以支持单只股票的绝对值预测
-        # print("  - 跳过因子横向 Z-Score 归一化 (使用因子原始值)...")
-        
-        # 最后的无效值填充 (in-place)
+        # 最后的无效值填充 (先清理特征矩阵的 NaN)
         np.nan_to_num(X_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        print("  - 应用因子分位数标准化 (Cross-sectional Quantile Normalization)...")
+        # 彻底消除量纲、极端值影响：将因子值映射为横截面上的 0~1 的分位数排名
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            
+            # 识别需要进行横截面排名的因子索引
+            # 必须排除市场情绪因子（mkt_等）和分类因子（market_type等），因为它们在同一天对所有股票相同，排名会抹除其信息量
+            sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
+            rank_cols_mask = np.array([not any(k in col.lower() for k in sentiment_keys) for col in col_names])
+            rank_cols_idx = np.where(rank_cols_mask)[0]
+            
+            if len(rank_cols_idx) > 0:
+                print(f"  - 正在对 {len(rank_cols_idx)} 个非市场类因子进行横截面排名...")
+                for start, count in zip(date_group_start, date_group_counts):
+                    end = start + count
+                    if count > 1:
+                        # 仅对选定的列进行排名
+                        X_to_rank = X_arr[start:end, rank_cols_idx]
+                        # 优化点：使用 rankdata 替代 pd.DataFrame.rank，由于在循环内部且涉及上万次调用，
+                        # 避免 DataFrame 实例化能提升显著速度。同时使用 method='average' 处理相同值。
+                        for j in range(X_to_rank.shape[1]):
+                            col = X_to_rank[:, j]
+                            # 进行百分位排名映射到 (0, 1)
+                            # rankdata + average method 能够公平处理相同值
+                            ranked_col = rankdata(col, method='average') / (count + 1)
+                            X_arr[start:end, rank_cols_idx[j]] = ranked_col
+            else:
+                print("  - [提示] 未发现需要排名的因子列")
         
         # 构建轻量级包装，仅用于审计报告分析，不进行大内存拷贝
         all_cols = col_names
         
-        # 2. 标签值映射 (Squashing)
-        # 即使移除了每日排名归一化，我们仍需确保标签在 [0, 1] 区间内，以满足 reg:logistic 损失函数的要求。
-        # 采用固定的 Sigmoid 映射：P = 1 / (1 + exp(-20 * y))。
-        # 这样处理保持了单兵打分的独立性（不耦合其他股票），且让 0% 涨幅对应 0.5，5% 涨幅对应约 0.73，符合“信心分”直觉。
-        print("  - 正在通过固定 Sigmoid 将路径质量分映射至 [0, 1] 置信度空间...")
-        y_arr = 1.0 / (1.0 + np.exp(-20.0 * y_arr))
+        # 2. 标签值映射 (Board-Neutral Normalization)
+        print("  - 正在进行每日板块中性化排名归一化标签，消除高波动板块偏见...")
+        for start, count in zip(date_group_start, date_group_counts):
+            end = start + count
+            if count > 1:
+                # 获取当日的所有 limit_threshold，用于区分板块 (主板/创业板/科创板/北交所)
+                day_limits = limit_groups_arr[start:end]
+                day_y = y_arr[start:end].copy()
+                
+                # 为每个板块独立计算组内排名，映射到 [0, 1]
+                unique_limits = np.unique(day_limits)
+                for limit_val in unique_limits:
+                    board_mask = day_limits == limit_val
+                    board_count = np.sum(board_mask)
+                    if board_count > 0:
+                        # 核心修改：在各板块内部进行百分位排名，从而使 10% 市场的龙头与 20% 市场的龙头具有相同的标签值
+                        # 使用 scipy.stats.rankdata 进行组内排名
+                        # rankdata = [1, 2, ..., n], 除以 (n + 1) 获得 (0, 1) 的映射，提升鲁棒性
+                        day_y[board_mask] = rankdata(day_y[board_mask], method='average') / (board_count + 1)
+                
+                y_arr[start:end] = day_y
+            else:
+                y_arr[start:end] = 0.5
 
         # 3. 惩罚不可买入样本 (涨停/停牌)
         # 将无法买入的标的标签强制设为极低值 (0.05)，迫使模型学习避开这些标的。
@@ -712,43 +847,67 @@ class MLModelTrainer:
 
         
         # 统计因子分类详情 (Factor Audit Report)
+        # 使用各模块的精确列名进行匹配，而非关键词启发式匹配
         remaining_all = set(all_cols)
         
-        # 1. 状态因子
-        status_cols = [c for c in all_cols if c in ['is_limit_up', 'is_suspended', 'market_type']]
+        # 1. 状态因子 (comprehensive_factor_calculator 中硬编码的3个)
+        _status_known = {'is_limit_up', 'is_suspended', 'market_type'}
+        status_cols = [c for c in all_cols if c in _status_known]
         remaining_all -= set(status_cols)
         
-        # 2. 市场情绪因子 (全市场维度)
-        # 匹配 market_sentiment 表中的字段名
-        sentiment_keywords = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'total_volume', 'sentiment_', 'mkt_']
-        sentiment_cols = [c for c in all_cols if c in remaining_all and any(k in c.lower() for k in sentiment_keywords)]
+        # 2. 市场情绪因子 — 精确匹配 market_sentiment 表的列名 (不含 date)
+        _sentiment_known = {
+            'up_ratio', 'strong_up_ratio', 'down_ratio',
+            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
+            'total_volume', 'adv_vol_ratio', 'breadth_ma20'
+        }
+        sentiment_cols = [c for c in all_cols if c in remaining_all and c in _sentiment_known]
         remaining_all -= set(sentiment_cols)
         
-        # 3. 特征工程 (衍生的复合因子)
-        engineered_cols = [c for c in all_cols if c in remaining_all and c in self.feature_engineer.get_generated_features()]
+        # 3. 特征工程 (衍生的复合因子) — 从 FeatureEngineer 实例获取精确列表
+        _engineered_set = set(self.feature_engineer.get_generated_features())
+        engineered_cols = [c for c in all_cols if c in remaining_all and c in _engineered_set]
         remaining_all -= set(engineered_cols)
         
-        # 4. K线形态
-        candle_names = [x.lower() for x in self.candlestick_calculator.get_pattern_names()]
-        candle_cols = [c for c in all_cols if c in remaining_all and any(x == c.lower() or f"cdl_{x}" in c.lower() for x in candle_names)]
+        # 4. K线形态 — 精确匹配 CandlestickPatternFactors.get_pattern_names()
+        _candle_set = set(self.candlestick_calculator.get_pattern_names())
+        candle_cols = [c for c in all_cols if c in remaining_all and c in _candle_set]
         remaining_all -= set(candle_cols)
         
-        # 5. 技术指标 (基础量价指标)
-        tech_names = [x.lower() for x in self.tech_calculator.get_factor_names()]
-        tech_cols = [c for c in all_cols if c in remaining_all and any(x in c.lower() for x in tech_names)]
+        # 5. 技术指标 — 精确匹配 QuantitativeFactors.get_factor_names()
+        _tech_set = set(self.tech_calculator.get_factor_names())
+        tech_cols = [c for c in all_cols if c in remaining_all and c in _tech_set]
         remaining_all -= set(tech_cols)
         
-        # 6. 基础基本面
-        fund_keywords = ['roe', 'xsjll', 'zzcjll', 'rev_yoy', 'np_yoy', 'pe', 'pb', 'eps', 'bps', 'ocf', 'zcfzl', 'qycs', 'bank_', 'org_type', 'peg', 'sue', 'eav']
-        fund_cols = [c for c in all_cols if c in remaining_all and any(k in c.lower() for k in fund_keywords)]
+        # 6. 基本面因子 — 精确匹配 FundamentalFactors.NUMERIC_COLS + 已知衍生列
+        _fund_known = set(FundamentalFactors.NUMERIC_COLS) | {
+            'dynamic_pe', 'dynamic_pb', 'inv_pe', 'inv_pb', 'market_cap',
+            'roe_x_np_growth', 'roe_to_pb',
+            'peg', 'sue', 'eav'
+        }
+        fund_cols = [c for c in all_cols if c in remaining_all and c in _fund_known]
         remaining_all -= set(fund_cols)
         
-        # 7. 高级时序/风险特征
-        adv_keywords = ['volatility', 'return_', 'momentum_', 'sharpe', 'drawdown', 'skewness', 'kurtosis', 'acceleration', 'position']
-        adv_cols = [c for c in all_cols if c in remaining_all and any(k in c.lower() for k in adv_keywords)]
+        # 7. 高级时序/风险特征 — 精确匹配 advanced_factors.py 中的列名
+        _adv_known = {
+            # TimeSeriesFactors.calculate_price_series_features
+            'hl_range_mean', 'hl_range_std', 'oc_ratio_mean', 'oc_ratio_std',
+            'price_volatility_20', 'price_volatility_60', 'price_skewness', 'price_kurtosis',
+            'high_position', 'low_position',
+            # TimeSeriesFactors.calculate_volume_series_features
+            'volume_change_rate', 'volume_volatility', 'price_volume_corr',
+            'amount_per_volume', 'amount_change_rate',
+            # TimeSeriesFactors.calculate_momentum_features
+            'return_5d', 'return_10d', 'return_20d', 'return_60d',
+            'momentum_5d', 'momentum_10d', 'momentum_20d', 'acceleration',
+            # RiskFactors.calculate_risk_features
+            'downside_risk', 'drawdown', 'max_drawdown_20', 'sharpe_ratio',
+            'return_skewness', 'return_kurtosis',
+        }
+        adv_cols = [c for c in all_cols if c in remaining_all and c in _adv_known]
         remaining_all -= set(adv_cols)
         
-        # 8. 其它
+        # 8. 其它 (未被以上任何类别匹配到的列)
         other_cols = list(remaining_all)
 
         print("\n" + "="*50)
@@ -761,6 +920,8 @@ class MLModelTrainer:
         print(f"5. 高级时序 (Advanced):     {len(adv_cols):>4} 个")
         print(f"6. 特征工程 (Engineered):   {len(engineered_cols):>4} 个")
         print(f"7. 其它状态 (Others):       {len(status_cols) + len(other_cols):>4} 个")
+        if other_cols:
+            print(f"   未分类列: {other_cols[:20]}{'...' if len(other_cols) > 20 else ''}")
         print("="*50 + "\n")
         
         # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
@@ -772,7 +933,7 @@ class MLModelTrainer:
                     dates: np.ndarray,
                     unbuyable_mask: np.ndarray = None,
                     limit_groups: np.ndarray = None,
-                    model_types: List[str] = ['xgboost', 'lightgbm']) -> Dict:
+                    model_types: List[str] = TrainingConfig.MODEL_TYPES) -> Dict:
         """
         训练多个模型
         
@@ -984,25 +1145,66 @@ class MLModelTrainer:
         return archive_dir
     
     def save_factor_summary(self, factor_names: List[str], save_dir: str = 'models'):
-        """保存因子汇总信息"""
+        """保存因子汇总信息（使用精确匹配，与审计报告逻辑一致）"""
         os.makedirs(save_dir, exist_ok=True)
         
-        tech_factor_count = len(self.tech_calculator.get_factor_names())
-        candlestick_factor_count = len(self.candlestick_calculator.get_pattern_names())
-        base_factor_count = tech_factor_count + candlestick_factor_count
-        fundamental_factor_count = max(0, len(factor_names) - base_factor_count - len(self.feature_engineer.get_generated_features()))
-        engineered_factor_count = len(self.feature_engineer.get_generated_features())
+        all_set = set(factor_names)
+        
+        # 精确匹配各类别
+        _tech_set = set(self.tech_calculator.get_factor_names())
+        _candle_set = set(self.candlestick_calculator.get_pattern_names())
+        _engineered_set = set(self.feature_engineer.get_generated_features())
+        _fund_known = set(FundamentalFactors.NUMERIC_COLS) | {
+            'dynamic_pe', 'dynamic_pb', 'inv_pe', 'inv_pb', 'market_cap',
+            'roe_x_np_growth', 'roe_to_pb', 'peg', 'sue', 'eav'
+        }
+        _sentiment_known = {
+            'up_ratio', 'strong_up_ratio', 'down_ratio',
+            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
+            'total_volume', 'adv_vol_ratio', 'breadth_ma20'
+        }
+        _adv_known = {
+            'hl_range_mean', 'hl_range_std', 'oc_ratio_mean', 'oc_ratio_std',
+            'price_volatility_20', 'price_volatility_60', 'price_skewness', 'price_kurtosis',
+            'high_position', 'low_position',
+            'volume_change_rate', 'volume_volatility', 'price_volume_corr',
+            'amount_per_volume', 'amount_change_rate',
+            'return_5d', 'return_10d', 'return_20d', 'return_60d',
+            'momentum_5d', 'momentum_10d', 'momentum_20d', 'acceleration',
+            'downside_risk', 'drawdown', 'max_drawdown_20', 'sharpe_ratio',
+            'return_skewness', 'return_kurtosis',
+        }
+        _status_known = {'is_limit_up', 'is_suspended', 'market_type'}
+        
+        tech_names = sorted(all_set & _tech_set)
+        candle_names = sorted(all_set & _candle_set)
+        fund_names = sorted(all_set & _fund_known)
+        sentiment_names = sorted(all_set & _sentiment_known)
+        adv_names = sorted(all_set & _adv_known)
+        engineered_names = sorted(all_set & _engineered_set)
+        status_names = sorted(all_set & _status_known)
+        classified = _tech_set | _candle_set | _fund_known | _sentiment_known | _adv_known | _engineered_set | _status_known
+        other_names = sorted(all_set - classified)
         
         summary = {
             'total_factors': len(factor_names),
-            'technical_factors': tech_factor_count,
-            'candlestick_factors': candlestick_factor_count,
-            'fundamental_factors': fundamental_factor_count,
-            'engineered_factors': engineered_factor_count,
+            'technical_factors': len(tech_names),
+            'candlestick_factors': len(candle_names),
+            'fundamental_factors': len(fund_names),
+            'sentiment_factors': len(sentiment_names),
+            'advanced_factors': len(adv_names),
+            'engineered_factors': len(engineered_names),
+            'status_factors': len(status_names),
+            'other_factors': len(other_names),
             'factor_names': factor_names,
-            'technical_factor_names': self.tech_calculator.get_factor_names(),
-            'candlestick_factor_names': self.candlestick_calculator.get_pattern_names(),
-            'engineered_factor_names': self.feature_engineer.get_generated_features(),
+            'technical_factor_names': tech_names,
+            'candlestick_factor_names': candle_names,
+            'fundamental_factor_names': fund_names,
+            'sentiment_factor_names': sentiment_names,
+            'advanced_factor_names': adv_names,
+            'engineered_factor_names': engineered_names,
+            'status_factor_names': status_names,
+            'other_factor_names': other_names,
             'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         
@@ -1100,7 +1302,7 @@ def main():
     )
     
     # 6. 训练模型
-    model_types = ['xgboost', 'lightgbm']
+    model_types = TrainingConfig.MODEL_TYPES
     results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, limit_groups, model_types)
     
     # 7. 对比模型

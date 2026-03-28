@@ -9,8 +9,8 @@ import sys
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.data.data_fetcher import DataFetcher
 from core.backtest import BacktestEngine, DataHandler, PerformanceAnalyzer
+from core.data.baostock_main import BaostockDataManager
 from core.backtest.strategies import MLFactorBacktestStrategy
 from config import DATABASE_PATH,TrainingConfig
 from config.strategy_config import (
@@ -92,14 +92,15 @@ def main():
     # 提前获取股票代码
     stock_codes = None # 这里可以指定，不指定则从DB获取
     if stock_codes is None:
-        df = DataFetcher()
-        df = df.get_stock_list(markets=SELECTOR_MARKETS)
-        stock_codes = df['code'].tolist()
+        bdm = BaostockDataManager()
+        df_stocks = bdm.get_stock_list_from_db(markets=SELECTOR_MARKETS)
+        stock_codes = df_stocks['code'].tolist()
+        bdm.close()
 
 
-    # 为了让第1个交易日就有足够的历史数据（DataHandler要求至少30天），
+    # 为了让第1个交易日就有足够的历史数据（例如250日均线需要，这里预留365个自然日），
     # 我们加载比回测开始日期更早的数据
-    load_start_date = (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=60)).strftime('%Y-%m-%d')
+    load_start_date = (datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=365)).strftime('%Y-%m-%d')
     data_handler.load_data(load_start_date, end_date, stock_codes)
     
     results = engine.run(

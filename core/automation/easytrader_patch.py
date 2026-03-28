@@ -260,8 +260,7 @@ class RobustClientTrader(ClientTrader):
                         break
             
             if self._main is None: 
-                self._main = self._app.top_window()
-                logger.warning(f"最终兜底使用 top_window: {self._main.window_text()}")
+                raise
 
             logger.info(f"最终绑定窗体: [{self._main.window_text()}] (Handle: {self._main.handle})")
             

@@ -23,7 +23,7 @@ class ModelConfig:
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
         'max_depth': 6,              # 增加深度以改善预测区分度
-        'min_child_weight': 200,       # 增加权重要求，防止过拟合
+        'min_child_weight': 250,       # 增加权重要求，防止过拟合
         'learning_rate': 0.05,       
         'subsample': 1,
         'colsample_bytree': 0.7,
@@ -46,17 +46,17 @@ class ModelConfig:
         'min_child_weight': 200,
         'num_leaves': 63,
         'learning_rate': 0.05,
-        'min_gain_to_split': 0.1,
+        'min_gain_to_split': 0.12,
 
-        'reg_alpha': 3,
-        'reg_lambda': 7,
+        'reg_alpha': 7,
+        'reg_lambda': 13,
         'subsample': 1,
         'colsample_bytree': 1,
 
-        'label_gain': [float(i**2 - 1) for i in range(100)], 
+        'label_gain': [float(i**2 - 1) for i in range(150)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 100,
+        'lambdarank_truncation_level': 150,
         'n_jobs': 15,
         'verbosity': -1,
         'early_stopping_rounds': 50,
@@ -95,7 +95,7 @@ class TrainingConfig:
     """训练参数配置"""
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
-    MODEL_TYPES = ['xgboost']
+    MODEL_TYPES = ['lightgbm', 'xgboost']
 
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子

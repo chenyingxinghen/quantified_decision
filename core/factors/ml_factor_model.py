@@ -581,8 +581,8 @@ class MLFactorModel:
         if not self.is_trained: raise ValueError("未训练")
         X = np.nan_to_num(factors[self.feature_names].values, nan=0.0)
         # 预测阶段必须使用训练阶段拟合好的 scaler
-        X_scaled = self.scaler.transform(X).astype(np.float32)
-        return self._get_predict_proba(X_scaled)
+        # X_scaled = self.scaler.transform(X).astype(np.float32)
+        return self._get_predict_proba(X)
 
     def predict_signal(self, factors: pd.DataFrame, threshold: float = 0.5) -> Dict:
         prob = self.predict(factors)[0]

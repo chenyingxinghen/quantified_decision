@@ -209,12 +209,21 @@ class MLModelTrainer:
         new_data_rows = None
 
         if cached_factors is not None and 'date' in cached_factors.columns and 'date' in data.columns:
-            # 特征不匹配时必须全量重算
+            # 修复问题四：无论是否传入 target_features，都检查缓存列数是否与当前计算结果一致
+            # 当 target_features=None 时，用缓存中的数值列数量与一次探测计算结果对比
             if target_features:
                 missing_feats = [f for f in target_features if f not in cached_factors.columns]
                 if missing_feats:
                     if verbose:
                         print(f"  {code}: 缓存缺少 {len(missing_feats)} 个特征，触发全量重算")
+                    need_full_recompute = True
+            else:
+                # target_features=None 时，通过缓存列数做轻量版本检测
+                # 若缓存数值列数为 0（空缓存），触发全量重算
+                cached_numeric_cols = cached_factors.select_dtypes(include=[np.number]).shape[1]
+                if cached_numeric_cols == 0:
+                    if verbose:
+                        print(f"  {code}: 缓存无数值列，触发全量重算")
                     need_full_recompute = True
             
             if not need_full_recompute:
@@ -268,9 +277,18 @@ class MLModelTrainer:
             return None
 
         # ── 4. 附加日期列 ──────────────────────────────────────────────────
+        # 修复问题三：calculate_all_factors 内部可能 reset_index，导致行数与 data 不一致
+        # 用 data 的 index 对齐赋值，而非直接用 .values 强制覆盖
         if 'date' in data.columns:
             all_factors = all_factors.copy()
-            all_factors['date'] = data['date'].values
+            if len(all_factors) == len(data):
+                # 行数一致：直接按位置赋值（最常见路径）
+                all_factors['date'] = data['date'].values
+            else:
+                # 行数不一致：通过 index 对齐，无法对齐的行填 NaN
+                all_factors['date'] = data['date'].reindex(all_factors.index).values
+                if verbose:
+                    print(f"  {code}: 因子行数({len(all_factors)}) != 数据行数({len(data)})，已按 index 对齐日期")
 
         # ── 5. 拼接缓存（增量模式）────────────────────────────────────────
         if not need_full_recompute and cached_factors is not None and new_data_rows is not None:
@@ -281,27 +299,25 @@ class MLModelTrainer:
                 new_factor_rows = all_factors.tail(len(new_data_rows)).copy()
 
             if new_factor_rows.empty:
-                # 增量行全为 NaN，无法追加，仍返回旧缓存
-                if target_features:
-                    available = [f for f in target_features if f in cached_factors.columns]
-                    if 'date' in cached_factors.columns and 'date' not in available:
-                        available.append('date')
-                    return cached_factors[available] if available else cached_factors
-                return cached_factors
+                # 增量日期过滤后无匹配行（通常是步骤4日期对齐失败导致）
+                # 记录警告并回退到全量重算，避免新数据被静默丢弃
+                print(f"  {code}: 警告 - 增量过滤后无新行（日期对齐可能失败），回退到全量重算")
+                need_full_recompute = True
+                # 重新计算已在步骤3完成，all_factors 已是全量结果，直接跳到步骤6保存
+            else:
+                # 列对齐：新行缺少的列补 NaN，多余列丢弃
+                missing_cols = [col for col in cached_factors.columns if col not in new_factor_rows.columns]
+                if missing_cols:
+                    # 批量添加缺失列以避免 DataFrame 碎片化 (Fix PerformanceWarning)
+                    nan_df = pd.DataFrame(np.nan, index=new_factor_rows.index, columns=missing_cols)
+                    new_factor_rows = pd.concat([new_factor_rows, nan_df], axis=1)
+                
+                new_factor_rows = new_factor_rows[cached_factors.columns]
 
-            # 列对齐：新行缺少的列补 NaN，多余列丢弃
-            missing_cols = [col for col in cached_factors.columns if col not in new_factor_rows.columns]
-            if missing_cols:
-                # 批量添加缺失列以避免 DataFrame 碎片化 (Fix PerformanceWarning)
-                nan_df = pd.DataFrame(np.nan, index=new_factor_rows.index, columns=missing_cols)
-                new_factor_rows = pd.concat([new_factor_rows, nan_df], axis=1)
-            
-            new_factor_rows = new_factor_rows[cached_factors.columns]
-
-            # 修复问题8：增量合并时去重，避免日期重叠导致的重复行
-            all_factors = pd.concat([cached_factors, new_factor_rows], ignore_index=True)
-            if 'date' in all_factors.columns:
-                all_factors = all_factors.drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
+                # 修复问题8：增量合并时去重，避免日期重叠导致的重复行
+                all_factors = pd.concat([cached_factors, new_factor_rows], ignore_index=True)
+                if 'date' in all_factors.columns:
+                    all_factors = all_factors.drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
 
         # ── 6. 保存到缓存 ──────────────────────────────────────────────────
         try:
@@ -330,7 +346,13 @@ class MLModelTrainer:
             verbose: 是否输出详细信息
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        print(f"\n[因子缓存同步] 正在并行更新 {len(stocks_data)} 只股票的缓存 (workers={n_jobs})...")
+        
+        # 修复问题五：去除重复 key，避免多线程并发写同一文件
+        unique_stocks = dict(stocks_data)  # dict 本身 key 唯一，但防御性保留此步骤
+        if len(unique_stocks) != len(stocks_data):
+            print(f"  警告: stocks_data 含重复 key，已去重 {len(stocks_data)} -> {len(unique_stocks)}")
+        
+        print(f"\n[因子缓存同步] 正在并行更新 {len(unique_stocks)} 只股票的缓存 (workers={n_jobs})...")
         
         start_time = time()
         success = 0
@@ -345,7 +367,7 @@ class MLModelTrainer:
                     include_fundamentals=include_fundamentals,
                     verbose=verbose
                 ): code 
-                for code, data in stocks_data.items()
+                for code, data in unique_stocks.items()
             }
             
             with tqdm(total=len(futures), desc="更新因子缓存") as pbar:

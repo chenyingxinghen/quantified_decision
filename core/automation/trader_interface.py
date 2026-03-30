@@ -94,6 +94,13 @@ class AutoTrader:
             if not self.connect(): return None
             
         try:
+            # 先切换到其他页面再切回，确保触发 WMCopy 的剪贴板读取流程，
+            # 从而激活验证码自动识别逻辑（与 test_captcha 保持一致）
+            try:
+                self.user._switch_left_menus(['撤单[F3]'])
+                time.sleep(0.5)
+            except Exception:
+                pass
             return self.user.position
         except Exception as e:
             logger.error(f"获取持仓失败: {e}")
@@ -233,12 +240,6 @@ class AutoTrader:
             
         try:
             logger.info("尝试触发持仓查询以测试验证码识别...")
-            # 为保证在同花顺中真正激活持仓页并选中所有内容进行复制测试，先主动调用一下撤单或者其他然后切回来
-            try:
-                self.user._switch_left_menus(['撤单[F3]']) # 先切走
-                time.sleep(0.5)
-            except: pass
-            
             pos = self.get_positions()
             if pos is not None:
                 logger.info("获取持仓成功！(如遇到验证码，应已自动填好)")

@@ -86,22 +86,49 @@ class AutoTrader:
             return {}
 
     def get_positions(self) -> List[Dict]:
-        """获取当前持仓"""
+        """
+        获取当前持仓。
+        返回语义：
+          - None  : 获取失败（GUI 异常、连接断开等）
+          - []    : 确认空仓（经资金交叉验证）
+          - [...]  : 正常持仓列表
+        """
         if self.dry_run:
             return []
-            
+
         if not self.is_connected:
             if not self.connect(): return None
-            
+
         try:
-            # 先切换到其他页面再切回，确保触发 WMCopy 的剪贴板读取流程，
-            # 从而激活验证码自动识别逻辑（与 test_captcha 保持一致）
+            # 先切换到撤单页再切回，确保触发完整的 WMCopy 流程（含验证码检测）
             try:
                 self.user._switch_left_menus(['撤单[F3]'])
                 time.sleep(0.5)
             except Exception:
                 pass
-            return self.user.position
+
+            positions = self.user.position
+
+            # 空列表时做资金交叉验证，防止验证码阻挡导致误判为空仓
+            if isinstance(positions, list) and len(positions) == 0:
+                try:
+                    balance = self.user.balance
+                    if isinstance(balance, list) and len(balance) > 0:
+                        balance = balance[0]
+                    market_value = float(
+                        balance.get('参考市值', balance.get('股票市值', balance.get('市值', 0))) or 0
+                    )
+                    if market_value > 0:
+                        logger.warning(
+                            f"持仓列表为空，但资金表显示股票市值={market_value}，"
+                            "疑似 GUI 读取被干扰（验证码未处理），返回 None 以触发上层保护。"
+                        )
+                        return None
+                except Exception as e:
+                    logger.warning(f"持仓空列表交叉验证资金时出错: {e}，保守返回 None。")
+                    return None
+
+            return positions
         except Exception as e:
             logger.error(f"获取持仓失败: {e}")
             return None

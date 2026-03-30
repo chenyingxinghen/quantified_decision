@@ -28,7 +28,7 @@ class ModelConfig:
         'subsample': 1,
         'colsample_bytree': 0.7,
         'colsample_bylevel': 0.7,
-        'gamma': 0.17,    
+        'gamma': 0.175,    
         
         'reg_alpha': 11,            
         'reg_lambda': 23,             
@@ -51,9 +51,9 @@ class ModelConfig:
         'reg_alpha': 7,
         'reg_lambda': 13,
         'subsample': 1,
-        'colsample_bytree': 1,
+        'colsample_bytree': 0.7,
 
-        'label_gain': [float(i**2 - 1) for i in range(150)], 
+        'label_gain': [float(i**1.2 - 1) for i in range(150)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 150,
@@ -108,7 +108,7 @@ class TrainingConfig:
     YEARS_FOR_TRAINING=15         # 训练年数
     STOCK_NUM = 6000             # 股票数量
     # 数据集划分
-    TRAIN_TEST_SPLIT = 0.8
+    TRAIN_TEST_SPLIT = 0.7
     
 
     # 预测天数 (用于分类、回归和排序任务)

@@ -63,67 +63,63 @@ import pywinauto.keyboard
 
 def patched_get_clipboard_data(self):
     """
-    改进的验证码交互逻辑：增加输入延迟，提升填入成功率
+    改进的验证码交互逻辑：每次都主动探测验证码弹窗，
+    不依赖 _need_captcha_reg 标志位（该标志一旦被置 False 就永久跳过检测）。
     """
-    if easy_strategies.Copy._need_captcha_reg:
+    # 每次都主动检测，不依赖 _need_captcha_reg 状态
+    try:
         top = self._trader.app.top_window()
-        # 增加识别“验证码”关键字的鲁棒性，使用 child_window + found_index 避免歧义
-        if top.child_window(class_name="Static", title_re=".*验证码.*", found_index=0).exists(timeout=1):
-            import tempfile
-            file_path = os.path.join(tempfile.gettempdir(), "easytrader_captcha.png")
-            count = 5
-            found = False
-            while count > 0:
-                # 截图前微调：确保窗口在前台
-                top.set_focus()
-                
-                # 截取验证码图片 (ID 0x965 是同花顺验证码图片的标准 ID)
-                # 使用 child_window 配合 control_id 更准确
-                top.child_window(control_id=0x965, class_name="Static").capture_as_image().save(file_path)
+        captcha_exists = top.child_window(
+            class_name="Static", title_re=".*验证码.*", found_index=0
+        ).exists(timeout=1)
+    except Exception:
+        captcha_exists = False
 
-                captcha_num = easy_captcha.captcha_recognize(file_path).strip()
-                captcha_num = "".join(captcha_num.split())
-                
-                if len(captcha_num) == 4:
-                    logger.info(f"Trying CAPTCHA: [{captcha_num}] (Attempt {6-count}/5)")
-                    
-                    edit_ctrl = top.child_window(control_id=0x964, class_name="Edit")
-                    edit_ctrl.set_focus()
-                    
-                    # 关键改进：改用 type_keys 模拟真实录入，并增加录入前后的等待
-                    edit_ctrl.type_keys("{BACKSPACE 10}{DELETE 10}", pause=0.01)
-                    edit_ctrl.type_keys(captcha_num, with_spaces=True, pause=0.1)
-                    
-                    time.sleep(0.3) # 给 GUI 一点反应时间
-                    top.type_keys("{ENTER}") # 使用窗口对象的 type_keys 比全局 SendKeys 更稳
-                    
-                    # 等待窗体消失或报错
-                    time.sleep(1.0) # 稍微增加等待时间
-                    try:
-                        if not top.exists(timeout=0.1):
-                            logger.info("CAPTCHA window disappeared, assuming success.")
-                            found = True
-                            break
-                    except Exception:
+    if captcha_exists:
+        import tempfile
+        file_path = os.path.join(tempfile.gettempdir(), "easytrader_captcha.png")
+        count = 5
+        found = False
+        while count > 0:
+            top.set_focus()
+            top.child_window(control_id=0x965, class_name="Static").capture_as_image().save(file_path)
+
+            captcha_num = easy_captcha.captcha_recognize(file_path).strip()
+            captcha_num = "".join(captcha_num.split())
+
+            if len(captcha_num) == 4:
+                logger.info(f"Trying CAPTCHA: [{captcha_num}] (Attempt {6-count}/5)")
+                edit_ctrl = top.child_window(control_id=0x964, class_name="Edit")
+                edit_ctrl.set_focus()
+                edit_ctrl.type_keys("{BACKSPACE 10}{DELETE 10}", pause=0.01)
+                edit_ctrl.type_keys(captcha_num, with_spaces=True, pause=0.1)
+                time.sleep(0.3)
+                top.type_keys("{ENTER}")
+                time.sleep(1.0)
+                try:
+                    if not top.exists(timeout=0.1):
+                        logger.info("CAPTCHA window disappeared, assuming success.")
                         found = True
                         break
-                        
-                count -= 1
-                if count > 0:
-                    # 点击图片刷新验证码
-                    logger.info("CAPTCHA failed, refreshing...")
-                    try:
-                        top.child_window(control_id=0x965, class_name="Static").click()
-                        time.sleep(0.5) # 等待刷新
-                    except:
-                        pass
-                    
-            if not found:
-                try: top.child_window(title="取消", class_name="Button").click()
-                except: pass
-        else:
-            easy_strategies.Copy._need_captcha_reg = False
-            
+                except Exception:
+                    found = True
+                    break
+
+            count -= 1
+            if count > 0:
+                logger.info("CAPTCHA failed, refreshing...")
+                try:
+                    top.child_window(control_id=0x965, class_name="Static").click()
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+
+        if not found:
+            try:
+                top.child_window(title="取消", class_name="Button").click()
+            except Exception:
+                pass
+
     # 原有的剪切板获取逻辑
     count = 5
     while count > 0:
@@ -134,7 +130,6 @@ def patched_get_clipboard_data(self):
             count -= 1
             time.sleep(0.2)
     return ""
-
 # 执行补丁
 easy_strategies.Copy._get_clipboard_data = patched_get_clipboard_data
 

@@ -612,14 +612,44 @@ class MLModelTrainer:
         
         return filtered_stocks, {'filtered': filtered_count, 'recomputed': recomputed_count, 'kept': kept_count}
     
+    def discover_target_features(self, stocks_data: Dict[str, pd.DataFrame],
+                                  include_fundamentals: bool = True,
+                                  n_discovery: int = 30) -> List[str]:
+        """
+        对前 n_discovery 只股票做一次因子计算，取列名并集，返回完整特征列表。
+        供 batch_update_factor_cache 和 prepare_dataset 共享，确保两者使用相同的
+        target_features，避免 Step 0 写缓存后 Step 2 因列不匹配而触发全量重算。
+        """
+        print(f"  正在识别完整特征集（采样 {n_discovery} 只股票）...")
+        all_possible_features: set = set()
+        discovery_codes = list(stocks_data.keys())[:n_discovery]
+        for code in discovery_codes:
+            try:
+                discovery_data = stocks_data[code]
+                if len(discovery_data) < 200:
+                    continue
+                f = self.factor_calculator.calculate_all_factors(
+                    code, discovery_data,
+                    apply_feature_engineering=True,
+                    include_fundamentals=include_fundamentals
+                )
+                if f is not None and not f.empty:
+                    all_possible_features.update(f.columns)
+            except Exception:
+                continue
+        target_features = sorted([f for f in all_possible_features if f != 'date'])
+        print(f"  识别到总计 {len(target_features)} 个特征（含特征工程生成项）")
+        return target_features
+
     def prepare_dataset(self, stocks_data: Dict[str, pd.DataFrame],
                        forward_days: int = None,
-                       n_jobs: int = 15, 
+                       n_jobs: int = 15,
                        cache_engineered_features: bool = True,
                        filter_incomplete_cache: bool = False,
                        train_start_date: str = None,
                        train_end_date: str = None,
-                       include_fundamentals: bool = True) -> tuple:
+                       include_fundamentals: bool = True,
+                       target_features: Optional[List[str]] = None) -> tuple:
         """
         准备训练数据集
         
@@ -632,6 +662,8 @@ class MLModelTrainer:
             train_start_date: 训练样本开始日期
             train_end_date: 训练样本结束日期
             include_fundamentals: 是否包含基本面因子
+            target_features: 外部传入的完整特征列表；若提供则跳过内部特征发现，
+                             与 batch_update_factor_cache 共享同一列表以保证缓存命中
         
         返回:
             (X, y, returns, factor_names, dates, unbuyable, limit_groups)
@@ -659,28 +691,14 @@ class MLModelTrainer:
         if cache_engineered_features:
             print(f"  缓存策略: 保存特征工程后的完整因子")
             
-            # 特征发现：识别完整的特征集
-            print("  正在识别完整特征集...")
-            all_possible_features = set()
-            # 选取具有代表性的股票（包含不同板块和充足历史数据）
-            discovery_codes = list(stocks_data.keys())[:30]  # 增加搜索范围到30只
-            for code in discovery_codes:
-                try:
-                    # 获取该股票最长的一段连续数据
-                    discovery_data = stocks_data[code]
-                    if len(discovery_data) < 200: continue # 跳过数据太少的
-                    
-                    # 预先探测所有可能的列
-                    f = self.factor_calculator.calculate_all_factors(
-                        code, discovery_data, apply_feature_engineering=True, include_fundamentals=include_fundamentals
-                    )
-                    if not f.empty:
-                        all_possible_features.update(f.columns)
-                except Exception as e:
-                    continue
-            
-            target_features = sorted([f for f in all_possible_features if f != 'date'])
-            print(f"  识别到总计 {len(target_features)} 个特征（含特征工程生成项）")
+            if target_features is not None:
+                # 外部已传入（由 Step 0 发现并共享），直接复用，跳过重复计算
+                print(f"  复用外部传入的特征集: {len(target_features)} 个特征")
+            else:
+                # 特征发现：识别完整的特征集
+                target_features = self.discover_target_features(
+                    stocks_data, include_fundamentals=include_fundamentals
+                )
         else:
             print(f"  缓存策略: 仅保存基础因子，训练时应用特征工程（方案A）")
             target_features = None

@@ -63,13 +63,20 @@ def main():
     manager.close()
 
     # ── 4. 增量更新因子缓存（到最新日期）────────────────────────────────
+    target_features = None  # 特征集，Step 0 发现后供 Step 2 复用
     if not args.skip_cache_update:
         print(f"\n[Step 0] 增量更新因子缓存 (截止 {cache_end_date})...")
         # 加载数据，用于更新缓存
         cache_data = trainer.load_training_data(trainer_stocks, train_start_date, cache_end_date)
+        # 先发现完整特征集，再用同一套 target_features 写缓存
+        # 这样 Step 2 的缓存命中检查能与缓存列完全匹配，避免全量重算
+        target_features = trainer.discover_target_features(
+            cache_data, include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
+        )
         trainer.batch_update_factor_cache(
             stocks_data=cache_data,
             include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS,
+            target_features=target_features,
             n_jobs=args.workers
         )
         del cache_data  # 释放内存
@@ -93,7 +100,8 @@ def main():
         train_start_date=train_start_date,
         train_end_date=train_end_date,
         include_fundamentals=True,
-        n_jobs=args.workers
+        n_jobs=args.workers,
+        target_features=target_features  # 复用 Step 0 发现的特征集，跳过重复发现
     )
 
     # ── 7. 训练模型 ──────────────────────────────────────────────────────

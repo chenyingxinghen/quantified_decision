@@ -265,10 +265,10 @@ if __name__ == "__main__":
             # 尝试先获取资金，验证连接质量
             balance = trader.get_balance()
             logger.info(f"当前资金状况: {balance}")
-            trader.buy("002397", 200, price=4.1)
+            # trader.buy("002397", 200, price=4.1)
             # 测试验证码识别
             # trader.test_captcha()
 
-            # print(trader.get_positions())
+            print(trader.get_positions())
         else:
             logger.error("连接测试失败")

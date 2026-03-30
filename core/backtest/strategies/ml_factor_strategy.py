@@ -193,20 +193,23 @@ class MLFactorBacktestStrategy(BaseStrategy):
         for code in predict_codes:
             factors = self._get_factors(code, None, current_date)
             if factors is not None and not factors.empty:
-                # 取最近的一行 (应恰好是 current_date 那行)
+                # 修复问题5: 严格验证日期对齐
                 latest_row = factors.iloc[[-1]].copy()
                 row_date = None
                 if 'date' in latest_row.columns:
                     row_date = latest_row['date'].iloc[0]
-                    latest_row = latest_row.drop(columns=['date'])
-                
-                # 调试: 检查因子行是否精确对应当前日期
-                if row_date is not None:
                     row_date_str = str(row_date)[:10]
-                    if row_date_str != current_date and code not in self._warned_stocks:
-                        self._warned_stocks.add(code)
-                        # if len(self._warned_stocks) <= 5:
-                        #     raise ValueError(f"  [日期对齐警告] {code}: 缓存最新因子日期={row_date_str}, 当前回测日期={current_date}")
+                    
+                    # 仅拒绝“未来日期”的因子；若是历史最近日期，允许使用，避免因缓存更新节奏导致股票池被异常压缩
+                    if row_date_str > current_date:
+                        if code not in self._warned_stocks:
+                            self._warned_stocks.add(code)
+                        continue
+                    
+                    latest_row = latest_row.drop(columns=['date'])
+                else:
+                    # 没有日期列，无法验证对齐，跳过
+                    continue
                 
                 raw_rows.append(latest_row)
                 stock_codes_with_data.append(code)
@@ -220,7 +223,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            # 识别需要进行横截面排名的因子索引 (同步 train_ml_model 逻辑)
+            # 修复问题7: 识别需要进行横截面排名的因子索引 (同步 train_ml_model 逻辑)
+            # 排除市场情绪因子，因为它们在同一天对所有股票相同
             sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
             rank_cols = [col for col in all_X.columns if not any(k in col.lower() for k in sentiment_keys)]
             

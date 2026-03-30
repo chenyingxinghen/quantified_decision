@@ -201,6 +201,7 @@ class MLModelTrainer:
                 if 'date' in cached_factors.columns and not pd.api.types.is_string_dtype(cached_factors['date']):
                     cached_factors['date'] = cached_factors['date'].astype(str)
             except Exception:
+                print(f"  {code}: 缓存文件损坏，触发全量重算")
                 cached_factors = None
         
         # ── 2. 判断是否需要更新 ────────────────────────────────────────────
@@ -411,23 +412,22 @@ class MLModelTrainer:
                 close = data['close']
                 high = data['high']
                 low = data['low']
-                next_open = data['open'].shift(-1)
                 
-                
-                # A. 收益率计算 (基于 T+1 开盘价的未来 n 日实际可得涨幅)
-                # 修正：使用下一日开盘价作为成本基础，避免夜间跳空高开导致的收益漏洞
+                # A. 收益率计算 (基于当前收盘价的未来 n 日涨幅)
+                # 修复问题1: 使用当前收盘价作为成本基础，避免未来信息泄露
+                # 在 T 日收盘时，我们无法知道 T+1 日的开盘价，因此必须使用 T 日收盘价
                 f_close = close.shift(-forward_days)
-                f_returns = (f_close / next_open - 1)
+                f_returns = (f_close / close - 1)
                 
                 # 获取未来 n 日内的最大涨幅 (Max Run-up)，基于 T+1 到 T+n
-                # 修复：使用 rolling(n).max().shift(-n) 确保获取的是未来 n 天的最高价
+                # 修复问题1: 使用当前收盘价作为基准，避免未来信息泄露
                 f_high_max = high.rolling(window=forward_days).max().shift(-forward_days)
-                f_max_returns = (f_high_max / next_open - 1)
+                f_max_returns = (f_high_max / close - 1)
                 
                 # 获取未来 n 日内的最大跌幅 (Max Drawdown/Pain)，基于 T+1 到 T+n
-                # 修复：使用 rolling(n).min().shift(-n) 确保获取的是未来 n 天的最低价
+                # 修复问题1: 使用当前收盘价作为基准，避免未来信息泄露
                 f_low_min = low.rolling(window=forward_days).min().shift(-forward_days)
-                f_min_returns = (f_low_min / next_open - 1)
+                f_min_returns = (f_low_min / close - 1)
 
                 # 1. 路径质量分 (Path-aware Score)
                 # 显著惩罚回撤大、先跌后涨的标的，引导模型选择“走势稳健”的头部标的
@@ -769,46 +769,19 @@ class MLModelTrainer:
         import gc
         gc.collect()
         
-        # 应用：按日横向归一化 (Cross-sectional Normalization)
-        # 获取日期分组索引（排序后日期是连续的）
+        # 修复问题2 & 问题4: 延迟横截面归一化和标签处理
+        # 不在这里进行全局的横截面归一化，而是在模型训练时分别处理训练集和验证集
+        # 这样可以避免验证集受到训练集数据的影响
+        
+        print(f"\n数据准备完成，将在模型训练时进行横截面归一化...")
+        
+        # 获取日期分组信息（用于后续处理）
         _, date_group_start, date_group_counts = np.unique(
             dates_arr, return_index=True, return_counts=True
         )
         
-        print(f"\n应用：进行每日横向处理 (共 {len(date_group_start)} 个交易日)...")
-        
         # 最后的无效值填充 (先清理特征矩阵的 NaN)
         np.nan_to_num(X_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
-        print("  - 应用因子分位数标准化 (Cross-sectional Quantile Normalization)...")
-        # 彻底消除量纲、极端值影响：将因子值映射为横截面上的 0~1 的分位数排名
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            
-            # 识别需要进行横截面排名的因子索引
-            # 必须排除市场情绪因子（mkt_等）和分类因子（market_type等），因为它们在同一天对所有股票相同，排名会抹除其信息量
-            sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
-            rank_cols_mask = np.array([not any(k in col.lower() for k in sentiment_keys) for col in col_names])
-            rank_cols_idx = np.where(rank_cols_mask)[0]
-            
-            if len(rank_cols_idx) > 0:
-                print(f"  - 正在对 {len(rank_cols_idx)} 个非市场类因子进行横截面排名...")
-                for start, count in zip(date_group_start, date_group_counts):
-                    end = start + count
-                    if count > 1:
-                        # 仅对选定的列进行排名
-                        X_to_rank = X_arr[start:end, rank_cols_idx]
-                        # 优化点：使用 rankdata 替代 pd.DataFrame.rank，由于在循环内部且涉及上万次调用，
-                        # 避免 DataFrame 实例化能提升显著速度。同时使用 method='average' 处理相同值。
-                        for j in range(X_to_rank.shape[1]):
-                            col = X_to_rank[:, j]
-                            # 进行百分位排名映射到 (0, 1)
-                            # rankdata + average method 能够公平处理相同值
-                            ranked_col = rankdata(col, method='average') / (count + 1)
-                            X_arr[start:end, rank_cols_idx[j]] = ranked_col
-            else:
-                print("  - [提示] 未发现需要排名的因子列")
         
         # 构建轻量级包装，仅用于审计报告分析，不进行大内存拷贝
         all_cols = col_names
@@ -938,12 +911,13 @@ class MLModelTrainer:
         训练多个模型
         
         参数:
-            X: 特征矩阵
-            y: 标签向量
+            X: 特征矩阵（未归一化）
+            y: 标签向量（原始路径质量分数）
             returns: 原始收益率（用于计算权重或排序评价）
             factor_names: 特征名称列表
             dates: 样本日期（用于排序组划分）
             unbuyable_mask: 无法买入的样本掩码（涨停或停牌）
+            limit_groups: 板块涨停阈值（用于区分不同板块）
             model_types: 要训练的模型类型列表
         
         返回:
@@ -970,10 +944,46 @@ class MLModelTrainer:
             X[np.isinf(X)] = 0.0
         
         print(f"  数据验证完成: {X.shape[0]} 行, {X.shape[1]} 列")
-        if self.task == 'classification':
-            print(f"  正样本比例: {y.mean():.2%}")
         
-        # 准备样本权重
+        # 修复问题2: 在 train/val split 之后，分别进行横截面归一化
+        print("\n修复问题2: 准备在 split 后分别进行横截面归一化...")
+        
+        # 先进行时间序列划分
+        raw_split_idx = int(len(dates) * TrainingConfig.TRAIN_TEST_SPLIT)
+        split_date = dates[raw_split_idx]
+        split_idx = np.searchsorted(dates, split_date, side='left')
+        
+        print(f"  划分点: {split_date}, 索引: {split_idx}")
+        print(f"  训练集: {split_idx} 样本, 验证集: {len(dates) - split_idx} 样本")
+        
+        # 分割数据
+        X_train_raw = X[:split_idx].copy()
+        X_val_raw = X[split_idx:].copy()
+        y_train_raw = y[:split_idx].copy()
+        y_val_raw = y[split_idx:].copy()
+        returns_train = returns[:split_idx].copy()
+        returns_val = returns[split_idx:].copy()
+        dates_train = dates[:split_idx].copy()
+        dates_val = dates[split_idx:].copy()
+        limit_groups_train = limit_groups[:split_idx].copy() if limit_groups is not None else None
+        limit_groups_val = limit_groups[split_idx:].copy() if limit_groups is not None else None
+        
+        # 对训练集和验证集分别进行横截面归一化
+        print("\n  对训练集进行横截面归一化...")
+        X_train_normalized = self._apply_cross_sectional_normalization(
+            X_train_raw, dates_train, factor_names
+        )
+        
+        print("  对验证集进行横截面归一化...")
+        X_val_normalized = self._apply_cross_sectional_normalization(
+            X_val_raw, dates_val, factor_names
+        )
+        
+        # 合并回完整数据集（用于传递给模型）
+        X = np.vstack([X_train_normalized, X_val_normalized])
+        
+        print(f"  横截面归一化完成")
+        
         sample_weight = None
         if self.punish_unbuyable:
             # 优化：使用相对涨跌幅 (returns / limit_threshold) 作为权重
@@ -1003,26 +1013,22 @@ class MLModelTrainer:
                 task = 'ranking' if model_type == 'lightgbm' else 'regression'
                 model = MLFactorModel(model_type=model_type, task=task)
                 
-                # 统一计算分组信息和 split_idx (所有任务通用，用于按组评估)
+                # 统一计算分组信息（所有任务通用，用于按组评估）
                 extra_params = {}
                 
-                # 关键修复：确保 split_idx 对齐到日期边界 (所有任务一致)
-                raw_split_idx = int(len(dates) * TrainingConfig.TRAIN_TEST_SPLIT)
-                split_date = dates[raw_split_idx]
-                split_idx = np.searchsorted(dates, split_date, side='left')
-                
-                train_dates = dates[:split_idx]
-                val_dates = dates[split_idx:]
+                # 使用已经计算好的 split_idx
+                train_dates = dates_train
+                val_dates = dates_val
                 
                 _, train_group = np.unique(train_dates, return_counts=True)
                 _, val_group = np.unique(val_dates, return_counts=True)
                 
-                extra_params['dates'] = dates  # 传递日期用于按组评估
+                extra_params['dates'] = dates  # 传递完整日期用于按组评估
                 extra_params['split_idx'] = split_idx  # 传递对齐后的 split 点
                 extra_params['group'] = train_group
                 extra_params['eval_group'] = val_group
                             
-                # 训练模型
+                # 训练模型（传入已归一化的数据）
                 train_result = model.train(X, y, validation_split=0.2, 
                                           use_time_series_split=True,
                                           feature_names=factor_names,
@@ -1083,6 +1089,50 @@ class MLModelTrainer:
         print(f"\n最佳选股模型: {best_model[0].upper()} (Rank IC: {best_model[1]['val_metrics'].get('rank_ic', 0.0):.4f})")
         
         return best_model[0]
+    
+    def _apply_cross_sectional_normalization(self, X: np.ndarray, dates: np.ndarray, 
+                                            factor_names: List[str]) -> np.ndarray:
+        """
+        对特征矩阵进行横截面归一化（按日期分组）
+        
+        参数:
+            X: 特征矩阵
+            dates: 日期数组
+            factor_names: 特征名称列表
+        
+        返回:
+            归一化后的特征矩阵
+        """
+        X_normalized = X.copy()
+        
+        # 获取日期分组
+        _, date_group_start, date_group_counts = np.unique(
+            dates, return_index=True, return_counts=True
+        )
+        
+        # 识别需要进行横截面排名的因子索引
+        # 修复问题7: 排除市场情绪因子，因为它们在同一天对所有股票相同
+        sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
+        rank_cols_mask = np.array([not any(k in col.lower() for k in sentiment_keys) for col in factor_names])
+        rank_cols_idx = np.where(rank_cols_mask)[0]
+        
+        if len(rank_cols_idx) > 0:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                
+                for start, count in zip(date_group_start, date_group_counts):
+                    end = start + count
+                    if count > 1:
+                        # 仅对选定的列进行排名
+                        X_to_rank = X_normalized[start:end, rank_cols_idx]
+                        for j in range(X_to_rank.shape[1]):
+                            col = X_to_rank[:, j]
+                            # 进行百分位排名映射到 (0, 1)
+                            ranked_col = rankdata(col, method='average') / (count + 1)
+                            X_normalized[start:end, rank_cols_idx[j]] = ranked_col
+        
+        return X_normalized
     
     def save_models(self, save_dir: str = 'models', years: int = 5, stocks: int = 5000):
         """

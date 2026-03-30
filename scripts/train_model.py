@@ -26,7 +26,7 @@ def main():
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
                         help='仅更新因子缓存到最新日期，不训练模型')
-    parser.add_argument('--skip-cache-update', action='store_true',default=True,
+    parser.add_argument('--skip-cache-update', action='store_true',
                         help='跳过增量缓存更新步骤，直接进入模型训练')
     parser.add_argument('--cache-end', type=str, default=None,
                         help='缓存更新截止日期 (YYYY-MM-DD)，默认=今天')

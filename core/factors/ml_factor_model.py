@@ -208,11 +208,11 @@ class MLFactorModel:
         # ---------------------------------------------------------------------
         # 3. 特征缩放 (RobustScaler)
         # ---------------------------------------------------------------------
-        # 修复 Bug：虽然在 __init__ 定义了 scaler，但原始代码未曾调用。
-        # 对于非排名化的绝对值因子（如 PE, 市场波动率等），缩放对模型稳定性至关重要。
-        print(f"  [INFO] 模型训练准备：正在进行特征缩放 (RobustScaler)...")
-        X_train_raw = self.scaler.fit_transform(X_train_raw).astype(np.float32)
-        X_val_raw = self.scaler.transform(X_val_raw).astype(np.float32)
+        # 修复问题3: 特征缩放应该在横截面归一化之后进行
+        # 注意：由于在 train_models 中已经进行了横截面归一化，
+        # print(f"  [INFO] 模型训练准备：正在进行特征缩放 (RobustScaler)...")
+        # X_train_raw = self.scaler.fit_transform(X_train_raw).astype(np.float32)
+        # X_val_raw = self.scaler.transform(X_val_raw).astype(np.float32)
 
         # ---------------------------------------------------------------------
         # 4. 样本打乱 (Shuffle) —— 解决分批训练导致的分布漂移关键
@@ -234,7 +234,7 @@ class MLFactorModel:
         # 5. 内存优化与分批训练
         # 如果启用内存优化且在 GPU 上，使用 XGBoost 的 DataIter 或 LightGBM 的 Dataset 优化
         use_gpu = TrainingConfig.USE_GPU
-        mem_efficient = getattr(TrainingConfig, 'MEMORY_EFFICIENT', False)
+        mem_efficient = getattr(TrainingConfig, 'MEMORY_EFFICIENT', True)
         batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 1000000)
 
         # ---------------------------------------------------------------------

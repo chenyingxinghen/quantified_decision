@@ -95,7 +95,7 @@ class TrainingConfig:
     """训练参数配置"""
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
-    MODEL_TYPES = ['lightgbm']
+    MODEL_TYPES = ['xgboost']
 
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
@@ -108,7 +108,7 @@ class TrainingConfig:
     YEARS_FOR_TRAINING=15         # 训练年数
     STOCK_NUM = 6000             # 股票数量
     # 数据集划分
-    TRAIN_TEST_SPLIT = 0.7
+    TRAIN_TEST_SPLIT = 0.8
     
 
     # 预测天数 (用于分类、回归和排序任务)

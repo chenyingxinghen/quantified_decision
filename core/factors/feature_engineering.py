@@ -577,11 +577,11 @@ class FeatureEngineer:
         # 2. 应用变换
         if config.get('ratio') and len(fundamental_factors) > 1:
             pre_count = len(self.generated_features)
-            # 比率特征：从基本面因子中随机选择 10 个，分为两组（每组 5 个）进行比率组合 (5*5=25)
+            # 修复问题6: 在随机选择前先排序，确保不同股票的特征一致
             import random
-            # 设置随机种子以保证可复现性
             random.seed(42)
-            selected_factors = random.sample(fundamental_factors, min(10, len(fundamental_factors)))
+            sorted_factors = sorted(fundamental_factors)  # 先排序
+            selected_factors = random.sample(sorted_factors, min(10, len(sorted_factors)))
             numerator_factors = selected_factors[:5]
             denominator_factors = selected_factors[5:10]
             result = self.create_ratio_features(result, numerator_factors, denominator_factors)
@@ -589,10 +589,11 @@ class FeatureEngineer:
         
         if config.get('product') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            # 乘积特征：从技术指标中随机选择 6 个，生成两两组合 (4*3/2=6)
+            # 修复问题6: 在随机选择前先排序
             import random
             random.seed(42)
-            selected_tech = random.sample(tech_indicators, min(4, len(tech_indicators)))
+            sorted_tech = sorted(tech_indicators)  # 先排序
+            selected_tech = random.sample(sorted_tech, min(4, len(sorted_tech)))
             important_pairs = [(selected_tech[i], selected_tech[j]) 
                               for i in range(len(selected_tech)) 
                               for j in range(i+1, len(selected_tech))]
@@ -601,10 +602,11 @@ class FeatureEngineer:
         
         if config.get('difference') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            # 差分特征：从技术指标中随机选择 8 个，生成两两差值组合 (6*5/2=15)
+            # 修复问题6: 在随机选择前先排序
             import random
             random.seed(42)
-            selected_tech = random.sample(tech_indicators, min(6, len(tech_indicators)))
+            sorted_tech = sorted(tech_indicators)  # 先排序
+            selected_tech = random.sample(sorted_tech, min(6, len(sorted_tech)))
             diff_pairs = [(selected_tech[i], selected_tech[j]) 
                          for i in range(len(selected_tech)) 
                          for j in range(i+1, len(selected_tech))]
@@ -613,47 +615,50 @@ class FeatureEngineer:
         
         if config.get('log'):
             pre_count = len(self.generated_features)
-            # 对数特征：涵盖规模类因子（市值、营收、资产等）及成交量
+            # 修复问题6: 在随机选择前先排序
             log_kws = ['market_cap', 'revenue', 'equity', 'asset', 'profit', 'cash']
             log_cols = [col for col in fundamental_factors if any(kw in col.lower() for kw in log_kws)]
             log_cols += [col for col in tech_indicators if 'vol' in col.lower() or 'amount' in col.lower()]
                     
             if log_cols:
-                # 从符合条件的列中随机选择 8 个进行对数变换
                 import random
                 random.seed(42)
-                selected_cols = random.sample(log_cols, min(8, len(log_cols)))
+                sorted_cols = sorted(log_cols)  # 先排序
+                selected_cols = random.sample(sorted_cols, min(8, len(sorted_cols)))
                 result = self.create_log_features(result, selected_cols)
             stats['对数变换 (Log)'] = len(self.generated_features) - pre_count
         
         if config.get('sqrt'):
             pre_count = len(self.generated_features)
-            # 平方根特征：包含波动率和成交量相关指标
+            # 修复问题6: 在随机选择前先排序
             sqrt_cols = [col for col in tech_indicators if any(kw in col.lower() for kw in ['volatility', 'atr', 'vol', 'amount'])]
             if sqrt_cols:
-                # 从符合条件的列中随机选择 5 个进行平方根变换
                 import random
                 random.seed(42)
-                selected_cols = random.sample(sqrt_cols, min(5, len(sqrt_cols)))
+                sorted_cols = sorted(sqrt_cols)  # 先排序
+                selected_cols = random.sample(sorted_cols, min(5, len(sorted_cols)))
                 result = self.create_sqrt_features(result, selected_cols)
             stats['平方根变换 (Sqrt)'] = len(self.generated_features) - pre_count
         
         if config.get('rank'):
             pre_count = len(self.generated_features)
-            # 排名特征：从基本面因子中随机选择 12 个进行滚动排名
+            # 修复问题6: 在随机选择前先排序
             import random
             random.seed(42)
-            selected_factors = random.sample(fundamental_factors, min(15, len(fundamental_factors)))
+            sorted_factors = sorted(fundamental_factors)  # 先排序
+            selected_factors = random.sample(sorted_factors, min(15, len(sorted_factors)))
             result = self.create_rank_features(result, selected_factors)
             stats['滚动排名 (Rolling Rank)'] = len(self.generated_features) - pre_count
         
         if config.get('interaction') and len(tech_indicators) > 0 and len(fundamental_factors) > 0:
             pre_count = len(self.generated_features)
-            # 交互特征：从技术指标和基本面因子中各随机选择 6 个和 6 个进行交互
+            # 修复问题6: 在随机选择前先排序
             import random
             random.seed(42)
-            selected_tech = random.sample(tech_indicators, min(6, len(tech_indicators)))
-            selected_fund = random.sample(fundamental_factors, min(5, len(fundamental_factors)))
+            sorted_tech = sorted(tech_indicators)  # 先排序
+            sorted_fund = sorted(fundamental_factors)  # 先排序
+            selected_tech = random.sample(sorted_tech, min(6, len(sorted_tech)))
+            selected_fund = random.sample(sorted_fund, min(5, len(sorted_fund)))
             result = self.create_interaction_features(result, selected_tech, selected_fund)
             stats['交互特征 (Tech*Fund)'] = len(self.generated_features) - pre_count
 

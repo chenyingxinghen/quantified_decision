@@ -5,7 +5,7 @@
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from sklearn.preprocessing import PolynomialFeatures
 
 
@@ -18,141 +18,98 @@ class FeatureEngineer:
     
     def create_ratio_features(self, df: pd.DataFrame, 
                              numerator_cols: List[str], 
-                             denominator_cols: List[str]) -> pd.DataFrame:
+                             denominator_cols: List[str],
+                             return_dict: bool = False) -> Any:
         """
         创建比率特征
-        
-        参数:
-            df: 输入DataFrame
-            numerator_cols: 分子列名列表
-            denominator_cols: 分母列名列表
-        
-        返回:
-            包含比率特征的DataFrame
         """
         new_features = {}
         
+        # 预先检查并缓存数值
+        cached_series = {}
+        target_cols = list(set(numerator_cols + denominator_cols))
+        for col in target_cols:
+            if col in df.columns:
+                cached_series[col] = pd.to_numeric(df[col], errors='coerce')
+
         for num_col in numerator_cols:
-            if num_col not in df.columns:
+            if num_col not in cached_series:
                 continue
             
             for den_col in denominator_cols:
-                if den_col not in df.columns or num_col == den_col:
+                if den_col not in cached_series or num_col == den_col:
                     continue
                 
                 feature_name = f'{num_col}_div_{den_col}'
                 
-                try:
-                    # 转换为数值类型
-                    numerator = pd.to_numeric(df[num_col], errors='coerce')
-                    denominator = pd.to_numeric(df[den_col], errors='coerce')
-                    
-                    # 避免除以零和NaN
-                    denominator = denominator.replace(0, np.nan)
-                    
-                    # 执行除法
-                    ratio = numerator / denominator
-                    
-                    # 清理无穷大和NaN
-                    ratio = ratio.replace([np.inf, -np.inf], np.nan)
-                    ratio = ratio.fillna(0)
-                    
-                    new_features[feature_name] = ratio
-                    self.generated_features.append(feature_name)
-                except:
-                    # 如果出错，跳过这个特征
-                    continue
+                # 避免除以零和NaN
+                denominator = cached_series[den_col].replace(0, np.nan)
+                ratio = cached_series[num_col] / denominator
+                
+                new_features[feature_name] = ratio.replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
+                self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_product_features(self, df: pd.DataFrame, 
-                               col_pairs: List[tuple]) -> pd.DataFrame:
+                               col_pairs: List[tuple],
+                               return_dict: bool = False) -> Any:
         """
         创建乘积特征
-        
-        参数:
-            df: 输入DataFrame
-            col_pairs: 列对列表 [(col1, col2), ...]
-        
-        返回:
-            包含乘积特征的DataFrame
         """
         new_features = {}
         
+        # 预加载
+        unique_cols = list(set([c for pair in col_pairs for c in pair]))
+        cached_series = {c: pd.to_numeric(df[c], errors='coerce') for c in unique_cols if c in df.columns}
+
         for col1, col2 in col_pairs:
-            if col1 not in df.columns or col2 not in df.columns:
+            if col1 not in cached_series or col2 not in cached_series:
                 continue
             
             feature_name = f'{col1}_mul_{col2}'
+            product = cached_series[col1] * cached_series[col2]
+            new_features[feature_name] = product.replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
+            self.generated_features.append(feature_name)
+        
+        if return_dict:
+            return new_features
             
-            try:
-                # 转换为数值类型
-                val1 = pd.to_numeric(df[col1], errors='coerce')
-                val2 = pd.to_numeric(df[col2], errors='coerce')
-                
-                # 计算乘积
-                product = val1 * val2
-                
-                # 清理无穷大和NaN
-                product = product.replace([np.inf, -np.inf], np.nan)
-                product = product.fillna(0)
-                
-                new_features[feature_name] = product
-                self.generated_features.append(feature_name)
-            except:
-                continue
-        
-        # 一次性添加所有新列
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_difference_features(self, df: pd.DataFrame, 
-                                  col_pairs: List[tuple]) -> pd.DataFrame:
+                                  col_pairs: List[tuple],
+                                  return_dict: bool = False) -> Any:
         """
         创建差值特征
-        
-        参数:
-            df: 输入DataFrame
-            col_pairs: 列对列表 [(col1, col2), ...]
-        
-        返回:
-            包含差值特征的DataFrame
         """
         new_features = {}
         
+        # 预计算
+        unique_cols = list(set([c for pair in col_pairs for c in pair]))
+        cached_series = {c: pd.to_numeric(df[c], errors='coerce') for c in unique_cols if c in df.columns}
+        
         for col1, col2 in col_pairs:
-            if col1 not in df.columns or col2 not in df.columns:
+            if col1 not in cached_series or col2 not in cached_series:
                 continue
             
             feature_name = f'{col1}_sub_{col2}'
+            diff = cached_series[col1] - cached_series[col2]
+            new_features[feature_name] = diff.replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
+            self.generated_features.append(feature_name)
+        
+        if return_dict:
+            return new_features
             
-            try:
-                # 转换为数值类型
-                val1 = pd.to_numeric(df[col1], errors='coerce')
-                val2 = pd.to_numeric(df[col2], errors='coerce')
-                
-                # 计算差值
-                diff = val1 - val2
-                
-                # 清理无穷大和NaN
-                diff = diff.replace([np.inf, -np.inf], np.nan)
-                diff = diff.fillna(0)
-                
-                new_features[feature_name] = diff
-                self.generated_features.append(feature_name)
-            except:
-                continue
-        
-        # 一次性添加所有新列
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_polynomial_features(self, df: pd.DataFrame, 
@@ -195,16 +152,10 @@ class FeatureEngineer:
         return df
     
     def create_log_features(self, df: pd.DataFrame, 
-                           columns: List[str]) -> pd.DataFrame:
+                           columns: List[str],
+                           return_dict: bool = False) -> Any:
         """
         创建对数特征
-        
-        参数:
-            df: 输入DataFrame
-            columns: 要生成对数特征的列
-        
-        返回:
-            包含对数特征的DataFrame
         """
         new_features = {}
         
@@ -213,35 +164,25 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'log_{col}'
-            
-            # 只对正值取对数
-            positive_values = df[col].clip(lower=1e-10)
+            series = pd.to_numeric(df[col], errors='coerce')
+            positive_values = series.clip(lower=1e-10)
             log_values = np.log(positive_values)
             
-            # 处理无穷大和NaN
-            log_values = log_values.replace([np.inf, -np.inf], np.nan)
-            log_values = log_values.fillna(0)
-            
-            new_features[feature_name] = log_values
+            new_features[feature_name] = log_values.replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
             self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_sqrt_features(self, df: pd.DataFrame, 
-                            columns: List[str]) -> pd.DataFrame:
+                             columns: List[str],
+                             return_dict: bool = False) -> Any:
         """
         创建平方根特征
-        
-        参数:
-            df: 输入DataFrame
-            columns: 要生成平方根特征的列
-        
-        返回:
-            包含平方根特征的DataFrame
         """
         new_features = {}
         
@@ -250,32 +191,25 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'sqrt_{col}'
-            
-            # 只对非负值取平方根
-            non_negative = df[col].clip(lower=0)
-            new_features[feature_name] = np.sqrt(non_negative)
+            series = pd.to_numeric(df[col], errors='coerce')
+            non_negative = series.clip(lower=0)
+            new_features[feature_name] = np.sqrt(non_negative).fillna(0).astype(np.float32)
             
             self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_rank_features(self, df: pd.DataFrame, 
-                            columns: List[str],
-                            window: int = 252) -> pd.DataFrame:
+                             columns: List[str],
+                             window: int = 252,
+                             return_dict: bool = False) -> Any:
         """
-        创建排名特征（滚动窗口排名，防止数据泄露）
-        
-        参数:
-            df: 输入DataFrame
-            columns: 要生成排名特征的列
-            window: 滚动窗口大小（默认252天）
-        
-        返回:
-            包含滚动排名特征的DataFrame
+        创建排名特征
         """
         new_features = {}
         
@@ -284,35 +218,24 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'rank_{col}'
-            
-            # 使用 pandas 原生的 rolling().rank(pct=True) 替代 apply(lambda)
-            # 性能提升约 50-100 倍且能够正确处理 ties
             series = pd.to_numeric(df[col], errors='coerce')
-            new_features[feature_name] = series.rolling(window=window, min_periods=window//2).rank(pct=True)
-            
+            new_features[feature_name] = series.rolling(window=window, min_periods=window//2).rank(pct=True).astype(np.float32)
             self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_quantile_features(self, df: pd.DataFrame, 
-                                columns: List[str],
-                                window: int = 252,
-                                n_quantiles: int = 5) -> pd.DataFrame:
+                                 columns: List[str],
+                                 window: int = 252,
+                                 n_quantiles: int = 5,
+                                 return_dict: bool = False) -> Any:
         """
-        创建分位数特征（滚动窗口分位，防止数据泄露）
-        
-        参数:
-            df: 输入DataFrame
-            columns: 要生成分位数特征的列
-            window: 滚动窗口大小（默认252天）
-            n_quantiles: 分位数数量
-        
-        返回:
-            包含滚动分位数特征的DataFrame
+        创建分位数特征
         """
         new_features = {}
         
@@ -321,81 +244,55 @@ class FeatureEngineer:
                 continue
             
             feature_name = f'quantile_{col}'
-            
-            # 复用高效的 rolling rank 逻辑
             series = pd.to_numeric(df[col], errors='coerce')
             rolled_rank = series.rolling(window=window, min_periods=window//4).rank(pct=True)
             
-            # 离散化为分位数
-            new_features[feature_name] = (rolled_rank * n_quantiles).fillna(0).astype(int).clip(0, n_quantiles-1)
+            new_features[feature_name] = (rolled_rank * n_quantiles).fillna(0).astype(np.float32).clip(0, n_quantiles-1)
             self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_interaction_features(self, df: pd.DataFrame,
-                                   technical_cols: List[str],
-                                   fundamental_cols: List[str]) -> pd.DataFrame:
+                                    technical_cols: List[str],
+                                    fundamental_cols: List[str],
+                                    return_dict: bool = False) -> Any:
         """
-        创建技术指标与基本面因子的交互特征
-        
-        参数:
-            df: 输入DataFrame
-            technical_cols: 技术指标列
-            fundamental_cols: 基本面因子列
-        
-        返回:
-            包含交互特征的DataFrame
+        创建交互特征
         """
         new_features = {}
         
-        # 选择重要的技术指标和基本面因子进行交互
         important_tech = [col for col in technical_cols if col in df.columns][:10]
         important_fund = [col for col in fundamental_cols if col in df.columns][:10]
         
+        # 预加载
+        cached_tech = {c: pd.to_numeric(df[c], errors='coerce') for c in important_tech}
+        cached_fund = {c: pd.to_numeric(df[c], errors='coerce') for c in important_fund}
+
         for tech_col in important_tech:
             for fund_col in important_fund:
                 feature_name = f'{tech_col}_x_{fund_col}'
-                
-                try:
-                    # 转换为数值类型
-                    tech_val = pd.to_numeric(df[tech_col], errors='coerce')
-                    fund_val = pd.to_numeric(df[fund_col], errors='coerce')
-                    
-                    # 计算交互
-                    interaction = tech_val * fund_val
-                    
-                    # 清理无穷大和NaN
-                    interaction = interaction.replace([np.inf, -np.inf], np.nan)
-                    interaction = interaction.fillna(0)
-                    
-                    new_features[feature_name] = interaction
-                    self.generated_features.append(feature_name)
-                except:
-                    continue
+                interaction = cached_tech[tech_col] * cached_fund[fund_col]
+                new_features[feature_name] = interaction.replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
+                self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_momentum_features(self, df: pd.DataFrame,
                                 columns: List[str],
-                                windows: List[int] = [5, 10, 20]) -> pd.DataFrame:
+                                windows: List[int] = [5, 10, 20],
+                                return_dict: bool = False) -> Any:
         """
-        创建动量特征（变化率）
-        
-        参数:
-            df: 输入DataFrame
-            columns: 要生成动量特征的列
-            windows: 时间窗口列表
-        
-        返回:
-            包含动量特征的DataFrame
+        创建动量特征
         """
         new_features = {}
         
@@ -403,38 +300,26 @@ class FeatureEngineer:
             if col not in df.columns:
                 continue
             
+            series = pd.to_numeric(df[col], errors='coerce')
             for window in windows:
-                # 动量计算
-                col_data = pd.to_numeric(df[col], errors='coerce')
-                momentum = col_data.pct_change(window)
-                
-                # 处理无穷大和NaN
-                momentum = momentum.replace([np.inf, -np.inf], np.nan)
-                momentum = momentum.fillna(0)
-                
                 feature_name = f'{col}_momentum_{window}'
-                new_features[feature_name] = momentum
+                momentum = series.pct_change(window)
+                new_features[feature_name] = momentum.replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
                 self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def create_volatility_features(self, df: pd.DataFrame,
                                   columns: List[str],
-                                  windows: List[int] = [5, 10, 20]) -> pd.DataFrame:
+                                  windows: List[int] = [5, 10, 20],
+                                  return_dict: bool = False) -> Any:
         """
-        创建波动率特征（滚动标准差）
-        
-        参数:
-            df: 输入DataFrame
-            columns: 要生成波动率特征的列
-            windows: 时间窗口列表
-        
-        返回:
-            包含波动率特征的DataFrame
+        创建波动率特征
         """
         new_features = {}
         
@@ -442,21 +327,18 @@ class FeatureEngineer:
             if col not in df.columns:
                 continue
             
+            series = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
             for window in windows:
                 feature_name = f'{col}_volatility_{window}'
-                col_data = pd.to_numeric(df[col], errors='coerce')
-                # 排除无穷大以避免std()中的RuntimeWarning
-                col_data = col_data.replace([np.inf, -np.inf], np.nan)
-                volatility = col_data.rolling(window).std()
-                volatility = volatility.fillna(0)
-                
-                new_features[feature_name] = volatility
+                volatility = series.rolling(window).std()
+                new_features[feature_name] = volatility.fillna(0).astype(np.float32)
                 self.generated_features.append(feature_name)
         
-        # 一次性添加所有新列
+        if return_dict:
+            return new_features
+            
         if new_features:
-            df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-        
+            return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
         return df
     
     def encode_categorical_features(self, df: pd.DataFrame,
@@ -537,9 +419,9 @@ class FeatureEngineer:
                                   config: Optional[Dict] = None,
                                   verbose: bool = False) -> pd.DataFrame:
         """
-        应用所有特征工程变换，根据 verbose 控制输出
+        应用所有特征工程变换 (Batch 优化版本)
         """
-        self.generated_features = [] # 每次转换重置结果列表，确保实例内逻辑干净
+        self.generated_features = [] 
         if config is None:
             config = {
                 'ratio': True, 'product': True, 'difference': True,
@@ -547,19 +429,19 @@ class FeatureEngineer:
                 'interaction': True, 'categorical': True,
             }
         
-        result = df
+        # 收集所有新生成的特征，最后一次性合并，避免多次 DataFrame 拷贝
+        collected_features = {}
         stats = {}
         initial_count = len(df.columns)
 
-        # 1. 编码分类特征
+        # 1. 编码分类特征 (这步可能修改原 DataFrame，先执行)
         if config.get('categorical'):
             pre_count = len(self.generated_features)
-            result = self.encode_categorical_features(result)
+            df = self.encode_categorical_features(df)
             stats['分类特征编码'] = len(self.generated_features) - pre_count
         
-        # 识别技术指标和基本面因子 - 优化匹配逻辑以兼容多种命名风格 (如 marketCap vs market_cap)
+        # 识别技术指标和基本面因子
         def fuzzy_match(col_name, keywords):
-            # 将列名和关键词处理成统一格式（小写且无下划线）进行匹配
             clean_col = col_name.lower().replace('_', '')
             for kw in keywords:
                 if kw.lower().replace('_', '') in clean_col:
@@ -567,113 +449,93 @@ class FeatureEngineer:
             return False
 
         tech_keywords = ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 'willr', 'bias', 'psy', 'boll', 'ma', 'ema', 'vol', 'amount', 'turnover']
-        tech_indicators = [col for col in result.columns if fuzzy_match(col, tech_keywords)][:100]
+        tech_indicators = [col for col in df.columns if fuzzy_match(col, tech_keywords)][:100]
 
         fund_keywords = ['pe', 'pb', 'roe', 'roa', 'margin', 'growth', 'yield', 'beta', 'market_cap', 'marketcap', 
                          'peg', 'sue', 'eav', 'revenue', 'share', 'ttm', 'yoy', 'ratio', 'equity', 'asset', 'profit']
-        fundamental_factors = [col for col in result.columns if fuzzy_match(col, fund_keywords) 
+        fundamental_factors = [col for col in df.columns if fuzzy_match(col, fund_keywords) 
                               and not any(x in col.lower() for x in ['slope', 'sharpe'])][:60]
         
-        # 2. 应用变换
+        # 2. 批量生成各类特征并存入 collected_features
+        import random
+        random.seed(42)
+
         if config.get('ratio') and len(fundamental_factors) > 1:
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序，确保不同股票的特征一致
-            import random
-            random.seed(42)
-            sorted_factors = sorted(fundamental_factors)  # 先排序
+            sorted_factors = sorted(fundamental_factors)
             selected_factors = random.sample(sorted_factors, min(10, len(sorted_factors)))
-            numerator_factors = selected_factors[:5]
-            denominator_factors = selected_factors[5:10]
-            result = self.create_ratio_features(result, numerator_factors, denominator_factors)
-            stats['比率特征 (Fund/Fund)'] = len(self.generated_features) - pre_count
-        
+            collected_features.update(self.create_ratio_features(df, selected_factors[:5], selected_factors[5:10], return_dict=True))
+            stats['比率特征'] = len(self.generated_features) - pre_count
+
         if config.get('product') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序
-            import random
-            random.seed(42)
-            sorted_tech = sorted(tech_indicators)  # 先排序
+            sorted_tech = sorted(tech_indicators)
             selected_tech = random.sample(sorted_tech, min(4, len(sorted_tech)))
-            important_pairs = [(selected_tech[i], selected_tech[j]) 
-                              for i in range(len(selected_tech)) 
-                              for j in range(i+1, len(selected_tech))]
-            result = self.create_product_features(result, important_pairs)
-            stats['乘积特征 (Tech*Tech)'] = len(self.generated_features) - pre_count
+            pairs = [(selected_tech[i], selected_tech[j]) for i in range(len(selected_tech)) for j in range(i+1, len(selected_tech))]
+            collected_features.update(self.create_product_features(df, pairs, return_dict=True))
+            stats['乘积特征'] = len(self.generated_features) - pre_count
         
         if config.get('difference') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序
-            import random
-            random.seed(42)
-            sorted_tech = sorted(tech_indicators)  # 先排序
+            sorted_tech = sorted(tech_indicators)
             selected_tech = random.sample(sorted_tech, min(6, len(sorted_tech)))
-            diff_pairs = [(selected_tech[i], selected_tech[j]) 
-                         for i in range(len(selected_tech)) 
-                         for j in range(i+1, len(selected_tech))]
-            result = self.create_difference_features(result, diff_pairs)
-            stats['差分特征 (Tech-Tech)'] = len(self.generated_features) - pre_count
-        
+            diff_pairs = [(selected_tech[i], selected_tech[j]) for i in range(len(selected_tech)) for j in range(i+1, len(selected_tech))]
+            collected_features.update(self.create_difference_features(df, diff_pairs, return_dict=True))
+            stats['差分特征'] = len(self.generated_features) - pre_count
+
         if config.get('log'):
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序
             log_kws = ['market_cap', 'revenue', 'equity', 'asset', 'profit', 'cash']
             log_cols = [col for col in fundamental_factors if any(kw in col.lower() for kw in log_kws)]
+            # 兼容技术指标
             log_cols += [col for col in tech_indicators if 'vol' in col.lower() or 'amount' in col.lower()]
-                    
             if log_cols:
-                import random
-                random.seed(42)
-                sorted_cols = sorted(log_cols)  # 先排序
+                sorted_cols = sorted(list(set(log_cols)))
                 selected_cols = random.sample(sorted_cols, min(8, len(sorted_cols)))
-                result = self.create_log_features(result, selected_cols)
-            stats['对数变换 (Log)'] = len(self.generated_features) - pre_count
-        
+                collected_features.update(self.create_log_features(df, selected_cols, return_dict=True))
+            stats['对数变换'] = len(self.generated_features) - pre_count
+
         if config.get('sqrt'):
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序
             sqrt_cols = [col for col in tech_indicators if any(kw in col.lower() for kw in ['volatility', 'atr', 'vol', 'amount'])]
             if sqrt_cols:
-                import random
-                random.seed(42)
-                sorted_cols = sorted(sqrt_cols)  # 先排序
+                sorted_cols = sorted(list(set(sqrt_cols)))
                 selected_cols = random.sample(sorted_cols, min(5, len(sorted_cols)))
-                result = self.create_sqrt_features(result, selected_cols)
-            stats['平方根变换 (Sqrt)'] = len(self.generated_features) - pre_count
-        
+                collected_features.update(self.create_sqrt_features(df, selected_cols, return_dict=True))
+            stats['平方根变换'] = len(self.generated_features) - pre_count
+
         if config.get('rank'):
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序
-            import random
-            random.seed(42)
-            sorted_factors = sorted(fundamental_factors)  # 先排序
+            sorted_factors = sorted(fundamental_factors)
             selected_factors = random.sample(sorted_factors, min(15, len(sorted_factors)))
-            result = self.create_rank_features(result, selected_factors)
-            stats['滚动排名 (Rolling Rank)'] = len(self.generated_features) - pre_count
-        
+            collected_features.update(self.create_rank_features(df, selected_factors, return_dict=True))
+            stats['滚动排名'] = len(self.generated_features) - pre_count
+
         if config.get('interaction') and len(tech_indicators) > 0 and len(fundamental_factors) > 0:
             pre_count = len(self.generated_features)
-            # 修复问题6: 在随机选择前先排序
-            import random
-            random.seed(42)
-            sorted_tech = sorted(tech_indicators)  # 先排序
-            sorted_fund = sorted(fundamental_factors)  # 先排序
+            sorted_tech = sorted(tech_indicators)
+            sorted_fund = sorted(fundamental_factors)
             selected_tech = random.sample(sorted_tech, min(6, len(sorted_tech)))
             selected_fund = random.sample(sorted_fund, min(5, len(sorted_fund)))
-            result = self.create_interaction_features(result, selected_tech, selected_fund)
-            stats['交互特征 (Tech*Fund)'] = len(self.generated_features) - pre_count
+            collected_features.update(self.create_interaction_features(df, selected_tech, selected_fund, return_dict=True))
+            stats['交互特征'] = len(self.generated_features) - pre_count
 
-        # 仅在 verbose 为 True 时输出统计报告
+        # 3. 最终合并 (仅一次)
+        if collected_features:
+            new_df = pd.DataFrame(collected_features, index=df.index)
+            # 确保类型为 float32
+            new_df = new_df.astype(np.float32, copy=False)
+            df = pd.concat([df, new_df], axis=1)
+
         if verbose:
             print("\n" + "-"*40)
-            print("特征工程报告:")
-            print(f"  识别到: {len(tech_indicators)} 个技术指标, {len(fundamental_factors)} 个基本面因子")
+            print("特征工程报告 (Batch 优化版):")
             for name, count in stats.items():
-                if count > 0:
-                    print(f"  - {name}: +{count} 个")
-            print(f"  总计: 原始 {initial_count} -> 现计 {len(result.columns)} (新增 {len(self.generated_features)})")
+                if count > 0: print(f"  - {name}: +{count} 个")
+            print(f"  总计: 原始 {initial_count} -> 现计 {len(df.columns)} (新增 {len(self.generated_features)})")
             print("-"*40 + "\n")
         
-        return result
+        return df
     
     def get_generated_features(self) -> List[str]:
         """获取生成的特征名称列表"""

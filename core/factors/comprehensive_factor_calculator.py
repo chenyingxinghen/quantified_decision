@@ -70,23 +70,28 @@ class ComprehensiveFactorCalculator:
         all_factors = self.filler.fill_nan_values(all_factors, fill_method='zero')
         all_factors = self.filler.fill_inf_values(all_factors, fill_value=0.0)
         
-        # 4. 统一数据清理 (向量化操作)
-        # 将整个 DataFrame 转换为数值类型以获得更好的性能
-        all_factors = all_factors.apply(pd.to_numeric, errors='coerce').fillna(0)
-        all_factors = all_factors.replace([np.inf, -np.inf], 0)
+        # 4. 统一数据清理 (向量化优化)
+        # 识别不应转换的列 (日期、代码等)
+        non_numeric_cols = ['date', 'code']
+        numeric_cols = [c for c in all_factors.columns if c not in non_numeric_cols]
+        
+        # 仅转换数值列到 float32 (比 float64 节省一半内存，通常足够回测精度)
+        # 使用 astype 避免 apply(pd.to_numeric) 的 cell-wise 循环
+        all_factors[numeric_cols] = all_factors[numeric_cols].astype(np.float32, copy=False)
+        all_factors[numeric_cols] = all_factors[numeric_cols].fillna(0)
+        all_factors[numeric_cols] = all_factors[numeric_cols].replace([np.inf, -np.inf], 0)
             
         # 5. 如果指定了目标特征且不仅是用来填充，则按目标特征排序/筛选
         if target_features:
+            # 高效补齐缺失特征
             missing = [f for f in target_features if f not in all_factors.columns]
             if missing:
                 if verbose:
                     print(f"  警告: 仍有 {len(missing)} 个特征无法生成，已进行批量填充")
+                # 预定义一个全零矩阵并扩充
+                all_factors = all_factors.reindex(columns=all_factors.columns.tolist() + missing, fill_value=0)
                 
-                # 批量创建缺失列的 DataFrame 以避免碎片化
-                missing_df = pd.DataFrame(0.0, index=all_factors.index, columns=missing)
-                all_factors = pd.concat([all_factors, missing_df], axis=1)
-                
-            # 只保留目标特征列表中的特征，并保持顺序一致
+            # 重排与筛选，使用固定的特征集和顺序
             all_factors = all_factors[target_features]
             
         return all_factors

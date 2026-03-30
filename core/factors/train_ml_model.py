@@ -454,7 +454,7 @@ class MLModelTrainer:
                 # 1. 路径质量分 (Path-aware Score)
                 # 显著惩罚回撤大、先跌后涨的标的，引导模型选择“走势稳健”的头部标的
                 # 修复：使用符号位保留的幂运算，避免负收益率产生 NaN
-                y = np.sign(f_returns) * (np.abs(f_returns) ** 1.5) + 0.5 * f_max_returns + 1.0 * f_min_returns
+                y = np.sign(f_returns) * (np.abs(f_returns) ** 0.5) + 0.3 * f_max_returns + 1.2 * f_min_returns
                 
                 # 用于计算 IC 的参考收益率 (使用最终涨幅)
                 ref_returns = f_returns.values

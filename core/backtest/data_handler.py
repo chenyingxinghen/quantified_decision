@@ -36,11 +36,18 @@ def _load_stock_batch(args):
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     
-    # 按股票分组
+    # 按股票分组 并进行 float32 转换 (节省内存)
     result = {}
     for code in df['code'].unique():
         stock_df = df[df['code'] == code].copy()
         stock_df = stock_df.sort_values('date').reset_index(drop=True)
+        
+        # 强制转换为 float32 (除了 date 和 code)
+        numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
+        # 排除 code (即便它是数字，通常也是类别)
+        numeric_cols = [c for c in numeric_cols if c not in ['code', 'date']]
+        stock_df[numeric_cols] = stock_df[numeric_cols].astype('float32', copy=False)
+        
         if len(stock_df) >= 30:
             result[code] = stock_df
     
@@ -111,8 +118,8 @@ class DataHandler:
         else:
             data = self._load_sequential(stock_codes, start_date, end_date, min_days)
         
-        # 缓存数据
-        self._data_cache = data
+        # 缓存并进一步压缩 (downcast)
+        self._data_cache = self.downcast_to_float32(data)
         
         # 构建日期索引和每日行情映射
         self._build_indexes()
@@ -121,6 +128,19 @@ class DataHandler:
         self._all_trading_dates = sorted(self._daily_bars.keys())
         
         print(f"数据加载完成: {len(data)} 只股票")
+        return data
+
+    def downcast_to_float32(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """将数据向下转型为 float32 以节省约 50% 的内存"""
+        for code, df in data.items():
+            numeric_cols = df.select_dtypes(include=['float64']).columns
+            df[numeric_cols] = df[numeric_cols].astype('float32', copy=False)
+            
+            # 对 int64 如果范围允许也进行 downcast
+            int_cols = df.select_dtypes(include=['int64']).columns
+            for col in int_cols:
+                if col in ['code', 'date']: continue
+                df[col] = pd.to_numeric(df[col], downcast='integer')
         return data
     
     def _get_all_stock_codes(self, start_date: str, end_date: str) -> List[str]:
@@ -159,6 +179,12 @@ class DataHandler:
         for code in df['code'].unique():
             stock_df = df[df['code'] == code].copy()
             stock_df = stock_df.sort_values('date').reset_index(drop=True)
+            
+            # 立即进行 float32 转换，减少单线程加载时的内存堆积
+            target_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
+            target_cols = [c for c in target_cols if c not in ['code', 'date']]
+            stock_df[target_cols] = stock_df[target_cols].astype('float32', copy=False)
+            
             if len(stock_df) >= min_days:
                 result[code] = stock_df
         
@@ -263,14 +289,7 @@ class DataHandler:
                            lookback_days: int = None) -> Optional[pd.DataFrame]:
         """
         获取历史数据（截止到指定日期）
-        
-        参数:
-            stock_code: 股票代码
-            end_date: 截止日期
-            lookback_days: 回看天数（None则返回全部）
-        
-        返回:
-            DataFrame或None
+        使用 View (不使用 copy) 以提升性能和减少内存开销
         """
         if stock_code not in self._data_cache:
             return None
@@ -283,15 +302,17 @@ class DataHandler:
             
             if lookback_days:
                 start_idx = max(0, end_idx - lookback_days + 1)
-                return df.iloc[start_idx:end_idx+1].copy()
+                # 移除 .copy()，返回 View
+                # 注：如果后续逻辑修改了此 DF，可能会影响全局缓存，但在回测框架中通常是只读的
+                return df.iloc[start_idx:end_idx+1]
             else:
-                return df.iloc[:end_idx+1].copy()
+                return df.iloc[:end_idx+1]
         
         # 回退到日期过滤
-        result = df[df['date'] <= end_date].copy()
+        result = df[df['date'] <= end_date]
         
         if lookback_days and len(result) > lookback_days:
-            result = result.tail(lookback_days)
+            result = result.iloc[-lookback_days:]
         
         return result if not result.empty else None
     

@@ -235,7 +235,7 @@ class MLFactorModel:
         # 如果启用内存优化且在 GPU 上，使用 XGBoost 的 DataIter 或 LightGBM 的 Dataset 优化
         use_gpu = TrainingConfig.USE_GPU
         mem_efficient = getattr(TrainingConfig, 'MEMORY_EFFICIENT', True)
-        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 1000000)
+        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 200000)
 
         # ---------------------------------------------------------------------
         # 情况 A: XGBoost 分批训练 (DataIter)
@@ -247,34 +247,80 @@ class MLFactorModel:
             BaseDataIter = getattr(xgb, 'DataIter', xgb.core.DataIter)
             
             class XGBDataIter(BaseDataIter):
+                """
+                带预取的 XGBoost DataIter。
+                QuantileDMatrix 会多次调用 reset() + 完整遍历（至少两遍），
+                因此预取线程必须在 reset() 时完全停止并等待确认，再重新启动，
+                保证每次遍历的行数严格一致。
+                后台线程提前做 np.ascontiguousarray（内存对齐），
+                使 CPU 数据准备与 XGBoost 分位数计算流水线并行。
+                """
                 def __init__(self, X, y, w=None, b_size=1000000):
+                    import threading, queue
+                    self._threading = threading
+                    self._queue_cls = queue.Queue
                     self.X = X
                     self.y = y
                     self.w = w
                     self.b_size = b_size
-                    self.it = 0
+                    self._n = len(X)
+                    self._queue = None
+                    self._stop = None
+                    self._prefetch_thread = None
                     super().__init__(cache_prefix=None)
+                    # super().__init__ 会立即调用 reset()，所以线程在 reset() 里启动
+
+                def _prefetch_worker(self, stop_event, out_queue):
+                    """后台线程：提前切片并确保内存连续，放入队列供 next() 消费"""
+                    offset = 0
+                    while not stop_event.is_set():
+                        if offset >= self._n:
+                            out_queue.put(None)  # 哨兵，通知本轮遍历结束
+                            break
+                        end = min(offset + self.b_size, self._n)
+                        # np.ascontiguousarray 确保内存连续，加速后续 PCIe 传输
+                        batch = (
+                            np.ascontiguousarray(self.X[offset:end]),
+                            np.ascontiguousarray(self.y[offset:end]),
+                            np.ascontiguousarray(self.w[offset:end]) if self.w is not None else None,
+                        )
+                        out_queue.put(batch)
+                        offset = end
 
                 def next(self, input_data):
-                    if self.it >= len(self.X):
+                    batch = self._queue.get()
+                    if batch is None:
                         return 0
-                    end = min(self.it + self.b_size, len(self.X))
-                    
-                    batch_data = self.X[self.it:end]
-                    batch_label = self.y[self.it:end]
-                    
-                    # 关键修复：不要把 None 作为 weight 传入，以免触发 XGBoost 的参数冲突检查
-                    if self.w is not None:
-                        batch_weight = self.w[self.it:end]
+                    batch_data, batch_label, batch_weight = batch
+                    if batch_weight is not None:
                         input_data(data=batch_data, label=batch_label, weight=batch_weight)
                     else:
                         input_data(data=batch_data, label=batch_label)
-                    
-                    self.it = end
                     return 1
 
                 def reset(self):
-                    self.it = 0
+                    # 1. 通知旧线程停止，并等待其真正退出，避免竞态
+                    if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+                        self._stop.set()
+                        # 排空队列，防止旧线程阻塞在 put() 无法退出
+                        try:
+                            while True:
+                                self._queue.get_nowait()
+                        except Exception:
+                            pass
+                        self._prefetch_thread.join(timeout=10)
+
+                    # 2. 重建 stop event 和队列（全新对象，无残留状态）
+                    self._stop = self._threading.Event()
+                    self._queue = self._queue_cls(maxsize=2)  # 最多预取2个batch，控制内存
+
+                    # 3. 启动新的预取线程
+                    self._prefetch_thread = self._threading.Thread(
+                        target=self._prefetch_worker,
+                        args=(self._stop, self._queue),
+                        daemon=True,
+                    )
+                    self._prefetch_thread.start()
 
             # 创建训练集迭代器
             it = XGBDataIter(X_train_raw, y_train, w_train, batch_size)

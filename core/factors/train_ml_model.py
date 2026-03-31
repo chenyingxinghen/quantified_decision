@@ -85,7 +85,7 @@ class MLModelTrainer:
     
     def load_training_data(self, stock_codes: List[str], 
                           start_date: str, end_date: str,
-                          batch_size: int = 200) -> Dict[str, pd.DataFrame]:
+                          batch_size: int = 300) -> Dict[str, pd.DataFrame]:
         """
         加载训练数据（批量加载优化）
         
@@ -263,10 +263,23 @@ class MLModelTrainer:
             need_full_recompute = True
 
         # ── 3. 计算因子 ─────────────────────────────────────────────────────
-        # 无论增量还是全量，都必须传入完整 data（技术指标需要历史 lookback 窗口）
+        # 优化点：如果是增量更新且不需要全量重算，仅传递最近的历史数据窗口即可
+        # 技术指标通常需要一定的历史回望（Cold Start），500 行足以满足绝大多数指标（如 250 日线）
+        if not need_full_recompute and cached_factors is not None and new_data_rows is not None:
+            # 增量模式：选取最后 500 行数据进行计算，不再进行全量重算
+            calc_window = 500
+            calculation_data = data.tail(calc_window).copy()
+            if verbose:
+                print(f"  {code}: 采用增量计算模式 (窗口={len(calculation_data)} 行)")
+        else:
+            # 全量模式
+            calculation_data = data
+            if verbose and need_full_recompute:
+                print(f"  {code}: 采用全量重算模式")
+
         all_factors = self.factor_calculator.calculate_all_factors(
             code=code,
-            data=data,
+            data=calculation_data,
             apply_feature_engineering=apply_feature_engineering,
             target_features=target_features,
             verbose=verbose,
@@ -277,18 +290,13 @@ class MLModelTrainer:
             return None
 
         # ── 4. 附加日期列 ──────────────────────────────────────────────────
-        # 修复问题三：calculate_all_factors 内部可能 reset_index，导致行数与 data 不一致
-        # 用 data 的 index 对齐赋值，而非直接用 .values 强制覆盖
-        if 'date' in data.columns:
+        # 确保日期对齐：使用用于计算的 data 部分的日期
+        if 'date' in calculation_data.columns:
             all_factors = all_factors.copy()
-            if len(all_factors) == len(data):
-                # 行数一致：直接按位置赋值（最常见路径）
-                all_factors['date'] = data['date'].values
+            if len(all_factors) == len(calculation_data):
+                all_factors['date'] = calculation_data['date'].values
             else:
-                # 行数不一致：通过 index 对齐，无法对齐的行填 NaN
-                all_factors['date'] = data['date'].reindex(all_factors.index).values
-                if verbose:
-                    print(f"  {code}: 因子行数({len(all_factors)}) != 数据行数({len(data)})，已按 index 对齐日期")
+                all_factors['date'] = calculation_data['date'].reindex(all_factors.index).values
 
         # ── 5. 拼接缓存（增量模式）────────────────────────────────────────
         if not need_full_recompute and cached_factors is not None and new_data_rows is not None:
@@ -346,13 +354,52 @@ class MLModelTrainer:
             verbose: 是否输出详细信息
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
         
-        # 修复问题五：去除重复 key，避免多线程并发写同一文件
-        unique_stocks = dict(stocks_data)  # dict 本身 key 唯一，但防御性保留此步骤
-        if len(unique_stocks) != len(stocks_data):
-            print(f"  警告: stocks_data 含重复 key，已去重 {len(stocks_data)} -> {len(unique_stocks)}")
+        # 1. 快速去重与预扫描
+        all_codes = list(stocks_data.keys())
+        total_initial = len(all_codes)
         
-        print(f"\n[因子缓存同步] 正在并行更新 {len(unique_stocks)} 只股票的缓存 (workers={n_jobs})...")
+        # 2. 增量跳过：快速检查哪些缓存已经是最新
+        to_update = {}
+        skipped = 0
+        
+        print(f"\n[因子缓存同步] 正在扫描磁盘缓存状态...")
+        for code in all_codes:
+            data = stocks_data[code]
+            if data.empty:
+                continue
+                
+            cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
+            if os.path.exists(cache_file):
+                try:
+                    # 仅读取最后一行日期进行对比
+                    # 注意：为了最高效率，可以使用 pyarrow 直接读 metadata，这里使用简单逻辑
+                    import pyarrow.parquet as pq
+                    last_row = pq.read_table(cache_file, columns=['date']).to_pandas().tail(1)
+                    
+                    if not last_row.empty:
+                        cache_last_date = str(last_row['date'].iloc[0])
+                        data_last_date = str(data['date'].max())
+                        
+                        if cache_last_date >= data_last_date:
+                            # 如果缓存已经覆盖了数据的最新日期，跳过
+                            skipped += 1
+                            continue
+                except Exception:
+                    # 任何异常（如列不存在）都触发重算
+                    pass
+            
+            to_update[code] = data
+
+        if skipped > 0:
+            print(f"  已跳过 {skipped} 只已同步的股票缓存")
+            
+        if not to_update:
+            print(f"✓ 缓存已是最新，无需更新。")
+            return
+
+        print(f"  正在并行更新 {len(to_update)} 只股票的缓存 (workers={n_jobs})...")
         
         start_time = time()
         success = 0
@@ -367,7 +414,7 @@ class MLModelTrainer:
                     include_fundamentals=include_fundamentals,
                     verbose=verbose
                 ): code 
-                for code, data in unique_stocks.items()
+                for code, data in to_update.items()
             }
             
             with tqdm(total=len(futures), desc="更新因子缓存") as pbar:
@@ -383,7 +430,7 @@ class MLModelTrainer:
                     pbar.update(1)
                     
         elapsed = time() - start_time
-        print(f"✓ 缓存同步完成: 成功 {success}, 失败 {failed} | 耗时 {elapsed:.1f}s")
+        print(f"✓ 缓存同步完成: 成功 {success}, 失败 {failed} | 已跳过 {skipped} | 耗时 {elapsed:.1f}s")
     
 
     def _load_or_compute_factors(self, code: str, data: pd.DataFrame, 
@@ -407,30 +454,36 @@ class MLModelTrainer:
         """
         return self.calculate_and_save_factors(code, data, apply_feature_engineering, target_features, verbose, include_fundamentals)
 
-    def _compute_path_quality_score(self, f_returns, f_low_min, f_high_idx, f_low_idx, atr_raw, close, rel_atr):
+    def _compute_path_quality_score(self, f_returns, f_low_min, f_high_idx, f_low_idx, atr_raw, next_open, rel_atr):
         """
-        改进版：路径质量分 (Path-aware Score)
+        参数:
+            f_returns: 
+            f_low_min: 
+            f_high_idx: 
+            f_low_idx: 
+            atr_raw: 
+            next_open: 
+            rel_atr: 
         """
         # 避免除以零
         eps = 1e-4
         
         # ---------------------------------------------------------
         # 1. 核心收益项 (转换为 ATR 倍数)
-        # 逻辑化简：f_returns / rel_atr 其实等于 (f_close - close) / atr_raw
         # ---------------------------------------------------------
-        core_term = f_returns / (rel_atr + eps)
+        core_term = f_returns / (rel_atr + eps)*getattr(TrainingConfig, 'LABEL_TARGET_SCALE', 1.5)
             
         # ---------------------------------------------------------
         # 2. 损失厌恶项 (非线性穿透惩罚)
         # ---------------------------------------------------------
         lambda_val = getattr(TrainingConfig, 'LABEL_LAMBDA', 1.0)
-        downside_gap = (close - f_low_min) / (atr_raw + eps) # 下跌倍数
+        downside_gap = (next_open - f_low_min) / (atr_raw + eps) # 下跌倍数
         
-        # 【优化】非线性惩罚：小于 1 ATR 线性计算，大于 1 ATR 呈1.5次方级放大
+        # 【优化】非线性惩罚：小于 1 ATR 线性计算，大于 1 ATR 呈2次方级放大
         # 这样模型会极度厌恶“破位”的股票
         loss_aversion = np.where(downside_gap <= 1.0,
                                 -lambda_val * np.maximum(0, downside_gap),
-                                -lambda_val * (1.0 + (downside_gap - 1.0) ** 1.5))
+                                -lambda_val * (1.0 + (downside_gap - 1.0) ** 2))
         
         # ---------------------------------------------------------
         # 3. 路径保护惩罚 (V型反转过滤)
@@ -447,9 +500,9 @@ class MLModelTrainer:
                                 0)
                                 
         # 4. 资金效率奖励 (如果高点发生得很早，给予微弱加分)
-        time_bonus = np.where(f_high_idx < 2, 0.2 * core_term, 0)
+        time_bonus = np.where(f_high_idx < 2, 0.3 * core_term, 0)
 
-        final_score = core_term + loss_aversion + path_penalty
+        final_score = core_term + loss_aversion + path_penalty+time_bonus
         
         return final_score
 
@@ -501,7 +554,7 @@ class MLModelTrainer:
 
                 # 计算当前波动率 (ATR) 作为分母，衡量收益的“性价比”
                 # 使用相对 ATR (ATR / close)
-                atr_raw = talib.ATR(high.values, low.values, close.values, timeperiod=getattr(FactorConfig, 'ATR_PERIOD', 14))
+                atr_raw = talib.ATR(high.values, low.values, close.values, timeperiod=14)
                 atr_rel = atr_raw / close.values
                     
 

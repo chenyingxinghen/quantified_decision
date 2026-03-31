@@ -23,40 +23,40 @@ class ModelConfig:
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
         'max_depth': 6,              # 增加深度以改善预测区分度
-        'min_child_weight': 250,       # 增加权重要求，防止过拟合
-        'learning_rate': 0.03,       
+        'min_child_weight': 200,       # 增加权重要求，防止过拟合
+        'learning_rate': 0.05,       
         'subsample': 1,
         'colsample_bytree': 0.7,
-        'colsample_bylevel': 0.7,
-        'gamma': 0.17,    
+        'colsample_bylevel': 0.7, 
+        'gamma': 0.1,    
         
-        'reg_alpha': 7,            
+        'reg_alpha': 5,            
         'reg_lambda': 13,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
-        'n_jobs': 15,
-        'early_stopping_rounds': 20,
+        'n_jobs': 8,
+        'early_stopping_rounds': 50,
         'verbosity': 0,              # 打印训练过程
     }
     
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 7,
-        'min_child_weight': 225,
-        'num_leaves': 127,
+        'max_depth': 6,
+        'min_child_weight': 200,
+        'num_leaves': 63,
         'learning_rate': 0.05,
-        'min_gain_to_split': 0.12,
+        'min_gain_to_split': 0.1,
 
-        'reg_alpha': 7,
+        'reg_alpha': 5,
         'reg_lambda': 13,
         'subsample': 1,
         'colsample_bytree': 0.7,
 
-        'label_gain': [float(i**1.5+1) for i in range(100)], 
+        'label_gain': [float(i**2+1) for i in range(50)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 100,
+        'lambdarank_truncation_level': 50,
         'n_jobs': 15,
         'verbosity': -1,
         'early_stopping_rounds': 50,
@@ -102,13 +102,14 @@ class TrainingConfig:
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚 (兼容旧逻辑)
     UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
     
-    # 标签构造参数 (Path Quality Score v2)
-    LABEL_LAMBDA = 2.0           # 损失厌恶系数 (惩罚回撤)
-    LABEL_PATH_PUNISH = 0.5      # 路径保护惩罚系数 (惩罚先跌后涨)
+    # 标签构造参数 
+    LABEL_TARGET_SCALE = 1.5
+    LABEL_LAMBDA = 0.8           # 损失厌恶系数 (惩罚回撤)
+    LABEL_PATH_PUNISH = 0.2      # 路径保护惩罚系数 (惩罚先跌后涨)
     
     USE_GPU = True               # 是否启用 GPU 加速
     MEMORY_EFFICIENT = True      # 是否启用内存优化模式 (针对大规模数据集)
-    GPU_BATCH_SIZE = 2000000     # GPU 分批训练的批大小 (增加此值可提高 GPU 利用率)
+    GPU_BATCH_SIZE = 100000     # GPU 分批训练的批大小 (增加此值可提高 GPU 利用率)
 
     YEARS=baostock_config.HISTORY_YEARS
 
@@ -116,7 +117,7 @@ class TrainingConfig:
     YEARS_FOR_TRAINING=15         # 训练年数
     STOCK_NUM = 6000             # 股票数量
     # 数据集划分
-    TRAIN_TEST_SPLIT = 0.7
+    TRAIN_TEST_SPLIT = 0.8
     
 
     # 预测天数 (用于分类、回归和排序任务)

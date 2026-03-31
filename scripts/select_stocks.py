@@ -39,7 +39,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 # 常量 & 默认配置
 # ============================================================================
-DEFAULT_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl' # 默认搜寻 mark 目录
+DEFAULT_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl' # 默认搜寻 mark 目录
 DEFAULT_MIN_CONFIDENCE = 0
 DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
@@ -755,7 +755,7 @@ def parse_args():
         help='不保存 CSV 文件',
     )
     parser.add_argument(
-        '--skip-cache-update', action='store_true', default=True,
+        '--skip-cache-update', action='store_true', default=False,
         help='跳过增量缓存更新步骤，直接使用已有缓存（速度更快，但因子可能非最新）',
     )
     return parser.parse_args()

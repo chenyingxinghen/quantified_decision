@@ -65,22 +65,52 @@ def main():
     # ── 4. 增量更新因子缓存（到最新日期）────────────────────────────────
     target_features = None  # 特征集，Step 0 发现后供 Step 2 复用
     if not args.skip_cache_update:
-        print(f"\n[Step 0] 增量更新因子缓存 (截止 {cache_end_date})...")
-        # 加载数据，用于更新缓存
-        cache_data = trainer.load_training_data(trainer_stocks, train_start_date, cache_end_date)
-        # 先发现完整特征集，再用同一套 target_features 写缓存
-        # 这样 Step 2 的缓存命中检查能与缓存列完全匹配，避免全量重算
-        target_features = trainer.discover_target_features(
-            cache_data, include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
-        )
-        trainer.batch_update_factor_cache(
-            stocks_data=cache_data,
-            include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS,
-            target_features=target_features,
-            n_jobs=args.workers
-        )
-        del cache_data  # 释放内存
-        import gc; gc.collect()
+        print(f"\n[Step 0] 检查并增量更新因子缓存 (目标: {cache_end_date})...")
+        
+        # 优化：预先检查已经是最新的缓存，避免全量加载行情数据到内存
+        import pyarrow.parquet as pq
+        cache_dir = TrainingConfig.CACHE_DIR
+        stocks_to_update = []
+        skipped_count = 0
+        
+        print(f"  正在扫描 {len(trainer_stocks)} 只股票的缓存状态...")
+        for code in trainer_stocks:
+            cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
+            if os.path.exists(cache_file):
+                try:
+                    # 快速读取日期列的最后一行
+                    last_row = pq.read_table(cache_file, columns=['date']).to_pandas().tail(1)
+                    if not last_row.empty:
+                        cache_last_date = str(last_row['date'].iloc[0])
+                        if cache_last_date >= cache_end_date:
+                            skipped_count += 1
+                            continue
+                except Exception:
+                    pass
+            stocks_to_update.append(code)
+            
+        print(f"  扫描完成: {skipped_count} 只已同步，{len(stocks_to_update)} 只待更新")
+        
+        if stocks_to_update:
+            # 仅为待更新股票加载数据
+            cache_data = trainer.load_training_data(stocks_to_update, train_start_date, cache_end_date)
+            
+            # 特征发现：采样一小部分（如果是增量，通常已有缓存，逻辑会很快）
+            target_features = trainer.discover_target_features(
+                cache_data, include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
+            )
+            
+            trainer.batch_update_factor_cache(
+                stocks_data=cache_data,
+                include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS,
+                target_features=target_features,
+                n_jobs=args.workers
+            )
+            del cache_data  # 释放内存
+            import gc; gc.collect()
+        else:
+            print(f"✓ 所有股票缓存均已是最新的 ({cache_end_date})")
+            
     else:
         print("\n[Step 0] 跳过增量缓存更新 (--skip-cache-update)")
 

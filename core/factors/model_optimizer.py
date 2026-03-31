@@ -655,7 +655,8 @@ class ModelOptimizer:
                              X_val: np.ndarray = None,
                              y_val: np.ndarray = None,
                              dates: np.ndarray = None,
-                             returns: np.ndarray = None) -> Dict:
+                             returns: np.ndarray = None,
+                             path_scores: np.ndarray = None) -> Dict:
         """
         运行完整优化流程
         
@@ -774,8 +775,27 @@ class ModelOptimizer:
                 train_kwargs['eval_group'] = group_val
                 print(f"  ✓ 已同步排序任务分组信息 (Train Groups: {len(group_train)}, Val Groups: {len(group_val)})")
 
+            # 针对 LGBM 的特殊逻辑：returns 作为排序标签，path_scores 作为权重
+            current_y = y
+            current_weight = None
+            
+            if getattr(model, 'task', '') == 'ranking':
+                print(f"  [LGBM 优化] 重构训练：使用原始收益率作为标签，并应用路径权重")
+                current_y = returns
+                
+                if path_scores is not None:
+                    # 优化：对得分取绝对值并进行缩放，重点关注极好或极坏的极端路径 (长尾样本)
+                    weight_scale = getattr(TrainingConfig, 'PATH_WEIGHT_SCALE', 1.0)
+                    processed_scores = np.abs(path_scores) * weight_scale
+                    
+                    # 为了数值稳定性，减去中位数并裁剪
+                    shifted_scores = processed_scores - np.nanmedian(processed_scores)
+                    current_weight = np.exp(np.clip(shifted_scores, -5, 5))
+                    current_weight = current_weight / (current_weight.mean() + 1e-6)
+                    train_kwargs['sample_weight'] = current_weight
+
             # 执行重新训练
-            model.train(X_selected, y, **train_kwargs)
+            model.train(X_selected, current_y, **train_kwargs)
             retrained_models[name] = model
         
         # 3. 集成学习权重优化

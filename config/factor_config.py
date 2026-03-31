@@ -42,21 +42,22 @@ class ModelConfig:
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 6,
-        'min_child_weight': 200,
-        'num_leaves': 63,
+        'max_depth': 7,
+        'min_child_weight': 250,
+        'num_leaves': 127,
         'learning_rate': 0.05,
-        'min_gain_to_split': 0.1,
+        'min_gain_to_split': 0.15,
 
         'reg_alpha': 5,
-        'reg_lambda': 13,
+        'reg_lambda': 17,
         'subsample': 1,
         'colsample_bytree': 0.7,
 
         'label_gain': [float(i**2+1) for i in range(50)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 50,
+        'lambdarank_truncation_level': 1000,
+
         'n_jobs': 15,
         'verbosity': -1,
         'early_stopping_rounds': 50,
@@ -102,7 +103,7 @@ class TrainingConfig:
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚 (兼容旧逻辑)
     UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
     
-    # 标签构造参数 
+    # XGB标签构造参数 LGB样本权重构造参数
     LABEL_TARGET_SCALE = 1.5
     LABEL_LAMBDA = 0.8           # 损失厌恶系数 (惩罚回撤)
     LABEL_PATH_PUNISH = 0.2      # 路径保护惩罚系数 (惩罚先跌后涨)

@@ -136,19 +136,30 @@ class MLFactorModel:
 
         # 如果是排序任务，使用相关度分数进行分档
         if self.task == 'ranking':
-            # 优先使用 y 作为相关度分数进行分档（y 可能包含路径质量等复合指标，比原始收益率更稳健）
-            # 只有当 y 已经是离散整数时，才跳过分档；否则无论是 y (软标签) 还是 returns 都要分档
+            # 优先判定：如果 y 是浮点数且不全是整数，则视为需要分档的软标签或原始分值
+            # 由于外层训练器（train_ml_model.py）已将 returns 作为 y 传入，
+            # 这里的 y 实际上就是排序的标准。
+            
+            # 检查 y 是否已经是离散整数标签 (0, 1, 2...)
+            # 如果 y 是 int 类型且非二元，则视为已经处理好的离散相关度分值
             has_discrete_y = np.issubdtype(y.dtype, np.integer) and len(np.unique(y)) > 2
             
             if not has_discrete_y:
-                # 确定分档目标：优先用 y (Soft Label)，没 y 用 returns
-                is_using_path_score = not np.issubdtype(y.dtype, np.integer)
-                target_score = y if is_using_path_score else returns
+                # 确定分档源：外层已将排序锚点（可能是 returns 或 path_score）赋值给 y
+                # 我们这里统一将其视为 target_score
+                target_score = y
+                
+                # 判定来源名称用于日志输出
+                # 如果 target_score 和 returns 极其接近，则认为是原始收益率
+                is_returns = False
+                if returns is not None and len(returns) == len(target_score):
+                    # 容差检查
+                    is_returns = np.allclose(target_score[:100], returns[:100], atol=1e-5)
+                
+                src_name = "原始收益率" if is_returns else "路径质量/逻辑分数"
+                print(f"  [INFO] 排序任务：使用 {src_name} 进行组内百分位分档 (Labels: 0-{len(ModelConfig.LIGHTGBM_PARAMS.get('label_gain', []))-1})")
                 
                 if target_score is not None:
-                    src_name = "路径质量评分(Y)" if is_using_path_score else "原始收益率"
-                    print(f"  [INFO] 排序任务：使用{src_name}进行组内百分位分档")
-                    
                     n_bins = len(ModelConfig.LIGHTGBM_PARAMS.get('label_gain', []))
                     if n_bins == 0: n_bins = 21
                     thresholds = np.linspace(1.0/n_bins, 1.0 - 1.0/n_bins, n_bins - 1)
@@ -160,13 +171,15 @@ class MLFactorModel:
                             all_group_sizes = np.concatenate([group_sizes, kwargs['eval_group']])
                         else:
                             all_group_sizes = group_sizes
+                        
                         y_ranked = np.zeros_like(target_score, dtype=np.int32)
                         offset = 0
                         for g_size in all_group_sizes:
                             g_size = int(g_size)
                             g_scores = target_score[offset:offset + g_size]
                             if len(g_scores) > 0:
-                                pct_rank = rankdata(g_scores, method='average') / len(g_scores)
+                                # 计算组内排名
+                                pct_rank = rankdata(g_scores, method='average') / (len(g_scores) + 1)
                                 labels = np.zeros(len(g_scores), dtype=np.int32)
                                 for i, thresh in enumerate(thresholds):
                                     labels[pct_rank > thresh] = i + 1
@@ -174,11 +187,9 @@ class MLFactorModel:
                             offset += g_size
                         y = y_ranked
                     else:
-                        raise ValueError('ranking分组失败')
-                    
-                    # print(f"  相关度标签分布 (0-{n_bins-1}): {dict(zip(*np.unique(y, return_counts=True)))}")
+                        raise ValueError('ranking任务必须提供 group 分组信息')
                 else:
-                    print(f"  [WARNING] 排序任务缺少分档目标(y/returns)，将直接使用原始标签")
+                    print(f"  [WARNING] 排序任务缺少分档目标值")
         
         
         # 2. 划分数据集
@@ -310,12 +321,8 @@ class MLFactorModel:
 
             from lightgbm import early_stopping, log_evaluation
             es_rounds = getattr(self, 'early_stopping_rounds', 100)
-            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
+            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=False)]
             
-            if self.task == 'ranking':
-                callbacks.append(log_evaluation(period=50))
-                if 'sample_weight' in fit_params: del fit_params['sample_weight']
-
             # 注意：LGBM 即使是用 numpy array 训练，内部也会转 Dataset。
             # 开启 histogram_pool_size (在 config 中已添加) 是 6G 显存的关键。
             self.model.fit(X_train, y_train, callbacks=callbacks, feature_name=self.feature_names, **fit_params)
@@ -349,10 +356,9 @@ class MLFactorModel:
             elif self.model_type == 'lightgbm':
                 from lightgbm import early_stopping, log_evaluation
                 es_rounds = getattr(self, 'early_stopping_rounds', 100)
-                callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
+                callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=False)]
                 if self.task == 'ranking':
                     callbacks.append(log_evaluation(period=50))
-                    if 'sample_weight' in fit_params: del fit_params['sample_weight']
                 self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
             else:
                 self.model.fit(X_train, y_train, sample_weight=w_train)
@@ -466,7 +472,7 @@ class MLFactorModel:
                 g_ref = reference[mask]
                 
                 # A. 组内 Rank IC
-                if len(np.unique(g_ref)) > 1:
+                if len(np.unique(g_ref)) > 1 and len(np.unique(g_prob)) > 1:
                     ic, _ = spearmanr(g_prob, g_ref)
                     if not np.isnan(ic):
                         rank_ics.append(ic)
@@ -500,7 +506,10 @@ class MLFactorModel:
             print(f"    Top-5 精度(命中前20%): {metrics['top5_precision']:.2%}")
         else:
             # 没有日期信息，退化为全局计算
-            metrics['rank_ic'], _ = spearmanr(y_prob, reference)
+            if len(np.unique(y_prob)) > 1 and len(np.unique(reference)) > 1:
+                metrics['rank_ic'], _ = spearmanr(y_prob, reference)
+            else:
+                metrics['rank_ic'] = 0.0
             metrics['top1_precision'] = 0.0
             metrics['top5_precision'] = 0.0
             

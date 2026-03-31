@@ -114,11 +114,13 @@ def main():
         
     # 计算并准备特征集 (含缓存逻辑)
     # 使用所有 CPU 核心并行加速 (n_jobs=-1)
-    X, y, returns, factor_names, dates, unbuyable, limit_groups = trainer.prepare_dataset(
+    full_dataset = trainer.prepare_dataset(
         stocks_data,
         n_jobs=-1,
         include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
     )
+    X, y, returns, factor_names, dates, unbuyable, limit_groups = full_dataset[:7]
+    path_scores = full_dataset[7] if len(full_dataset) > 7 else None
     
     logger.info(f"特征矩阵规模: {X.shape[0]} 样本 x {X.shape[1]} 特征")
     logger.info(f"正样本率: {np.mean(y >= 0.5):.2%} (软标签均值: {np.mean(y):.4f})")
@@ -184,7 +186,8 @@ def main():
         logger.info("\n[步骤 2/6] 未提供本地模型，执行全量特征训练...")
         train_results = trainer.train_models(
             X, y, returns, factor_names, dates, unbuyable, limit_groups, 
-            model_types=model_types
+            model_types=model_types,
+            path_scores=path_scores
         )
     
     if not trainer.models:
@@ -205,7 +208,8 @@ def main():
         y=y,
         feature_names=factor_names,
         dates=dates,       # 传递日期以支持排序任务分组
-        returns=returns    # 传递收益率以支持评估
+        returns=returns,    # 传递收益率以支持评估
+        path_scores=path_scores
     )
     
     # ---------------------------------------------------------

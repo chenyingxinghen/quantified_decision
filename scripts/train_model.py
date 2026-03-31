@@ -125,7 +125,7 @@ def main():
 
     # ── 6. 准备数据集 ────────────────────────────────────────────────────
     print(f"\n[Step 2] 准备特征数据集与标签...")
-    X, y, returns, factor_names, dates, unbuyable_mask, limit_groups = trainer.prepare_dataset(
+    full_dataset = trainer.prepare_dataset(
         stocks_data,
         train_start_date=train_start_date,
         train_end_date=train_end_date,
@@ -136,10 +136,16 @@ def main():
 
     # ── 7. 训练模型 ──────────────────────────────────────────────────────
     print(f"\n[Step 3] 训练机器学习模型...")
+    
+    # 解析数据集
+    X, y, returns, factor_names, dates, unbuyable_mask, limit_groups = full_dataset[:7]
+    path_scores = full_dataset[7] if len(full_dataset) > 7 else None
+    
     results = trainer.train_models(
         X, y, returns, factor_names, dates,
         unbuyable_mask=unbuyable_mask,
-        limit_groups=limit_groups
+        limit_groups=limit_groups,
+        path_scores=path_scores
     )
 
     # ── 8. 对比与保存 ────────────────────────────────────────────────────

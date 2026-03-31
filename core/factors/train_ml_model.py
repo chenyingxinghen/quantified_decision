@@ -850,7 +850,7 @@ class MLModelTrainer:
         
         # 2. 预分配最终的内存空间
         X_arr = np.empty((actual_rows, num_features), dtype=np.float32)
-        y_arr = np.empty(actual_rows, dtype=np.float32)
+        y_raw_arr = np.empty(actual_rows, dtype=np.float32) # 原始路径质量分
         returns_arr = np.empty(actual_rows, dtype=np.float32)
         dates_arr = np.empty(actual_rows, dtype=object)
         unbuyable_arr = np.empty(actual_rows, dtype=bool)
@@ -871,7 +871,7 @@ class MLModelTrainer:
                 l = np.full(n, 0.1, dtype=np.float32)
 
             X_arr[cursor:cursor+n] = X.values.astype(np.float32, copy=False)
-            y_arr[cursor:cursor+n] = y.values if isinstance(y, pd.Series) else y
+            y_raw_arr[cursor:cursor+n] = y.values if isinstance(y, pd.Series) else y
             returns_arr[cursor:cursor+n] = r
             dates_arr[cursor:cursor+n] = d
             unbuyable_arr[cursor:cursor+n] = u
@@ -885,80 +885,67 @@ class MLModelTrainer:
         del results, valid_results_indices
         gc.collect()
 
-        # 4. 全局时间排序 (由于 X_arr 超过 2GB 时排序会很耗内存，我们采用最小化拷贝策略)
+        # 4. 全局时间排序
         print("  - 全局时间排序...")
         sort_idx = np.argsort(dates_arr)
         
-        # 排序其它小数组
+        # 排序所有数组
         dates_arr = dates_arr[sort_idx]
-        y_arr = y_arr[sort_idx]
+        y_raw_arr = y_raw_arr[sort_idx]
         returns_arr = returns_arr[sort_idx]
         unbuyable_arr = unbuyable_arr[sort_idx]
         limit_groups_arr = limit_groups_arr[sort_idx]
         
-        # X_arr 排序（大头）
+        # X_arr 排序
         X_sorted = X_arr[sort_idx] 
         del X_arr, sort_idx
         X_arr = X_sorted
         del X_sorted
         gc.collect()
-        
-        print(f"\n数据准备完成，将在模型训练时进行横截面归一化...")
-        
-        # 获取日期分组信息（用于后续处理）
-        _, date_group_start, date_group_counts = np.unique(
-            dates_arr, return_index=True, return_counts=True
-        )
-        
-        # 最后的无效值填充 (先清理特征矩阵的 NaN)
-        np.nan_to_num(X_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # 构建轻量级包装，仅用于审计报告分析，不进行大内存拷贝
         all_cols = col_names
-        
+        # 3. 不可买入样本处理 (涨停/停牌) - 提前到归一化之前，确保排序不含涨停股
+        if unbuyable_arr is not None:
+            penalty_count = np.sum(unbuyable_arr)
+            if penalty_count > 0:
+                handling = getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'remove')
+                if handling == 'remove':
+                    print(f"  - 剔除不可买入样本 (排序前): 正在剔除 {penalty_count} 个涨停/停牌样本")
+                    keep_mask = ~unbuyable_arr
+                    X_arr = X_arr[keep_mask]
+                    y_raw_arr = y_raw_arr[keep_mask]
+                    returns_arr = returns_arr[keep_mask]
+                    dates_arr = dates_arr[keep_mask]
+                    limit_groups_arr = limit_groups_arr[keep_mask]
+                    # 重新获取日期分组信息
+                    _, date_group_start, date_group_counts = np.unique(dates_arr, return_index=True, return_counts=True)
+                    unbuyable_arr = unbuyable_arr[keep_mask]
+                else:
+                    print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.05")
+                    y_raw_arr[unbuyable_arr] = 0.05
+                    # 重新获取日期分组信息 (虽然行数没变)
+                    _, date_group_start, date_group_counts = np.unique(dates_arr, return_index=True, return_counts=True)
+        else:
+            _, date_group_start, date_group_counts = np.unique(dates_arr, return_index=True, return_counts=True)
+
         # 2. 标签值映射 (Board-Neutral Normalization)
-        print("  - 正在进行每日板块中性化排名归一化标签，消除高波动板块偏见...")
+        # 注意：此处生成的 y_norm_arr 仅供 XGB 等回归模型默认使用
+        y_norm_arr = y_raw_arr.copy()
+        print("  - 正在进行每日板块中性化排名归一化标签...")
         for start, count in zip(date_group_start, date_group_counts):
             end = start + count
             if count > 1:
-                # 获取当日的所有 limit_threshold，用于区分板块 (主板/创业板/科创板/北交所)
                 day_limits = limit_groups_arr[start:end]
-                day_y = y_arr[start:end].copy()
-                
-                # 为每个板块独立计算组内排名，映射到 [0, 1]
+                day_y = y_norm_arr[start:end].copy()
                 unique_limits = np.unique(day_limits)
                 for limit_val in unique_limits:
                     board_mask = day_limits == limit_val
                     board_count = np.sum(board_mask)
                     if board_count > 0:
-                        # 核心修改：在各板块内部进行百分位排名，从而使 10% 市场的龙头与 20% 市场的龙头具有相同的标签值
-                        # 使用 scipy.stats.rankdata 进行组内排名
-                        # rankdata = [1, 2, ..., n], 除以 (n + 1) 获得 (0, 1) 的映射，提升鲁棒性
                         day_y[board_mask] = rankdata(day_y[board_mask], method='average') / (board_count + 1)
-                
-                y_arr[start:end] = day_y
+                y_norm_arr[start:end] = day_y
             else:
-                y_arr[start:end] = 0.5
+                y_norm_arr[start:end] = 0.5
 
-        # 3. 不可买入样本处理 (涨停/停牌)
-        if unbuyable_arr is not None:
-            penalty_count = np.sum(unbuyable_arr)
-            if penalty_count > 0:
-                handling = getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'remove')
-                
-                if handling == 'remove':
-                    print(f"  - 剔除不可买入样本: 正在剔除 {penalty_count} 个涨停/停牌样本 (Removal Strategy)")
-                    keep_mask = ~unbuyable_arr
-                    X_arr = X_arr[keep_mask]
-                    y_arr = y_arr[keep_mask]
-                    returns_arr = returns_arr[keep_mask]
-                    dates_arr = dates_arr[keep_mask]
-                    limit_groups_arr = limit_groups_arr[keep_mask]
-                    unbuyable_arr = unbuyable_arr[keep_mask] # 实际上此后全为 False
-                else:
-                    # 方案2：惩罚 (Penalty) - 将标签设为极低值
-                    print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.05 (Penalty Strategy)")
-                    y_arr[unbuyable_arr] = 0.05
 
         
         # 统计因子分类详情 (Factor Audit Report)
@@ -1040,7 +1027,7 @@ class MLModelTrainer:
         print("="*50 + "\n")
         
         # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
-        return X_arr, y_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr
+        return X_arr, y_norm_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, y_raw_arr
     
     def train_models(self, X: np.ndarray, y: np.ndarray, 
                     returns: np.ndarray,
@@ -1048,7 +1035,8 @@ class MLModelTrainer:
                     dates: np.ndarray,
                     unbuyable_mask: np.ndarray = None,
                     limit_groups: np.ndarray = None,
-                    model_types: List[str] = TrainingConfig.MODEL_TYPES) -> Dict:
+                    model_types: List[str] = TrainingConfig.MODEL_TYPES,
+                    path_scores: np.ndarray = None) -> Dict:
         """
         训练多个模型
         """
@@ -1088,14 +1076,14 @@ class MLModelTrainer:
             X[split_idx:], dates[split_idx:], factor_names
         )
         
-        # sample_weight 计算等逻辑保持
-        sample_weight = None
+        # Default sample_weight (for XGBM and others)
+        default_sample_weight = None
         if self.punish_unbuyable:
             if limit_groups is not None:
-                sample_weight = np.abs(returns / np.clip(limit_groups, 0.04, 0.3))
+                default_sample_weight = np.abs(returns / np.clip(limit_groups, 0.04, 0.3))
             else:
-                sample_weight = np.abs(returns)
-            sample_weight = sample_weight / (sample_weight.mean() + 1e-6)
+                default_sample_weight = np.abs(returns)
+            default_sample_weight = default_sample_weight / (default_sample_weight.mean() + 1e-6)
         
         results = {}
         for model_type in model_types:
@@ -1104,16 +1092,41 @@ class MLModelTrainer:
                 task = 'ranking' if model_type == 'lightgbm' else 'regression'
                 model = MLFactorModel(model_type=model_type, task=task)
                 
+                # LGBM 特殊逻辑：使用原始收益作为排序标准，路径得分变换为权重
+                current_y = y
+                current_weight = default_sample_weight
+                
+                if model_type == 'lightgbm':
+                    print("  [LGBM 优化] 使用原始收益率(returns)作为标签，路径质量分变换为权重")
+                    current_y = returns # 使用原始收益作为排序标准
+                    
+                    if path_scores is not None:
+                        # 1. 取绝对值并处理异常值
+                        processed_scores = np.abs(np.nan_to_num(path_scores, nan=0.0))
+                        
+                        # 2. 稳健的中位数平移
+                        median_val = np.nanmedian(processed_scores)
+                        shifted_scores = processed_scores - median_val
+                        
+                        # 3. 限制极端权重 (建议缩减 clip 范围)
+                        # exp(2) 约 7.4 倍权重, exp(-2) 约 0.13 倍权重，这个跨度对模型比较友好
+                        log_weight = np.clip(shifted_scores * 0.5, -1, 1) 
+                        current_weight = np.exp(log_weight)
+                        
+                        # 4. 归一化：保持总梯度规模不变
+                        # 这一步非常重要，防止因为加了权重导致整体 Learning Rate 失效
+                        current_weight = current_weight / (current_weight.mean() + 1e-8)
+                
                 # 统一计算分组信息（所有任务通用，用于按组评估）
                 # 注意：对于 LightGBM Ranking 任务，group 信息是必须的
                 _, train_group = np.unique(dates[:split_idx], return_counts=True)
                 _, val_group = np.unique(dates[split_idx:], return_counts=True)
                 
                 # 训练模型（直接传入 X 的视图，减少内存拷贝）
-                train_result = model.train(X, y, validation_split=0.2, 
+                train_result = model.train(X, current_y, validation_split=0.2, 
                                           use_time_series_split=True,
                                           feature_names=factor_names,
-                                          sample_weight=sample_weight,
+                                          sample_weight=current_weight,
                                           returns=returns,
                                           split_idx=split_idx,
                                           dates=dates,
@@ -1455,7 +1468,7 @@ def main():
 
     
     # 5. 准备数据集
-    X, y, returns, factor_names, dates, unbuyable, limit_groups = trainer.prepare_dataset(
+    dataset = trainer.prepare_dataset(
         stocks_data,
         cache_engineered_features=args.cache_engineered,
         train_start_date=train_start_date,
@@ -1463,9 +1476,16 @@ def main():
         include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
     )
     
+    # 解析数据集
+    if len(dataset) == 8:
+        X, y, returns, factor_names, dates, unbuyable, limit_groups, path_scores = dataset
+    else:
+        X, y, returns, factor_names, dates, unbuyable, limit_groups = dataset
+        path_scores = None
+    
     # 6. 训练模型
     model_types = TrainingConfig.MODEL_TYPES
-    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, limit_groups, model_types)
+    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, limit_groups, model_types, path_scores=path_scores)
     
     # 7. 对比模型
     best_model_type = trainer.compare_models(results)

@@ -10,6 +10,7 @@ import numpy as np
 import sqlite3
 import hashlib
 import talib
+from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 from core.backtest.strategy import BaseStrategy, StrategySignal
 from core.factors.ml_factor_model import MLFactorModel
@@ -169,11 +170,14 @@ class MLFactorBacktestStrategy(BaseStrategy):
         try:
             self._meta_map = pd.read_sql_query("SELECT code, code_name AS name FROM meta.stock_basic", conn).set_index('code')['name'].to_dict()
             self._all_finance_df = pd.read_sql_query("""
-                SELECT code, pub_date, stat_date, epsTTM AS EPSJB, totalShare, liabilityToAsset AS ZCFZL
-                FROM finance.profit_ability WHERE pub_date IS NOT NULL AND pub_date != ''
+                SELECT p.code, p.pub_date, p.stat_date, p.epsTTM AS EPSJB, p.totalShare, b.liabilityToAsset AS ZCFZL
+                FROM finance.profit_ability p
+                LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
+                WHERE p.pub_date IS NOT NULL AND p.pub_date != ''
             """, conn)
             num_cols = ['EPSJB', 'totalShare', 'ZCFZL']
-            self._all_finance_df[num_cols] = self._all_finance_df[num_cols].astype('float32')
+            for col in num_cols:
+                self._all_finance_df[col] = pd.to_numeric(self._all_finance_df[col], errors='coerce').astype('float32')
             self._all_finance_df = self._all_finance_df.sort_values('pub_date')
         finally: conn.close()
 
@@ -203,14 +207,50 @@ class MLFactorBacktestStrategy(BaseStrategy):
         """股票池预筛选，保持逻辑完全一致"""
         if not apply_filter: return all_codes, {}
         passed = []
+        
+        def _get_val(k, default):
+            v = criteria.get(k)
+            return v if v is not None else default
+
+        # 预计算允许的市场前缀
+        markets_filter = _get_val('markets', [])
+        allowed_prefixes = []
+        if markets_filter:
+            for m in markets_filter:
+                p = SUPPORTED_MARKETS.get(m, {}).get('prefixes')
+                if p: allowed_prefixes.extend(p)
+        allowed_prefixes = tuple(allowed_prefixes) if allowed_prefixes else None
+            
         for code in all_codes:
             info = info_map.get(code)
             if not info: continue
-            if not criteria.get('include_st', True) and (info['is_st'] == 1 or '退' in info['name']): continue
+            
+            # 1. 市场类型筛选
+            if allowed_prefixes and not str(code).startswith(allowed_prefixes):
+                continue
+
+            # 2. ST股及退市搜索
+            if not _get_val('include_st', True) and (info['is_st'] == 1 or '退' in info['name']): continue
+            
+            # 3. PE 筛选
             pe = info.get('pe_ratio')
-            if pe is not None and (pe <= 0 or pe > criteria.get('max_pe', float('inf'))): continue
+            max_pe = _get_val('max_pe', float('inf'))
+            if pe is not None and (pe <= 0 or pe > max_pe): continue
+            
+            # 4. 价格筛选
             price = info['current_price']
-            if price < criteria.get('min_price', 0) or price > criteria.get('max_price', float('inf')): continue
+            if price < _get_val('min_price', 0) or price > _get_val('max_price', float('inf')): continue
+            
+            # 5. 市值筛选
+            mkt_cap = info.get('market_cap')
+            if mkt_cap is not None:
+                if mkt_cap < _get_val('min_market_cap', 0): continue
+            
+            # 6. 资产负债率筛选
+            zcfzl = info.get('zcfzl')
+            if zcfzl is not None:
+                if zcfzl > _get_val('max_zcfzl', float('inf')): continue
+                
             passed.append(code)
         return passed, {}
 
@@ -230,9 +270,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
         """获取 PIT 因子行"""
         cached_factors = self._load_factors_from_cache(stock_code)
         if cached_factors is None or 'date' not in cached_factors.columns: return None
-        target_dt = pd.Timestamp(current_date)
+        target_dt = datetime.strptime(current_date, '%Y-%m-%d')
         # 获取不晚于当前日期的最新因子
-        factors = cached_factors[cached_factors['date'] <= target_dt]
+        factors = cached_factors[pd.to_datetime(cached_factors['date']) <= target_dt]
         if factors.empty: return None
         factors = factors.iloc[[-1]]
         

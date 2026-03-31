@@ -15,8 +15,9 @@ import sys
 import os
 import time
 import logging
+import json
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # 添加项目根目录
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +33,10 @@ from config.automation_config import (
     AUTO_MIN_PRICE, AUTO_MAX_PRICE, AUTO_INCLUDE_ST,
     DRY_RUN
 )
+from config.config import SYSTEM_DATA_DIR
+
+# 信号存档目录
+SIGNALS_DIR = os.path.join(SYSTEM_DATA_DIR, "automation", "signals")
 
 # 配置日志
 logging.basicConfig(
@@ -43,6 +48,36 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("AutoTraderApp")
+
+def save_signals_to_file(signals: List[Dict]):
+    """将每日信号持久化到 JSON 文件以供重启恢复"""
+    if not os.path.exists(SIGNALS_DIR):
+        os.makedirs(SIGNALS_DIR, exist_ok=True)
+    
+    today_str = datetime.now().strftime("%Y%m%d")
+    file_path = os.path.join(SIGNALS_DIR, f"signals_{today_str}.json")
+    
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(signals, f, ensure_ascii=False, indent=4)
+        logger.info(f"今日信号已存档至: {file_path}")
+    except Exception as e:
+        logger.error(f"存档信号失败: {e}")
+
+def load_signals_from_file() -> Optional[List[Dict]]:
+    """从本地存档读取今日信号 (当日系统重启恢复用)"""
+    today_str = datetime.now().strftime("%Y%m%d")
+    file_path = os.path.join(SIGNALS_DIR, f"signals_{today_str}.json")
+    
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                signals = json.load(f)
+            logger.info(f"成功从本地存档加载今日信号 ({today_str})，共 {len(signals)} 条。")
+            return signals
+        except Exception as e:
+            logger.error(f"读取存档信号失败: {e}")
+    return None
 
 def get_latest_signals() -> List[Dict]:
     """
@@ -109,6 +144,11 @@ def get_latest_signals() -> List[Dict]:
             final_signals.append(r)
             
         logger.info(f"信号获取完成，共 {len(final_signals)} 只。")
+        
+        # 存档信号
+        if final_signals:
+            save_signals_to_file(final_signals)
+            
         return final_signals
     except Exception as e:
         logger.error(f"获取信号失败: {e}", exc_info=True)
@@ -127,24 +167,35 @@ def main_loop():
         logger.error("无法建立交易客户端连接，请确保同花顺等客户端已手动登录并处于解锁状态。")
         if not DRY_RUN: return
 
-    logger.info("=" * 60)
-    logger.info("自动交易主调度开始运行 (基于 APScheduler 任务中断模式)")
-    logger.info("=" * 60)
+    logger.info("-" * 60)
 
-    # # 启动时先获取一下今日信号作为兜底
-    # signals = get_latest_signals()
-    # if signals:
-    #     controller.set_buy_signals(signals)
+    # 启动时恢复或获取今日信号 (当日系统重启保护)
+    signals = load_signals_from_file()
+    if not signals:
+        # 如果还没存档且已经过了早上 9 点，说明可能错过了定时任务，手动触发一次
+        now = datetime.now()
+        # 注意：这里判断 9:00 之后，但 15:00 之前（交易时间内）
+        if now.hour >= 9 and now.hour < 15:
+            logger.info("检测到今日尚未生成信号且已过 09:00，正在手动触发同步与信号生成...")
+            controller.sync_positions()
+            signals = get_latest_signals()
+        else:
+            logger.info("当前未到 09:00 或已收盘，等待定时任务自动生成。")
+    
+    if signals:
+        controller.set_buy_signals(signals)
 
     scheduler = BlockingScheduler()
 
     def job_get_signals():
         """定时任务：收盘后或盘前获取最新信号"""
-        logger.info("=== 触发定时任务：同步实盘并获取最新信号 ===")
-        controller.sync_positions()
+        logger.info("=== 触发定时任务：获取今日选股信号 ===")
+        # 获取信号 (会自动计算 ATR 并保存存档)
         sigs = get_latest_signals()
         if sigs:
             controller.set_buy_signals(sigs)
+            # 顺便同步一遍持仓记录
+            controller.sync_positions()
 
     def job_execute_buys():
         """定时任务：执行买入"""
@@ -180,6 +231,15 @@ def main_loop():
 
     # 4. 盘中心跳日志 (每半小时一次)
     scheduler.add_job(job_heartbeat, CronTrigger(day_of_week='mon-fri', hour="9-15", minute="0,30"))
+
+    # 5. 启动时检查：如果当前就在交易窗口内，则立即触发一次买入/卖出检查
+    now_str = datetime.now().strftime("%H:%M:%S")
+    if BUY_WINDOW_START <= now_str <= BUY_WINDOW_END:
+        logger.info(f"启动时正处于买入窗口 ({now_str})，立即触发买入任务...")
+        job_execute_buys()
+    elif SELL_WINDOW_START <= now_str <= SELL_WINDOW_END:
+        logger.info(f"启动时正处于卖出窗口 ({now_str})，立即触发卖出任务...")
+        job_execute_sells()
 
     logger.info("任务调度配置完毕。调度器已启动。")
     try:

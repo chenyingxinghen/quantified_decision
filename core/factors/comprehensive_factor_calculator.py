@@ -76,8 +76,9 @@ class ComprehensiveFactorCalculator:
         numeric_cols = [c for c in all_factors.columns if c not in non_numeric_cols]
         
         # 仅转换数值列到 float32 (比 float64 节省一半内存，通常足够回测精度)
-        # 使用 astype 避免 apply(pd.to_numeric) 的 cell-wise 循环
-        all_factors[numeric_cols] = all_factors[numeric_cols].astype(np.float32, copy=False)
+        # 使用 pd.to_numeric 兼容空字符串 '' 等异常情况
+        for col in numeric_cols:
+            all_factors[col] = pd.to_numeric(all_factors[col], errors='coerce').astype(np.float32)
         all_factors[numeric_cols] = all_factors[numeric_cols].fillna(0)
         all_factors[numeric_cols] = all_factors[numeric_cols].replace([np.inf, -np.inf], 0)
             

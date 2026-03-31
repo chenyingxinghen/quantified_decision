@@ -407,6 +407,7 @@ class MLModelTrainer:
         """
         return self.calculate_and_save_factors(code, data, apply_feature_engineering, target_features, verbose, include_fundamentals)
 
+
     def _process_single_stock(self, code: str, data: pd.DataFrame, 
                              forward_days: int,
                              apply_feature_engineering: bool = False,
@@ -454,7 +455,23 @@ class MLModelTrainer:
                 # 1. 路径质量分 (Path-aware Score)
                 # 显著惩罚回撤大、先跌后涨的标的，引导模型选择“走势稳健”的头部标的
                 # 修复：使用符号位保留的幂运算，避免负收益率产生 NaN
-                y = np.sign(f_returns) * (np.abs(f_returns) ** 0.5) + 0.3 * f_max_returns + 1.2 * f_min_returns
+                def _compute_path_quality_score(self, f_returns, f_max_returns, f_min_returns, method='balanced'):
+                    """
+                    计算路径质量分
+                    
+                    Parameters:
+                    - method: 'simple' | 'balanced' | 'calmar' | 'weighted'
+                    """
+                    if method == 'simple':
+                        return (np.sign(f_returns) * (np.abs(f_returns) ** 0.8) + 
+                                0.5 * f_max_returns - 0.8 * np.abs(f_min_returns))
+                    
+                    elif method == 'calmar':
+                        # 卡尔玛风格
+                        max_drawdown = np.abs(f_min_returns) + 1e-6
+                        calmar = f_returns / max_drawdown
+                        return calmar + 0.3 * f_max_returns
+                y = self._compute_path_quality_score(f_returns, f_max_returns, f_min_returns, method='calmar')
                 
                 # 用于计算 IC 的参考收益率 (使用最终涨幅)
                 ref_returns = f_returns.values
@@ -1157,20 +1174,23 @@ class MLModelTrainer:
         rank_cols_idx = np.where(rank_cols_mask)[0]
         
         if len(rank_cols_idx) > 0:
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                
-                for start, count in zip(date_group_start, date_group_counts):
-                    end = start + count
-                    if count > 1:
-                        # 仅对选定的列进行排名
-                        X_to_rank = X_normalized[start:end, rank_cols_idx]
-                        for j in range(X_to_rank.shape[1]):
-                            col = X_to_rank[:, j]
-                            # 进行百分位排名映射到 (0, 1)
-                            ranked_col = rankdata(col, method='average') / (count + 1)
-                            X_normalized[start:end, rank_cols_idx[j]] = ranked_col
+            print(f"    - 正在对 {len(rank_cols_idx)} 个特征进行向量化横截面归一化...")
+            # 优化：使用 pandas 分组排序，极大提升大规模数据的处理速度（由数分钟缩短至数秒）
+            # 注意：此处必须保持 input X 的原始索引顺序，pandas groupby.rank 默认满足
+            rank_df = pd.DataFrame(X_normalized[:, rank_cols_idx], columns=[factor_names[i] for i in rank_cols_idx])
+            rank_df['date'] = dates
+            
+            # 使用更加稳健的归一化映射 (rank / (n + 1))
+            # groupby().rank() 返回与原 DataFrame 同形状且索引对齐的排名
+            ranked_values = rank_df.groupby('date', sort=False).rank(method='average')
+            
+            # 映射到 (0, 1) 空间
+            # transform('count') 会将每组的数量扩展到所有行，实现矢量化除法
+            counts = rank_df.groupby('date', sort=False)['date'].transform('count')
+            X_normalized[:, rank_cols_idx] = (ranked_values.values / (counts.values[:, np.newaxis] + 1)).astype(np.float32)
+            
+            del rank_df, ranked_values, counts
+            import gc; gc.collect()
         
         return X_normalized
     

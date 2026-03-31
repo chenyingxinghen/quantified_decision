@@ -260,11 +260,6 @@ class ExecutionController:
             logger.warning("可用资金不足 1000 元，取消买入。")
             return
 
-        # 1. 预清空已有的未成交单，确保资金可用 (可选，但在反复重试中很有用)
-        logger.info("  正在清空现有未成交订单以准备新委托...")
-        self.trader.cancel_all()
-        time.sleep(1)
-
         # 检查当前持仓
         self.sync_positions()
         positions = self.trader.get_positions()

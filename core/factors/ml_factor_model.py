@@ -235,11 +235,11 @@ class MLFactorModel:
         # 如果启用内存优化且在 GPU 上，使用 XGBoost 的 DataIter 或 LightGBM 的 Dataset 优化
         use_gpu = TrainingConfig.USE_GPU
         mem_efficient = getattr(TrainingConfig, 'MEMORY_EFFICIENT', True)
-        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 200000)
-
         # ---------------------------------------------------------------------
         # 情况 A: XGBoost 分批训练 (DataIter)
         # ---------------------------------------------------------------------
+        # 优化：通过 DataIter 分批向 GPU 供弹，核心在于 batch_size 需足够大以遮掩 PCIe 延迟
+        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 2000000)
         if self.model_type == 'xgboost' and mem_efficient and len(X_train_raw) > batch_size:
             print(f"  [INFO] XGBoost 启动分批训练模式 (样本数: {len(X_train_raw)}, Batch: {batch_size})")
             
@@ -312,7 +312,7 @@ class MLFactorModel:
 
                     # 2. 重建 stop event 和队列（全新对象，无残留状态）
                     self._stop = self._threading.Event()
-                    self._queue = self._queue_cls(maxsize=2)  # 最多预取2个batch，控制内存
+                    self._queue = self._queue_cls(maxsize=4)  # 增加 prefetch 深度至 4
 
                     # 3. 启动新的预取线程
                     self._prefetch_thread = self._threading.Thread(

@@ -28,7 +28,7 @@ class ModelConfig:
         'subsample': 1,
         'colsample_bytree': 0.7,
         'colsample_bylevel': 0.7,
-        'gamma': 0.175,    
+        'gamma': 0.17,    
         
         'reg_alpha': 11,            
         'reg_lambda': 23,             
@@ -53,7 +53,7 @@ class ModelConfig:
         'subsample': 1,
         'colsample_bytree': 0.7,
 
-        'label_gain': [float(i**2) for i in range(100)], 
+        'label_gain': [float(i**1.5+1) for i in range(100)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 100,
@@ -101,6 +101,8 @@ class TrainingConfig:
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
     USE_GPU = True               # 是否启用 GPU 加速
+    MEMORY_EFFICIENT = True      # 是否启用内存优化模式 (针对大规模数据集)
+    GPU_BATCH_SIZE = 2000000     # GPU 分批训练的批大小 (增加此值可提高 GPU 利用率)
 
     YEARS=baostock_config.HISTORY_YEARS
 

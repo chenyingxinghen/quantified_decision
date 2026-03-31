@@ -30,8 +30,8 @@ class ModelConfig:
         'colsample_bylevel': 0.7,
         'gamma': 0.17,    
         
-        'reg_alpha': 11,            
-        'reg_lambda': 23,             
+        'reg_alpha': 7,            
+        'reg_lambda': 13,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
         'n_jobs': 15,
@@ -44,7 +44,7 @@ class ModelConfig:
         'n_estimators': 3000,
         'max_depth': 7,
         'min_child_weight': 225,
-        'num_leaves': 63,
+        'num_leaves': 127,
         'learning_rate': 0.05,
         'min_gain_to_split': 0.12,
 
@@ -99,7 +99,13 @@ class TrainingConfig:
 
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
-    PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚
+    PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚 (兼容旧逻辑)
+    UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
+    
+    # 标签构造参数 (Path Quality Score v2)
+    LABEL_LAMBDA = 2.0           # 损失厌恶系数 (惩罚回撤)
+    LABEL_PATH_PUNISH = 0.5      # 路径保护惩罚系数 (惩罚先跌后涨)
+    
     USE_GPU = True               # 是否启用 GPU 加速
     MEMORY_EFFICIENT = True      # 是否启用内存优化模式 (针对大规模数据集)
     GPU_BATCH_SIZE = 2000000     # GPU 分批训练的批大小 (增加此值可提高 GPU 利用率)

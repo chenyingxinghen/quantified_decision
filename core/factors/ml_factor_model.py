@@ -239,131 +239,54 @@ class MLFactorModel:
         # 情况 A: XGBoost 分批训练 (DataIter)
         # ---------------------------------------------------------------------
         # 优化：通过 DataIter 分批向 GPU 供弹，核心在于 batch_size 需足够大以遮掩 PCIe 延迟
-        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 2000000)
+        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 100000)
         if self.model_type == 'xgboost' and mem_efficient and len(X_train_raw) > batch_size:
-            print(f"  [INFO] XGBoost 启动分批训练模式 (样本数: {len(X_train_raw)}, Batch: {batch_size})")
+            print(f"  [INFO] XGBoost 启动 QuantileDMatrix 训练模式 (样本数: {len(X_train_raw)})")
             
-            # 使用更加通用的 DataIter 基类 (兼容不同版本)
-            BaseDataIter = getattr(xgb, 'DataIter', xgb.core.DataIter)
-            
-            class XGBDataIter(BaseDataIter):
-                """
-                带预取的 XGBoost DataIter。
-                QuantileDMatrix 会多次调用 reset() + 完整遍历（至少两遍），
-                因此预取线程必须在 reset() 时完全停止并等待确认，再重新启动，
-                保证每次遍历的行数严格一致。
-                后台线程提前做 np.ascontiguousarray（内存对齐），
-                使 CPU 数据准备与 XGBoost 分位数计算流水线并行。
-                """
-                def __init__(self, X, y, w=None, b_size=1000000):
-                    import threading, queue
-                    self._threading = threading
-                    self._queue_cls = queue.Queue
-                    self.X = X
-                    self.y = y
-                    self.w = w
-                    self.b_size = b_size
-                    self._n = len(X)
-                    self._queue = None
-                    self._stop = None
-                    self._prefetch_thread = None
-                    super().__init__(cache_prefix=None)
-                    # super().__init__ 会立即调用 reset()，所以线程在 reset() 里启动
-
-                def _prefetch_worker(self, stop_event, out_queue):
-                    """后台线程：提前切片并确保内存连续，放入队列供 next() 消费"""
-                    offset = 0
-                    while not stop_event.is_set():
-                        if offset >= self._n:
-                            out_queue.put(None)  # 哨兵，通知本轮遍历结束
-                            break
-                        end = min(offset + self.b_size, self._n)
-                        # np.ascontiguousarray 确保内存连续，加速后续 PCIe 传输
-                        batch = (
-                            np.ascontiguousarray(self.X[offset:end]),
-                            np.ascontiguousarray(self.y[offset:end]),
-                            np.ascontiguousarray(self.w[offset:end]) if self.w is not None else None,
-                        )
-                        out_queue.put(batch)
-                        offset = end
-
-                def next(self, input_data):
-                    batch = self._queue.get()
-                    if batch is None:
-                        return 0
-                    batch_data, batch_label, batch_weight = batch
-                    if batch_weight is not None:
-                        input_data(data=batch_data, label=batch_label, weight=batch_weight)
-                    else:
-                        input_data(data=batch_data, label=batch_label)
-                    return 1
-
-                def reset(self):
-                    # 1. 通知旧线程停止，并等待其真正退出，避免竞态
-                    if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
-                        self._stop.set()
-                        # 排空队列，防止旧线程阻塞在 put() 无法退出
-                        try:
-                            while True:
-                                self._queue.get_nowait()
-                        except Exception:
-                            pass
-                        self._prefetch_thread.join(timeout=10)
-
-                    # 2. 重建 stop event 和队列（全新对象，无残留状态）
-                    self._stop = self._threading.Event()
-                    self._queue = self._queue_cls(maxsize=4)  # 增加 prefetch 深度至 4
-
-                    # 3. 启动新的预取线程
-                    self._prefetch_thread = self._threading.Thread(
-                        target=self._prefetch_worker,
-                        args=(self._stop, self._queue),
-                        daemon=True,
-                    )
-                    self._prefetch_thread.start()
-
-            # 创建训练集迭代器
-            it = XGBDataIter(X_train_raw, y_train, w_train, batch_size)
-            
-            # 创建训练集和验证集的 DMatrix
-            # 为避免某些版本中 feature_names 触发 DataIter 冲突检查，在此处先不传入 feature_names
-            dtrain = xgb.QuantileDMatrix(it)
-            dval = xgb.DMatrix(X_val_raw, label=y_val)
-            
-            # 统一设置特征名
-            dtrain.feature_names = self.feature_names
-            dval.feature_names = self.feature_names
-            
+            # 优化：直接传整个数组给 QuantileDMatrix，避免 DataIter 多次遍历的队列等待瓶颈。
+            # QuantileDMatrix 内部会自动分块处理，GPU/CPU 利用率更均衡。
             params = ModelConfig.get_model_params('xgboost')
-            # 兼容 scikit-learn 参数名到 native 参数名
             xgb_params = {
                 'tree_method': params.get('tree_method', 'hist'),
-                'device': params.get('device', 'cuda'),
-                'learning_rate': params.get('learning_rate', 0.02),
-                'max_depth': params.get('max_depth', 6),
-                'min_child_weight': params.get('min_child_weight', 1),
-                'subsample': params.get('subsample', 1),
-                'colsample_bytree': params.get('colsample_bytree', 1),
-                'reg_alpha': params.get('reg_alpha', 0),
-                'reg_lambda': params.get('reg_lambda', 1),
-                'objective': params.get('objective', 'reg:logistic'),
-                'eval_metric': params.get('eval_metric', 'auc'),
-                'nthread': params.get('n_jobs', -1)
+                'device':           params.get('device', 'cuda'),
+                'learning_rate':    params.get('learning_rate', 0.03),
+                'max_depth':        params.get('max_depth', 6),
+                'min_child_weight': params.get('min_child_weight', 250),
+                'subsample':        params.get('subsample', 1),
+                'colsample_bytree': params.get('colsample_bytree', 0.7),
+                'colsample_bylevel':params.get('colsample_bylevel', 0.7),
+                'gamma':            params.get('gamma', 0.17),
+                'reg_alpha':        params.get('reg_alpha', 11),
+                'reg_lambda':       params.get('reg_lambda', 23),
+                'objective':        params.get('objective', 'reg:logistic'),
+                'eval_metric':      params.get('eval_metric', 'auc'),
+                'nthread':          params.get('n_jobs', -1),
+                'verbosity':        params.get('verbosity', 0),
             }
-            
-            # 使用 native train 接口
+
+            dtrain = xgb.QuantileDMatrix(
+                X_train_raw, label=y_train, weight=w_train,
+                feature_names=self.feature_names,
+            )
+            dval = xgb.QuantileDMatrix(
+                X_val_raw, label=y_val,
+                feature_names=self.feature_names,
+                ref=dtrain,   # 复用训练集的分位数草图，节省显存和计算
+            )
+
+            verbose_eval = 50 if params.get('verbosity', 0) >= 0 else False
             self.model = xgb.train(
                 xgb_params,
                 dtrain,
-                num_boost_round=params.get('n_estimators', 1000),
-                evals=[(dval, 'validation')],
-                early_stopping_rounds=params.get('early_stopping_rounds', 50),
-                verbose_eval=params.get('verbosity', 1) > 0
+                num_boost_round=params.get('n_estimators', 3000),
+                evals=[(dtrain, 'train'), (dval, 'validation')],
+                early_stopping_rounds=params.get('early_stopping_rounds', 20),
+                verbose_eval=verbose_eval,
             )
-            
+
             # 内存回收
             del dtrain, dval
-            X_train = X_train_raw # 仅用于后续评估
+            X_train = X_train_raw  # 仅用于后续评估
             X_val = X_val_raw
 
         # ---------------------------------------------------------------------

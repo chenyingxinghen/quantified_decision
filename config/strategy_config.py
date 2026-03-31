@@ -15,7 +15,7 @@
 
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
-ML_FACTOR_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
 
 
 # ==============================================================================

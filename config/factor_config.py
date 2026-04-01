@@ -49,11 +49,11 @@ class ModelConfig:
         'min_gain_to_split': 0.15,
 
         'reg_alpha': 7,
-        'reg_lambda': 17,
+        'reg_lambda': 23,
         'subsample': 1,
-        'colsample_bytree': 1,
+        'colsample_bytree': 0.7,
 
-        'label_gain': [float(i*1.2+1) for i in range(256)], 
+        'label_gain': [float(i**1.5+1) for i in range(50)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 1024,
@@ -96,7 +96,7 @@ class TrainingConfig:
     """训练参数配置"""
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
-    MODEL_TYPES = ['xgboost', 'lightgbm']
+    MODEL_TYPES = ['lightgbm']
 
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
@@ -104,9 +104,10 @@ class TrainingConfig:
     UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
     
     # XGB标签构造参数 LGB样本权重构造参数
-    LABEL_TARGET_SCALE = 1.5
-    LABEL_LAMBDA = 0.8           # 损失厌恶系数 (惩罚回撤)
-    LABEL_PATH_PUNISH = 0.2      # 路径保护惩罚系数 (惩罚先跌后涨)
+    LABEL_TARGET_SCALE = 2
+    LABEL_LAMBDA = 1.5           # 损失厌恶系数 (惩罚回撤)
+    LABEL_PATH_PUNISH = 0.8      # 路径保护惩罚系数 (惩罚先跌后涨)
+    LABEL_TIME_BONUS = 0.5       # 时间奖励系数 (奖励高点早的票)
     
     USE_GPU = True               # 是否启用 GPU 加速
     MEMORY_EFFICIENT = True      # 是否启用内存优化模式 (针对大规模数据集)

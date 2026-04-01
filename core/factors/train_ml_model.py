@@ -40,7 +40,7 @@ from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalc
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller, fill_factors_with_defaults
 from core.data.market_sentiment_calculator import MarketSentimentCalculator
-from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, MARKET_PREFIXES
+from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, MARKET_PREFIXES,strategy_config
 class MLModelTrainer:
     """机器学习模型训练器"""
     
@@ -507,7 +507,7 @@ class MLModelTrainer:
                                 
         # 4. 资金效率奖励 (如果高点发生得很早，且核心收益为正，给予微弱加分)
         # 修复：仅对正收益生效，避免对"高点早但最终亏损"的票产生额外惩罚
-        time_bonus = np.where((f_high_idx < 2) & (core_term > 0), 0.3 * core_term, 0)
+        time_bonus = np.where((f_high_idx < 2) & (core_term > 0), TrainingConfig.LABEL_TIME_BONUS * core_term, 0)
 
         final_score = core_term + loss_aversion + path_penalty+time_bonus
         
@@ -561,7 +561,7 @@ class MLModelTrainer:
 
                 # 计算当前波动率 (ATR) 作为分母，衡量收益的“性价比”
                 # 使用相对 ATR (ATR / close)
-                atr_raw = talib.ATR(high.values, low.values, close.values, timeperiod=14)
+                atr_raw = talib.ATR(high.values, low.values, close.values, timeperiod=strategy_config.ATR_PERIOD)
                 atr_rel = atr_raw / close.values
                     
 

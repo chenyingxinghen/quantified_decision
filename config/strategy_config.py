@@ -23,7 +23,7 @@ ML_FACTOR_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl'  # 默认模型
 # ==============================================================================
 
 # ATR相关参数（用于止损止盈计算）
-ATR_PERIOD = 14                     # ATR计算周期
+ATR_PERIOD = 7                     # ATR计算周期
 ATR_STOP_MULTIPLIER = 1.0           # ATR止损倍数 (与训练一致)
 ATR_TARGET_MULTIPLIER = 4.0         # ATR目标倍数 (与训练一致)
 
@@ -44,7 +44,7 @@ MAX_POSITIONS = 1                   # 最大持仓数量，分散风险
 ENABLE_STOP_LOSS_EXIT = True        # 是否启用止损卖出
 ENABLE_TAKE_PROFIT_EXIT = True     # 是否启用止盈卖出
 ENABLE_SUPPORT_BREAK_EXIT = False    # 是否启用跌破支撑卖出
-ENABLE_TIME_STOP_EXIT = True        # 是否启用时间止损卖出
+ENABLE_TIME_STOP_EXIT = False        # 是否启用时间止损卖出
 
 # 时间止损参数
 TIME_STOP_DAYS = 15                 # 增加时间止损天数，匹配预测周期

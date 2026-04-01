@@ -286,10 +286,9 @@ class MLFactorModel:
             dval = xgb.QuantileDMatrix(
                 X_val_raw, label=y_val,
                 feature_names=self.feature_names,
-                ref=dtrain,   # 复用训练集的分位数草图，节省显存和计算
             )
 
-            verbose_eval = 50 if params.get('verbosity', 0) >= 0 else False
+            verbose_eval = 50
             self.model = xgb.train(
                 xgb_params,
                 dtrain,
@@ -311,8 +310,6 @@ class MLFactorModel:
             X_train = X_train_raw
             X_val = X_val_raw
             
-            # LightGBM 不直接通过 DataIter 分批，但可以通过 Dataset 构造函数级优化
-            # 这里我们不再使用 scikit-learn API，而是转向更加省内存的 Native API 或优化参数
             fit_params = {'sample_weight': w_train}
             if self.task == 'ranking':
                 if 'group' in kwargs: fit_params['group'] = kwargs['group']
@@ -325,10 +322,8 @@ class MLFactorModel:
 
             from lightgbm import early_stopping, log_evaluation
             es_rounds = getattr(self, 'early_stopping_rounds', 100)
-            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
+            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True),log_evaluation(50)]
             
-            # 注意：LGBM 即使是用 numpy array 训练，内部也会转 Dataset。
-            # 开启 histogram_pool_size (在 config 中已添加) 是 6G 显存的关键。
             self.model.fit(X_train, y_train, callbacks=callbacks, feature_name=self.feature_names, **fit_params)
 
         # ---------------------------------------------------------------------

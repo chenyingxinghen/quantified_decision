@@ -73,7 +73,7 @@ class AutoTrader:
             return {"可用金额": 1000000.0, "总资产": 1000000.0, "可用": 1000000.0}
             
         if not self.is_connected:
-            if not self.connect(): return {}
+            if not self.connect(): return None
             
         try:
             # easytrader 的 balance 返回通常是列表
@@ -82,12 +82,18 @@ class AutoTrader:
                 return res[0]
             return res
         except Exception as e:
-            logger.error(f"获取资金失败: {e}", exc_info=True)
-            return {}
+            logger.error(f"获取资金异常 (可能 GUI 锁定或被验证码阻断): {e}")
+            return None
 
-    def get_positions(self) -> List[Dict]:
+    def get_positions(self, force_refresh: bool = False) -> List[Dict]:
         """
         获取当前持仓。
+
+        Args:
+            force_refresh: 若为 True，在读取前先切换到撤单页以强制触发完整 WMCopy 刷新流程。
+                           默认 False，避免不必要的 GUI 切换带来的额外验证码触发和延迟。
+                           仅在首次初始化或已知 GUI 有缓存问题时使用。
+
         返回语义：
           - None  : 获取失败（GUI 异常、连接断开等）
           - []    : 确认空仓（经资金交叉验证）
@@ -100,12 +106,13 @@ class AutoTrader:
             if not self.connect(): return None
 
         try:
-            # 先切换到撤单页再切回，确保触发完整的 WMCopy 流程（含验证码检测）
-            try:
-                self.user._switch_left_menus(['撤单[F3]'])
-                time.sleep(0.5)
-            except Exception:
-                pass
+            # 仅在 force_refresh=True 时才切换到撤单页，避免高频调用时的 GUI 扰动
+            if force_refresh:
+                try:
+                    self.user._switch_left_menus(['撤单[F3]'])
+                    time.sleep(0.5)
+                except Exception:
+                    pass
 
             positions = self.user.position
 

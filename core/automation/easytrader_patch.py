@@ -98,7 +98,8 @@ def patched_get_clipboard_data(self):
                 time.sleep(1.0)
                 try:
                     if not top.exists(timeout=0.1):
-                        logger.info("CAPTCHA window disappeared, assuming success.")
+                        logger.info("CAPTCHA window disappeared, assuming success. Waiting for GUI refresh...")
+                        time.sleep(1.0)
                         found = True
                         break
                 except Exception:

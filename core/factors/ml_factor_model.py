@@ -121,6 +121,10 @@ class MLFactorModel:
              **kwargs) -> Dict:
         """
         训练模型
+
+        注意：当 use_time_series_split=True 且 kwargs 中传入 split_idx 时，
+        validation_split 参数会被忽略，实际划分由 split_idx 控制。
+        split_idx 由外层 train_models 按日期边界对齐后传入，确保同一天的样本不被拆分。
         """
         # 1. 预处理
         # 优化：由 float64 改为 float32，避免内存翻倍。且预先在 prepare_dataset 中已完成填充，此处仅做校验。
@@ -321,7 +325,7 @@ class MLFactorModel:
 
             from lightgbm import early_stopping, log_evaluation
             es_rounds = getattr(self, 'early_stopping_rounds', 100)
-            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=False)]
+            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
             
             # 注意：LGBM 即使是用 numpy array 训练，内部也会转 Dataset。
             # 开启 histogram_pool_size (在 config 中已添加) 是 6G 显存的关键。
@@ -356,7 +360,7 @@ class MLFactorModel:
             elif self.model_type == 'lightgbm':
                 from lightgbm import early_stopping, log_evaluation
                 es_rounds = getattr(self, 'early_stopping_rounds', 100)
-                callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=False)]
+                callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
                 if self.task == 'ranking':
                     callbacks.append(log_evaluation(period=50))
                 self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)

@@ -22,13 +22,13 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 6,              # 增加深度以改善预测区分度
-        'min_child_weight': 200,       # 增加权重要求，防止过拟合
+        'max_depth': 7,              # 增加深度以改善预测区分度
+        'min_child_weight': 250,       # 增加权重要求，防止过拟合
         'learning_rate': 0.05,       
         'subsample': 1,
-        'colsample_bytree': 0.7,
-        'colsample_bylevel': 0.7, 
-        'gamma': 0.1,    
+        'colsample_bytree': 0.8,
+        'colsample_bylevel': 0.8, 
+        'gamma': 0.17,    
         
         'reg_alpha': 5,            
         'reg_lambda': 13,             
@@ -48,15 +48,15 @@ class ModelConfig:
         'learning_rate': 0.05,
         'min_gain_to_split': 0.15,
 
-        'reg_alpha': 5,
+        'reg_alpha': 7,
         'reg_lambda': 17,
         'subsample': 1,
-        'colsample_bytree': 0.7,
+        'colsample_bytree': 1,
 
-        'label_gain': [float(i**2+1) for i in range(50)], 
+        'label_gain': [float(i*1.2+1) for i in range(256)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 1000,
+        'lambdarank_truncation_level': 1024,
 
         'n_jobs': 15,
         'verbosity': -1,

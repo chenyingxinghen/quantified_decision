@@ -266,8 +266,14 @@ class MLModelTrainer:
         # 优化点：如果是增量更新且不需要全量重算，仅传递最近的历史数据窗口即可
         # 技术指标通常需要一定的历史回望（Cold Start），500 行足以满足绝大多数指标（如 250 日线）
         if not need_full_recompute and cached_factors is not None and new_data_rows is not None:
-            # 增量模式：选取最后 500 行数据进行计算，不再进行全量重算
-            calc_window = 500
+        # 增量模式：选取最后 N 行数据进行计算，N 取最大因子回望窗口 + 新增行数的较大值
+            max_lookback = max(
+                getattr(FactorConfig, 'BB_PERIOD', 100),
+                getattr(FactorConfig, 'MA_RATIO_PERIOD', 120),
+                getattr(FactorConfig, 'ROC_PERIOD', 60),
+                250,  # 年线保底
+            ) + 50  # 额外缓冲
+            calc_window = max(max_lookback, len(new_data_rows) + max_lookback)
             calculation_data = data.tail(calc_window).copy()
             if verbose:
                 print(f"  {code}: 采用增量计算模式 (窗口={len(calculation_data)} 行)")
@@ -499,8 +505,9 @@ class MLModelTrainer:
                                 -core_term * path_punish_coef * np.clip(downside_gap, 1.0, 2.0), 
                                 0)
                                 
-        # 4. 资金效率奖励 (如果高点发生得很早，给予微弱加分)
-        time_bonus = np.where(f_high_idx < 2, 0.3 * core_term, 0)
+        # 4. 资金效率奖励 (如果高点发生得很早，且核心收益为正，给予微弱加分)
+        # 修复：仅对正收益生效，避免对"高点早但最终亏损"的票产生额外惩罚
+        time_bonus = np.where((f_high_idx < 2) & (core_term > 0), 0.3 * core_term, 0)
 
         final_score = core_term + loss_aversion + path_penalty+time_bonus
         
@@ -638,13 +645,14 @@ class MLModelTrainer:
 
     def _validate_and_filter_stocks(self, stocks_data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
         """
-        验证并过滤特征不完整的股票
+        验证缓存特征完整性，过滤掉缓存损坏的股票（触发重算），统计需要重算的数量。
+        注意：特征不匹配的股票仍会保留（后续会触发重算），只有无法恢复的损坏缓存才被标记。
         
         参数:
             stocks_data: 股票数据字典
         
         返回:
-            (过滤后的股票数据, 验证统计信息)
+            (处理后的股票数据, 验证统计信息)
         """
         print("\n验证缓存特征完整性...")
         
@@ -664,7 +672,7 @@ class MLModelTrainer:
                     model_features = None
         
         if not model_features:
-            print("  警告: 无法获取模型特征，尝试实时计算")
+            print("  警告: 无法获取模型特征，跳过验证")
             return stocks_data, {'filtered': 0, 'kept': len(stocks_data)}
         
         filtered_stocks = {}
@@ -672,38 +680,29 @@ class MLModelTrainer:
         recomputed_count = 0
         
         for code, data in tqdm(stocks_data.items(), desc="验证缓存完整性"):
-            # 检查缓存
             cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
             
             if os.path.exists(cache_file):
                 try:
-                    # 使用 pyarrow 引擎快速读取元数据或部分数据进行检查
-                    # 为了检查 NaNs，我们仍需要读取数值列
                     factors = pd.read_parquet(cache_file)
                     
-                    # 仅对数值列进行检查
                     numeric_factors = factors.select_dtypes(include=[np.number])
                     cache_features = set(numeric_factors.columns)
                     
-                    # 检查特征完整性 (子集匹配即可，允许缓存特征多于模型特征)
-                    is_feature_match = (model_features.issubset(cache_features))
-                    
-                    # 只有当特征不匹配时，才标记为重新计算
-                    # 不再因为 NaN 或 Inf 删文件，因为技术指标产生前置 NaN 是正常的
-                    # 且后续计算流程中会有 fillna(0) 处理
-                    if is_feature_match:
-                        filtered_stocks[code] = data
-                    else:
-                        # 只有特征不匹配才计入重新计算
-                        filtered_stocks[code] = data
+                    # 特征不匹配：保留股票，标记为需要重算（calculate_and_save_factors 会处理）
+                    if not model_features.issubset(cache_features):
                         recomputed_count += 1
+                    
+                    filtered_stocks[code] = data
                         
                 except Exception as e:
-                    # 缓存读取失败，说明文件可能损坏，保留并重新计算
-                    filtered_stocks[code] = data
+                    # 缓存读取失败（文件损坏），删除损坏文件并保留股票触发重算
                     recomputed_count += 1
-                    try: os.remove(cache_file) # 仅在读取失败（损坏）时尝试删除
-                    except: pass
+                    filtered_stocks[code] = data
+                    try:
+                        os.remove(cache_file)
+                    except:
+                        pass
             else:
                 # 缓存不存在，保留该股票（会实时计算）
                 filtered_stocks[code] = data
@@ -1097,6 +1096,10 @@ class MLModelTrainer:
                 current_weight = default_sample_weight
                 
                 if model_type == 'lightgbm':
+                    # [LGBM 标签/权重分离]
+                    # 训练目标：用原始收益率(returns)作为排序标准，让模型直接优化收益排名
+                    # 样本权重：用路径质量分(path_scores)变换为权重，让高质量路径的样本梯度更大
+                    # 评估基准：_evaluate 中 reference=y=returns，与训练目标一致
                     print("  [LGBM 优化] 使用原始收益率(returns)作为标签，路径质量分变换为权重")
                     current_y = returns # 使用原始收益作为排序标准
                     
@@ -1148,8 +1151,14 @@ class MLModelTrainer:
         """
         原位对特征矩阵进行横截面归一化（按日期分组），降低内存占用。
         """
-        sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
-        rank_cols_mask = np.array([not any(k in col.lower() for k in sentiment_keys) for col in factor_names])
+        # 精确匹配情绪因子集合，避免关键词匹配误伤同名技术因子（如 mean_return_20d）
+        _sentiment_exact = {
+            'up_ratio', 'strong_up_ratio', 'down_ratio',
+            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
+            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
+            'market_type',
+        }
+        rank_cols_mask = np.array([col not in _sentiment_exact for col in factor_names])
         rank_cols_idx = np.where(rank_cols_mask)[0]
         
         if len(rank_cols_idx) > 0:
@@ -1233,9 +1242,15 @@ class MLModelTrainer:
         )
         
         # 识别需要进行横截面排名的因子索引
-        # 修复问题7: 排除市场情绪因子，因为它们在同一天对所有股票相同
-        sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
-        rank_cols_mask = np.array([not any(k in col.lower() for k in sentiment_keys) for col in factor_names])
+        # 排除市场情绪因子，因为它们在同一天对所有股票相同
+        # 使用精确集合匹配，避免关键词匹配误伤同名技术因子（如 mean_return_20d）
+        _sentiment_exact = {
+            'up_ratio', 'strong_up_ratio', 'down_ratio',
+            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
+            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
+            'market_type',
+        }
+        rank_cols_mask = np.array([col not in _sentiment_exact for col in factor_names])
         rank_cols_idx = np.where(rank_cols_mask)[0]
         
         if len(rank_cols_idx) > 0:

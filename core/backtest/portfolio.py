@@ -51,10 +51,15 @@ class Position:
             return 0.0
         return (self.current_price - self.entry_price) / abs(self.entry_price)
     
-    def update_price(self, price: float):
+    def update_price(self, price: float, date: str = None):
         """更新当前价格"""
         self.current_price = price
-        self.holding_days += 1
+        # 只有在非买入日才增加持仓天数，以对齐实盘常用的 (today - entry_date) 逻辑
+        if date and date != self.entry_date:
+            self.holding_days += 1
+        elif not date:
+            # 兼容旧调用
+            self.holding_days += 1
         
         # 更新最大盈利率
         current_pnl_pct = self.unrealized_pnl_pct
@@ -276,7 +281,7 @@ class Portfolio:
             # 使用 get_bar 直接获取单日 Series，不触发 get_historical_data 的切片拷贝
             bar = market_data.get_bar(stock_code)
             if bar is not None:
-                position.update_price(bar['close'])
+                position.update_price(bar['close'], date=date)
     
     def record_equity(self, date: str):
         """记录资产曲线"""

@@ -33,7 +33,7 @@ MULTI_WINDOW = True
 # 开盘买入时间窗点 (格式: HH:MM:SS)
 # 策略: 开盘集合竞价后立即挂涨停价买入，确保以开盘价成交（对齐回测的 next_day_open 成交逻辑）
 BUY_WINDOW_START = "09:20:00"
-BUY_WINDOW_END   = "09:26:00"
+BUY_WINDOW_END   = "09:30:00"
 
 # 尾盘卖出时间窗点
 # 策略: 在尾盘集合竞价前挂跌停价卖出，确保以当日收盘价附近成交（对齐回测以当日 close 成交的尾盘逻辑）
@@ -69,7 +69,6 @@ AUTO_MIN_CONFIDENCE = 0.0
 AUTO_TOP_N = MAX_POSITIONS_AUTO
 
 # 信号历史记录保存路径
-POSITIONS_TRACKING_PATH = 'data/automation/positions.json'
 
 
 # ==============================================================================
@@ -93,5 +92,7 @@ AUTO_MAX_PRICE = 20.0           # 最高 20 元
 
 # 是否包含 ST / *ST 股票。实盘建议设为 False 规避退市风险
 AUTO_INCLUDE_ST = True
+
+SELECTOR_MARKETS=['sh_main','sz_main']
 
 

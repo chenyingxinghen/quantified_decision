@@ -6,135 +6,136 @@
     </div>
 
     <!-- 搜索栏 -->
-    <div class="card mb-24 glass-search-bar" style="padding: 16px 24px">
-      <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap">
-        <div style="display: flex; align-items: center; gap: 12px">
-          <span style="font-size: 13px; font-weight: 700; color: var(--text-secondary)">标的代码</span>
-          <el-select
-            v-model="stockCode"
-            filterable
-            remote
-            reserve-keyword
-            placeholder="代码/名称"
-            :remote-method="queryStock"
-            :loading="searchLoading"
-            style="width: 180px"
-            @change="loadChart"
-          >
-            <el-option
-              v-for="item in searchResults"
-              :key="item.code"
-              :label="item.code + ' ' + item.name"
-              :value="item.code"
-            />
-          </el-select>
-          <el-tooltip content="基本面分析" placement="top">
-            <el-button 
-              v-if="stockCode" 
-              circle 
-              size="small" 
-              type="warning" 
-              @click="$router.push({ path: '/fundamental', query: { code: stockCode } })"
+    <div class="card mb-24 glass-search-bar search-bar-card">
+      <div class="search-bar-inner">
+        <div class="search-row">
+          <div class="search-group">
+            <span class="search-label">标的代码</span>
+            <el-select
+              v-model="stockCode"
+              filterable
+              remote
+              reserve-keyword
+              placeholder="代码/名称"
+              :remote-method="queryStock"
+              :loading="searchLoading"
+              class="search-select"
+              @change="loadChart"
             >
-              <el-icon><Histogram /></el-icon>
-            </el-button>
-          </el-tooltip>
+              <el-option
+                v-for="item in searchResults"
+                :key="item.code"
+                :label="item.code + ' ' + item.name"
+                :value="item.code"
+              />
+            </el-select>
+            <el-tooltip content="基本面分析" placement="top">
+              <el-button 
+                v-if="stockCode" 
+                circle 
+                size="small" 
+                type="warning" 
+                @click="$router.push({ path: '/fundamental', query: { code: stockCode } })"
+              >
+                <el-icon><Histogram /></el-icon>
+              </el-button>
+            </el-tooltip>
+          </div>
+          <div class="search-group">
+            <span class="search-label">历史范围</span>
+            <el-select v-model="days" class="days-select">
+              <el-option :value="60" label="60 天" />
+              <el-option :value="120" label="120 天" />
+              <el-option :value="250" label="250 天" />
+              <el-option :value="500" label="500 天" />
+            </el-select>
+          </div>
         </div>
-        <div style="display: flex; align-items: center; gap: 12px">
-          <span style="font-size: 13px; font-weight: 700; color: var(--text-secondary)">历史范围</span>
-          <el-select v-model="days" style="width: 110px">
-            <el-option :value="60" label="60 天" />
-            <el-option :value="120" label="120 天" />
-            <el-option :value="250" label="250 天" />
-            <el-option :value="500" label="500 天" />
-          </el-select>
-        </div>
-        
-        <div class="v-divider"></div>
 
-        <div style="display: flex; align-items: center; gap: 8px">
-          <span style="font-size: 11px; font-weight: 700; color: var(--text-muted)">长期趋势</span>
-          <el-input-number v-model="longPeriod" :min="50" :max="500" :step="10" size="small" style="width: 90px" />
+        <div class="search-row search-row-secondary">
+          <div class="search-group">
+            <span class="search-label-sm">长期趋势</span>
+            <el-input-number v-model="longPeriod" :min="50" :max="500" :step="10" size="small" class="period-input" />
+          </div>
+          <div class="search-group">
+            <span class="search-label-sm">短期趋势</span>
+            <el-input-number v-model="shortPeriod" :min="10" :max="100" :step="5" size="small" class="period-input" />
+          </div>
+          <div class="v-divider"></div>
+          <el-checkbox v-model="showTrendlines" @change="loadChart">显示趋势</el-checkbox>
+          <el-checkbox v-model="showPatterns" @change="loadChart">显示信号</el-checkbox>
+          <el-button type="primary" @click="loadChart" :loading="loading" class="analyze-btn">
+            <el-icon style="margin-right: 8px"><TrendCharts /></el-icon> 执行分析
+          </el-button>
         </div>
-        <div style="display: flex; align-items: center; gap: 8px">
-          <span style="font-size: 11px; font-weight: 700; color: var(--text-muted)">短期趋势</span>
-          <el-input-number v-model="shortPeriod" :min="10" :max="100" :step="5" size="small" style="width: 90px" />
-        </div>
-        
-        <div class="v-divider"></div>
-
-        <el-checkbox v-model="showTrendlines" @change="loadChart">显示趋势</el-checkbox>
-        <el-checkbox v-model="showPatterns" @change="loadChart">显示信号</el-checkbox>
-
-        <el-button type="primary" @click="loadChart" :loading="loading" style="margin-left: auto; padding: 0 24px">
-          <el-icon style="margin-right: 8px"><TrendCharts /></el-icon> 执行分析
-        </el-button>
       </div>
     </div>
 
     <!-- K 线图 -->
-    <div class="card" style="padding: 24px; min-height: 550px">
-      <div v-if="loading" class="flex-center" style="height: 500px">
+    <div class="card chart-card">
+      <div v-if="loading" class="flex-center chart-placeholder">
         <el-icon class="loading-pulse" :size="48" color="var(--accent-blue)"><Loading /></el-icon>
       </div>
-      <div v-else-if="!klineData" class="flex-center" style="height: 500px; flex-direction: column">
+      <div v-else-if="!klineData" class="flex-center chart-placeholder" style="flex-direction: column">
         <el-icon :size="64" style="color: var(--border-color); margin-bottom: 20px"><Monitor /></el-icon>
         <p style="color: var(--text-muted); font-size: 14px">输入标的代码以初始化可视化分析</p>
       </div>
-      <div ref="chartRef" style="width: 100%; height: 500px" v-show="klineData && !loading"></div>
+      <div ref="chartRef" class="chart-container" v-show="klineData && !loading"></div>
     </div>
 
     <!-- 形态识别面板 -->
-    <div v-if="patterns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 24px">
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">信号识别</span>
+    <div v-if="patterns" class="grid-2-mobile-1" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px">
+      <div class="card" style="padding: 16px">
+        <div class="card-header" style="margin-bottom: 16px">
+          <span class="card-title">信号实时识别</span>
         </div>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px">
+        <div style="display: flex; flex-direction: column; gap: 16px">
           <div>
-            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px">
-              <div style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent-red)"></div>
-              <span style="font-size: 13px; font-weight: 700; color: var(--accent-red)">看多形态</span>
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+              <div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-red)"></div>
+              <span style="font-size: 11px; font-weight: 700; color: var(--accent-red); text-transform: uppercase; letter-spacing: 0.5px">看多</span>
             </div>
-            <div v-for="p in patterns.bullish_patterns.filter(x => x.date === klineData.dates[klineData.dates.length-1])" :key="p.description" class="pattern-tag bullish">
-              <span>{{ p.description }}</span>
-              <span class="score">{{ p.score }}</span>
+            <div style="display: flex; flex-wrap: wrap; gap: 8px">
+              <div v-for="p in patterns.bullish_patterns?.filter(x => x.date === klineData.dates[klineData.dates.length-1])" :key="p.description" class="pattern-tag-mini bullish">
+                {{ p.description }}
+              </div>
+              <div v-if="!patterns.bullish_patterns?.filter(x => x.date === klineData.dates[klineData.dates.length-1]).length" class="text-muted" style="font-size: 12px">无显著型号</div>
             </div>
-            <div v-if="!patterns.bullish_patterns?.filter(x => x.date === klineData.dates[klineData.dates.length-1]).length" class="text-muted" style="font-size: 12px">未检测到显著信号</div>
           </div>
           <div>
-            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px">
-              <div style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent-green)"></div>
-              <span style="font-size: 13px; font-weight: 700; color: var(--accent-green)">看空形态</span>
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px">
+              <div style="width: 6px; height: 6px; border-radius: 50%; background: var(--accent-green)"></div>
+              <span style="font-size: 11px; font-weight: 700; color: var(--accent-green); text-transform: uppercase; letter-spacing: 0.5px">看空</span>
             </div>
-            <div v-for="p in patterns.bearish_patterns.filter(x => x.date === klineData.dates[klineData.dates.length-1])" :key="p.description" class="pattern-tag bearish">
-              <span>{{ p.description }}</span>
-              <span class="score">{{ p.score }}</span>
+            <div style="display: flex; flex-wrap: wrap; gap: 8px">
+              <div v-for="p in patterns.bearish_patterns?.filter(x => x.date === klineData.dates[klineData.dates.length-1])" :key="p.description" class="pattern-tag-mini bearish">
+                {{ p.description }}
+              </div>
+              <div v-if="!patterns.bearish_patterns?.filter(x => x.date === klineData.dates[klineData.dates.length-1]).length" class="text-muted" style="font-size: 12px">无显著型号</div>
             </div>
-            <div v-if="!patterns.bearish_patterns?.filter(x => x.date === klineData.dates[klineData.dates.length-1]).length" class="text-muted" style="font-size: 12px">未检测到显著信号</div>
           </div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">市场微观结构</span>
-          <span v-if="patterns.market_structure?.structure_shift" class="tag tag-buy">结构反转</span>
+      <div class="card" style="padding: 16px">
+        <div class="card-header" style="margin-bottom: 16px">
+          <span class="card-title">微观结构</span>
+          <span v-if="patterns.market_structure?.structure_shift" class="tag tag-buy" style="font-size: 9px">结构反转</span>
         </div>
-        <div v-if="patterns.market_structure" class="structure-grid">
-          <div class="structure-item">
-            <span class="label">核心趋势</span>
+        <div v-if="patterns.market_structure" class="structure-grid-optimized">
+          <div class="structure-mini">
+            <span class="label">趋势</span>
             <span class="value" :style="{ color: patterns.market_structure.trend?.includes('UP') ? 'var(--accent-red)' : 'var(--accent-green)' }">
-              {{ patterns.market_structure.trend?.toUpperCase() ?? 'NEUTRAL' }}
+              {{ patterns.market_structure.trend ?? 'NEUTRAL' }}
             </span>
           </div>
-          <div class="structure-item">
-            <span class="label">动量强度</span>
-            <span class="value text-mono">{{ patterns.market_structure.strength ?? '0%' }}</span>
+          <div class="structure-mini">
+            <span class="label">动量</span>
+            <span class="value">{{ patterns.market_structure.strength ?? '0%' }}</span>
           </div>
-          <div class="structure-item">
-            <span class="label">当前阶段</span>
-            <span class="value">{{ patterns.market_structure.pattern?.toUpperCase() ?? 'UNKNOWN' }}</span>
+          <div class="structure-mini">
+            <span class="label">阶段</span>
+            <span class="value">{{ patterns.market_structure.pattern ?? 'UNKNOWN' }}</span>
           </div>
         </div>
       </div>
@@ -414,12 +415,135 @@ function renderChart() {
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
+
+.search-bar-card {
+  padding: 16px 24px;
+}
+
+.search-bar-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.search-row-secondary {
+  flex-wrap: wrap;
+}
+
+.search-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.search-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.search-label-sm {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.search-select {
+  width: 180px;
+}
+
+.days-select {
+  width: 110px;
+}
+
+.period-input {
+  width: 90px;
+}
+
+.analyze-btn {
+  margin-left: auto;
+  padding: 0 24px;
+}
+
+.chart-card {
+  padding: 24px;
+  min-height: 400px;
+}
+
+.chart-placeholder {
+  height: 400px;
+}
+
+.chart-container {
+  width: 100%;
+  height: 500px;
+}
+
 .v-divider {
   width: 1px;
   height: 24px;
   background: rgba(255, 255, 255, 0.1);
-  margin: 0 10px;
+  margin: 0 4px;
 }
+
+@media (max-width: 768px) {
+  .search-bar-card {
+    padding: 14px 16px;
+  }
+
+  .search-row {
+    gap: 10px;
+  }
+
+  .search-select {
+    width: 150px;
+  }
+
+  .analyze-btn {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .v-divider {
+    display: none;
+  }
+
+  .chart-container {
+    height: 320px;
+  }
+
+  .chart-placeholder {
+    height: 320px;
+  }
+
+  .chart-card {
+    min-height: 320px;
+  }
+}
+
+@media (max-width: 480px) {
+  .search-select {
+    width: 130px;
+  }
+
+  .days-select {
+    width: 90px;
+  }
+
+  .period-input {
+    width: 80px;
+  }
+}
+
 .pattern-tag {
   display: flex;
   justify-content: space-between;
@@ -447,6 +571,42 @@ function renderChart() {
   gap: 16px;
   margin-top: 20px;
 }
+@media (max-width: 768px) {
+  .structure-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 移动端形态标签与微观结构优化 */
+.pattern-tag-mini {
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.pattern-tag-mini.bullish { border-left: 2px solid var(--accent-red); color: var(--accent-red); }
+.pattern-tag-mini.bearish { border-left: 2px solid var(--accent-green); color: var(--accent-green); }
+
+.structure-grid-optimized {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.structure-mini {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.structure-mini .label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; }
+.structure-mini .value { font-size: 12px; font-weight: 700; color: var(--text-primary); }
+
+@media (max-width: 480px) {
+  .structure-grid-optimized {
+    grid-template-columns: 1fr;
+  }
+}
+
 .structure-item {
   background: rgba(255, 255, 255, 0.02);
   padding: 16px;

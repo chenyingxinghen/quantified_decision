@@ -6,39 +6,39 @@
     </div>
 
     <!-- 统计大网格 -->
-    <div class="stat-grid">
+    <div class="stat-grid dash-stat-grid">
       <div class="stat-card">
         <div class="stat-label">市场覆盖</div>
-        <div class="stat-value">{{ formatNum(dbStatus.total_stocks) }} <small style="font-size: 14px; color: var(--text-muted)">只标的</small></div>
+        <div class="stat-value" style="font-size: 26px">{{ formatNum(dbStatus.total_stocks) }} <small style="font-size: 13px; color: var(--text-muted)">只标的</small></div>
         <div class="stat-sub">最新同步: {{ dbStatus.latest_date ?? '—' }}</div>
       </div>
       
-      <div class="stat-card" style="border-bottom: 2px solid var(--accent-blue)">
+      <div class="stat-card">
         <div class="stat-label">系统状态</div>
         <div class="stat-value text-mono" style="font-size: 20px; color: var(--accent-green)">运行稳定</div>
-        <div class="stat-sub">数据节点正常运转</div>
+        <div class="stat-sub">功能节点运转正常</div>
       </div>
 
-      <div class="stat-card" style="border-bottom: 2px solid var(--accent-purple)">
+      <div class="stat-card">
         <div class="stat-label">AI 选股池</div>
-        <div class="stat-value">{{ formatNum(selectionCount) }}</div>
+        <div class="stat-value" style="font-size: 26px">{{ formatNum(selectionCount) }}</div>
         <div class="stat-sub">{{ selectionFile ? selectionFile.slice(-15) : '暂无近期结果' }}</div>
       </div>
 
-      <div class="stat-card" style="border-bottom: 2px solid var(--accent-green)">
+      <div class="stat-card">
         <div class="stat-label">实盘追踪</div>
-        <div class="stat-value">{{ formatNum(activePositions) }}</div>
+        <div class="stat-value" style="font-size: 26px">{{ formatNum(activePositions) }}</div>
         <div class="stat-sub">当前活跃监控标的</div>
       </div>
     </div>
 
-    <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 24px">
+    <div class="secondary-grid">
       <!-- 快捷操作 -->
       <div class="card">
         <div class="card-header">
           <span class="card-title">快捷指令</span>
         </div>
-        <div class="flex-center" style="gap: 20px; flex-wrap: wrap; justify-content: flex-start">
+        <div class="action-btn-group">
           <div class="action-btn glass" @click="$router.push('/selector')">
             <el-icon><Search /></el-icon>
             <span>启动选股</span>
@@ -51,7 +51,6 @@
             <el-icon><Briefcase /></el-icon>
             <span>实盘监控</span>
           </div>
-
         </div>
       </div>
 
@@ -121,6 +120,12 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.action-btn-group {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
 .action-btn {
   display: flex;
   flex-direction: column;
@@ -145,5 +150,27 @@ onMounted(async () => {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
+}
+
+@media (max-width: 768px) {
+  .action-btn-group {
+    gap: 10px;
+  }
+  .action-btn {
+    flex: 1;
+    min-width: 80px;
+    width: auto;
+    padding: 16px 10px;
+    gap: 8px;
+  }
+  .action-btn span {
+    font-size: 11px;
+  }
+}
+
+@media (max-width: 480px) {
+  .dash-stat-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
 }
 </style>

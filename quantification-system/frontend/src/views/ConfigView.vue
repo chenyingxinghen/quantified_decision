@@ -16,7 +16,7 @@
         />
       </div>
 
-      <el-form label-position="top" :model="config" :disabled="!config.ENABLE_FUNDAMENTAL_FILTER" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px">
+      <el-form label-position="top" :model="config" :disabled="!config.ENABLE_FUNDAMENTAL_FILTER" class="grid-2-mobile-1" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px">
         <div class="config-item glass">
           <label>最小市值 (亿元)</label>
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">剔除市值过小的公司</div>
@@ -52,7 +52,7 @@
             <el-option label="北交所" value="bj" />
           </el-select>
         </div>
-        <div class="config-item glass" style="grid-column: span 2">
+        <div class="config-item glass config-full-width">
           <label>ST 股过滤</label>
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">是否在选股池中包含 ST 股票</div>
           <el-switch v-model="config.INCLUDE_ST" active-text="包含ST股" inactive-text="排除ST股" style="--el-switch-on-color: var(--accent-red)"/>
@@ -76,7 +76,7 @@
         <el-switch v-model="config.ENABLE_TIME_STOP_EXIT" active-text="启用时间止损监控" />
       </div>
 
-      <el-form label-position="top" :model="config" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px">
+      <el-form label-position="top" :model="config" class="grid-2-mobile-1" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px">
         <div class="config-item glass">
           <label>ATR 周期</label>
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">真实波动幅度计算窗口</div>
@@ -101,7 +101,7 @@
           <el-input-number v-model="config.TIME_STOP_DAYS" :min="1" :max="100" :step="1" style="width: 100%" :disabled="!config.ENABLE_TIME_STOP_EXIT" />
         </div>
 
-        <div class="config-item glass" style="grid-column: span 2">
+        <div class="config-item glass config-full-width">
           <label>时间止损容忍值 (%)</label>
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">持仓到期且收益地域此阈值时强平</div>
           <el-input-number v-model="config.TIME_STOP_MIN_LOSS_PCT" :min="-1.0" :max="0.0" :step="0.01" :precision="2" style="width: 100%" :disabled="!config.ENABLE_TIME_STOP_EXIT" />
@@ -187,5 +187,15 @@ async function saveConfig() {
   font-weight: 700;
   color: var(--text-primary);
   margin-bottom: 4px;
+}
+
+.config-full-width {
+  grid-column: span 2;
+}
+
+@media (max-width: 768px) {
+  .config-full-width {
+    grid-column: span 1;
+  }
 }
 </style>

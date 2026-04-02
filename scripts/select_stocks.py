@@ -39,7 +39,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 # 常量 & 默认配置
 # ============================================================================
-DEFAULT_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl' # 默认搜寻 mark 目录
+DEFAULT_MODEL_PATH = 'models/mark/automation' # 默认搜寻 mark 目录
 DEFAULT_MIN_CONFIDENCE = 0
 DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
@@ -424,14 +424,15 @@ def get_factors_for_single_stock(
 def _update_factor_cache_incremental(db_path: str, codes: List[str], cache_dir: str, workers: int = 12, lookback_days: int = 500, target_features: Optional[List[str]] = None):
     """更清晰的增量缓存更新实现"""
     trainer = MLModelTrainer(db_path=db_path)
-    # 强制使 trainer 使用传入的 cache_dir
-    trainer.factors_cache_dir = DEFAULT_CACHE_DIR
-    os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
+    # 使用传入的 cache_dir，若未指定则回退到默认目录
+    effective_cache_dir = cache_dir if cache_dir else DEFAULT_CACHE_DIR
+    trainer.factors_cache_dir = effective_cache_dir
+    os.makedirs(effective_cache_dir, exist_ok=True)
     
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
     
-    print(f"   [因子同步] 正在为 {len(codes)} 只股票从数据库加载行情 (缓存: {DEFAULT_CACHE_DIR}) ...")
+    print(f"   [因子同步] 正在为 {len(codes)} 只股票从数据库加载行情 (缓存: {effective_cache_dir}) ...")
     stocks_data = trainer.load_training_data(codes, start_date, end_date)
     
     if not stocks_data:
@@ -528,9 +529,10 @@ def select_stocks(
             'max_zcfzl': max_zcfzl, 'min_price': min_price, 
             'max_price': max_price, 'include_st': include_st,
             'markets': markets
-        } if markets else None
+        }
         passed_codes, skipped_stats = pre_filter_stocks(all_codes, info_map, DATABASE_PATH, criteria=criteria)
         predict_codes = passed_codes
+        print(f'筛选条件：{criteria}')
         print(f"   筛选完成: 满足条件 {len(predict_codes)} 只 (已过滤 {sum(skipped_stats.values())} 只)")
         if not predict_codes:
             print("❌ 无符合条件的股票进入下一步。")
@@ -600,8 +602,8 @@ def select_stocks(
     if 'date' in all_X.columns:
         all_X = all_X.drop(columns=['date'])
     
-    # 输入对齐 & 缺失值填充
-    all_X_input = all_X.astype(np.float64).fillna(0)
+    # 输入对齐 & 缺失值填充 (与回测 ml_factor_strategy 保持一致，用 0.5 而非 0)
+    all_X_input = all_X.astype(np.float64).fillna(0.5)
     
     # 强制与模型特征对齐 (补 0)
     if target_features:
@@ -620,12 +622,22 @@ def select_stocks(
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         
-        # 识别需要进行横截面排名的因子索引 (同步 train_ml_model 逻辑)
-        sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
-        rank_cols = [col for col in all_X_input.columns if not any(k in col.lower() for k in sentiment_keys)]
+        # 识别需要进行横截面排名的因子索引 (与 train_ml_model 精确匹配逻辑保持一致)
+        _sentiment_exact = {
+            'up_ratio', 'strong_up_ratio', 'down_ratio',
+            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
+            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
+            'market_type',
+        }
+        rank_cols = [col for col in all_X_input.columns if col not in _sentiment_exact]
         
         if rank_cols:
-            all_X_input[rank_cols] = all_X_input[rank_cols].rank(pct=True).fillna(0.5)
+            n = len(all_X_input)
+            # 与训练时公式一致: rankdata / (count + 1)，值域 (0, 1) 开区间
+            from scipy.stats import rankdata as _rankdata
+            arr = all_X_input[rank_cols].values
+            ranked = _rankdata(arr, method='average', axis=0) / (n + 1)
+            all_X_input[rank_cols] = ranked.astype(np.float64)
     
     try:
         probs = model.predict(all_X_input)

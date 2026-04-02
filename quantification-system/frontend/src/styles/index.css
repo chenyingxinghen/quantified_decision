@@ -180,6 +180,7 @@ body {
   padding: 40px;
   min-height: 100vh;
   width: calc(100% - 240px);
+  transition: padding 0.3s ease;
 }
 
 /* ── 统计区域 (拒绝卡片，改为流式布局) ──────────────── */
@@ -322,23 +323,31 @@ body {
   --el-table-header-text-color: var(--text-secondary) !important;
   font-family: var(--font-main);
   background-color: transparent !important;
+  width: 100% !important;
+}
+
+.el-table__inner-wrapper::before {
+  display: none !important;
+}
+
+/* 移动端表格溢出滚动优化 */
+.el-table .el-table__body-wrapper,
+.el-table .el-table__header-wrapper {
+  overflow-x: auto !important;
 }
 
 .el-table th.el-table__cell {
   border-bottom: 1px solid var(--border-color) !important;
   font-weight: 500;
   text-transform: uppercase;
-  font-size: 12px;
+  font-size: 11px;
   letter-spacing: 0.05em;
   background-color: transparent !important;
+  white-space: nowrap;
 }
 
 .el-table td.el-table__cell {
   border-bottom: 1px solid var(--border-color) !important;
-}
-
-.el-table::before {
-  display: none !important;
 }
 
 .el-table tr {
@@ -652,4 +661,170 @@ body {
   font-size: 14px;
   font-weight: 500;
   color: var(--text-primary);
+}
+
+/* ── 辅助类 ─────────────────────────────────────────── */
+.secondary-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 24px;
+}
+
+.primary-secondary-grid {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 24px;
+}
+
+/* ── 移动端适配 (Mobile Support) ───────────────────────── */
+@media (max-width: 1024px) {
+  .secondary-grid, .primary-secondary-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  html {
+    font-size: 13px;
+  }
+
+  .main-content {
+    margin-left: 0 !important;
+    width: 100% !important;
+    padding: 76px 12px 32px 12px !important;
+  }
+
+  .page-header {
+    margin-bottom: 20px;
+    gap: 12px;
+  }
+
+  .page-title {
+    font-size: 20px;
+    letter-spacing: -0.02em;
+  }
+
+  .stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    padding-bottom: 16px;
+    margin-bottom: 20px;
+  }
+
+  .stat-card {
+    border-left: none !important;
+    padding-left: 0 !important;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 10px !important;
+  }
+
+  .stat-card:nth-child(2n) {
+    border-left: 1px solid var(--border-color) !important;
+    padding-left: 12px !important;
+  }
+
+  .stat-card:nth-last-child(-n+2) {
+      border-bottom: none !important;
+      padding-bottom: 0 !important;
+  }
+
+  .stat-value {
+    font-size: 22px;
+  }
+
+  .card, .glass-card {
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+
+  /* 元素覆盖 */
+  .el-dialog {
+    width: 94% !important;
+    margin: 12px auto !important;
+    max-width: 100%;
+    border-radius: var(--radius-md) !important;
+  }
+
+  .el-table {
+    font-size: 12px;
+  }
+
+  /* 核心修复：移动端禁用表格固定列，避免遮挡 */
+  .el-table__fixed, 
+  .el-table__fixed-right {
+    display: none !important;
+  }
+
+  .el-table__inner-wrapper {
+    overflow-x: auto !important;
+  }
+
+  .el-button {
+    padding: 8px 12px !important;
+    height: auto !important;
+  }
+
+  .flex-wrap-mobile {
+    flex-direction: column;
+    align-items: stretch !important;
+    gap: 12px !important;
+  }
+
+  .flex-wrap-mobile > * {
+    width: 100% !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+  }
+
+  .hide-on-mobile {
+    display: none;
+  }
+
+  .period-input {
+    width: 80px;
+  }
+
+  /* 响应式辅助类 */
+  .w-full-mobile { width: 100% !important; }
+  .m-0-mobile { margin: 0 !important; }
+  .p-0-mobile { padding: 0 !important; }
+  .grid-2-mobile-1 { grid-template-columns: 1fr; }
+  .grid-3-mobile-1 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 480px) {
+  /* 默认单列，但允许子页面通过具体类覆盖 */
+  .stat-grid:not(.pt-stat-grid):not(.dash-stat-grid) {
+    grid-template-columns: 1fr;
+  }
+
+  /* 仪表盘保持 2 列 */
+  .dash-stat-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+
+  /* 实盘验证 3 个统计保持 3 列 */
+  .pt-stat-grid {
+    grid-template-columns: repeat(3, 1fr) !important;
+    gap: 8px !important;
+  }
+
+  .stat-card {
+    border-left: none !important;
+    padding-left: 0 !important;
+    border-bottom: 1px solid var(--border-color) !important;
+    padding-bottom: 14px !important;
+  }
+
+  .stat-card:last-child {
+    border-bottom: none !important;
+  }
+}
+
+/* el-table 移动端隐藏列支持 */
+@media (max-width: 768px) {
+  .el-table :deep(td.hide-on-mobile),
+  .el-table :deep(th.hide-on-mobile) {
+    display: none !important;
+  }
 }

@@ -67,3 +67,5 @@ logs
 new_data/*
 
 database/*
+.*
+tests/

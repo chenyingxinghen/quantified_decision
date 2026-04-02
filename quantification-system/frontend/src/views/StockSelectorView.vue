@@ -7,10 +7,10 @@
 
     <!-- 操作栏 -->
     <div class="card mb-24">
-      <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap">
-        <div class="glass" style="padding: 4px 12px; display: flex; align-items: center; gap: 12px">
+      <div class="flex-wrap-mobile" style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap">
+        <div class="glass w-full-mobile" style="padding: 4px 12px; display: flex; align-items: center; gap: 12px">
           <span style="font-size: 13px; font-weight: 600; color: var(--text-secondary)">模型</span>
-          <el-select v-model="selectedModelSelection" placeholder="选择模型" size="default" style="width: 240px" clearable popper-class="dark-dropdown">
+          <el-select v-model="selectedModelSelection" placeholder="选择模型" size="default" style="flex: 1; min-width: 140px" clearable popper-class="dark-dropdown">
             <el-option-group v-for="m in models" :key="m.path" :label="m.name">
               <el-option v-if="m.types.includes('xgboost')" label="XGBoost 模型" :value="JSON.stringify({ path: m.path, types: ['xgboost'] })" />
               <el-option v-if="m.types.includes('lgbm')" label="LightGBM 模型" :value="JSON.stringify({ path: m.path, types: ['lgbm'] })" />
@@ -19,18 +19,20 @@
           </el-select>
         </div>
 
-        <div class="glass" style="padding: 4px 12px; display: flex; align-items: center; gap: 12px">
+        <div class="glass w-full-mobile" style="padding: 4px 12px; display: flex; align-items: center; gap: 12px">
           <span style="font-size: 13px; font-weight: 600; color: var(--text-secondary)">数量</span>
-          <el-input-number v-model="topN" :min="5" :max="100" :step="5" size="default" style="width: 100px" />
+          <el-input-number v-model="topN" :min="5" :max="100" :step="5" size="default" style="flex: 1" />
         </div>
 
-        <el-button type="primary" :loading="running" @click="runSelection" style="height: 42px; padding: 0 24px">
-          <el-icon style="margin-right: 8px"><Search /></el-icon> 执行扫描
-        </el-button>
-        
-        <el-button @click="refreshAll" :loading="loading" style="height: 42px">
-          <el-icon><Refresh /></el-icon>
-        </el-button>
+        <div class="flex-center gap-12 w-full-mobile" style="justify-content: flex-start">
+          <el-button type="primary" :loading="running" @click="runSelection" style="height: 40px; flex: 1; padding: 0 16px">
+            <el-icon style="margin-right: 8px"><Search /></el-icon> 执行扫描
+          </el-button>
+          
+          <el-button @click="refreshAll" :loading="loading" style="height: 40px; width: 44px">
+            <el-icon><Refresh /></el-icon>
+          </el-button>
+        </div>
 
         <div v-if="running" class="text-cyan" style="font-size: 13px; display: flex; align-items: center; gap: 10px">
           <el-icon class="loading-pulse"><Loading /></el-icon>
@@ -39,7 +41,7 @@
       </div>
     </div>
 
-    <!-- 结果表格 -->
+    <!-- 结果表格 / 移动端卡片列表 -->
     <div class="card" style="padding: 0">
       <div class="card-header" style="padding: 24px 24px 0 24px; margin-bottom: 16px">
         <span class="card-title">选股结果 <small class="text-muted" style="margin-left: 8px">找到 {{ items.length }} 只股票</small></span>
@@ -49,28 +51,29 @@
       <el-tabs v-if="Object.keys(groupedItems).length > 0" v-model="activeModelTab" style="padding: 0 24px">
         <el-tab-pane v-for="(list, model) in groupedItems" :key="model" :label="model.toUpperCase()" :name="model" />
       </el-tabs>
-      
+
+      <!-- 桌面端表格 -->
       <el-table 
         :data="activeItems" 
         style="width: 100%" 
         max-height="650" 
         row-class-name="glass-row"
+        class="selector-table desktop-table"
       >
-        <el-table-column prop="stock_code" label="代码" width="160">
+        <el-table-column prop="stock_code" label="代码" width="90">
           <template #default="{ row }">
             <span class="text-mono" style="font-weight: 700; color: var(--accent-blue)">{{ String(row.stock_code).padStart(6, '0') }}</span>
-            <span v-if="row.is_resonance" class="tag tag-buy" style="margin-left: 8px; font-size: 10px; padding: 2px 4px">共振</span>
           </template>
         </el-table-column>
-        <el-table-column prop="name" label="名称" width="120" />
-        <el-table-column prop="signal" label="信号" width="100">
+        <el-table-column prop="name" label="名称" min-width="80">
           <template #default="{ row }">
-            <span :class="row.signal === 'buy' || row.signal === '买入' ? 'tag tag-buy' : 'tag tag-neutral'">
-              {{ row.signal?.toUpperCase() ?? '—' }}
-            </span>
+            <div style="display: flex; flex-direction: column; align-items: flex-start">
+              <span>{{ row.name }}</span>
+              <span v-if="row.is_resonance" class="tag tag-buy" style="font-size: 9px; padding: 0px 4px; transform: scale(0.9); transform-origin: left">共振</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column prop="confidence" label="胜率" width="130" sortable>
+        <el-table-column prop="confidence" label="胜率" min-width="110" sortable>
           <template #default="{ row }">
             <div style="display: flex; align-items: center; gap: 8px">
               <span class="text-mono" :style="{ color: row.confidence > 70 ? 'var(--accent-red)' : 'inherit' }">
@@ -80,47 +83,88 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="prediction" label="原始分数" width="120" sortable>
-          <template #default="{ row }">
-            <span class="text-muted text-mono">{{ row.prediction != null ? Number(row.prediction).toFixed(4) : '—' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="current_price" label="当前价格" width="100">
+        <el-table-column prop="current_price" label="价格" min-width="80">
           <template #default="{ row }">
             <span class="text-mono" style="font-weight: 600">{{ row.current_price != null ? Number(row.current_price).toFixed(2) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" min-width="220" align="right">
+        <el-table-column prop="prediction" label="分数" min-width="90" sortable>
           <template #default="{ row }">
-            <div style="display: flex; gap: 8px; justify-content: flex-end; padding-right: 12px">
-              <el-tooltip content="基本面分析" placement="top"><el-button size="small" circle type="warning" @click.stop="showFundamental(row.stock_code)"><el-icon><InfoFilled /></el-icon></el-button></el-tooltip>
-              <el-tooltip content="因子快照" placement="top"><el-button size="small" circle @click.stop="showFactors(row.stock_code)"><el-icon><PieChart /></el-icon></el-button></el-tooltip>
-              <el-tooltip content="形态识别" placement="top"><el-button size="small" circle @click.stop="showSignals(row.stock_code)"><el-icon><Lightning /></el-icon></el-button></el-tooltip>
-              <el-tooltip content="技术分析" placement="top"><el-button size="small" circle type="primary" @click.stop="goAnalysis(row.stock_code)"><el-icon><TrendCharts /></el-icon></el-button></el-tooltip>
-              <el-tooltip content="加入实盘验证" placement="top"><el-button size="small" circle type="success" style="background-color: var(--accent-green) !important; border-color: var(--accent-green) !important; color: #fff !important" @click.stop="addToPaperTrading(row)"><el-icon><Aim /></el-icon></el-button></el-tooltip>
+            <span class="text-muted text-mono">{{ row.prediction != null ? Number(row.prediction).toFixed(4) : '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" min-width="180" align="right" fixed="right">
+          <template #default="{ row }">
+            <div class="action-btns">
+              <el-tooltip content="基本面" placement="top"><el-button size="small" circle type="warning" @click.stop="showFundamental(row.stock_code)"><el-icon><InfoFilled /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="因子" placement="top"><el-button size="small" circle @click.stop="showFactors(row.stock_code)"><el-icon><PieChart /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="形态" placement="top"><el-button size="small" circle @click.stop="showSignals(row.stock_code)"><el-icon><Lightning /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="K线" placement="top"><el-button size="small" circle type="primary" @click.stop="goAnalysis(row.stock_code)"><el-icon><TrendCharts /></el-icon></el-button></el-tooltip>
+              <el-tooltip content="加入实盘" placement="top"><el-button size="small" circle type="success" style="background-color: var(--accent-green) !important; border-color: var(--accent-green) !important; color: #fff !important" @click.stop="addToPaperTrading(row)"><el-icon><Aim /></el-icon></el-button></el-tooltip>
             </div>
           </template>
         </el-table-column>
       </el-table>
+
+      <!-- 移动端卡片列表 -->
+      <div class="mobile-stock-list">
+        <div v-for="row in activeItems" :key="row.stock_code" class="mobile-stock-card glass">
+          <div class="msc-top">
+            <div class="msc-info">
+              <span class="text-mono msc-code">{{ String(row.stock_code).padStart(6, '0') }}</span>
+              <span class="msc-name">{{ row.name }}</span>
+              <span v-if="row.is_resonance" class="tag tag-buy" style="font-size: 9px; padding: 0 4px">共振</span>
+            </div>
+            <div class="msc-confidence">
+              <span class="text-mono" :style="{ color: row.confidence > 70 ? 'var(--accent-red)' : 'var(--text-primary)', fontWeight: 700, fontSize: '16px' }">
+                {{ row.confidence != null ? Number(row.confidence).toFixed(1) : '—' }}%
+              </span>
+              <div class="msc-bar-wrap">
+                <div class="msc-bar" :style="{ width: (row.confidence || 0) + '%', background: row.confidence > 70 ? 'var(--accent-red)' : 'var(--accent-blue)' }"></div>
+              </div>
+            </div>
+          </div>
+          <div class="msc-meta">
+            <span class="msc-meta-item">价格 <b>{{ row.current_price != null ? Number(row.current_price).toFixed(2) : '—' }}</b></span>
+            <span class="msc-meta-item">分数 <b class="text-muted">{{ row.prediction != null ? Number(row.prediction).toFixed(4) : '—' }}</b></span>
+          </div>
+          <div class="msc-actions">
+            <el-button size="small" type="warning" @click.stop="showFundamental(row.stock_code)"><el-icon><InfoFilled /></el-icon> 基本面</el-button>
+            <el-button size="small" @click.stop="showFactors(row.stock_code)"><el-icon><PieChart /></el-icon> 因子</el-button>
+            <el-button size="small" @click.stop="showSignals(row.stock_code)"><el-icon><Lightning /></el-icon> 形态</el-button>
+            <el-button size="small" type="primary" @click.stop="goAnalysis(row.stock_code)"><el-icon><TrendCharts /></el-icon> K线</el-button>
+            <el-button size="small" type="success" style="background-color: var(--accent-green) !important; border-color: var(--accent-green) !important; color: #fff !important" @click.stop="addToPaperTrading(row)"><el-icon><Aim /></el-icon> 实盘</el-button>
+          </div>
+        </div>
+        <div v-if="activeItems.length === 0" class="text-muted" style="padding: 40px; text-align: center">暂无数据</div>
+      </div>
     </div>
 
     <!-- 因子弹窗 -->
-    <el-dialog v-model="factorVisible" title="因子快照" width="800px" custom-class="glass-dialog">
+    <el-dialog v-model="factorVisible" title="因子快照" :width="isMobile ? '95%' : '800px'" custom-class="glass-dialog">
       <div v-if="factorLoading" class="flex-center" style="padding: 60px">
         <el-icon class="loading-pulse" :size="40" color="var(--accent-blue)"><Loading /></el-icon>
       </div>
-      <div v-else style="padding: 0 10px">
-        <div class="mb-24" style="display: flex; justify-content: space-between; align-items: flex-end">
+      <div v-else style="padding: 0 4px">
+        <div class="mb-16" style="display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 8px">
           <div>
-            <h2 class="text-mono" style="font-size: 24px; color: var(--accent-blue)">{{ String(factorCode).padStart(6, '0') }}</h2>
-            <p class="text-muted">基于近期市场数据计算的 {{ factorList.length }} 个表现因子</p>
+            <h2 class="text-mono" style="font-size: 22px; color: var(--accent-blue)">{{ String(factorCode).padStart(6, '0') }}</h2>
+            <p class="text-muted" style="font-size: 12px">{{ factorList.length }} 个因子</p>
           </div>
           <div class="tag tag-neutral">{{ factorData.latest_date ?? '最新' }}</div>
         </div>
+
+        <!-- 因子分组 tabs -->
+        <el-tabs v-model="factorTab" size="small" style="margin-bottom: 8px">
+          <el-tab-pane label="基本面" name="fundamental" />
+          <el-tab-pane label="量价" name="price_vol" />
+          <el-tab-pane label="估值" name="valuation" />
+          <el-tab-pane label="全部" name="all" />
+        </el-tabs>
         
-        <div style="max-height: 500px; overflow-y: auto; padding-right: 8px">
-          <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px">
-            <div v-for="item in factorList.slice(0, 100)" :key="item.name" class="factor-item glass" :style="{ borderLeft: getFactorColor(item.name) }">
+        <div style="max-height: 420px; overflow-y: auto; padding-right: 4px">
+          <div class="factor-grid">
+            <div v-for="item in filteredFactorList" :key="item.name" class="factor-item glass" :style="{ borderLeft: getFactorColor(item.name) }">
               <el-tooltip :content="item.name" placement="top">
                 <span class="factor-name">{{ formatFactorName(item.name) }}</span>
               </el-tooltip>
@@ -132,12 +176,12 @@
     </el-dialog>
 
     <!-- 信号弹窗 -->
-    <el-dialog v-model="signalVisible" title="形态识别" width="600px" custom-class="glass-dialog">
+    <el-dialog v-model="signalVisible" title="形态识别" :width="isMobile ? '95%' : '600px'" custom-class="glass-dialog">
       <div v-if="signalLoading" class="flex-center" style="padding: 60px">
         <el-icon class="loading-pulse" :size="40" color="var(--accent-blue)"><Loading /></el-icon>
       </div>
       <div v-else>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 32px">
+        <div class="grid-2-mobile-1" style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 32px">
           <div class="stat-card" style="border-bottom: 2px solid var(--accent-red)">
             <div class="stat-label">看多强度</div>
             <div class="stat-value text-up">{{ signalData.bullish_score ?? 0 }}</div>
@@ -219,12 +263,27 @@ const factorVisible = ref(false)
 const factorLoading = ref(false)
 const factorCode = ref('')
 const factorData = ref({})
+const factorTab = ref('all')
 const factorList = computed(() => {
   if (factorData.value.factor_details) {
     return factorData.value.factor_details
   }
   return Object.entries(factorData.value.factors || {}).map(([name, value]) => ({ name, value }))
 })
+
+const filteredFactorList = computed(() => {
+  const list = factorList.value.slice(0, 100)
+  if (factorTab.value === 'all') return list
+  return list.filter(item => {
+    const n = item.name.toLowerCase()
+    if (factorTab.value === 'fundamental') return n.includes('roe') || n.includes('rev') || n.includes('np') || n.includes('xsjll') || n.includes('zzcjll') || n.includes('zcfzl') || n.includes('ocf')
+    if (factorTab.value === 'price_vol') return n.includes('pv_') || n.includes('vol') || n.includes('sync') || n.includes('greed') || n.includes('buy') || n.includes('amount') || n.includes('turnover')
+    if (factorTab.value === 'valuation') return n.includes('pe') || n.includes('pb') || n.includes('peg')
+    return true
+  })
+})
+
+const isMobile = computed(() => window.innerWidth <= 768)
 
 const signalVisible = ref(false)
 const signalLoading = ref(false)
@@ -440,23 +499,145 @@ function getFactorColor(name) {
   max-width: 60px;
 }
 
+.action-btns {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-right: 8px;
+  flex-wrap: wrap;
+}
+
+/* 桌面端显示表格，隐藏卡片 */
+.desktop-table { display: table; }
+.mobile-stock-list { display: none; }
+
+@media (max-width: 768px) {
+  .desktop-table { display: none !important; }
+  .mobile-stock-list { display: block; padding: 0 12px 16px; }
+}
+
+/* 移动端股票卡片 */
+.mobile-stock-card {
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-color);
+}
+
+.msc-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.msc-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.msc-code {
+  font-weight: 700;
+  color: var(--accent-blue);
+  font-size: 15px;
+}
+
+.msc-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.msc-confidence {
+  text-align: right;
+  min-width: 60px;
+}
+
+.msc-bar-wrap {
+  width: 60px;
+  height: 4px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+  margin-top: 4px;
+  margin-left: auto;
+}
+
+.msc-bar {
+  height: 100%;
+  border-radius: 2px;
+  max-width: 100%;
+}
+
+.msc-meta {
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+.msc-meta-item b {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+.msc-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.msc-actions .el-button {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 6px 4px;
+}
+
+/* 因子网格 */
+.factor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+@media (max-width: 768px) {
+  .factor-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 400px) {
+  .factor-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .factor-item {
   display: flex;
   justify-content: space-between;
-  padding: 12px 16px;
-  font-size: 13px;
+  align-items: center;
+  padding: 10px 12px;
+  font-size: 12px;
   border-radius: var(--radius-md);
+  gap: 6px;
 }
 
 .factor-name {
   color: var(--text-secondary);
   font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 70%;
 }
 
 .factor-value {
   font-family: var(--font-mono);
   color: var(--accent-blue);
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .pattern-badge {
@@ -482,33 +663,5 @@ function getFactorColor(name) {
 .pattern-badge .score {
   font-family: var(--font-mono);
   font-weight: 800;
-}
-
-.stat-card.mini {
-  padding: 12px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  text-align: center;
-}
-
-.stat-card.mini .stat-label {
-  font-size: 11px;
-  margin-bottom: 4px;
-}
-
-.stat-card.mini .stat-value.small {
-  font-size: 18px;
-  font-family: var(--font-mono);
-  color: var(--accent-blue);
-}
-
-.mini-table :deep(.el-table__cell) {
-  padding: 8px 0 !important;
-}
-
-.mini-table :deep(.el-table__header-wrapper th) {
-  font-size: 11px;
-  color: var(--text-muted);
 }
 </style>

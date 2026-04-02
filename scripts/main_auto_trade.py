@@ -23,14 +23,11 @@ from typing import List, Dict, Optional
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from select_stocks import select_stocks
 from core.automation.trader_interface import AutoTrader
 from core.automation.execution_controller import ExecutionController
 from config.automation_config import (
-    AUTO_MODEL_PATH, AUTO_MIN_CONFIDENCE, AUTO_TOP_N, MAX_POSITIONS_AUTO,
+    AUTO_MIN_CONFIDENCE, AUTO_TOP_N, MAX_POSITIONS_AUTO,
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
-    AUTO_APPLY_FILTER, AUTO_MIN_MARKET_CAP, AUTO_MAX_PE,
-    AUTO_MIN_PRICE, AUTO_MAX_PRICE, AUTO_INCLUDE_ST,
     DRY_RUN
 )
 from config.config import SYSTEM_DATA_DIR
@@ -81,75 +78,45 @@ def load_signals_from_file() -> Optional[List[Dict]]:
 
 def get_latest_signals() -> List[Dict]:
     """
-    获取今日信号并计算止损止盈。
-    
-    选股逻辑：完全对齐回测流程：
-      - 使用 automation_config 中的独立筛选条件（市值/PE/股价/ST）
-      - top_n = AUTO_TOP_N，与 MAX_POSITIONS_AUTO 一致
-      - ATR 止损/止盈参数与 strategy_config 对齐
+    获取今日信号。直接复用 MLFactorBacktestStrategy，保证与回测逻辑完全一致。
     """
-    from config.strategy_config import ATR_STOP_MULTIPLIER, ATR_TARGET_MULTIPLIER
-    from config.factor_config import FactorConfig
-    import talib
-    import numpy as np
-    import sqlite3
+    from config.automation_config import AUTO_MODEL_PATH, AUTO_TOP_N
+    from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
+    from config.factor_config import TrainingConfig
     from config import DATABASE_PATH
-    from scripts.select_stocks import get_stock_data
 
-    logger.info("正在获取今日信号并计算止损止盈...")
-    logger.info(f"  选股配置: top_n={AUTO_TOP_N}, min_confidence={AUTO_MIN_CONFIDENCE}, apply_filter={AUTO_APPLY_FILTER}")
-    if AUTO_APPLY_FILTER:
-        logger.info(f"  筛选条件: 市值>={AUTO_MIN_MARKET_CAP}亿, PE<={AUTO_MAX_PE}, "
-                    f"股价[{AUTO_MIN_PRICE}, {AUTO_MAX_PRICE}], ST={AUTO_INCLUDE_ST}")
+    logger.info("正在获取今日信号")
+    logger.info(f"  配置: top_n={AUTO_TOP_N}, min_confidence={AUTO_MIN_CONFIDENCE}")
     try:
-        # 1. 执行选股（传入 automation_config 的专属筛选参数）
-        results = select_stocks(
+        strategy = MLFactorBacktestStrategy(
             model_path=AUTO_MODEL_PATH,
             min_confidence=AUTO_MIN_CONFIDENCE,
-            top_n=AUTO_TOP_N,
-            apply_filter=AUTO_APPLY_FILTER,
-            save_csv=False,
-            # 自动化专属筛选条件（仅在 apply_filter=True 时生效）
-            min_market_cap=AUTO_MIN_MARKET_CAP,
-            max_pe=AUTO_MAX_PE,
-            min_price=AUTO_MIN_PRICE,
-            max_price=AUTO_MAX_PRICE,
-            include_st=AUTO_INCLUDE_ST,
+            cache_dir=TrainingConfig.CACHE_DIR,
         )
+        strategy.initialize()
+
+        from config import automation_config
+        # 设置实盘专用筛选条件
+        criteria = {
+            'min_market_cap': getattr(automation_config, 'AUTO_MIN_MARKET_CAP', None),
+            'max_pe': getattr(automation_config, 'AUTO_MAX_PE', None),
+            'min_price': getattr(automation_config, 'AUTO_MIN_PRICE', None),
+            'max_price': getattr(automation_config, 'AUTO_MAX_PRICE', None),
+            'include_st': getattr(automation_config, 'AUTO_INCLUDE_ST', True),
+            'markets': getattr(automation_config, 'SELECTOR_MARKETS', ['sh_main', 'sz_main'])
+        }
         
-        # 2. 对每只股票补充 ATR 止损止盈（对齐回测 ml_factor_strategy 中的计算逻辑）
-        final_signals = []
-        for r in results:
-            code = r['stock_code']
-            # 获取历史数据计算 ATR（与回测中信号生成时一致）
-            data = get_stock_data(DATABASE_PATH, code, days=100)
-            if data is not None and len(data) >= FactorConfig.ATR_PERIOD + 1:
-                atr_series = talib.ATR(
-                    data['high'].values.astype(float),
-                    data['low'].values.astype(float),
-                    data['close'].values.astype(float),
-                    timeperiod=FactorConfig.ATR_PERIOD
-                )
-                atr = float(atr_series[-1])
-                if np.isfinite(atr) and atr > 0:
-                    r['stop_loss'] = r['current_price'] - ATR_STOP_MULTIPLIER * atr
-                    r['take_profit'] = r['current_price'] + ATR_TARGET_MULTIPLIER * atr
-                    logger.info(f"  信号: {code} | 现价: {r['current_price']:.2f} | "
-                                f"止损: {r['stop_loss']:.2f} | 止盈: {r['take_profit']:.2f}")
-                else:
-                    logger.warning(f"  {code}: ATR 无效 ({atr})，跳过止损止盈设置")
-            else:
-                logger.warning(f"  {code}: 数据不足，无法计算 ATR")
-            
-            final_signals.append(r)
-            
-        logger.info(f"信号获取完成，共 {len(final_signals)} 只。")
-        
-        # 存档信号
-        if final_signals:
-            save_signals_to_file(final_signals)
-            
-        return final_signals
+        results = strategy.select_for_live(
+            db_path=DATABASE_PATH,
+            top_n=AUTO_TOP_N,
+            criteria=criteria
+        )
+        strategy.cleanup()
+
+        logger.info(f"信号获取完成，共 {len(results)} 只。")
+        if results:
+            save_signals_to_file(results)
+        return results
     except Exception as e:
         logger.error(f"获取信号失败: {e}", exc_info=True)
         return []

@@ -554,4 +554,66 @@ function formatBillion(val) {
   justify-content: center;
   border: 1px solid var(--border-color);
 }
+
+@media (max-width: 1024px) {
+  .analysis-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .summary-card .card-body {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 24px;
+    gap: 24px;
+  }
+  
+  .mini-stats {
+    padding-left: 0;
+    border-left: none;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    width: 100%;
+    gap: 16px;
+  }
+
+  .stock-name {
+    font-size: 28px;
+  }
+
+  .price-val {
+    font-size: 32px;
+    text-align: left;
+  }
+
+  .indicator-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+
+  .indicator-item {
+    padding: 12px;
+  }
+
+  .indicator-item .value {
+    font-size: 18px;
+  }
+
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start !important;
+    gap: 12px;
+  }
+
+  .header-search, .header-search .el-select {
+    width: 100% !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .mini-stats {
+    grid-template-columns: 1fr;
+  }
+}
 </style>

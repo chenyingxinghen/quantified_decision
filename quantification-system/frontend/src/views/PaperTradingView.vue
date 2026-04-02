@@ -6,7 +6,7 @@
     </div>
 
     <!-- 统计 -->
-    <div class="stat-grid">
+    <div class="stat-grid pt-stat-grid">
       <div class="stat-card">
         <div class="stat-label">活跃监控</div>
         <div class="stat-value text-mono">{{ activePositions.length }}</div>
@@ -24,7 +24,7 @@
       </div>
     </div>
 
-    <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 24px">
+    <div class="primary-secondary-grid">
       <!-- 买入表单 -->
       <div class="card" style="min-width: 0">
         <div class="card-header">
@@ -80,19 +80,19 @@
           </el-button>
         </div>
         <el-table :data="activePositions" style="width: 100%" row-class-name="glass-row">
-          <el-table-column prop="code" label="代码" width="100">
+          <el-table-column prop="code" label="代码" min-width="90">
             <template #default="{ row }">
               <span class="text-mono" style="font-weight: 700; color: var(--accent-blue)">{{ String(row.code).padStart(6, '0') }}</span>
             </template>
           </el-table-column>
-          <el-table-column prop="name" label="名称" width="100" />
-          <el-table-column prop="buy_price" label="买入价" width="100">
+          <el-table-column prop="name" label="名称" min-width="80" />
+          <el-table-column prop="buy_price" label="买入价" min-width="80" class-name="hide-on-mobile">
             <template #default="{ row }"><span class="text-mono">{{ Number(row.buy_price).toFixed(2) }}</span></template>
           </el-table-column>
-          <el-table-column prop="latest_price" label="最新价" width="100">
+          <el-table-column prop="latest_price" label="最新价" min-width="80">
             <template #default="{ row }"><span class="text-mono" style="font-weight: 600">{{ row.latest_price != null ? Number(row.latest_price).toFixed(2) : '—' }}</span></template>
           </el-table-column>
-          <el-table-column prop="unrealized_pct" label="浮动盈亏" width="90" sortable>
+          <el-table-column prop="unrealized_pct" label="浮盈" min-width="80" sortable>
             <template #default="{ row }">
               <span v-if="row.unrealized_pct != null" :class="row.unrealized_pct >= 0 ? 'text-up' : 'text-down'" class="text-mono" style="font-weight: 800">
                 {{ row.unrealized_pct > 0 ? '+' : '' }}{{ row.unrealized_pct }}%
@@ -100,7 +100,7 @@
               <span v-else class="text-muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="智能分析" min-width="280">
+          <el-table-column label="智能分析" min-width="220" class-name="hide-on-mobile">
             <template #default="{ row }">
               <div v-if="analysisMap[row.id]" style="padding: 10px 0">
                 <div v-if="analysisMap[row.id].status === 'pending'" class="text-secondary" style="font-size: 12px">
@@ -142,9 +142,9 @@
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" align="right" width="150" fixed="right">
+          <el-table-column label="操作" align="right" min-width="100" fixed="right">
             <template #default="{ row }">
-              <div style="display: flex; gap: 8px; justify-content: flex-end; padding-right: 4px">
+              <div class="action-col">
                 <el-tooltip content="了结获利/止损" placement="top"><el-button size="small" circle type="danger" @click="openSellDialog(row)"><el-icon><Sell /></el-icon></el-button></el-tooltip>
                 <el-tooltip content="技术分析" placement="top"><el-button size="small" circle @click="$router.push({ path: '/analysis', query: { code: row.code } })"><el-icon><TrendCharts /></el-icon></el-button></el-tooltip>
                 <el-tooltip content="删除监控" placement="top"><el-button size="small" circle type="info" plain @click="handleDelete(row)"><el-icon><Delete /></el-icon></el-button></el-tooltip>
@@ -164,26 +164,26 @@
         </el-button>
       </div>
       <el-table :data="historyTrades" style="width: 100%" max-height="400">
-        <el-table-column prop="code" label="代码" width="100">
+        <el-table-column prop="code" label="代码" min-width="80">
           <template #default="{ row }">{{ String(row.code).padStart(6, '0') }}</template>
         </el-table-column>
-        <el-table-column prop="name" label="名称" width="100" />
-        <el-table-column prop="buy_date" label="买入日" width="110" />
-        <el-table-column prop="sell_date" label="卖出日" width="110" />
-        <el-table-column prop="profit_pct" label="净盈亏" width="120" sortable>
+        <el-table-column prop="name" label="名称" min-width="80" />
+        <el-table-column prop="buy_date" label="买入日" min-width="100" class-name="hide-on-mobile" />
+        <el-table-column prop="sell_date" label="卖出日" min-width="100" class-name="hide-on-mobile" />
+        <el-table-column prop="profit_pct" label="净盈亏" min-width="90" sortable>
           <template #default="{ row }">
             <span :class="row.profit_pct >= 0 ? 'text-up' : 'text-down'" class="text-mono" style="font-weight: 800">
               {{ row.profit_pct > 0 ? '+' : '' }}{{ row.profit_pct }}%
             </span>
           </template>
         </el-table-column>
-        <el-table-column prop="sell_reason" label="退出原因" />
+        <el-table-column prop="sell_reason" label="退出原因" min-width="100" class-name="hide-on-mobile" />
       </el-table>
     </div>
 
 
     <!-- 卖出弹窗 -->
-    <el-dialog v-model="sellVisible" title="了结交易" width="400px" custom-class="glass-dialog">
+    <el-dialog v-model="sellVisible" title="了结交易" width="min(400px, 94vw)" custom-class="glass-dialog">
       <el-form :model="sellForm" label-position="top">
         <el-form-item label="卖出日期">
           <el-date-picker v-model="sellForm.sell_date" type="date" format="YYYY-MM-DD" value-format="YYYY-MM-DD" style="width: 100%" />
@@ -443,5 +443,46 @@ async function handleSell() {
   color: var(--text-secondary);
   display: flex;
   gap: 16px;
+}
+
+.action-col {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-right: 4px;
+}
+
+@media (max-width: 768px) {
+  :deep(.hide-on-mobile) {
+    display: none !important;
+  }
+
+  /* 3个统计卡片在移动端显示为 3列 */
+  .pt-stat-grid {
+    grid-template-columns: repeat(3, 1fr) !important;
+  }
+
+  /* 买入表单与持仓表格在移动端各占全宽，表格先显示 */
+  :deep(.primary-secondary-grid) {
+    display: flex;
+    flex-direction: column-reverse;
+  }
+
+  /* 持仓表格允许横向滚动 */
+  :deep(.el-table__body-wrapper) {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .action-col {
+    gap: 4px;
+  }
+}
+
+@media (max-width: 480px) {
+  .pt-stat-grid {
+    grid-template-columns: repeat(3, 1fr) !important;
+    gap: 8px !important;
+  }
 }
 </style>

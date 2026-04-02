@@ -128,7 +128,8 @@ class CandlestickPatterns:
             else:
                 signal_arr = method(data)
             
-            if signal_arr[idx] > 0:
+            val = signal_arr.iloc[idx] if hasattr(signal_arr, 'iloc') else signal_arr[idx]
+            if val > 0:
                 res = meta.copy()
                 res['detected'] = True
                 results.append(res)

@@ -94,11 +94,16 @@ class MLFactorBacktestStrategy(BaseStrategy):
         info_map = self._get_optimized_info_map(current_date, market_data)
         
         # 按照基本面指标筛选 predict_codes (与原始 select_stocks 逻辑严格一致)
-        predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, apply_filter=sc.ENABLE_FUNDAMENTAL_FILTER, criteria={
+        # 优先使用实时传入的 criteria
+        filter_criteria = getattr(self, '_custom_criteria', {
             'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,
             'min_price': sc.MIN_PRICE, 'max_price': sc.MAX_PRICE, 'include_st': sc.INCLUDE_ST,
             'markets': sc.SELECTOR_MARKETS
         })
+        
+        predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
+                                                 apply_filter=sc.ENABLE_FUNDAMENTAL_FILTER, 
+                                                 criteria=filter_criteria)
         
         if not predict_codes: return signals
 
@@ -123,11 +128,19 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 4. 批量预测
         all_X = pd.DataFrame(raw_rows, columns=self.model.feature_names)
         
-        # 横截面归一化 (保持与训练分布一致)
-        sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
-        rank_cols = [col for col in all_X.columns if not any(k in col.lower() for k in sentiment_keys)]
+        # 横截面归一化 (与训练时精确匹配逻辑保持一致)
+        _sentiment_exact = {
+            'up_ratio', 'strong_up_ratio', 'down_ratio',
+            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
+            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
+            'market_type',
+        }
+        rank_cols = [col for col in all_X.columns if col not in _sentiment_exact]
         if rank_cols and len(all_X) > 1:
-            all_X[rank_cols] = all_X[rank_cols].rank(pct=True).fillna(0.5)
+            from scipy.stats import rankdata as _rankdata
+            arr = all_X[rank_cols].values
+            ranked = _rankdata(arr, method='average', axis=0) / (len(all_X) + 1)
+            all_X[rank_cols] = ranked.astype(np.float32)
 
         probs = self.model.predict(all_X.fillna(0.5))
         
@@ -301,6 +314,111 @@ class MLFactorBacktestStrategy(BaseStrategy):
             self._factors_cache[stock_code] = factors
             return factors
         except: return None
+
+    def select_for_live(self,
+                        db_path: str,
+                        top_n: int = 10,
+                        lookback_days: int = 500,
+                        criteria: Optional[Dict] = None) -> List[Dict]:
+        """
+        实盘选股入口，完全复用 generate_signals 逻辑，保证与回测一致。
+
+        返回列表，每项包含：
+            stock_code, confidence, current_price, stop_loss, take_profit
+        """
+        import sqlite3
+        from datetime import datetime, timedelta
+
+        self._custom_criteria = criteria
+
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # --- 构造轻量 LiveMarketData 适配器 ---
+        class LiveMarketData:
+            """从数据库读取最新行情，提供与回测 MarketSnapshot 相同的接口"""
+            def __init__(self, db_path: str, lookback_days: int):
+                self._db_path = db_path
+                self._lookback_days = lookback_days
+                self._cache: Dict[str, pd.DataFrame] = {}
+                self._bar_cache: Dict[str, Optional[Dict]] = {}
+                self._codes: Optional[List[str]] = None
+
+            def _load(self, code: str) -> Optional[pd.DataFrame]:
+                if code in self._cache:
+                    return self._cache[code]
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                start_date = (datetime.now() - timedelta(days=self._lookback_days)).strftime('%Y-%m-%d')
+                try:
+                    conn = sqlite3.connect(self._db_path)
+                    df = pd.read_sql_query(
+                        """SELECT k.date, k.open, k.high, k.low, k.close, k.volume,
+                                  k.amount, k.turnover_rate, a.fore_adjust_factor
+                           FROM daily_data k
+                           LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
+                           WHERE k.code = ? AND k.date >= ? AND k.date <= ?
+                           ORDER BY k.date ASC""",
+                        conn, params=(code, start_date, end_date)
+                    )
+                    conn.close()
+                    if df.empty or len(df) < 35:
+                        return None
+                    self._cache[code] = df
+                    return df
+                except Exception:
+                    return None
+
+            def get_bar(self, code: str) -> Optional[Dict]:
+                if code in self._bar_cache:
+                    return self._bar_cache[code]
+                df = self._load(code)
+                if df is None:
+                    self._bar_cache[code] = None
+                    return None
+                row = df.iloc[-1]
+                bar = {c: row[c] for c in df.columns}
+                bar['is_st'] = 0  # 实盘时 ST 信息由 _pre_filter_stocks 处理
+                self._bar_cache[code] = bar
+                return bar
+
+            def __getitem__(self, code: str) -> Optional[pd.DataFrame]:
+                return self._load(code)
+
+            def keys(self) -> List[str]:
+                if self._codes is not None:
+                    return self._codes
+                try:
+                    conn = sqlite3.connect(self._db_path)
+                    rows = pd.read_sql_query(
+                        "SELECT DISTINCT code FROM daily_data WHERE date >= date('now', '-30 days')",
+                        conn
+                    )
+                    conn.close()
+                    self._codes = rows['code'].tolist()
+                except Exception:
+                    self._codes = []
+                return self._codes
+
+        market_data = LiveMarketData(db_path, lookback_days)
+
+        # 复用 generate_signals，portfolio_state 传空持仓、足够的 slots
+        portfolio_state = {'positions': {}, 'available_slots': top_n}
+        # 临时覆盖 min_confidence 为 0，让所有信号通过，由调用方自行过滤
+        orig_min = self.min_confidence
+        self.min_confidence = 0.0
+        signals = self.generate_signals(today, market_data, portfolio_state)
+        self.min_confidence = orig_min
+
+        # 转换为与 select_stocks 兼容的字典格式
+        results = []
+        for sig in sorted(signals, key=lambda s: s.confidence, reverse=True)[:top_n]:
+            results.append({
+                'stock_code': sig.stock_code,
+                'confidence': sig.confidence,
+                'current_price': sig.price,
+                'stop_loss': sig.stop_loss,
+                'take_profit': sig.take_profit,
+            })
+        return results
 
     def cleanup(self):
         """清理缓存"""

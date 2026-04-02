@@ -238,7 +238,7 @@ class FundamentalFactors:
         返回:
             与 daily_data 等长的基本面因子 DataFrame
         """
-        dates = pd.to_datetime(daily_data['date'])
+        dates = pd.to_datetime(daily_data['date'], errors='coerce')
         
         # 1. 获取 PIT 对齐的原始财务数据
         raw = self.fetcher.get_pit_series(code, dates)

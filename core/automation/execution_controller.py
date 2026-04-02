@@ -218,7 +218,7 @@ class ExecutionController:
                 logger.debug(f"  同步检测: {code} 实盘有持仓但本地无元数据。")
 
         self._save_tracking()
-        logger.info("持仓同步完成。")
+        logger.info(f"持仓同步完成。{real_positions}")
         return real_positions
 
     def _execute_with_retry(self, action_func, max_retries=3, retry_delay=2) -> Dict:
@@ -267,8 +267,8 @@ class ExecutionController:
         available_cash = float(balance.get('可用', balance.get('可用余额', balance.get('可用金额', 0))))
         logger.info(f"当前可用资金: {available_cash:.2f}")
 
-        if available_cash < 1000:
-            logger.warning(f"可用资金 ({available_cash:.2f}) 不足 1000 元，取消买入。")
+        if available_cash < 200:
+            logger.warning(f"可用资金 ({available_cash:.2f}) 不足 200 元，取消买入。")
             return
 
         # 检查当前持仓
@@ -346,7 +346,7 @@ class ExecutionController:
                 if bal:
                     current_avail_gui = float(bal.get('可用', bal.get('可用余额', bal.get('可用金额', 0))))
                     # 如果读到 0 且我们本地认为还有很多钱，信任本地
-                    if current_avail_gui == 0 and running_avail > 1000:
+                    if current_avail_gui == 0 and running_avail > 200:
                         logger.warning(f"  {code}: GUI 资金读数为 0，但本地记录为 {running_avail:.2f}，由于刚完成同步，信任本地缓存以绕过刷新延迟。")
                     else:
                         running_avail = current_avail_gui
@@ -361,11 +361,24 @@ class ExecutionController:
 
             if res_report["op_status"] == OperationStatus.SUCCESS:
                 self.tracking_data["processed_today"][base_code] = OperationStatus.SUCCESS.value
+                # 根据实际委托价重新锚定止损/止盈（对齐回测 engine.py 的入场价调整逻辑）
+                # 信号止损/止盈是基于 ref_price 计算的，实际委托价为 limit_up_price，需平移距离
+                raw_sl = signal.get('stop_loss')
+                raw_tp = signal.get('take_profit')
+                actual_entry = limit_up_price  # 委托价即预期成交价
+                if ref_price > 0 and raw_sl is not None:
+                    adjusted_sl = actual_entry - (ref_price - float(raw_sl))
+                else:
+                    adjusted_sl = raw_sl
+                if ref_price > 0 and raw_tp is not None:
+                    adjusted_tp = actual_entry + (float(raw_tp) - ref_price)
+                else:
+                    adjusted_tp = raw_tp
                 self.tracking_data["positions"][base_code] = {
                     "entry_date": datetime.now().strftime("%Y-%m-%d"),
-                    "entry_price": ref_price,
-                    "stop_loss": signal.get('stop_loss'),
-                    "take_profit": signal.get('take_profit'),
+                    "entry_price": actual_entry,
+                    "stop_loss": adjusted_sl,
+                    "take_profit": adjusted_tp,
                     "confidence": signal.get('confidence'),
                     "is_st": is_st,
                 }

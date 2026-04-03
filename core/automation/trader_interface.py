@@ -41,6 +41,37 @@ class AutoTrader:
         # 确保数据目录存在
         os.makedirs(os.path.join(PROJECT_ROOT, "data", "automation"), exist_ok=True)
         
+    def wait_for_desktop(self, timeout_seconds: int = 120) -> bool:
+        """
+        等待桌面会话恢复可用（用于锁屏后自动恢复）。
+        通过轻量级 pywinauto 探测替代鼠标操作来判断桌面是否可用。
+        
+        Args:
+            timeout_seconds: 最长等待秒数，超时返回 False
+        Returns:
+            True 表示桌面已恢复，False 表示超时仍不可用
+        """
+        import pywinauto
+        logger.info(f"等待桌面会话恢复（最长 {timeout_seconds}s）...")
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                # 用纯窗口枚举探测，不涉及鼠标移动
+                app = pywinauto.Desktop(backend="win32")
+                _ = app.windows()
+                # 进一步验证：尝试重连交易客户端
+                if self.connect():
+                    logger.info("桌面会话已恢复，交易客户端重连成功。")
+                    return True
+            except Exception as e:
+                if "no active desktop" in str(e).lower():
+                    logger.debug("桌面仍不可用，继续等待...")
+                else:
+                    logger.debug(f"桌面探测异常: {e}")
+            time.sleep(10)
+        logger.error(f"等待桌面恢复超时（{timeout_seconds}s），放弃本次操作。")
+        return False
+
     def connect(self):
         """连接交易客户端"""
         if self.dry_run:
@@ -82,6 +113,14 @@ class AutoTrader:
                 return res[0]
             return res
         except Exception as e:
+            err_msg = str(e)
+            if "no active desktop" in err_msg.lower() or "moving mouse cursor" in err_msg.lower():
+                logger.error(
+                    f"获取资金失败：桌面会话不可用（可能已锁屏或 RDP 断开）。"
+                    f"标记连接失效。原始错误: {e}"
+                )
+                self.is_connected = False
+                return None
             logger.error(f"获取资金异常 (可能 GUI 锁定或被验证码阻断): {e}")
             return None
 
@@ -137,6 +176,15 @@ class AutoTrader:
 
             return positions
         except Exception as e:
+            err_msg = str(e)
+            # 桌面不可用（锁屏/RDP断开）：重试无意义，标记连接失效并立即返回
+            if "no active desktop" in err_msg.lower() or "moving mouse cursor" in err_msg.lower():
+                logger.error(
+                    f"获取持仓失败：桌面会话不可用（可能已锁屏或 RDP 断开）。"
+                    f"重试无效，标记连接失效等待恢复。原始错误: {e}"
+                )
+                self.is_connected = False
+                return None
             logger.error(f"获取持仓失败: {e}")
             return None
 

@@ -183,7 +183,14 @@ class ExecutionController:
         logger.info("正在同步实盘持仓状态...")
         real_positions = self.trader.get_positions()
         if real_positions is None:
-            logger.warning("同步持仓失败: 无法获取实盘数据。")
+            # 区分桌面不可用（连接已被标记失效）和普通 GUI 故障
+            if not self.trader.is_connected:
+                logger.error(
+                    "同步持仓失败：桌面会话不可用（锁屏或 RDP 断开）。"
+                    "请解锁桌面后系统将在下一个调度周期自动恢复。"
+                )
+            else:
+                logger.warning("同步持仓失败: 无法获取实盘数据。")
             return None
 
         # 交叉验证：如果 real_positions 为空，但本地记录非空，我们需要二次确认是否真的是空仓
@@ -232,8 +239,14 @@ class ExecutionController:
                 if res.get('entrust_no') or res.get('status') == 'success':
                     return {"op_status": OperationStatus.SUCCESS, "raw": res}
                 
-                # 判定重试：含有验证码错误、界面未响应等关键字
                 msg = str(res.get('message', res.get('msg', ''))).lower()
+
+                # 桌面不可用：重试无意义，直接失败
+                if "no active desktop" in msg or "moving mouse cursor" in msg:
+                    logger.error(f"  桌面会话不可用，停止重试。")
+                    return {"op_status": OperationStatus.FAILED, "raw": res}
+
+                # 判定重试：含有验证码错误、界面未响应等关键字
                 retry_keywords = ["验证码", "超时", "未响应", "识别", "captcha", "timeout", "failed to refresh"]
                 if any(k in msg for k in retry_keywords):
                     logger.warning(f"  执行疑似触发界面故障 ({msg})，准备第 {i+2} 次尝试...")
@@ -247,6 +260,11 @@ class ExecutionController:
 
                 last_res = res
             except Exception as e:
+                err_msg = str(e).lower()
+                # 桌面不可用：立即停止重试
+                if "no active desktop" in err_msg or "moving mouse cursor" in err_msg:
+                    logger.error(f"  桌面会话不可用，停止重试: {e}")
+                    return {"op_status": OperationStatus.FAILED, "raw": {"status": "error", "msg": str(e)}}
                 logger.error(f"  执行异常 (第 {i+1} 次尝试): {e}")
                 time.sleep(retry_delay)
                 last_res = {"status": "error", "msg": str(e)}
@@ -261,8 +279,16 @@ class ExecutionController:
 
         balance = self.trader.get_balance()
         if not balance:
-            logger.warning("获取资金数据失败 (可能是 GUI 异常或验证码阻挡)，取消本次买入循环以防误判。")
-            return
+            # 桌面不可用时，在买入窗口内等待恢复
+            if not self.trader.is_connected:
+                logger.warning("桌面不可用，尝试等待恢复后继续买入...")
+                if not self.trader.wait_for_desktop(timeout_seconds=300):
+                    logger.error("桌面恢复超时，取消本次买入。")
+                    return
+                balance = self.trader.get_balance()
+            if not balance:
+                logger.warning("获取资金数据失败 (可能是 GUI 异常或验证码阻挡)，取消本次买入循环以防误判。")
+                return
 
         available_cash = float(balance.get('可用', balance.get('可用余额', balance.get('可用金额', 0))))
         logger.info(f"当前可用资金: {available_cash:.2f}")
@@ -404,13 +430,18 @@ class ExecutionController:
         )
 
         # 修复(P0)：复用 sync_positions() 的返回值，避免再次触发 GUI 读取。
-        # 之前写法 self.sync_positions() 后再调 self.trader.get_positions()，
-        # 在买入刚完成后的短暂窗口内会触发"持仓空但市值>0"的保护逻辑（返回 None），
-        # 从而错误地阻止所有卖出操作。
         positions = self.sync_positions()
         if positions is None:
-            logger.error("  ❌ 未获取到持仓信息 (sync_positions 返回 None)，为防止意外清仓，不执行。")
-            return
+            # 桌面不可用时，在卖出窗口内等待恢复（尾盘卖出是关键操作，值得等待）
+            if not self.trader.is_connected:
+                logger.warning("桌面不可用，尝试等待恢复后继续卖出...")
+                if not self.trader.wait_for_desktop(timeout_seconds=300):
+                    logger.error("桌面恢复超时，取消本次卖出。")
+                    return
+                positions = self.sync_positions()
+            if positions is None:
+                logger.error("  ❌ 未获取到持仓信息 (sync_positions 返回 None)，为防止意外清仓，不执行。")
+                return
 
         if not positions:
             logger.info("  当前确认为无持仓。")

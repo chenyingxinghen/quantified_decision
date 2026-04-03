@@ -16,6 +16,8 @@ import os
 import time
 import logging
 import json
+import threading
+import ctypes
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
@@ -87,6 +89,22 @@ def get_latest_signals() -> List[Dict]:
 
     logger.info("正在获取今日信号")
     logger.info(f"  配置: top_n={AUTO_TOP_N}, min_confidence={AUTO_MIN_CONFIDENCE}")
+
+    # 先刷新因子缓存，确保 select_for_live 使用最新数据
+    try:
+        from scripts.select_stocks import _update_factor_cache_incremental, get_all_stock_codes
+        from core.factors.ml_factor_model import MLModelTrainer
+        logger.info("正在增量更新因子缓存...")
+        all_codes = get_all_stock_codes(DATABASE_PATH)
+        _update_factor_cache_incremental(
+            db_path=DATABASE_PATH,
+            codes=all_codes,
+            cache_dir=TrainingConfig.CACHE_DIR,
+        )
+        logger.info(f"因子缓存更新完成，覆盖 {len(all_codes)} 只股票。")
+    except Exception as e:
+        logger.warning(f"因子缓存更新失败，将使用旧缓存继续: {e}", exc_info=True)
+
     try:
         strategy = MLFactorBacktestStrategy(
             model_path=AUTO_MODEL_PATH,
@@ -121,10 +139,42 @@ def get_latest_signals() -> List[Dict]:
         logger.error(f"获取信号失败: {e}", exc_info=True)
         return []
 
+def keep_display_awake():
+    """
+    防止系统锁屏/息屏的后台线程。
+    通过 Windows SetThreadExecutionState API 告知系统当前线程需要持续运行，
+    阻止显示器关闭和系统锁屏（ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED | ES_CONTINUOUS）。
+    这是最干净的方式，不需要模拟鼠标移动。
+    """
+    ES_CONTINUOUS        = 0x80000000
+    ES_SYSTEM_REQUIRED   = 0x00000001
+    ES_DISPLAY_REQUIRED  = 0x00000002
+
+    result = ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    )
+    if result:
+        logger.info("已通过 SetThreadExecutionState 阻止系统锁屏和息屏。")
+    else:
+        logger.warning("SetThreadExecutionState 调用失败，无法阻止锁屏，请手动设置电源计划。")
+
+    # 每 4 分钟续期一次（防止某些系统策略覆盖）
+    while True:
+        time.sleep(240)
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        )
+
+
 def main_loop():
     """使用 APScheduler 调度的事件驱动主逻辑"""
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
+
+    # 启动防锁屏线程（仅 Windows 有效）
+    if sys.platform == 'win32':
+        awake_thread = threading.Thread(target=keep_display_awake, daemon=True, name="KeepAwake")
+        awake_thread.start()
 
     trader = AutoTrader()
     controller = ExecutionController(trader)

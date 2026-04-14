@@ -220,8 +220,43 @@ class RobustClientTrader(ClientTrader):
         super().__init__()
         self._window_title_re = window_title_re or r".*股票交易.*|.*模拟炒股.*|同花顺.*"
 
+    @staticmethod
+    def _grab_foreground(hwnd=None):
+        """
+        向 Windows 申请前台输入权限，解决长时间无用户操作后
+        SendInput / type_keys 报 'no active desktop' 的问题。
+        使用 PostMessage 不需要前台权限，但 set_focus/type_keys 需要。
+        """
+        import ctypes
+        pid = ctypes.windll.kernel32.GetCurrentProcessId()
+        ctypes.windll.user32.AllowSetForegroundWindow(pid)
+        if hwnd:
+            # 先附加到目标线程的输入队列，再设置前台
+            target_tid = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, None)
+            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            if target_tid and target_tid != cur_tid:
+                ctypes.windll.user32.AttachThreadInput(cur_tid, target_tid, True)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                ctypes.windll.user32.AttachThreadInput(cur_tid, target_tid, False)
+            else:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+    @staticmethod
+    def _post_key(hwnd, vk_code):
+        """
+        用 PostMessage 发送按键，完全绕过 SendInput 的前台限制。
+        WM_KEYDOWN=0x0100, WM_KEYUP=0x0101
+        """
+        import ctypes
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP   = 0x0101
+        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, vk_code, 0)
+        time.sleep(0.05)
+        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP,   vk_code, 0)
+
     def connect(self, exe_path=None, **kwargs):
         import pywinauto
+        import ctypes
         connect_path = exe_path or self._config.DEFAULT_EXE_PATH
         os.startfile(connect_path)
         time.sleep(5)
@@ -260,7 +295,8 @@ class RobustClientTrader(ClientTrader):
 
             logger.info(f"最终绑定窗体: [{self._main.window_text()}] (Handle: {self._main.handle})")
             
-            # 手动激活主窗体
+            # 抢占前台输入权限，防止后续 type_keys 因无用户操作而失败
+            self._grab_foreground(self._main.handle)
             try:
                 self._main.set_focus()
             except:
@@ -367,7 +403,8 @@ class RobustClientTrader(ClientTrader):
         return self._do_trade(stock_code, price, amount)
 
     def _do_trade(self, stock_code, price, amount):
-        self.wait(1.0) 
+        self.wait(1.0)
+        self._grab_foreground(self._main.handle)
         self._main.set_focus()
         
         self._fill_stock_code(stock_code)
@@ -377,6 +414,7 @@ class RobustClientTrader(ClientTrader):
         self._fill_amount(amount)
         self.wait(0.5)
         
+        self._grab_foreground(self._main.handle)
         self._main.set_focus()
         self._submit_trade()
         
@@ -423,18 +461,28 @@ class RobustClientTrader(ClientTrader):
         return res
 
     def _switch_left_menus(self, path, sleep=0.5):
-        """修复菜单切换，增加快捷键补偿"""
+        """修复菜单切换：优先用 PostMessage 发快捷键，完全绕过 SendInput 前台限制"""
+        # VK codes for F1-F4
+        VK_F = {1: 0x70, 2: 0x71, 3: 0x72, 4: 0x73}
+        first_menu = path[0] if path else ""
+        fkey = None
+        if "买入" in first_menu:   fkey = VK_F[1]
+        elif "卖出" in first_menu: fkey = VK_F[2]
+        elif "撤单" in first_menu: fkey = VK_F[3]
+        elif "查询" in first_menu: fkey = VK_F[4]
+
         try:
             self.close_pop_dialog()
+            # 先抢占前台权限再走原始逻辑（鼠标点击菜单）
+            self._grab_foreground(self._main.handle)
             super()._switch_left_menus(path, sleep)
         except Exception as e:
-            logger.warning(f"菜单切换失败 {path}, 尝试直接发送快捷键补偿...")
-            first_menu = path[0] if path else ""
-            if "买入" in first_menu: self._main.type_keys("{F1}")
-            elif "卖出" in first_menu: self._main.type_keys("{F2}")
-            elif "撤单" in first_menu: self._main.type_keys("{F3}")
-            elif "查询" in first_menu: self._main.type_keys("{F4}")
-            time.sleep(sleep)
+            logger.warning(f"菜单切换失败 {path}, 尝试 PostMessage 快捷键补偿...")
+            if fkey and self._main:
+                self._post_key(self._main.handle, fkey)
+                time.sleep(sleep)
+            else:
+                logger.error(f"无法识别菜单路径对应快捷键: {path}")
 
     def cancel_all(self):
         """撤销所有待成交的委托单"""

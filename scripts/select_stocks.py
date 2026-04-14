@@ -39,7 +39,7 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 # 常量 & 默认配置
 # ============================================================================
-DEFAULT_MODEL_PATH = 'models/mark/automation' # 默认搜寻 mark 目录
+DEFAULT_MODEL_PATH = 'models/mark/automation/lightgbm_factor_model.pkl' # 默认搜寻 mark 目录
 DEFAULT_MIN_CONFIDENCE = 0
 DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
@@ -503,7 +503,7 @@ def select_stocks(
         print(f"❌ 无法从 {model_path} 加载模型。")
         return []
     print("=" * 80)
-    print("📊 量化因子选股系统 (绝对值打分模式)")
+    print("📊 量化因子选股系统")
     print("=" * 80)
     print(f"\n🕐 运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📈 模型类型: {getattr(model, 'model_type', 'unknown')} | 特征数: {len(getattr(model, 'feature_names', []))}")
@@ -529,10 +529,9 @@ def select_stocks(
             'max_zcfzl': max_zcfzl, 'min_price': min_price, 
             'max_price': max_price, 'include_st': include_st,
             'markets': markets
-        }
+        } if (min_market_cap or max_pe or max_zcfzl or min_price or max_price or include_st or markets) else None
         passed_codes, skipped_stats = pre_filter_stocks(all_codes, info_map, DATABASE_PATH, criteria=criteria)
         predict_codes = passed_codes
-        print(f'筛选条件：{criteria}')
         print(f"   筛选完成: 满足条件 {len(predict_codes)} 只 (已过滤 {sum(skipped_stats.values())} 只)")
         if not predict_codes:
             print("❌ 无符合条件的股票进入下一步。")

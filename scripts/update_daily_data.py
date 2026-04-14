@@ -45,7 +45,7 @@ def update_multiple_stocks(symbols, incremental=True, workers=None, start_date=N
     finally:
         manager.close()
 
-def update_all_stocks(incremental=True, workers=None, start_date="2026-01-01", end_date="2030-01-01"):
+def update_all_stocks(incremental=True, workers=None, start_date=None, end_date="2030-01-01"):
     """更新所有股票数据"""
     if workers is None:
         workers = getattr(config, 'WORKERS_NUM', 5)

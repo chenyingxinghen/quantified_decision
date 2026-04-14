@@ -32,7 +32,7 @@ MULTI_WINDOW = True
 
 # 开盘买入时间窗点 (格式: HH:MM:SS)
 # 策略: 开盘集合竞价后立即挂涨停价买入，确保以开盘价成交（对齐回测的 next_day_open 成交逻辑）
-BUY_WINDOW_START = "09:20:00"
+BUY_WINDOW_START = "09:15:00"
 BUY_WINDOW_END   = "09:30:00"
 
 # 尾盘卖出时间窗点

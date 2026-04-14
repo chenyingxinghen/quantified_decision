@@ -55,6 +55,7 @@ class BaostockDataManager(BaostockFetcher):
             if incremental:
                 # 如果记录的最后同步日期已经达到或超过了目标交易日，则直接跳过
                 if sync_info['daily'] and sync_info['daily'] > check_end_date:
+                    print(f'sync_info:{sync_info['daily']} > check_end_date:{check_end_date}')
                     return
                 # if sync_info['daily'] == today_str: # 兜底逻辑
                 #     return
@@ -76,7 +77,7 @@ class BaostockDataManager(BaostockFetcher):
                 else:
                     calc_start_date = datetime.now() - timedelta(days=365 * HISTORY_YEARS)
             else:
-                calc_start_date = start_date if start_date else datetime.now() - timedelta(days=365 * HISTORY_YEARS)
+                calc_start_date = start_date if start_date else datetime.strptime('2009-03-03','%Y-%m-%d')
             
             # 安全检查：解包为字符串
             start_str = calc_start_date.strftime('%Y-%m-%d')
@@ -84,6 +85,7 @@ class BaostockDataManager(BaostockFetcher):
             
             # 如果起始日期晚于结束日期，跳过
             if calc_start_date > calc_end_date:
+                print(f'calc_start_date:{calc_start_date} > cal_end_date:{calc_end_date}')
                 return
             
             # 获取K线数据

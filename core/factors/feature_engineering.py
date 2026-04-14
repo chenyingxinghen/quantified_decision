@@ -524,7 +524,7 @@ class FeatureEngineer:
         if collected_features:
             new_df = pd.DataFrame(collected_features, index=df.index)
             # 确保类型为 float32
-            new_df = new_df.astype(np.float32, copy=False)
+            new_df = new_df.astype(np.float32)
             df = pd.concat([df, new_df], axis=1)
 
         if verbose:

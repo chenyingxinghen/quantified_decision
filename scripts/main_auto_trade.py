@@ -93,7 +93,6 @@ def get_latest_signals() -> List[Dict]:
     # 先刷新因子缓存，确保 select_for_live 使用最新数据
     try:
         from scripts.select_stocks import _update_factor_cache_incremental, get_all_stock_codes
-        from core.factors.ml_factor_model import MLModelTrainer
         logger.info("正在增量更新因子缓存...")
         all_codes = get_all_stock_codes(DATABASE_PATH)
         _update_factor_cache_incremental(
@@ -141,10 +140,13 @@ def get_latest_signals() -> List[Dict]:
 
 def keep_display_awake():
     """
-    防止系统锁屏/息屏的后台线程。
-    通过 Windows SetThreadExecutionState API 告知系统当前线程需要持续运行，
-    阻止显示器关闭和系统锁屏（ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED | ES_CONTINUOUS）。
-    这是最干净的方式，不需要模拟鼠标移动。
+    防止系统锁屏/息屏 + 保持 SendInput 前台权限的后台线程。
+
+    双重保活策略：
+    1. SetThreadExecutionState：阻止显示器关闭和系统休眠
+    2. 模拟鼠标原地微移：让 Windows 认为持续有用户输入，
+       防止 ForegroundLockTimeout 策略回收 SendInput 前台权限，
+       避免 pywinauto 报 'no active desktop' 错误。
     """
     ES_CONTINUOUS        = 0x80000000
     ES_SYSTEM_REQUIRED   = 0x00000001
@@ -154,16 +156,70 @@ def keep_display_awake():
         ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
     )
     if result:
-        logger.info("已通过 SetThreadExecutionState 阻止系统锁屏和息屏。")
+        logger.info("已阻止系统锁屏和息屏 (SetThreadExecutionState)。")
     else:
-        logger.warning("SetThreadExecutionState 调用失败，无法阻止锁屏，请手动设置电源计划。")
+        logger.warning("SetThreadExecutionState 调用失败，请手动设置电源计划防止锁屏。")
 
-    # 每 4 分钟续期一次（防止某些系统策略覆盖）
+    # INPUT 结构体，用于 SendInput 模拟鼠标事件
+    # MOUSEINPUT: dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_MOVE(0x0001), time=0, dwExtraInfo=0
+    MOUSEEVENTF_MOVE = 0x0001
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class INPUT(ctypes.Structure):
+        class _INPUT(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT)]
+        _anonymous_ = ("_input",)
+        _fields_ = [("type", ctypes.c_ulong), ("_input", _INPUT)]
+
+    def nudge_mouse():
+        """原地微移鼠标 +1 再 -1，视觉上不可见但刷新系统活跃计时器"""
+        inp = (INPUT * 2)()
+        inp[0].type = 0  # INPUT_MOUSE
+        inp[0].mi.dx = 1
+        inp[0].mi.dy = 0
+        inp[0].mi.dwFlags = MOUSEEVENTF_MOVE
+        inp[1].type = 0
+        inp[1].mi.dx = -1
+        inp[1].mi.dy = 0
+        inp[1].mi.dwFlags = MOUSEEVENTF_MOVE
+        ctypes.windll.user32.SendInput(2, inp, ctypes.sizeof(INPUT))
+
     while True:
-        time.sleep(240)
+        time.sleep(60)  # 每分钟保活一次
+        try:
+            nudge_mouse()
+        except Exception:
+            pass
+        # 同时续期 SetThreadExecutionState
         ctypes.windll.kernel32.SetThreadExecutionState(
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
         )
+
+
+def disable_foreground_lock_timeout():
+    """
+    将 ForegroundLockTimeout 设为 0，关闭 Windows 前台锁定超时策略。
+    该策略默认值为 200000（约 200 秒），超时后后台进程无法通过 SendInput 注入输入事件。
+    设为 0 表示永不超时，彻底解决 pywinauto 长时间无操作后报 'no active desktop' 的问题。
+    需要管理员权限写入 HKCU，通常不需要 UAC 提权。
+    """
+    try:
+        import winreg
+        key_path = r"Control Panel\Desktop"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "ForegroundLockTimeout", 0, winreg.REG_DWORD, 0)
+        logger.info("ForegroundLockTimeout 已设为 0，前台锁定策略已关闭。")
+    except Exception as e:
+        logger.warning(f"无法修改 ForegroundLockTimeout: {e}，将依赖鼠标保活线程。")
 
 
 def main_loop():
@@ -173,6 +229,7 @@ def main_loop():
 
     # 启动防锁屏线程（仅 Windows 有效）
     if sys.platform == 'win32':
+        disable_foreground_lock_timeout()
         awake_thread = threading.Thread(target=keep_display_awake, daemon=True, name="KeepAwake")
         awake_thread.start()
 
@@ -181,7 +238,7 @@ def main_loop():
     
     # 初始化：连接并尝试获取信号
     if not trader.connect():
-        logger.error("无法建立交易客户端连接，请确保同花顺等客户端已手动登录并处于解锁状态。")
+        logger.error("无法连接交易客户端，请确保同花顺已登录。")
         if not DRY_RUN: return
 
     logger.info("-" * 60)
@@ -206,40 +263,46 @@ def main_loop():
 
     def job_get_signals():
         """定时任务：收盘后或盘前获取最新信号"""
-        logger.info("=== 触发定时任务：获取今日选股信号 ===")
-        # 获取信号 (会自动计算 ATR 并保存存档)
+        logger.info("=== 获取今日选股信号 ===")
         sigs = get_latest_signals()
         if sigs:
             controller.set_buy_signals(sigs)
-            # 顺便同步一遍持仓记录
             controller.sync_positions()
 
     def job_execute_buys():
         """定时任务：执行买入"""
-        if datetime.now().weekday() >= 5: return # 周末不交易
-        logger.info("=== 触发定时任务：检查并执行买入 ===")
+        if datetime.now().weekday() >= 5: return
+        logger.info("=== 执行买入 ===")
         controller.execute_buys()
 
     def job_execute_sells():
-        """定时任务：执行卖出（尾盘清理）"""
+        """定时任务：执行卖出（尾盘）"""
         if datetime.now().weekday() >= 5: return
-        logger.info("=== 触发定时任务：检查并执行尾盘卖出 ===")
+        logger.info("=== 执行尾盘卖出 ===")
         controller.execute_sells()
 
     def job_heartbeat():
         """心跳日志"""
-        now_str = datetime.now().strftime("%H:%M:%S")
-        logger.info(f"心跳在线，当前交易客户端状态检查正常。({now_str})")
+        logger.info(f"心跳 | 客户端状态: {'已连接' if trader.is_connected else '未连接'} | {datetime.now().strftime('%H:%M:%S')}")
+
+    def job_update_entry_prices():
+        """买入窗口结束后，用实盘成本价修正 entry_price"""
+        if datetime.now().weekday() >= 5: return
+        logger.info("=== 修正入场价（成本价同步）===")
+        controller.update_entry_prices_from_positions()
 
     # 配置任务调度
-    # 1. 每天上午 9:10 重新获取一次今日选股信号
-    scheduler.add_job(job_get_signals, CronTrigger(day_of_week='mon-fri', hour=9, minute=00))
+    # 1. 每天上午 8:00 重新获取一次今日选股信号
+    scheduler.add_job(job_get_signals, CronTrigger(day_of_week='mon-fri', hour=8, minute=00))
 
     # 2. 从 BUY_WINDOW_START 到 BUY_WINDOW_END 期间，每隔一两分钟尝试买入
     start_buy_h, start_buy_m, _ = map(int, BUY_WINDOW_START.split(':'))
     end_buy_h, end_buy_m, _ = map(int, BUY_WINDOW_END.split(':'))
     # 为了简单起见，设定在指定的起始分钟运行，比如 9点 20-25 分每分钟执行一次
     scheduler.add_job(job_execute_buys, CronTrigger(day_of_week='mon-fri', hour=start_buy_h, minute=f"{start_buy_m}-{end_buy_m}"))
+
+    # 2b. 买入窗口结束后 1 分钟，用实盘成本价修正 entry_price
+    scheduler.add_job(job_update_entry_prices, CronTrigger(day_of_week='mon-fri', hour=end_buy_h, minute=end_buy_m + 1))
 
     # 3. 从 SELL_WINDOW_START 到 SELL_WINDOW_END 期间，执行尾盘卖出
     start_sell_h, start_sell_m, _ = map(int, SELL_WINDOW_START.split(':'))

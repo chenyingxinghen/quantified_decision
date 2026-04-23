@@ -79,7 +79,7 @@ def main():
 
         elif choice == '2':
             logger.info("正在同步持仓状态...")
-            controller.sync_positions()
+            controller.sync_positions(cleanup=False)
             positions = trader.get_positions()
             if positions is not None:
                 print(f"\n>>> 当前持仓 (共 {len(positions)} 只):")
@@ -188,7 +188,7 @@ def main():
             
             # 1. 同步持仓
             logger.info("步骤 1/4: 同步实盘持仓状态...")
-            controller.sync_positions()
+            controller.sync_positions(cleanup=False)
             
             # 2. 获取最新信号
             logger.info("步骤 2/4: 获取选股信号 (select_stocks)...")

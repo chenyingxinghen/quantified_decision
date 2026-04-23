@@ -117,6 +117,7 @@ def get_latest_signals() -> List[Dict]:
         criteria = {
             'min_market_cap': getattr(automation_config, 'AUTO_MIN_MARKET_CAP', None),
             'max_pe': getattr(automation_config, 'AUTO_MAX_PE', None),
+            'max_zcfzl': getattr(automation_config, 'AUTO_MAX_ZCFZL', None),
             'min_price': getattr(automation_config, 'AUTO_MIN_PRICE', None),
             'max_price': getattr(automation_config, 'AUTO_MAX_PRICE', None),
             'include_st': getattr(automation_config, 'AUTO_INCLUDE_ST', True),
@@ -251,7 +252,7 @@ def main_loop():
         # 注意：这里判断 9:00 之后，但 15:00 之前（交易时间内）
         if now.hour >= 9 and now.hour < 15:
             logger.info("检测到今日尚未生成信号且已过 09:00，正在手动触发同步与信号生成...")
-            controller.sync_positions()
+            controller.sync_positions(cleanup=False)
             signals = get_latest_signals()
         else:
             logger.info("当前未到 09:00 或已收盘，等待定时任务自动生成。")
@@ -267,7 +268,6 @@ def main_loop():
         sigs = get_latest_signals()
         if sigs:
             controller.set_buy_signals(sigs)
-            controller.sync_positions()
 
     def job_execute_buys():
         """定时任务：执行买入"""

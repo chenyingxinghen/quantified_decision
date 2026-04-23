@@ -81,28 +81,36 @@ class MLFactorBacktestStrategy(BaseStrategy):
         """生成交易信号 (极速版)"""
         signals = []
         existing_positions = portfolio_state.get('positions', {})
-        available_slots = sc.MAX_POSITIONS - len(existing_positions)
+        
+        # 优先使用 portfolio_state 中的 available_slots (用于实盘选股指定数量)
+        # 如果未指定，则根据最大仓位限制计算剩余空位
+        if 'available_slots' in portfolio_state:
+            available_slots = portfolio_state['available_slots']
+        else:
+            available_slots = sc.MAX_POSITIONS - len(existing_positions)
+            
         if available_slots <= 0: return signals
 
         # 1. 获取所有股票列表
-        if not hasattr(self, '_all_db_codes'):
-            # 兼容旧版本：_factors.parquet 后缀
-            self._all_db_codes = [f[:-16] for f in os.listdir(self.cache_dir) if f.endswith('_factors.parquet')]
-        all_codes = self._all_db_codes
+        all_codes = market_data.keys()
         
         # 2. 预筛选 (利用内存快照，无 SQL)
         info_map = self._get_optimized_info_map(current_date, market_data)
         
-        # 按照基本面指标筛选 predict_codes (与原始 select_stocks 逻辑严格一致)
-        # 优先使用实时传入的 criteria
-        filter_criteria = getattr(self, '_custom_criteria', {
-            'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,
-            'min_price': sc.MIN_PRICE, 'max_price': sc.MAX_PRICE, 'include_st': sc.INCLUDE_ST,
-            'markets': sc.SELECTOR_MARKETS
-        })
+        # 优先使用实时传入的 criteria，如果传入了则强制开启过滤
+        if hasattr(self, '_custom_criteria') and self._custom_criteria is not None:
+            filter_criteria = self._custom_criteria
+            should_apply_filter = True
+        else:
+            filter_criteria = {
+                'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,
+                'min_price': sc.MIN_PRICE, 'max_price': sc.MAX_PRICE, 'include_st': sc.INCLUDE_ST,
+                'markets': sc.SELECTOR_MARKETS
+            }
+            should_apply_filter = sc.ENABLE_FUNDAMENTAL_FILTER
         
         predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
-                                                 apply_filter=sc.ENABLE_FUNDAMENTAL_FILTER, 
+                                                 apply_filter=should_apply_filter, 
                                                  criteria=filter_criteria)
         
         if not predict_codes: return signals
@@ -231,7 +239,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if markets_filter:
             for m in markets_filter:
                 p = SUPPORTED_MARKETS.get(m, {}).get('prefixes')
-                if p: allowed_prefixes.extend(p)
+                if p: 
+                    allowed_prefixes.extend(p)
+                else:
+                    # 兼容性处理：支持交易所级别代码 (如 'sh' -> ['60', '68'])
+                    for m_info in SUPPORTED_MARKETS.values():
+                        if m_info.get('code') == m:
+                            allowed_prefixes.extend(m_info.get('prefixes', []))
         allowed_prefixes = tuple(allowed_prefixes) if allowed_prefixes else None
             
         for code in all_codes:
@@ -410,7 +424,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
 
         # 转换为与 select_stocks 兼容的字典格式
         results = []
-        for sig in sorted(signals, key=lambda s: s.confidence, reverse=True)[:top_n]:
+        for sig in sorted(signals, key=lambda s: s.confidence, reverse=True):
+            if sig.confidence < orig_min:
+                continue
             results.append({
                 'stock_code': sig.stock_code,
                 'confidence': sig.confidence,
@@ -418,6 +434,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 'stop_loss': sig.stop_loss,
                 'take_profit': sig.take_profit,
             })
+            if len(results) >= top_n:
+                break
         return results
 
     def cleanup(self):

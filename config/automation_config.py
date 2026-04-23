@@ -86,6 +86,9 @@ AUTO_MIN_MARKET_CAP = None       # 至少 20 亿市值
 # 最大市盈率（倍），过滤估值过高的股票。None = 不限制
 AUTO_MAX_PE = None              # PE 不高于 150 倍
 
+# 最大资产负债率（%）。None = 不限制
+AUTO_MAX_ZCFZL = None
+
 # 股价区间（元），过滤极低价或高价股。None = 不限制
 AUTO_MIN_PRICE = 1.0             # 最低 1 元
 AUTO_MAX_PRICE = 20.0           # 最高 20 元

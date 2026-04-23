@@ -273,7 +273,6 @@ class BaostockDataManager(BaostockFetcher):
         codes = stock_df['code'].tolist()
         
         print(f"开始更新 {len(codes)} 只股票 [Mode: {mode}]...")
-        
         worker_func = {
             'all': _update_stock_worker,
             'daily': _update_daily_worker,
@@ -281,10 +280,13 @@ class BaostockDataManager(BaostockFetcher):
         }.get(mode, _update_stock_worker)
         
         from tqdm import tqdm
+        import sys
+        is_atty = sys.stdout.isatty()
+        
         executor = ProcessPoolExecutor(max_workers=workers)
         try:
             futures = {executor.submit(worker_func, code, incremental, start_date, end_date): code for code in codes}
-            with tqdm(total=len(codes), desc=f"同步进度({mode})", unit="只") as pbar:
+            with tqdm(total=len(codes), desc=f"同步进度({mode})", unit="只", disable=not is_atty) as pbar:
                 _drain_futures(futures, pbar, task_label=mode)
         finally:
             try:
@@ -513,6 +515,11 @@ class BaostockDataManager(BaostockFetcher):
             for market in markets:
                 if market in SUPPORTED_MARKETS:
                     prefixes.extend(SUPPORTED_MARKETS[market]['prefixes'])
+                else:
+                    # 尝试匹配 exchange code (如 'sh' 匹配 'sh_main' 和 'sh_star')
+                    for m_info in SUPPORTED_MARKETS.values():
+                        if m_info.get('code') == market:
+                            prefixes.extend(m_info.get('prefixes', []))
             
             if prefixes:
                 df = df[df['code'].str.startswith(tuple(prefixes))]

@@ -46,7 +46,8 @@
           <label>股票市场</label>
           <div class="text-muted" style="font-size: 11px; margin-bottom: 8px">选择要扫描的市场</div>
           <el-select v-model="config.SELECTOR_MARKETS" multiple collapse-tags placeholder="全选" style="width: 100%">
-            <el-option label="沪市主板" value="sh" />
+            <el-option label="沪市主板" value="sh_main" />
+            <el-option label="科创板" value="sh_star" />
             <el-option label="深市主板" value="sz_main" />
             <el-option label="创业板" value="sz_gem" />
             <el-option label="北交所" value="bj" />
@@ -142,7 +143,7 @@ const config = ref({
     MIN_PRICE: 1,
     MAX_PRICE: 200,
     INCLUDE_ST: false,
-    SELECTOR_MARKETS: ['sh', 'sz_main', 'sz_gem']
+    SELECTOR_MARKETS: ['sh_main', 'sz_main', 'sz_gem']
 })
 
 onMounted(async () => {
@@ -152,6 +153,14 @@ onMounted(async () => {
             const saved = typeof res.data.config_json === 'string' 
                 ? JSON.parse(res.data.config_json) 
                 : res.data.config_json
+            
+            // 兼容性处理: 如果历史配置中包含 'sh' (代表沪市全选)
+            if (saved.SELECTOR_MARKETS && saved.SELECTOR_MARKETS.includes('sh')) {
+                saved.SELECTOR_MARKETS = saved.SELECTOR_MARKETS.filter(m => m !== 'sh');
+                if (!saved.SELECTOR_MARKETS.includes('sh_main')) saved.SELECTOR_MARKETS.push('sh_main');
+                if (!saved.SELECTOR_MARKETS.includes('sh_star')) saved.SELECTOR_MARKETS.push('sh_star');
+            }
+            
             Object.assign(config.value, saved)
         }
     } catch (e) {

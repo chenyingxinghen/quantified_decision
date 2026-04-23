@@ -14,6 +14,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from core.data.baostock_main import BaostockDataManager
 import config
+from config import DATABASE_PATH
 
 def update_single_stock(symbol, incremental=False, start_date=None, end_date=None):
     """更新单只股票数据"""
@@ -62,6 +63,25 @@ def update_all_stocks(incremental=True, workers=None, start_date=None, end_date=
         manager.init_all_stocks(incremental=incremental, workers=workers, mode='finance')
     finally:
         manager.close()
+
+    # 第三步：更新因子缓存
+    print("\n--- 第三步: 更新选股因子缓存 ---")
+    try:
+        from scripts.select_stocks import _update_factor_cache_incremental, get_all_stock_codes
+        from config.factor_config import TrainingConfig
+        cache_dir = os.path.join(PROJECT_ROOT, TrainingConfig.CACHE_DIR)
+        all_codes = get_all_stock_codes(DATABASE_PATH)
+        _update_factor_cache_incremental(
+            db_path=DATABASE_PATH,
+            codes=all_codes,
+            cache_dir=cache_dir,
+            workers=workers,
+        )
+        print("✓ 因子缓存更新完成")
+    except Exception as e:
+        import traceback
+        print(f"[警告] 因子缓存更新失败，不影响行情数据: {e}")
+        traceback.print_exc()
 
 def main():
     parser = argparse.ArgumentParser(description='股票数据增量更新脚本')

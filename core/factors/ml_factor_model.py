@@ -286,6 +286,7 @@ class MLFactorModel:
             dval = xgb.QuantileDMatrix(
                 X_val_raw, label=y_val,
                 feature_names=self.feature_names,
+                ref=dtrain,
             )
 
             verbose_eval = 50

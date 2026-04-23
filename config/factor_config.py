@@ -30,8 +30,8 @@ class ModelConfig:
         'colsample_bylevel': 0.8, 
         'gamma': 0.17,    
         
-        'reg_alpha': 5,            
-        'reg_lambda': 13,             
+        'reg_alpha': 11,            
+        'reg_lambda': 23,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
         'n_jobs': 8,
@@ -42,21 +42,21 @@ class ModelConfig:
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 7,
-        'min_child_weight': 250,
+        'max_depth': 8,
+        'min_child_weight': 200,
         'num_leaves': 127,
         'learning_rate': 0.05,
-        'min_gain_to_split': 0.15,
+        'min_gain_to_split': 0.12,
 
-        'reg_alpha': 7,
-        'reg_lambda': 23,
+        'reg_alpha': 5,
+        'reg_lambda': 13,
         'subsample': 1,
-        'colsample_bytree': 0.7,
+        'colsample_bytree': 1,
 
-        'label_gain': [float(i**1.5+1) for i in range(50)], 
+        'label_gain': [float(i**1.5+1) for i in range(100)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 1024,
+        'lambdarank_truncation_level': 512,
 
         'n_jobs': 15,
         'verbosity': -1,
@@ -105,9 +105,9 @@ class TrainingConfig:
     
     # XGB标签构造参数 LGB样本权重构造参数
     LABEL_TARGET_SCALE = 2
-    LABEL_LAMBDA = 1.5           # 损失厌恶系数 (惩罚回撤)
-    LABEL_PATH_PUNISH = 0.8      # 路径保护惩罚系数 (惩罚先跌后涨)
-    LABEL_TIME_BONUS = 0.5       # 时间奖励系数 (奖励高点早的票)
+    LABEL_LAMBDA = 1.3           # 损失厌恶系数 (惩罚回撤)
+    LABEL_PATH_PUNISH = 0.5      # 路径保护惩罚系数 (惩罚先跌后涨)
+    LABEL_TIME_BONUS = 0.8       # 时间奖励系数 (奖励高点早的票)
     
     USE_GPU = True               # 是否启用 GPU 加速
     MEMORY_EFFICIENT = True      # 是否启用内存优化模式 (针对大规模数据集)
@@ -123,7 +123,7 @@ class TrainingConfig:
     
 
     # 预测天数 (用于分类、回归和排序任务)
-    FUTURE_DAYS = 5
+    FUTURE_DAYS = 7
     
 
     # 缓存目录

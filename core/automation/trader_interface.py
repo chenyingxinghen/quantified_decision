@@ -124,7 +124,7 @@ class AutoTrader:
         """
         获取当前持仓。
         返回语义：None=获取失败，[]=确认空仓，[...]=持仓列表
-        force_refresh=True 时先切换到撤单页强制刷新，仅在已知 GUI 缓存问题时使用。
+        force_refresh=True 时发送 F5 强制刷新 GUI 数据，仅在买卖后需要读取最新持仓时使用。
         """
         if self.dry_run:
             return []
@@ -135,8 +135,7 @@ class AutoTrader:
         try:
             if force_refresh:
                 try:
-                    self.user._switch_left_menus(['撤单[F3]'])
-                    time.sleep(0.5)
+                    self.user._switch_left_menus_by_shortcut("{F5}", sleep=1.5)
                 except Exception:
                     pass
 

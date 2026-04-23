@@ -225,11 +225,13 @@ class ExecutionController:
             logger.info(f"从 pending_buys 恢复 {len(restored)} 个买入信号: {[s['stock_code'] for s in restored]}")
         return restored
 
-    def sync_positions(self):
+    def sync_positions(self, cleanup=False):
         """同步本地追踪与实盘持仓。
+        cleanup=True: 仅在确认账户绝对空仓（市值=0且列表空）时清理本地 positions。
+        cleanup=False: 仅返回实盘持仓列表，不修改本地元数据（默认安全模式）。
         返回：None=获取失败，[]=确认空仓，[...]=持仓列表
         """
-        logger.info("同步持仓...")
+        logger.info(f"同步持仓 (cleanup={cleanup})...")
         real_positions = self.trader.get_positions()
         if real_positions is None:
             if not self.trader.is_connected:
@@ -238,42 +240,55 @@ class ExecutionController:
                 logger.warning("持仓同步失败：GUI 数据获取异常。")
             return None
 
-        # 空仓时交叉验证，防止 GUI 被干扰导致误判
-        if len(real_positions) == 0 and len(self.tracking_data["positions"]) > 0:
+        # 实盘识别为空时的交叉验证，防止 GUI 被干扰（如验证码、未加载完）导致误判空仓
+        if len(real_positions) == 0:
             balance = self.trader.get_balance()
             if not balance:
-                logger.warning("实盘持仓为空，但资金读取失败（可能 GUI 异常），跳过同步。")
+                logger.warning("实盘持仓为空，但资金表读取失败，跳过同步以保护本地数据。")
                 return None
-            market_value = float(balance.get('参考市值', balance.get('股票市值', balance.get('市值', 0))) or 0)
-            if market_value > 0:
-                logger.warning(f"实盘持仓为空，但资金表显示股票市值={market_value}，疑似 GUI 干扰，跳过同步。")
+            
+            # 扩展市值字段检查，确保覆盖模拟盘和实盘不同版本
+            market_val_keys = ['参考市值', '股票市值', '证券市值', '持仓市值', '市值', '总市值']
+            market_value = 0.0
+            for k in market_val_keys:
+                v = balance.get(k)
+                if v is not None:
+                    try:
+                        market_value = float(v)
+                        break
+                    except ValueError:
+                        continue
+
+            if market_value > 5.0: # 留 5 元容错
+                logger.warning(f"实盘持仓列表为空，但资金表显示市值={market_value}，疑似 GUI 干扰，跳过同步。")
                 return None
 
         real_codes = []
         for p in real_positions:
             code = p.get('证券代码', p.get('stock_code', ''))
             base_code = code[:6] if len(code) >= 6 else code
+            if not base_code:
+                logger.debug(f"  同步: 跳过无效持仓记录（证券代码为空）: {p}")
+                continue
             real_codes.append(base_code)
 
-        # 移除实盘已清仓的本地记录
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        for code in list(self.tracking_data["positions"].keys()):
-            if code not in real_codes:
-                pos_meta = self.tracking_data["positions"].get(code, {})
-                entry_date = pos_meta.get("entry_date", "")
-                if entry_date == today_str:
-                    # 今日刚买入，委托可能尚未成交或持仓 GUI 未刷新，保留元数据
-                    logger.debug(f"  同步: {code} 实盘暂无持仓，但今日刚买入，保留本地元数据。")
-                    continue
-                logger.info(f"  同步: {code} 实盘已无持仓，移除本地记录。")
-                del self.tracking_data["positions"][code]
+        # 逻辑修改：不再根据实盘列表“差集”删除本地记录。
+        # 理由：GUI 自动化经常出现漏扫、滚动不到位等情况，按差集删除会导致元数据永久丢失。
+        # 元数据的删除应严格由 execute_sells 在确认成交后执行。
+        if cleanup:
+            if len(real_codes) == 0:
+                # 只有当实盘和资金表均确认为 0 时，才允许清理
+                if self.tracking_data["positions"]:
+                    logger.info("实盘与资金表均确认绝对空仓，安全清除本地持仓记录。")
+                    self.tracking_data["positions"].clear()
+                    self._save_tracking()
+            else:
+                # 实盘非空。如果本地有但实盘没读到，仅警告，不删除。
+                for code in list(self.tracking_data["positions"].keys()):
+                    if code not in real_codes:
+                        logger.warning(f"  [数据同步不一致] 本地追踪 {code} 但实盘未见，可能因 GUI 未滚动或已手动卖出，保留记录。")
 
-        for code in real_codes:
-            if code not in self.tracking_data["positions"]:
-                logger.debug(f"  同步: {code} 实盘有持仓但无本地元数据。")
-
-        self._save_tracking()
-        logger.info(f"持仓同步完成，实盘持仓 {len(real_positions)} 只: {[p.get('证券代码', p.get('stock_code',''))[:6] for p in real_positions]}")
+        logger.info(f"持仓同步运行完毕，实盘持仓 {len(real_positions)} 只: {real_codes}")
         return real_positions
 
     def _execute_with_retry(self, action_func, max_retries=3, retry_delay=2,
@@ -334,6 +349,16 @@ class ExecutionController:
             logger.info("无待买入信号，跳过。")
             return
 
+        # 所有信号已处理完毕（全部 SUCCESS/SKIPPED/FAILED），静默跳过
+        all_done = all(
+            self.tracking_data["processed_today"].get(s['stock_code'][:6]) in (
+                OperationStatus.SUCCESS.value, OperationStatus.SKIPPED.value, OperationStatus.FAILED.value
+            )
+            for s in self.signals_cache
+        )
+        if all_done:
+            return
+
         balance = self.trader.get_balance()
         if not balance:
             if not self.trader.is_connected:
@@ -353,8 +378,8 @@ class ExecutionController:
             logger.warning(f"可用资金 ({available_cash:.2f}) 不足 200 元，取消买入。")
             return
 
-        # 检查当前持仓
-        positions = self.sync_positions()
+        # 开始时同步一次持仓，后续不再重复查询
+        positions = self.sync_positions(cleanup=False)
         if positions is None:
             logger.error("  获取持仓失败，为安全起见，取消本次买入。")
             return
@@ -481,7 +506,8 @@ class ExecutionController:
             ENABLE_STOP_LOSS_EXIT, ENABLE_TAKE_PROFIT_EXIT, ENABLE_TIME_STOP_EXIT
         )
 
-        positions = self.sync_positions()
+        # 核心修复：卖出时仅以此刻读到的实盘为准，不执行破坏性的 cleanup。
+        positions = self.sync_positions(cleanup=False)
         if positions is None:
             if not self.trader.is_connected:
                 logger.warning("桌面不可用，等待恢复后继续卖出...")
@@ -518,12 +544,12 @@ class ExecutionController:
 
             # 获取元数据
             meta = self.tracking_data["positions"].get(base_code, {})
-            current_price = float(p.get('当前价', p.get('市价', p.get('现价', 0))) or 0)
             is_st = bool(meta.get('is_st', False))
+            current_price = float(p.get('当前价', p.get('市价', p.get('现价', 0))) or 0)
+            avail_amount = int(p.get('可用余额', p.get('可卖数量', p.get('可用数量', 0))) or 0)
 
             if not meta:
                 logger.warning(f"  {code} 无跟踪元数据，执行兜底卖出。")
-                avail_amount = int(p.get('可用余额', p.get('可卖数量', 0)) or 0)
                 success, op_status = self._do_sell_robust(code, ref_price=current_price, is_st=is_st, avail_amount=avail_amount)
                 self.tracking_data["processed_today"][f"sell_{base_code}"] = op_status.value
                 self._save_tracking()
@@ -561,7 +587,6 @@ class ExecutionController:
 
             if should_exit:
                 logger.info(f"  {code} 触发卖出: {reason} | 持有 {holding_days}D | 浮盈 {unrealized_pnl_pct*100:.2f}%")
-                avail_amount = int(p.get('可用余额', p.get('可卖数量', 0)) or 0)
                 success, op_status = self._do_sell_robust(code, ref_price=current_price, is_st=is_st, avail_amount=avail_amount)
                 if op_status in [OperationStatus.SUCCESS, OperationStatus.SKIPPED]:
                     self.tracking_data["processed_today"][f"sell_{base_code}"] = op_status.value
@@ -631,10 +656,15 @@ class ExecutionController:
 
 
     def update_entry_prices_from_positions(self):
-        """买入窗口结束后，从实盘持仓的「成本价」字段修正 entry_price 并重算止盈止损偏移。"""
-        positions = self.sync_positions()
+        """买入窗口结束后，从实盘持仓的「成本价」字段修正 entry_price 并重算止盈止损偏移。
+        使用 cleanup=False：只读取实盘持仓用于修正，不触发本地记录清理（清理由 execute_sells 负责）。
+        """
+        positions = self.sync_positions(cleanup=False)
+        if positions is None:
+            logger.warning("update_entry_prices: 持仓获取失败，跳过修正。")
+            return
         if not positions:
-            logger.warning("update_entry_prices: 持仓获取失败或空仓，跳过修正。")
+            logger.info("update_entry_prices: 当前无持仓，跳过修正。")
             return
 
         updated = []

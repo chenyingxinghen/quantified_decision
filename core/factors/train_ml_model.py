@@ -410,7 +410,7 @@ class MLModelTrainer:
         start_time = time()
         success = 0
         failed = 0
-        
+        is_atty = sys.stdout.isatty()
         with ThreadPoolExecutor(max_workers=n_jobs) as executor:
             futures = {
                 executor.submit(
@@ -423,7 +423,7 @@ class MLModelTrainer:
                 for code, data in to_update.items()
             }
             
-            with tqdm(total=len(futures), desc="更新因子缓存") as pbar:
+            with tqdm(total=len(futures), desc="更新因子缓存", disable=not is_atty) as pbar:
                 for future in as_completed(futures):
                     code = futures[future]
                     try:
@@ -1112,8 +1112,7 @@ class MLModelTrainer:
                         shifted_scores = processed_scores - median_val
                         
                         # 3. 限制极端权重 (建议缩减 clip 范围)
-                        # exp(2) 约 7.4 倍权重, exp(-2) 约 0.13 倍权重，这个跨度对模型比较友好
-                        log_weight = np.clip(shifted_scores * 0.5, -1, 1) 
+                        log_weight = np.clip(shifted_scores * 1, 1, 2) 
                         current_weight = np.exp(log_weight)
                         
                         # 4. 归一化：保持总梯度规模不变

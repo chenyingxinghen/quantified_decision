@@ -35,7 +35,7 @@ from config.factor_config import TrainingConfig
 from core.factors.ml_factor_model import MLFactorModel
 
 
-DEFAULT_CODES = ["001356", "001391"]
+DEFAULT_CODES = ["000001", "001391"]
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "latest" / "lightgbm_factor_model.pkl"
 DEFAULT_CACHE_DIR = PROJECT_ROOT / TrainingConfig.CACHE_DIR
 
@@ -159,6 +159,7 @@ def main() -> int:
 
         df = pd.read_parquet(cache_file)
         cache_columns = list(df.columns)
+        print(f"缓存列、值：{df.loc[0, [col for col in cache_columns if 'pattern' in col]]}")
         missing = [f for f in model_features if f not in cache_columns]
         extra = [f for f in cache_columns if f not in model_features and f != "date"]
 

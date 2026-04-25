@@ -98,7 +98,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         info_map = self._get_optimized_info_map(current_date, market_data)
         
         # 优先使用实时传入的 criteria，如果传入了则强制开启过滤
-        if hasattr(self, '_custom_criteria') and self._custom_criteria is not None:
+        if hasattr(self, '_custom_criteria'):
             filter_criteria = self._custom_criteria
             should_apply_filter = True
         else:
@@ -108,10 +108,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 'markets': sc.SELECTOR_MARKETS
             }
             should_apply_filter = sc.ENABLE_FUNDAMENTAL_FILTER
-        
-        predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
+        if filter_criteria:
+            predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
                                                  apply_filter=should_apply_filter, 
                                                  criteria=filter_criteria)
+        else: predict_codes = all_codes
         
         if not predict_codes: return signals
 

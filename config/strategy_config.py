@@ -23,9 +23,9 @@ ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型�
 # ==============================================================================
 
 # ATR相关参数（用于止损止盈计算）
-ATR_PERIOD = 7                     # ATR计算周期
+ATR_PERIOD = 5                     # ATR计算周期
 ATR_STOP_MULTIPLIER = 1.0           # ATR止损倍数 (与训练一致)
-ATR_TARGET_MULTIPLIER = 4.0         # ATR目标倍数 (与训练一致)
+ATR_TARGET_MULTIPLIER = 3.0         # ATR目标倍数 (与训练一致)
 
 # 交易费率
 COMMISSION_RATE = 0.005           
@@ -48,7 +48,7 @@ ENABLE_TIME_STOP_EXIT = True        # 是否启用时间止损卖出
 
 # 时间止损参数
 TIME_STOP_DAYS = 15                 # 增加时间止损天数，匹配预测周期
-TIME_STOP_MIN_LOSS_PCT = 0.02      # 时间止损最小亏损比例（2%）
+TIME_STOP_MIN_LOSS_PCT = 0.05      # 时间止损最小亏损比例（2%）
 
 # ==============================================================================
 # 趋势线分析参数

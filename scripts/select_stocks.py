@@ -375,7 +375,6 @@ def select_stocks(
             'include_st':     include_st,
             'markets':        markets,
         }
-    print(f"apply_filter={apply_filter}, min_market_cap={min_market_cap}, max_pe={max_pe}, max_zcfzl={max_zcfzl}, min_price={min_price}, max_price={max_price}, include_st={include_st}, markets={markets}")
 
     strategy = MLFactorBacktestStrategy(
         model_path=model_path,

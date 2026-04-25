@@ -107,13 +107,17 @@ class CandlestickPatternFactors:
             context = self.analyzer.calculate_context(data)
         return self.analyzer.identify_bearish_engulfing(data, context)
     
-    def calculate_piercing_line(self, data: pd.DataFrame) -> np.ndarray:
+    def calculate_piercing_line(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """刺穿线"""
-        return self.analyzer.identify_piercing_line(data)
+        if context is None:
+            context = self.analyzer.calculate_context(data)
+        return self.analyzer.identify_piercing_line(data, context=context)
     
-    def calculate_dark_cloud_cover(self, data: pd.DataFrame) -> np.ndarray:
+    def calculate_dark_cloud_cover(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """乌云盖顶"""
-        return self.analyzer.identify_dark_cloud_cover(data)
+        if context is None:
+            context = self.analyzer.calculate_context(data)
+        return self.analyzer.identify_dark_cloud_cover(data, context=context)
     
     def calculate_morning_star(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """晨星"""
@@ -127,9 +131,11 @@ class CandlestickPatternFactors:
             context = self.analyzer.calculate_context(data)
         return self.analyzer.identify_evening_star(data, context)
     
-    def calculate_harami(self, data: pd.DataFrame) -> np.ndarray:
+    def calculate_harami(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """孕线"""
-        return self.analyzer.identify_harami(data)
+        if context is None:
+            context = self.analyzer.calculate_context(data)
+        return self.analyzer.identify_harami(data, context=context)
     
     def calculate_three_white_soldiers(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """三个白兵"""
@@ -157,11 +163,11 @@ class CandlestickPatternFactors:
         """下影线比率"""
         return self.analyzer.get_lower_shadow_ratio(data)
     
-    def calculate_pattern_strength(self, data: pd.DataFrame, window: int = 5) -> np.ndarray:
+    def calculate_pattern_strength(self, data: pd.DataFrame, window: int = 30) -> np.ndarray:
         """形态强度指标"""
         return self.analyzer.get_pattern_strength(data, window=window)
     
-    def calculate_pattern_confirmation(self, data: pd.DataFrame, window: int = 3) -> np.ndarray:
+    def calculate_pattern_confirmation(self, data: pd.DataFrame, window: int = 30) -> np.ndarray:
         """形态确认度"""
         return self.analyzer.get_pattern_confirmation(data, window=window)
     
@@ -194,11 +200,11 @@ class CandlestickPatternFactors:
         # 多根K线形态
         factors['bullish_engulfing'] = self.calculate_bullish_engulfing(data, context=context)
         factors['bearish_engulfing'] = self.calculate_bearish_engulfing(data, context=context)
-        factors['piercing_line'] = self.calculate_piercing_line(data)
-        factors['dark_cloud_cover'] = self.calculate_dark_cloud_cover(data)
+        factors['piercing_line'] = self.calculate_piercing_line(data, context=context)
+        factors['dark_cloud_cover'] = self.calculate_dark_cloud_cover(data, context=context)
         factors['morning_star'] = self.calculate_morning_star(data, context=context)
         factors['evening_star'] = self.calculate_evening_star(data, context=context)
-        factors['harami'] = self.calculate_harami(data)
+        factors['harami'] = self.calculate_harami(data, context=context)
         factors['three_white_soldiers'] = self.calculate_three_white_soldiers(data, context=context)
         factors['three_black_crows'] = self.calculate_three_black_crows(data, context=context)
         

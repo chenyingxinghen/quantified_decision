@@ -90,7 +90,7 @@ AUTO_MAX_PE = None              # PE 不高于 150 倍
 AUTO_MAX_ZCFZL = None
 
 # 股价区间（元），过滤极低价或高价股。None = 不限制
-AUTO_MIN_PRICE = 1.0             # 最低 1 元
+AUTO_MIN_PRICE = 0.0             # 最低 0 元
 AUTO_MAX_PRICE = 20.0           # 最高 20 元
 
 # 是否包含 ST / *ST 股票。实盘建议设为 False 规避退市风险

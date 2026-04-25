@@ -399,7 +399,18 @@ class ExecutionController:
             code = s['stock_code']
             base_code = code[:6]
             if base_code in holding_codes:
-                logger.info(f"  {code} 已在持仓，跳过。")
+                logger.info(f"  {code} 已在持仓，同步元数据后跳过下单。")
+                # 即使已持仓，也确保本地有元数据（防止手动买入或之前记录丢失）
+                if base_code not in self.tracking_data["positions"]:
+                    self.tracking_data["positions"][base_code] = {
+                        "entry_date": datetime.now().strftime("%Y-%m-%d"),
+                        "entry_price": signal.get('current_price', 0),
+                        "stop_loss": signal.get('stop_loss'),
+                        "take_profit": signal.get('take_profit'),
+                        "confidence": signal.get('confidence'),
+                        "is_st": signal.get('is_st', False),
+                    }
+                    self._save_tracking()
                 continue
             
             p_status = self.tracking_data["processed_today"].get(base_code)
@@ -656,60 +667,109 @@ class ExecutionController:
 
 
     def update_entry_prices_from_positions(self):
-        """买入窗口结束后，从实盘持仓的「成本价」字段修正 entry_price 并重算止盈止损偏移。
-        使用 cleanup=False：只读取实盘持仓用于修正，不触发本地记录清理（清理由 execute_sells 负责）。
+        """买入窗口结束后，从实盘持仓的「成本价」字段修正 entry_price 并同步持仓列表。
+        1. 移除本地 tracking 中已不存在于实盘的记录。
+        2. 将实盘中存在但本地 tracking 缺失的记录添加进来（尽量从今日信号中恢复元数据）。
+        3. 修正已存在记录的成本价。
         """
         positions = self.sync_positions(cleanup=False)
         if positions is None:
-            logger.warning("update_entry_prices: 持仓获取失败，跳过修正。")
-            return
-        if not positions:
-            logger.info("update_entry_prices: 当前无持仓，跳过修正。")
+            logger.warning("update_entry_prices: 持仓获取失败，跳过同步。")
             return
 
-        updated = []
+        real_codes = []
+        real_positions_dict = {}
         for p in positions:
             code = p.get('证券代码', p.get('stock_code', ''))
-            if not code:
-                continue
+            if not code: continue
             base_code = code[:6]
+            real_codes.append(base_code)
+            real_positions_dict[base_code] = p
 
-            meta = self.tracking_data["positions"].get(base_code)
-            if not meta:
-                continue  # 非本系统买入的持仓，不处理
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        modified = False
 
-            raw_cost = p.get('成本价')
-            if raw_cost is None:
-                logger.warning(f"  {base_code}: 持仓数据中无「成本价」字段，跳过修正。")
-                continue
+        # 1. 移除：本地有但实盘没读到（确认已卖出或手动卖出）
+        tracking_codes = list(self.tracking_data["positions"].keys())
+        for code in tracking_codes:
+            if code not in real_codes:
+                logger.info(f"  {code}: 实盘已无持仓，从本地追踪中移除。")
+                del self.tracking_data["positions"][code]
+                modified = True
 
-            actual_entry = float(raw_cost)
-            if actual_entry <= 0:
-                logger.warning(f"  {base_code}: 成本价为 {actual_entry}，跳过修正。")
-                continue
+        # 2. 添加与修正
+        for base_code, p in real_positions_dict.items():
+            # 兼容多种成本价字段名称
+            cost_keys = ['成本价', '成本', '买入成本', '持仓成本', '买入均价']
+            raw_cost = None
+            for k in cost_keys:
+                if k in p:
+                    raw_cost = p.get(k)
+                    break
+            
+            actual_entry = 0.0
+            if raw_cost is not None:
+                try:
+                    actual_entry = float(raw_cost)
+                except (ValueError, TypeError):
+                    pass
 
-            old_entry = meta.get('entry_price', 0)
-            if abs(actual_entry - old_entry) < 0.001:
-                logger.info(f"  {base_code}: 成本价与委托价一致 ({actual_entry})，无需修正。")
-                continue
+            if base_code not in self.tracking_data["positions"]:
+                # 添加：实盘有但本地无 (可能是今日买入成功但确认记录丢失，或者手动买入)
+                logger.info(f"  {base_code}: 实盘有持仓但本地未追踪，尝试添加记录...")
+                
+                # 尝试从今日信号中恢复 SL/TP
+                signal = next((s for s in self.signals_cache if s['stock_code'][:6] == base_code), None)
+                
+                if signal:
+                    ref_price = signal.get('current_price', 0)
+                    raw_sl = signal.get('stop_loss')
+                    raw_tp = signal.get('take_profit')
+                    # 按实际成交价偏移重算
+                    adjusted_sl = (actual_entry - (ref_price - float(raw_sl))) if ref_price > 0 and raw_sl is not None else raw_sl
+                    adjusted_tp = (actual_entry + (float(raw_tp) - ref_price)) if ref_price > 0 and raw_tp is not None else raw_tp
+                    
+                    self.tracking_data["positions"][base_code] = {
+                        "entry_date": today_str,
+                        "entry_price": actual_entry,
+                        "stop_loss": adjusted_sl,
+                        "take_profit": adjusted_tp,
+                        "confidence": signal.get('confidence'),
+                        "is_st": signal.get('is_st', False),
+                    }
+                    logger.info(f"  {base_code}: 已从信号列表恢复元数据并添加。")
+                else:
+                    # 彻底无元数据，添加基础记录
+                    self.tracking_data["positions"][base_code] = {
+                        "entry_date": today_str, # 只能假设是今天
+                        "entry_price": actual_entry,
+                        "stop_loss": None,
+                        "take_profit": None,
+                        "is_st": False, # 默认
+                    }
+                    logger.info(f"  {base_code}: 无关联信号，已添加基础追踪记录。")
+                modified = True
+            else:
+                # 修正已有的成本价
+                meta = self.tracking_data["positions"][base_code]
+                old_entry = meta.get('entry_price', 0)
+                if abs(actual_entry - old_entry) >= 0.001:
+                    old_sl = meta.get('stop_loss')
+                    old_tp = meta.get('take_profit')
+                    new_sl = round(actual_entry + (float(old_sl) - old_entry), 3) if old_sl is not None and old_entry > 0 else old_sl
+                    new_tp = round(actual_entry + (float(old_tp) - old_entry), 3) if old_tp is not None and old_entry > 0 else old_tp
+                    
+                    meta['entry_price'] = actual_entry
+                    meta['stop_loss'] = new_sl
+                    meta['take_profit'] = new_tp
+                    logger.info(f"  {base_code}: 成本价修正 {old_entry} → {actual_entry} | SL {old_sl} → {new_sl}")
+                    modified = True
 
-            # 按原始偏移量重算止盈止损
-            old_sl = meta.get('stop_loss')
-            old_tp = meta.get('take_profit')
-            new_sl = round(actual_entry + (float(old_sl) - old_entry), 3) if old_sl is not None and old_entry > 0 else old_sl
-            new_tp = round(actual_entry + (float(old_tp) - old_entry), 3) if old_tp is not None and old_entry > 0 else old_tp
-
-            meta['entry_price'] = actual_entry
-            meta['stop_loss'] = new_sl
-            meta['take_profit'] = new_tp
-            updated.append(base_code)
-            logger.info(f"  {base_code}: entry_price {old_entry} → {actual_entry} | SL {old_sl} → {new_sl} | TP {old_tp} → {new_tp}")
-
-        if updated:
+        if modified:
             self._save_tracking()
-            logger.info(f"update_entry_prices: 已修正 {len(updated)} 只持仓: {updated}")
+            logger.info("update_entry_prices: tracking.json 已同步。")
         else:
-            logger.info("update_entry_prices: 无需修正。")
+            logger.info("update_entry_prices: 无需变更。")
 
     def is_in_buy_window(self) -> bool:
         now = datetime.now().strftime("%H:%M:%S")

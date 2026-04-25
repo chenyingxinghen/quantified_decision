@@ -22,19 +22,21 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 7,              # 增加深度以改善预测区分度
-        'min_child_weight': 250,       # 增加权重要求，防止过拟合
-        'learning_rate': 0.05,       
-        'subsample': 1,
+        'max_depth': 8,              # 增加深度以改善预测区分度
+        'learning_rate': 0.03, 
+
+      
+        'subsample': 0.8,
         'colsample_bytree': 0.8,
         'colsample_bylevel': 0.8, 
-        'gamma': 0.17,    
-        
-        'reg_alpha': 11,            
-        'reg_lambda': 23,             
+
+        # 'min_child_weight': 50,       # 增加权重要求，防止过拟合
+        'gamma': 0.05,    
+        'reg_alpha': 1,            
+        'reg_lambda': 1,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
-        'n_jobs': 8,
+        'n_jobs': 15,
         'early_stopping_rounds': 50,
         'verbosity': 0,              # 打印训练过程
     }
@@ -43,17 +45,17 @@ class ModelConfig:
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
         'max_depth': 8,
-        'min_child_weight': 200,
-        'num_leaves': 127,
-        'learning_rate': 0.05,
-        'min_gain_to_split': 0.12,
+        'num_leaves': 255,
+        'learning_rate': 0.03,
+        
+        # 'min_child_weight': 50,
+        'min_gain_to_split': 0.05,
+        'reg_alpha': 1,
+        'reg_lambda': 1,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
 
-        'reg_alpha': 5,
-        'reg_lambda': 13,
-        'subsample': 1,
-        'colsample_bytree': 1,
-
-        'label_gain': [float(i**1.5+1) for i in range(100)], 
+        'label_gain': [float(i**2+1) for i in range(50)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 512,
@@ -96,8 +98,8 @@ class TrainingConfig:
     """训练参数配置"""
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
-    MODEL_TYPES = ['lightgbm']
-
+    MODEL_TYPES = ['xgboost','lightgbm']
+    SAMPLE_EVAL = False    # 是否使用随机采样评估
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚 (兼容旧逻辑)
@@ -105,7 +107,7 @@ class TrainingConfig:
     
     # XGB标签构造参数 LGB样本权重构造参数
     LABEL_TARGET_SCALE = 2
-    LABEL_LAMBDA = 1.3           # 损失厌恶系数 (惩罚回撤)
+    LABEL_LAMBDA = 1           # 损失厌恶系数 (惩罚回撤)
     LABEL_PATH_PUNISH = 0.5      # 路径保护惩罚系数 (惩罚先跌后涨)
     LABEL_TIME_BONUS = 0.8       # 时间奖励系数 (奖励高点早的票)
     
@@ -116,8 +118,8 @@ class TrainingConfig:
     YEARS=baostock_config.HISTORY_YEARS
 
     YEARS_FOR_BACKTEST=1         # 回测年数
-    YEARS_FOR_TRAINING=15         # 训练年数
-    STOCK_NUM = 6000             # 股票数量
+    YEARS_FOR_TRAINING=2         # 训练年数
+    STOCK_NUM = 500             # 股票数量
     # 数据集划分
     TRAIN_TEST_SPLIT = 0.8
     

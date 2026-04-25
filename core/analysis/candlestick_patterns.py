@@ -56,8 +56,8 @@ class CandlestickPatterns:
         signal = c0 & c1 & c2 & ascending
         
         if context is not None:
-            # 强化：处于下降趋势末端或低位
-            signal = signal & (context['is_downtrend'] | (context['price_pos'] < 0.3))
+            # 强化：处于相对低位 (放宽到 0.5，因为三个阳线后价格会抬升)
+            signal = signal & (context['price_pos'] < 0.5)
             
         return signal.fillna(False).astype(float).values
 
@@ -72,8 +72,8 @@ class CandlestickPatterns:
         signal = c0 & c1 & c2 & descending
         
         if context is not None:
-            # 强化：处于上升趋势末端或高位
-            signal = signal & (context['is_uptrend'] | (context['price_pos'] > 0.7))
+            # 强化：处于相对高位 (放宽到 0.5，因为三个阴线后价格会下跌)
+            signal = signal & (context['price_pos'] > 0.5)
             
         return signal.fillna(False).astype(float).values
 
@@ -123,7 +123,8 @@ class CandlestickPatterns:
             
             # 部分方法需要 context
             if pid in ['hammer', 'hanging_man', 'shooting_star', 'inverted_hammer', 
-                      'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']:
+                      'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star',
+                      'three_white_soldiers', 'three_black_crows', 'piercing_line', 'dark_cloud_cover', 'harami']:
                 signal_arr = method(data, context)
             else:
                 signal_arr = method(data)
@@ -165,7 +166,8 @@ class CandlestickPatterns:
             method = getattr(self, f"identify_{pid}", None)
             if not method: continue
             if pid in ['hammer', 'hanging_man', 'shooting_star', 'inverted_hammer', 
-                      'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']:
+                      'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star',
+                      'three_white_soldiers', 'three_black_crows', 'piercing_line', 'dark_cloud_cover', 'harami', 'marubozu']:
                 signals[pid] = method(data, context)
             else:
                 signals[pid] = method(data)
@@ -196,7 +198,7 @@ class CandlestickPatterns:
     
     # ==================== 向量化识别逻辑 (精细识别) ====================
     
-    def calculate_context(self, data: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    def calculate_context(self, data: pd.DataFrame, window: int = 30) -> pd.DataFrame:
         """
         计算价格位置和趋势强度 (向量化)
         
@@ -208,25 +210,23 @@ class CandlestickPatterns:
         low = data['low']
         
         # 1. 价格位置 (0-1: 0=低位, 1=高位)
-        low_min = low.rolling(window).min()
-        high_max = high.rolling(window).max()
+        low_min = low.rolling(window, min_periods=1).min()
+        high_max = high.rolling(window, min_periods=1).max()
         # 避免除以零
-        denominator = (high_max - low_min).replace(0, 1e-6)
-        price_pos = (close - low_min) / denominator
+        range_val = (high_max - low_min).replace(0, 1e-6)
+        price_pos = (close - low_min) / range_val
         
-        # 2. 趋势方向 (使用更稳健的 MA 组合或线性回归，这里使用多周期 MA 确认)
-        ma_short = close.rolling(int(window/2)).mean()
-        ma_long = close.rolling(window).mean()
+        # 2. 趋势方向
+        ma_short = close.rolling(max(1, int(window/2)), min_periods=1).mean()
+        ma_long = close.rolling(window, min_periods=1).mean()
         
-        is_uptrend = (close > ma_short) & (ma_short > ma_long)
-        is_downtrend = (close < ma_short) & (ma_short < ma_long)
+        is_uptrend = (close >= ma_short) & (ma_short >= ma_long)
+        is_downtrend = (close <= ma_short) & (ma_short <= ma_long)
         
         # 3. 波动幅度 (判断是否横盘/窄幅震荡)
-        # 使用 ATR 或价格极差的百分比。这里定义：window日内波幅小于 7% 且 价格在 MA 附近波动
         diff_pct = (high_max - low_min) / low_min.replace(0, 1)
-        # 辅助判断：价格是否在 ma_long 的上下 2% 范围内
-        near_ma = (close / ma_long - 1).abs() < 0.02
-        is_sideways = (diff_pct < 0.07) | ((diff_pct < 0.12) & near_ma)
+        near_ma = (close / ma_long - 1).abs() < 0.03 # 略微放宽
+        is_sideways = (diff_pct < 0.10) & near_ma # 综合判断
         
         return pd.DataFrame({
             'price_pos': price_pos,
@@ -246,9 +246,10 @@ class CandlestickPatterns:
         return (data['open'] > data['close']).astype(float)
     
     def identify_doji(self, data: pd.DataFrame, threshold: float = 0.003) -> np.ndarray:
-        """识别十字星"""
+        """识别十字星 (考虑低价股最小变动单位)"""
         body_size = np.abs(data['close'] - data['open'])
-        price_scaled_threshold = data['close'] * threshold
+        # 针对低价股，如果 threshold 计算出的值小于 0.01，则放宽至 0.01 (最小跳动)
+        price_scaled_threshold = np.maximum(data['close'] * threshold, 0.0101)
         return (body_size < price_scaled_threshold).astype(float)
     
     def identify_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
@@ -413,8 +414,8 @@ class CandlestickPatterns:
         )
         return engulfed.fillna(False).astype(float).values
     
-    def identify_piercing_line(self, data: pd.DataFrame) -> np.ndarray:
-        """识别刺穿线"""
+    def identify_piercing_line(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """识别刺穿线 (看涨反转)"""
         prev_open = data['open'].shift(1)
         prev_close = data['close'].shift(1)
         curr_open = data['open']
@@ -429,10 +430,15 @@ class CandlestickPatterns:
             (curr_close > midpoint) &
             (curr_close < prev_open)
         )
+        
+        if context is not None:
+            # 强化：处于相对低位
+            piercing = piercing & (context['price_pos'] < 0.4)
+            
         return piercing.fillna(False).astype(float).values
     
-    def identify_dark_cloud_cover(self, data: pd.DataFrame) -> np.ndarray:
-        """识别乌云盖顶"""
+    def identify_dark_cloud_cover(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """识别乌云盖顶 (看跌反转)"""
         prev_open = data['open'].shift(1)
         prev_close = data['close'].shift(1)
         curr_open = data['open']
@@ -447,6 +453,11 @@ class CandlestickPatterns:
             (curr_close < midpoint) &
             (curr_close > prev_open)
         )
+        
+        if context is not None:
+            # 强化：处于相对高位
+            dark_cloud = dark_cloud & (context['price_pos'] > 0.6)
+            
         return dark_cloud.fillna(False).astype(float).values
     
     def identify_morning_star(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
@@ -493,8 +504,8 @@ class CandlestickPatterns:
         )
         return evening_star.fillna(False).astype(float).values
     
-    def identify_harami(self, data: pd.DataFrame) -> np.ndarray:
-        """识别孕线"""
+    def identify_harami(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+        """识别孕线 (反转信号)"""
         open0 = data['open'].shift(1)
         close0 = data['close'].shift(1)
         open1 = data['open']
@@ -502,12 +513,17 @@ class CandlestickPatterns:
         
         body0 = np.abs(close0 - open0)
         body1 = np.abs(close1 - open1)
-        high0 = np.maximum(open0, close0)
-        low0 = np.minimum(open0, close0)
         high1 = np.maximum(open1, close1)
         low1 = np.minimum(open1, close1)
+        high0 = np.maximum(open0, close0)
+        low0 = np.minimum(open0, close0)
         
         harami = (body0 > body1 * 2) & (high1 < high0) & (low1 > low0)
+        
+        if context is not None:
+            # 只有在极端位置才认为是有效的反转孕线
+            harami = harami & ((context['price_pos'] < 0.3) | (context['price_pos'] > 0.7))
+            
         return harami.fillna(False).astype(float).values
     
     # --- 强度与确认度计算 ---
@@ -543,13 +559,17 @@ class CandlestickPatterns:
         return strength.fillna(0).values
     
     def get_pattern_confirmation(self, data: pd.DataFrame, window: int = 3) -> np.ndarray:
-        """计算形态确认度 (future direction alignment)"""
+        """
+        计算形态确认度 (使用过去的数据确认)
+        修复前视偏差：不再使用 shift(-i)，改为观察过去 window 天的方向一致性
+        """
         direction = np.where(data['close'] > data['open'], 1, -1)
         direction_ser = pd.Series(direction, index=data.index)
         confirm_count = pd.Series(0.0, index=data.index)
         for i in range(1, window):
-            next_direction = direction_ser.shift(-i)
-            confirm_count += (next_direction == direction_ser).astype(int)
+            # 改为向后看 (Positive shift)
+            prev_direction = direction_ser.shift(i)
+            confirm_count += (prev_direction == direction_ser).astype(int)
         return (confirm_count / (window - 1)).fillna(0).values
 
     def get_total_bearish_score(self, data: pd.DataFrame) -> int:

@@ -361,7 +361,7 @@ async def get_stock_factors(code: str, days: int = Query(default=250, ge=30, le=
 
         df = df.sort_values("date").reset_index(drop=True)
         calc = _load_factor_calculator()
-        factors = calc.calculate_all_factors(code, df, apply_feature_engineering=False)
+        factors = calc.calculate_all_factors(code, df, apply_feature_engineering=True)
         if factors is None or factors.empty:
             raise HTTPException(status_code=500, detail="因子计算失败")
 

@@ -428,7 +428,8 @@ class MLFactorModel:
     def _evaluate(self, X: Any, y: np.ndarray, dataset_name: str, returns: np.ndarray = None, 
                  dates: np.ndarray = None, sample_ratio: float = 1.0) -> Dict:
         y_prob = self._get_predict_proba(X)
-        
+        if not TrainingConfig.SAMPLE_EVAL:
+            sample_ratio = 1.0
         # 1. 基础指标计算 (针对类别/回归)
         # y 可能包含软标签，因此先进行二元化处理
         y_true_bin = (y >= 0.5).astype(int)

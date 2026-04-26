@@ -23,9 +23,9 @@ ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型�
 # ==============================================================================
 
 # ATR相关参数（用于止损止盈计算）
-ATR_PERIOD = 5                     # ATR计算周期
+ATR_PERIOD = 7                     # ATR计算周期
 ATR_STOP_MULTIPLIER = 1.0           # ATR止损倍数 (与训练一致)
-ATR_TARGET_MULTIPLIER = 3.0         # ATR目标倍数 (与训练一致)
+ATR_TARGET_MULTIPLIER = 4.0         # ATR目标倍数 (与训练一致)
 
 # 交易费率
 COMMISSION_RATE = 0.005           

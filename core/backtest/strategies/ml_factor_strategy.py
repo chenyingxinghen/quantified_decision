@@ -100,7 +100,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 优先使用实时传入的 criteria，如果传入了则强制开启过滤
         if hasattr(self, '_custom_criteria'):
             filter_criteria = self._custom_criteria
-            should_apply_filter = True
+            should_apply_filter = True if not self._custom_criteria else False
         else:
             filter_criteria = {
                 'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,

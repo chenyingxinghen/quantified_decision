@@ -140,12 +140,14 @@ def main():
     # 解析数据集
     X, y, returns, factor_names, dates, unbuyable_mask, limit_groups = full_dataset[:7]
     path_scores = full_dataset[7] if len(full_dataset) > 7 else None
+    is_st_arr = full_dataset[8] if len(full_dataset) > 8 else None
     
     results = trainer.train_models(
         X, y, returns, factor_names, dates,
         unbuyable_mask=unbuyable_mask,
         limit_groups=limit_groups,
-        path_scores=path_scores
+        path_scores=path_scores,
+        is_st_arr=is_st_arr
     )
 
     # ── 8. 对比与保存 ────────────────────────────────────────────────────

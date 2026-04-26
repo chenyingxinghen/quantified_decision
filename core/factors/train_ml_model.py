@@ -475,9 +475,9 @@ class MLModelTrainer:
         eps = 1e-4
         
         # ---------------------------------------------------------
-        # 1. 核心收益项 (转换为 ATR 倍数)
+        # 1. 核心收益项
         # ---------------------------------------------------------
-        core_term = f_returns / (rel_atr + eps)*getattr(TrainingConfig, 'LABEL_TARGET_SCALE', 1.5)
+        base_weight = 1+f_returns * getattr(TrainingConfig, 'LABEL_TARGET_SCALE', 1.5)
             
         # ---------------------------------------------------------
         # 2. 损失厌恶项 (非线性穿透惩罚)
@@ -487,9 +487,9 @@ class MLModelTrainer:
         
         # 【优化】非线性惩罚：小于 1 ATR 线性计算，大于 1 ATR 呈2次方级放大
         # 这样模型会极度厌恶“破位”的股票
-        loss_aversion = np.where(downside_gap <= 1.0,
-                                -lambda_val * np.maximum(0, downside_gap),
-                                -lambda_val * (1.0 + (downside_gap - 1.0) ** 2))
+        loss_aversion = np.where(downside_gap > 0,
+                                -lambda_val * downside_gap,
+                                0)
         
         # ---------------------------------------------------------
         # 3. 路径保护惩罚 (V型反转过滤)
@@ -500,16 +500,16 @@ class MLModelTrainer:
         is_v_shape = (f_low_idx < f_high_idx) & (downside_gap > 1.0)
         
         # 【优化】对于先大跌再拉回的票，我们将其核心收益进行“打折”，而不是单纯叠加负分
-        # 如果 core_term 是正的，按下跌深度削减其得分；如果是负的，保持原样（因为 loss_aversion 已经惩罚过了）
-        path_penalty = np.where(is_v_shape & (core_term > 0),
-                                -core_term * path_punish_coef * np.clip(downside_gap, 1.0, 2.0), 
+        # 如果 base_weight 是正的，按下跌深度削减其得分；如果是负的，保持原样（因为 loss_aversion 已经惩罚过了）
+        path_penalty = np.where(is_v_shape & (base_weight > 1),
+                                -path_punish_coef * np.clip(downside_gap, 1, 2), 
                                 0)
                                 
         # 4. 资金效率奖励 (如果高点发生得很早，且核心收益为正，给予微弱加分)
         # 修复：仅对正收益生效，避免对"高点早但最终亏损"的票产生额外惩罚
-        time_bonus = np.where((f_high_idx < 2) & (core_term > 0), TrainingConfig.LABEL_TIME_BONUS * core_term, 0)
+        time_bonus = np.where((f_high_idx < 2) & (base_weight > 1), TrainingConfig.LABEL_TIME_BONUS * base_weight, 0)
 
-        final_score = core_term + loss_aversion + path_penalty+time_bonus
+        final_score = base_weight + loss_aversion + path_penalty+time_bonus
         
         return final_score
 
@@ -608,13 +608,13 @@ class MLModelTrainer:
                     # 为每一行计算对应的涨停阈值
                     limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
                     
-                    if 'is_st' in data.columns:
-                        limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
-                    
                     if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
                         limit_thresholds[:] = MARKET_LIMITS['gem_star']
                     elif code.startswith(MARKET_PREFIXES['bj']):
                         limit_thresholds[:] = MARKET_LIMITS['bj']
+                    
+                    if 'is_st' in data.columns:
+                        limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
                     
                     # 使用逐行的阈值判断涨停 (引入 epsilon 容差防止浮点数和四舍五入判定失效)
                     pct_change = data['close'].pct_change()
@@ -631,11 +631,12 @@ class MLModelTrainer:
                     if not getattr(TrainingConfig, 'USE_AMOUNT_TURNOVER', False):
                         drop_cols.extend(['amount', 'turnover_rate'])
                     X_df = X_df.drop(columns=[c for c in drop_cols if c in X_df.columns], errors='ignore')
+                    is_st_mask = is_st_series.values
                     
                     if len(X_df) > 0:
-                        return X_df, final_y, final_returns, dates, unbuyable_mask, limit_groups
+                        return X_df, final_y, final_returns, dates, unbuyable_mask, limit_groups, is_st_mask
             
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         
         except Exception as e:
             import traceback
@@ -854,6 +855,7 @@ class MLModelTrainer:
         dates_arr = np.empty(actual_rows, dtype=object)
         unbuyable_arr = np.empty(actual_rows, dtype=bool)
         limit_groups_arr = np.empty(actual_rows, dtype=np.float32)
+        is_st_arr = np.empty(actual_rows, dtype=bool)
         
         # 3. 填充数据并立即从 results 中剔除已处理对象
         print("  - 正在合并数据 (Incremental Fill)...")
@@ -863,11 +865,15 @@ class MLModelTrainer:
             n = len(res[0])
             
             # 分解结果
-            if len(res) == 6:
+            if len(res) == 7:
+                X, y, r, d, u, l, is_st = res
+            elif len(res) == 6:
                 X, y, r, d, u, l = res
+                is_st = np.zeros(n, dtype=bool)
             else:
                 X, y, r, d, u = res
                 l = np.full(n, 0.1, dtype=np.float32)
+                is_st = np.zeros(n, dtype=bool)
 
             X_arr[cursor:cursor+n] = X.values.astype(np.float32, copy=False)
             y_raw_arr[cursor:cursor+n] = y.values if isinstance(y, pd.Series) else y
@@ -875,6 +881,7 @@ class MLModelTrainer:
             dates_arr[cursor:cursor+n] = d
             unbuyable_arr[cursor:cursor+n] = u
             limit_groups_arr[cursor:cursor+n] = l
+            is_st_arr[cursor:cursor+n] = is_st
             
             # 手动销毁 results 中的引用，释放 DataFrame 内存
             results[idx] = None
@@ -894,6 +901,7 @@ class MLModelTrainer:
         returns_arr = returns_arr[sort_idx]
         unbuyable_arr = unbuyable_arr[sort_idx]
         limit_groups_arr = limit_groups_arr[sort_idx]
+        is_st_arr = is_st_arr[sort_idx]
         
         # X_arr 排序
         X_sorted = X_arr[sort_idx] 
@@ -915,6 +923,7 @@ class MLModelTrainer:
                     returns_arr = returns_arr[keep_mask]
                     dates_arr = dates_arr[keep_mask]
                     limit_groups_arr = limit_groups_arr[keep_mask]
+                    is_st_arr = is_st_arr[keep_mask]
                     # 重新获取日期分组信息
                     _, date_group_start, date_group_counts = np.unique(dates_arr, return_index=True, return_counts=True)
                     unbuyable_arr = unbuyable_arr[keep_mask]
@@ -1026,7 +1035,7 @@ class MLModelTrainer:
         print("="*50 + "\n")
         
         # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
-        return X_arr, y_norm_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, y_raw_arr
+        return X_arr, y_norm_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, y_raw_arr, is_st_arr
     
     def train_models(self, X: np.ndarray, y: np.ndarray, 
                     returns: np.ndarray,
@@ -1035,7 +1044,8 @@ class MLModelTrainer:
                     unbuyable_mask: np.ndarray = None,
                     limit_groups: np.ndarray = None,
                     model_types: List[str] = TrainingConfig.MODEL_TYPES,
-                    path_scores: np.ndarray = None) -> Dict:
+                    path_scores: np.ndarray = None,
+                    is_st_arr: np.ndarray = None) -> Dict:
         """
         训练多个模型
         """
@@ -1079,10 +1089,25 @@ class MLModelTrainer:
         default_sample_weight = None
         if self.punish_unbuyable:
             if limit_groups is not None:
+                ref_limit = 0.10
                 default_sample_weight = np.abs(returns / np.clip(limit_groups, 0.04, 0.3))
+                default_sample_weight = default_sample_weight * (limit_groups / ref_limit)
             else:
-                default_sample_weight = np.abs(returns)
+                raise ValueError("limit_groups is required when punish_unbuyable is True")
             default_sample_weight = default_sample_weight / (default_sample_weight.mean() + 1e-6)
+        
+        ST_WEIGHT_FACTOR = getattr(TrainingConfig, 'ST_WEIGHT_FACTOR', 1.0)
+        if is_st_arr is not None and ST_WEIGHT_FACTOR < 1.0:
+            st_weight = np.ones(len(is_st_arr), dtype=np.float32)
+            st_weight[is_st_arr] = ST_WEIGHT_FACTOR
+            if default_sample_weight is not None:
+                default_sample_weight = default_sample_weight * st_weight
+            else:
+                default_sample_weight = st_weight
+            default_sample_weight = default_sample_weight / (default_sample_weight.mean() + 1e-6)
+            st_count = np.sum(is_st_arr)
+            if st_count > 0:
+                print(f"  - ST 样本权重降低因子: {ST_WEIGHT_FACTOR} (ST 样本数: {st_count})")
         
         results = {}
         for model_type in model_types:
@@ -1112,7 +1137,7 @@ class MLModelTrainer:
                         shifted_scores = processed_scores - median_val
                         
                         # 3. 限制极端权重 (建议缩减 clip 范围)
-                        log_weight = np.clip(shifted_scores * 1, 1, 2) 
+                        log_weight = np.clip(shifted_scores * 1, -1, 1) 
                         current_weight = np.exp(log_weight)
                         
                         # 4. 归一化：保持总梯度规模不变
@@ -1482,7 +1507,7 @@ def main():
 
     
     # 5. 准备数据集
-    dataset = trainer.prepare_dataset(
+    X, y, returns, factor_names, dates, unbuyable, limit_groups, path_scores, is_st_arr = trainer.prepare_dataset(
         stocks_data,
         cache_engineered_features=args.cache_engineered,
         train_start_date=train_start_date,
@@ -1490,16 +1515,9 @@ def main():
         include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
     )
     
-    # 解析数据集
-    if len(dataset) == 8:
-        X, y, returns, factor_names, dates, unbuyable, limit_groups, path_scores = dataset
-    else:
-        X, y, returns, factor_names, dates, unbuyable, limit_groups = dataset
-        path_scores = None
-    
     # 6. 训练模型
     model_types = TrainingConfig.MODEL_TYPES
-    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, limit_groups, model_types, path_scores=path_scores)
+    results = trainer.train_models(X, y, returns, factor_names, dates, unbuyable, limit_groups, model_types, path_scores=path_scores, is_st_arr=is_st_arr)
     
     # 7. 对比模型
     best_model_type = trainer.compare_models(results)

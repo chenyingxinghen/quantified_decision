@@ -121,6 +121,7 @@ def main():
     )
     X, y, returns, factor_names, dates, unbuyable, limit_groups = full_dataset[:7]
     path_scores = full_dataset[7] if len(full_dataset) > 7 else None
+    is_st_arr = full_dataset[8] if len(full_dataset) > 8 else None
     
     logger.info(f"特征矩阵规模: {X.shape[0]} 样本 x {X.shape[1]} 特征")
     logger.info(f"正样本率: {np.mean(y >= 0.5):.2%} (软标签均值: {np.mean(y):.4f})")
@@ -187,7 +188,8 @@ def main():
         train_results = trainer.train_models(
             X, y, returns, factor_names, dates, unbuyable, limit_groups, 
             model_types=model_types,
-            path_scores=path_scores
+            path_scores=path_scores,
+            is_st_arr=is_st_arr
         )
     
     if not trainer.models:

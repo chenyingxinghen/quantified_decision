@@ -22,18 +22,17 @@ class ModelConfig:
     # XGBoost配置
     XGBOOST_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 8,              # 增加深度以改善预测区分度
+        'max_depth': 7,              # 增加深度以改善预测区分度
         'learning_rate': 0.03, 
-
       
         'subsample': 0.8,
-        'colsample_bytree': 0.8,
+        'colsample_bytree': 0.5,
         'colsample_bylevel': 0.8, 
 
-        # 'min_child_weight': 50,       # 增加权重要求，防止过拟合
-        'gamma': 0.05,    
-        'reg_alpha': 1,            
-        'reg_lambda': 1,             
+        'min_child_weight': 1,       # 增加权重要求，防止过拟合
+        'gamma': 0.1,    
+        'reg_alpha': 7,            
+        'reg_lambda': 17,             
         'objective': 'reg:logistic', 
         'eval_metric': 'auc',       
         'n_jobs': 15,
@@ -44,22 +43,23 @@ class ModelConfig:
     # LightGBM配置
     LIGHTGBM_PARAMS = {
         'n_estimators': 3000,
-        'max_depth': 8,
-        'num_leaves': 255,
-        'learning_rate': 0.03,
+        'max_depth': 7,
+        'num_leaves': 127,
+        'learning_rate': 0.05,
         
-        # 'min_child_weight': 50,
-        'min_gain_to_split': 0.05,
-        'reg_alpha': 1,
-        'reg_lambda': 1,
+        'min_child_weight': 1,
+        'min_gain_to_split': 0.1,
+        'reg_alpha': 3,
+        'reg_lambda': 17,
         'subsample': 0.8,
         'colsample_bytree': 0.8,
 
-        'label_gain': [float(i**2+1) for i in range(50)], 
+        'label_gain': [float(i**2+1) for i in range(100)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 512,
+        'lambdarank_truncation_level': 100,
 
+        'ndcg_eval_at': [i for i in range(1, 5)],  # 评估 ndcg@100'
         'n_jobs': 15,
         'verbosity': -1,
         'early_stopping_rounds': 50,
@@ -99,10 +99,11 @@ class TrainingConfig:
     # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
     TASK_TYPE = 'hybrid' 
     MODEL_TYPES = ['xgboost','lightgbm']
-    SAMPLE_EVAL = False    # 是否使用随机采样评估
+    SAMPLE_EVAL = True    # 是否使用随机采样评估
 
     INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
     PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚 (兼容旧逻辑)
+    ST_WEIGHT_FACTOR = 0.5       # ST 股票样本权重降低因子 (0.5 表示权重减半)
     UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
     
     # XGB标签构造参数 LGB样本权重构造参数
@@ -118,8 +119,8 @@ class TrainingConfig:
     YEARS=baostock_config.HISTORY_YEARS
 
     YEARS_FOR_BACKTEST=1         # 回测年数
-    YEARS_FOR_TRAINING=2         # 训练年数
-    STOCK_NUM = 500             # 股票数量
+    YEARS_FOR_TRAINING=16         # 训练年数
+    STOCK_NUM = 6000             # 股票数量
     # 数据集划分
     TRAIN_TEST_SPLIT = 0.8
     
@@ -140,68 +141,68 @@ class TrainingConfig:
 # ============================================================================
 
 class FactorConfig:
-    """因子计算参数配置"""
+    """因子计算参数配置（优化为短线策略，适合1-5日持仓）"""
     
-    # 动量因子参数
-    RSI_PERIOD = 42
-    ROC_PERIOD = 60
-    MTM_PERIOD = 40
-    CMO_PERIOD = 42
-    STOCHRSI_PERIOD = 28
-    RVI_PERIOD = 14
+    # ========== 动量因子参数 ==========
+    RSI_PERIOD = 9            # 原42，短线常用7~14，取9平衡灵敏度与稳定性
+    ROC_PERIOD = 10           # 原60，10日变动率捕捉短期加速
+    MTM_PERIOD = 8            # 原40，8日动量适应快速转折
+    CMO_PERIOD = 14           # 原42，钱德指标缩短至14日
+    STOCHRSI_PERIOD = 12      # 原28，随机RSI缩短至12
+    RVI_PERIOD = 7            # 原14，相对活力指数更短以快速确认方向
     
-    # 趋势因子参数
-    MACD_FAST = 25
-    MACD_SLOW = 90
-    MACD_SIGNAL = 20
-    ADX_PERIOD = 35
-    DMI_PERIOD = 35
-    AROON_PERIOD = 50
-    TRIX_PERIOD = 30
+    # ========== 趋势因子参数 ==========
+    MACD_FAST = 6             # 原25，快线缩短提高交叉频率
+    MACD_SLOW = 13            # 原90，慢线大幅缩短
+    MACD_SIGNAL = 5           # 原20，信号线同步缩短
+    ADX_PERIOD = 14           # 原35，14日ADX识别短期趋势强度
+    DMI_PERIOD = 14           # 原35，与ADX保持一致
+    AROON_PERIOD = 14         # 原50，阿隆周期缩短，更快捕捉新高低点
+    TRIX_PERIOD = 12          # 原30，三重指数均线缩短至12
     
-    # 均线参数
-    MA_RATIO_PERIOD = 120
-    MA_SLOPE_PERIOD = 30
+    # ========== 均线参数 ==========
+    MA_RATIO_PERIOD = 20      # 原120，使用20日均线衡量短期偏离
+    MA_SLOPE_PERIOD = 8       # 原30，8日均线斜率判断短期方向
     
-    # 波动率因子参数
-    ATR_PERIOD = 30
-    NATR_PERIOD = 28
-    BB_PERIOD = 100
-    BB_STD = 1.5
-    CCI_PERIOD = 35
-    ULCER_PERIOD = 35
-    PRICE_VAR_PERIOD = 30
+    # ========== 波动率因子参数 ==========
+    ATR_PERIOD = 10           # 原30，10日ATR快速反映近期波幅
+    NATR_PERIOD = 10          # 原28，归一化ATR同周期
+    BB_PERIOD = 20            # 原100，布林带中轨20日均线，短线标准
+    BB_STD = 1.5              # 保持不变，1.5倍标准差带略宽过滤噪音
+    CCI_PERIOD = 14           # 原35，14日CCI捕捉短期超买超卖
+    ULCER_PERIOD = 14         # 原35，溃疡指数缩短
+    PRICE_VAR_PERIOD = 10     # 原30，价格方差窗口缩短
     
-    # 成交量因子参数
-    VOLUME_MA_PERIOD = 5
-    VOLUME_STD_PERIOD = 10
-    VOLUME_MA_SHORT = 5
-    VOLUME_MA_LONG = 10
-    AMOUNT_MA_PERIOD = 5
-    AMOUNT_STD_PERIOD = 10
-    MFI_PERIOD = 35
-    VR_PERIOD = 52
-    VROC_PERIOD = 36
-    VRSI_PERIOD = 21
-    VMACD_FAST = 25
-    VMACD_SLOW = 60
-    VMACD_SIGNAL = 20
-    ADOSC_FAST = 3
-    ADOSC_SLOW = 7
+    # ========== 成交量因子参数 ==========
+    VOLUME_MA_PERIOD = 5      # 原5，短线维持5日均量
+    VOLUME_STD_PERIOD = 8     # 原10，略微缩短量标准差周期
+    VOLUME_MA_SHORT = 3       # 原5，快量线改为3日
+    VOLUME_MA_LONG = 8        # 原10，慢量线改为8日
+    AMOUNT_MA_PERIOD = 5      # 原5，成交额均线保持
+    AMOUNT_STD_PERIOD = 8     # 原10，成交额标准差缩短
+    MFI_PERIOD = 14           # 原35，资金流向指标缩短至14
+    VR_PERIOD = 12            # 原52，量比率缩短至12
+    VROC_PERIOD = 10          # 原36，量变动速率缩短至10
+    VRSI_PERIOD = 9           # 原21，量RSI缩短至9
+    VMACD_FAST = 6            # 原25，量MACD参数与价格MACD近似
+    VMACD_SLOW = 13           # 原60
+    VMACD_SIGNAL = 5          # 原20
+    ADOSC_FAST = 2            # 原3，佳庆振荡器快线缩短
+    ADOSC_SLOW = 5            # 原7，慢线缩短，信号更灵敏
     
-    # 摆动指标参数
-    KDJ_N = 28
-    WILLR_PERIOD = 35
-    BIAS_PERIOD = 36
-    PSY_PERIOD = 30
-    AR_BR_PERIOD = 52
-    CR_PERIOD = 52
+    # ========== 摆动指标参数 ==========
+    KDJ_N = 9                 # 原28，KDJ周期常用9
+    WILLR_PERIOD = 14         # 原35，威廉指标14日标准短线
+    BIAS_PERIOD = 8           # 原36，乖离率缩短到8日
+    PSY_PERIOD = 12           # 原30，心理线12日
+    AR_BR_PERIOD = 13         # 原52，人气意愿指标缩短至13
+    CR_PERIOD = 13            # 原52，中间意愿指标一致
     
-    # K线形态参数
-    BODY_SIZE_THRESHOLD_LARGE = 0.015  # 大实体阈值（2%）
-    BODY_SIZE_THRESHOLD_SMALL = 0.003  # 小实体阈值（1%）
-    HAMMER_LOWER_SHADOW_RATIO = 1.5   # 锤子线下影线/实体比率
-    HAMMER_UPPER_SHADOW_RATIO = 0.5   # 锤子线上影线/实体比率
+    # ========== K线形态参数 ==========
+    BODY_SIZE_THRESHOLD_LARGE = 0.012   # 原0.015，短线中等波动即可视为大实体
+    BODY_SIZE_THRESHOLD_SMALL = 0.0025  # 原0.003，微调小实体识别精度
+    HAMMER_LOWER_SHADOW_RATIO = 1.5     # 保持
+    HAMMER_UPPER_SHADOW_RATIO = 0.5     # 保持
 
 
 # ============================================================================

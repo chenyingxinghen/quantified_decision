@@ -26,14 +26,14 @@ class ModelConfig:
         'learning_rate': 0.03, 
       
         'subsample': 0.8,
-        'colsample_bytree': 0.5,
+        'colsample_bytree': 0.8,
         'colsample_bylevel': 0.8, 
 
         'min_child_weight': 1,       # 增加权重要求，防止过拟合
-        'gamma': 0.1,    
+        'gamma': 0.15,    
         'reg_alpha': 7,            
         'reg_lambda': 17,             
-        'objective': 'reg:logistic', 
+        'objective': 'reg:squarederror', 
         'eval_metric': 'auc',       
         'n_jobs': 15,
         'early_stopping_rounds': 50,
@@ -45,21 +45,21 @@ class ModelConfig:
         'n_estimators': 3000,
         'max_depth': 7,
         'num_leaves': 127,
-        'learning_rate': 0.05,
+        'learning_rate': 0.03,
         
         'min_child_weight': 1,
-        'min_gain_to_split': 0.1,
-        'reg_alpha': 3,
+        'min_gain_to_split': 0.15,
+        'reg_alpha': 7,
         'reg_lambda': 17,
         'subsample': 0.8,
         'colsample_bytree': 0.8,
 
-        'label_gain': [float(i**2+1) for i in range(100)], 
+        'label_gain': [float(i**1.5+1) for i in range(100)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'lambdarank_truncation_level': 512,
 
-        'ndcg_eval_at': [i for i in range(1, 5)],  # 评估 ndcg@100'
+        'ndcg_eval_at': [i for i in range(1, 5)],  # 评估 ndcg@5'
         'n_jobs': 15,
         'verbosity': -1,
         'early_stopping_rounds': 50,

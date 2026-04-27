@@ -39,7 +39,7 @@ class AutoTrader:
         self.dry_run = DRY_RUN
         
         # 确保数据目录存在
-        os.makedirs(os.path.join(PROJECT_ROOT, "data", "automation"), exist_ok=True)
+        os.makedirs(os.path.join(PROJECT_ROOT, "database",'system_data', "automation"), exist_ok=True)
         
     def wait_for_desktop(self, timeout_seconds: int = 120) -> bool:
         """

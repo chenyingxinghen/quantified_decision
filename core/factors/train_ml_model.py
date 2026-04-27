@@ -654,8 +654,15 @@ class MLModelTrainer:
                     elif code.startswith(MARKET_PREFIXES['bj']):
                         limit_thresholds[:] = MARKET_LIMITS['bj']
                     
+                    # 只有主板ST才是5%；创业板/科创板ST仍是20%，北交所ST仍是30%
                     if 'is_st' in data.columns:
-                        limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
+                        is_main_board = ~(
+                            code.startswith(MARKET_PREFIXES['sz_gem']) or
+                            code.startswith(MARKET_PREFIXES['star']) or
+                            code.startswith(MARKET_PREFIXES['bj'])
+                        )
+                        if is_main_board:
+                            limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
                     
                     # 使用逐行的阈值判断涨停 (引入 epsilon 容差防止浮点数和四舍五入判定失效)
                     pct_change = data['close'].pct_change()
@@ -1174,14 +1181,8 @@ class MLModelTrainer:
                 current_weight = returns_weight
                 
                 if model_type == 'lightgbm':
-                    # LGBM ranking：标签用原始路径质量分，保留跨日绝对大小信息
-                    # ranking loss 本身只关心组内相对顺序，原始分比归一化分更稳定
-                    if path_scores is not None:
-                        current_y = path_scores.astype(np.float32)
-                        print("  [LGBM] 标签=原始路径质量分(ranking), 权重=收益归一化权重")
-                    else:
-                        current_y = y  # fallback
-                        print("  [LGBM] 标签=归一化路径质量分(fallback), 权重=收益归一化权重")
+                    current_y = y  # fallback
+                    print("  [LGBM] 标签=归一化路径质量分(ranking), 权重=收益归一化权重")
                 else:
                     # XGB regression：标签用每日板块中性化归一化后的路径质量分
                     current_y = y

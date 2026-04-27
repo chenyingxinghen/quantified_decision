@@ -191,9 +191,12 @@ class ComprehensiveFactorCalculator:
                 market_type[:] = 4
                 limit_threshold[:] = MARKET_LIMITS['bj']
             
-            # ST 具有最高优先级 (任何板块进入 ST 后，波动率限制都会变为 ST 标准)
+            # ST 只在主板才会将涨跌幅限制降至 5%；创业板/科创板/北交所的 ST 股票
+            # 涨跌幅限制不变（仍为 20%/30%），仅更新 market_type 标记
+            is_main_board = not code.startswith(('300', '301', '688', '689', '43', '83', '87', '88'))
             market_type[is_st_series] = 5
-            limit_threshold[is_st_series] = MARKET_LIMITS['st']
+            if is_main_board:
+                limit_threshold[is_st_series] = MARKET_LIMITS['st']
             
             # 记录市场类型特征 (作为机器学习特征)
             status_factors['market_type'] = market_type

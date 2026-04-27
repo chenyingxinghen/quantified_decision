@@ -45,7 +45,8 @@ class CandlestickPatterns:
             'harami': {'description': '孕线', 'score': 15, 'type': 'reversal', 'reliability': 60}
         }
 
-    def identify_three_white_soldiers(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+    def identify_three_white_soldiers(self, data: pd.DataFrame, context: pd.DataFrame = None,
+                                      price_pos_threshold: float = 0.5) -> np.ndarray:
         """识别三个白兵 (看涨反转)"""
         is_white = data['close'] > data['open']
         c0 = is_white.shift(2)
@@ -56,12 +57,12 @@ class CandlestickPatterns:
         signal = c0 & c1 & c2 & ascending
         
         if context is not None:
-            # 强化：处于相对低位 (放宽到 0.5，因为三个阳线后价格会抬升)
-            signal = signal & (context['price_pos'] < 0.5)
+            signal = signal & (context['price_pos'] < price_pos_threshold)
             
         return signal.fillna(False).astype(float).values
 
-    def identify_three_black_crows(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+    def identify_three_black_crows(self, data: pd.DataFrame, context: pd.DataFrame = None,
+                                   price_pos_threshold: float = 0.5) -> np.ndarray:
         """识别三只乌鸦 (看跌反转)"""
         is_black = data['open'] > data['close']
         c0 = is_black.shift(2)
@@ -72,8 +73,7 @@ class CandlestickPatterns:
         signal = c0 & c1 & c2 & descending
         
         if context is not None:
-            # 强化：处于相对高位 (放宽到 0.5，因为三个阴线后价格会下跌)
-            signal = signal & (context['price_pos'] > 0.5)
+            signal = signal & (context['price_pos'] > price_pos_threshold)
             
         return signal.fillna(False).astype(float).values
 
@@ -198,9 +198,16 @@ class CandlestickPatterns:
     
     # ==================== 向量化识别逻辑 (精细识别) ====================
     
-    def calculate_context(self, data: pd.DataFrame, window: int = 30) -> pd.DataFrame:
+    def calculate_context(self, data: pd.DataFrame, window: int = 30,
+                          sideways_ma_deviation: float = 0.03,
+                          sideways_range_pct: float = 0.10) -> pd.DataFrame:
         """
         计算价格位置和趋势强度 (向量化)
+        
+        Args:
+            window: 滚动窗口天数
+            sideways_ma_deviation: 横盘判断时收盘价偏离均线的最大比例
+            sideways_range_pct: 横盘判断时区间波动幅度最大比例
         
         返回:
             DataFrame 包含 price_pos(0-1), is_uptrend, is_downtrend, is_sideways, range_high, range_low
@@ -225,8 +232,8 @@ class CandlestickPatterns:
         
         # 3. 波动幅度 (判断是否横盘/窄幅震荡)
         diff_pct = (high_max - low_min) / low_min.replace(0, 1)
-        near_ma = (close / ma_long - 1).abs() < 0.03 # 略微放宽
-        is_sideways = (diff_pct < 0.10) & near_ma # 综合判断
+        near_ma = (close / ma_long - 1).abs() < sideways_ma_deviation
+        is_sideways = (diff_pct < sideways_range_pct) & near_ma
         
         return pd.DataFrame({
             'price_pos': price_pos,
@@ -253,7 +260,8 @@ class CandlestickPatterns:
         return (body_size < price_scaled_threshold).astype(float)
     
     def identify_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
-                        lower_ratio: float = 2.0, upper_ratio: float = 0.5) -> np.ndarray:
+                        lower_ratio: float = 2.0, upper_ratio: float = 0.5,
+                        price_pos_threshold: float = 0.3) -> np.ndarray:
         """
         识别锤子线 (看涨反转)
         符合市场常识：下影线至少是实体的2倍，上影线极短，且处于低位（超跌或趋势末端）
@@ -268,12 +276,13 @@ class CandlestickPatterns:
         is_hammer = (
             (lower_shadow > safe_body * lower_ratio) &
             (upper_shadow < safe_body * upper_ratio) &
-            (context['price_pos'] < 0.3) & (~context['is_sideways'])
+            (context['price_pos'] < price_pos_threshold) & (~context['is_sideways'])
         )
         return is_hammer.astype(float)
     
     def identify_hanging_man(self, data: pd.DataFrame, context: pd.DataFrame, 
-                            lower_ratio: float = 2.0, upper_ratio: float = 0.5) -> np.ndarray:
+                            lower_ratio: float = 2.0, upper_ratio: float = 0.5,
+                            price_pos_threshold: float = 0.75) -> np.ndarray:
         """
         识别上吊线 (看跌反转)
         符合市场常识：虽然形状像锤子，但出现在高位，预示买盘衰竭
@@ -287,12 +296,13 @@ class CandlestickPatterns:
         is_hanging_man = (
             (lower_shadow > safe_body * lower_ratio) &
             (upper_shadow < safe_body * upper_ratio) &
-            (context['price_pos'] > 0.75) & (context['is_uptrend'])
+            (context['price_pos'] > price_pos_threshold) & (context['is_uptrend'])
         )
         return is_hanging_man.astype(float)
     
     def identify_shooting_star(self, data: pd.DataFrame, context: pd.DataFrame, 
-                               upper_ratio: float = 2.0, lower_ratio: float = 0.5) -> np.ndarray:
+                               upper_ratio: float = 2.0, lower_ratio: float = 0.5,
+                               price_pos_threshold: float = 0.75) -> np.ndarray:
         """
         识别射击之星 (看跌反转)
         符合市场常识：长上影线（实体2倍以上），小实体，处于上涨后的高位
@@ -306,12 +316,13 @@ class CandlestickPatterns:
         is_shooting_star = (
             (upper_shadow > safe_body * upper_ratio) &
             (lower_shadow < safe_body * lower_ratio) &
-            (context['price_pos'] > 0.75) & (context['is_uptrend'])
+            (context['price_pos'] > price_pos_threshold) & (context['is_uptrend'])
         )
         return is_shooting_star.astype(float)
     
     def identify_inverted_hammer(self, data: pd.DataFrame, context: pd.DataFrame, 
-                                 upper_ratio: float = 2.0, lower_ratio: float = 0.5) -> np.ndarray:
+                                 upper_ratio: float = 2.0, lower_ratio: float = 0.5,
+                                 price_pos_threshold: float = 0.25) -> np.ndarray:
         """
         识别倒锤子线 (看涨反转)
         符合市场常识：长上影线（实体2倍以上），且处于低位，预示买盘尝试反攻
@@ -325,11 +336,12 @@ class CandlestickPatterns:
         is_inverted_hammer = (
             (upper_shadow > safe_body * upper_ratio) &
             (lower_shadow < safe_body * lower_ratio) &
-            (context['price_pos'] < 0.25) & (context['is_downtrend'])
+            (context['price_pos'] < price_pos_threshold) & (context['is_downtrend'])
         )
         return is_inverted_hammer.astype(float)
     
-    def identify_marubozu(self, data: pd.DataFrame, context: pd.DataFrame = None, threshold_ratio: float = 0.002) -> np.ndarray:
+    def identify_marubozu(self, data: pd.DataFrame, context: pd.DataFrame = None,
+                          threshold_ratio: float = 0.002, min_body_ratio: float = 0.015) -> np.ndarray:
         """
         识别光头光脚线 (趋势持续或横盘突破)
         符合市场常识：无影线或影线极短。
@@ -340,7 +352,7 @@ class CandlestickPatterns:
         threshold = data['close'] * threshold_ratio
         
         body = np.abs(data['close'] - data['open'])
-        is_long_body = body > (data['close'] * 0.015) # 实体至少1.5%
+        is_long_body = body > (data['close'] * min_body_ratio)
         
         is_pure = (lower_shadow < threshold) & (upper_shadow < threshold) & is_long_body
         
@@ -357,7 +369,9 @@ class CandlestickPatterns:
             
         return is_pure.astype(float)
     
-    def identify_spinning_top(self, data: pd.DataFrame) -> np.ndarray:
+    def identify_spinning_top(self, data: pd.DataFrame,
+                              body_ratio_max: float = 0.1,
+                              shadow_symmetry_max: float = 0.3) -> np.ndarray:
         """识别纺锤线"""
         body = np.abs(data['close'] - data['open'])
         candle_range = data['high'] - data['low']
@@ -367,12 +381,14 @@ class CandlestickPatterns:
         candle_range = np.where(candle_range == 0, 1, candle_range)
         
         is_spinning_top = (
-            (body / candle_range < 0.1) &
-            (np.abs(lower_shadow - upper_shadow) / candle_range < 0.3)
+            (body / candle_range < body_ratio_max) &
+            (np.abs(lower_shadow - upper_shadow) / candle_range < shadow_symmetry_max)
         )
         return is_spinning_top.astype(float)
     
-    def identify_bullish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+    def identify_bullish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame,
+                                   significance: float = 0.002,
+                                   price_pos_threshold: float = 0.4) -> np.ndarray:
         """识别看涨吞没"""
         prev_open = data['open'].shift(1)
         prev_close = data['close'].shift(1)
@@ -384,16 +400,18 @@ class CandlestickPatterns:
         
         engulfed = (
             prev_is_black & curr_is_white &
-            (curr_close > prev_open * 1.002) & # 显著吞没
+            (curr_close > prev_open * (1 + significance)) &
             (curr_open < prev_close) &
             (
-                ((context['price_pos'] < 0.4) & (~context['is_sideways'])) | # 反转
-                (context['is_sideways'] & (curr_close > context['range_high'].shift(1))) # 横盘突破
+                ((context['price_pos'] < price_pos_threshold) & (~context['is_sideways'])) |
+                (context['is_sideways'] & (curr_close > context['range_high'].shift(1)))
             )
         )
         return engulfed.fillna(False).astype(float).values
     
-    def identify_bearish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+    def identify_bearish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame,
+                                   significance: float = 0.002,
+                                   price_pos_threshold: float = 0.6) -> np.ndarray:
         """识别看跌吞没"""
         prev_open = data['open'].shift(1)
         prev_close = data['close'].shift(1)
@@ -405,39 +423,40 @@ class CandlestickPatterns:
         
         engulfed = (
             prev_is_white & curr_is_black &
-            (curr_close < prev_open * 0.998) & # 显著吞没
+            (curr_close < prev_open * (1 - significance)) &
             (curr_open > prev_close) &
             (
-                ((context['price_pos'] > 0.6) & (~context['is_sideways'])) | # 反转
-                (context['is_sideways'] & (curr_close < context['range_low'].shift(1))) # 横盘突破
+                ((context['price_pos'] > price_pos_threshold) & (~context['is_sideways'])) |
+                (context['is_sideways'] & (curr_close < context['range_low'].shift(1)))
             )
         )
         return engulfed.fillna(False).astype(float).values
     
-    def identify_piercing_line(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+    def identify_piercing_line(self, data: pd.DataFrame, context: pd.DataFrame = None,
+                               price_pos_threshold: float = 0.4) -> np.ndarray:
         """识别刺穿线 (看涨反转)"""
         prev_open = data['open'].shift(1)
         prev_close = data['close'].shift(1)
+        prev_high = data['high'].shift(1)
         curr_open = data['open']
         curr_close = data['close']
-        
-        prev_is_black = prev_open > prev_close
-        curr_is_white = curr_close > curr_open
+        body = np.abs(curr_close - curr_open)
+        curr_upper_shadow = data['high'] - np.maximum(data['open'], data['close'])        
         midpoint = (prev_open + prev_close) / 2
         
         piercing = (
-            prev_is_black & curr_is_white &
             (curr_close > midpoint) &
-            (curr_close < prev_open)
+            (curr_upper_shadow > prev_high) &
+            (curr_upper_shadow > body * 2)           
         )
         
         if context is not None:
-            # 强化：处于相对低位
-            piercing = piercing & (context['price_pos'] < 0.4)
+            piercing = piercing & (context['price_pos'] < price_pos_threshold)
             
         return piercing.fillna(False).astype(float).values
     
-    def identify_dark_cloud_cover(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+    def identify_dark_cloud_cover(self, data: pd.DataFrame, context: pd.DataFrame = None,
+                                  price_pos_threshold: float = 0.6) -> np.ndarray:
         """识别乌云盖顶 (看跌反转)"""
         prev_open = data['open'].shift(1)
         prev_close = data['close'].shift(1)
@@ -450,17 +469,17 @@ class CandlestickPatterns:
         
         dark_cloud = (
             prev_is_white & curr_is_black &
-            (curr_close < midpoint) &
-            (curr_close > prev_open)
+            (curr_close < midpoint) 
         )
         
         if context is not None:
-            # 强化：处于相对高位
-            dark_cloud = dark_cloud & (context['price_pos'] > 0.6)
+            dark_cloud = dark_cloud & (context['price_pos'] > price_pos_threshold)
             
         return dark_cloud.fillna(False).astype(float).values
     
-    def identify_morning_star(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+    def identify_morning_star(self, data: pd.DataFrame, context: pd.DataFrame,
+                              second_body_ratio: float = 0.5,
+                              price_pos_threshold: float = 0.3) -> np.ndarray:
         """识别晨星"""
         open0 = data['open'].shift(2)
         close0 = data['close'].shift(2)
@@ -472,17 +491,19 @@ class CandlestickPatterns:
         first_is_black = open0 > close0
         second_body = np.abs(close1 - open1)
         first_body = np.abs(close0 - open0)
-        second_is_small = second_body < first_body * 0.5
+        second_is_small = second_body < first_body * second_body_ratio
         third_is_white = close2 > open2
         midpoint = (open0 + close0) / 2
         
         morning_star = (
             first_is_black & second_is_small & third_is_white & 
-            (close2 > midpoint) & (context['price_pos'] < 0.3)
+            (close2 > midpoint) & (context['price_pos'] < price_pos_threshold)
         )
         return morning_star.fillna(False).astype(float).values
     
-    def identify_evening_star(self, data: pd.DataFrame, context: pd.DataFrame) -> np.ndarray:
+    def identify_evening_star(self, data: pd.DataFrame, context: pd.DataFrame,
+                              second_body_ratio: float = 0.5,
+                              price_pos_threshold: float = 0.7) -> np.ndarray:
         """识别暮星"""
         open0 = data['open'].shift(2)
         close0 = data['close'].shift(2)
@@ -494,17 +515,20 @@ class CandlestickPatterns:
         first_is_white = close0 > open0
         second_body = np.abs(close1 - open1)
         first_body = np.abs(close0 - open0)
-        second_is_small = second_body < first_body * 0.5
+        second_is_small = second_body < first_body * second_body_ratio
         third_is_black = open2 > close2
         midpoint = (open0 + close0) / 2
         
         evening_star = (
             first_is_white & second_is_small & third_is_black & 
-            (close2 < midpoint) & (context['price_pos'] > 0.7)
+            (close2 < midpoint) & (context['price_pos'] > price_pos_threshold)
         )
         return evening_star.fillna(False).astype(float).values
     
-    def identify_harami(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
+    def identify_harami(self, data: pd.DataFrame, context: pd.DataFrame = None,
+                        body_ratio: float = 2.0,
+                        price_pos_low: float = 0.3,
+                        price_pos_high: float = 0.7) -> np.ndarray:
         """识别孕线 (反转信号)"""
         open0 = data['open'].shift(1)
         close0 = data['close'].shift(1)
@@ -518,11 +542,10 @@ class CandlestickPatterns:
         high0 = np.maximum(open0, close0)
         low0 = np.minimum(open0, close0)
         
-        harami = (body0 > body1 * 2) & (high1 < high0) & (low1 > low0)
+        harami = (body0 > body1 * body_ratio) & (high1 < high0) & (low1 > low0)
         
         if context is not None:
-            # 只有在极端位置才认为是有效的反转孕线
-            harami = harami & ((context['price_pos'] < 0.3) | (context['price_pos'] > 0.7))
+            harami = harami & ((context['price_pos'] < price_pos_low) | (context['price_pos'] > price_pos_high))
             
         return harami.fillna(False).astype(float).values
     

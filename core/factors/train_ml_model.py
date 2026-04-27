@@ -102,13 +102,27 @@ class MLModelTrainer:
         
         stocks_data = {}
         conn = sqlite3.connect(self.db_path)
-        # 挂载元数据库以支持 is_st 查询
+        # 挂载元数据库以支持 is_st 查询 & 退市日期
         db_dir = os.path.dirname(self.db_path)
         meta_db = os.path.join(db_dir, 'stock_meta.db')
         if os.path.exists(meta_db):
             conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
         
         conn.row_factory = sqlite3.Row
+        
+        # 预加载退市日期映射 {code: outDate_str or None}
+        delist_map: Dict[str, Optional[str]] = {}
+        try:
+            placeholders_all = ','.join(['?' for _ in stock_codes])
+            delist_df = pd.read_sql_query(
+                f"SELECT code, outDate FROM meta.stock_basic WHERE code IN ({placeholders_all})",
+                conn, params=stock_codes
+            )
+            for _, row in delist_df.iterrows():
+                out = row['outDate']
+                delist_map[row['code']] = out if (out and str(out).strip() not in ('', 'None', 'nan')) else None
+        except Exception as e:
+            print(f"  ⚠ 读取退市日期失败，退市特征将不可用: {e}")
         
         # 分批加载，避免 IN 子句过长
         pbar = tqdm(total=len(stock_codes), desc="加载进度")
@@ -153,6 +167,21 @@ class MLModelTrainer:
                 if len(stock_df) < 100:
                     continue
                 
+                # 注入退市临近特征
+                # days_to_delist: 距退市日的自然日数，已退市为 0，无退市计划为 -1（哨兵值）
+                # 模型可从历史已退市股票的负样本中学习到"临近退市 → 规避"的规律
+                out_date_str = delist_map.get(code)
+                if out_date_str:
+                    try:
+                        out_dt = pd.Timestamp(out_date_str)
+                        dates_ts = pd.to_datetime(stock_df['date'])
+                        days_diff = (out_dt - dates_ts).dt.days.clip(lower=0).astype(np.float32)
+                        stock_df['days_to_delist'] = days_diff
+                    except Exception:
+                        stock_df['days_to_delist'] = np.float32(-1)
+                else:
+                    stock_df['days_to_delist'] = np.float32(-1)
+                
                 stocks_data[code] = stock_df
             
             # 进度提示
@@ -161,7 +190,8 @@ class MLModelTrainer:
         pbar.close()
         conn.close()
         
-        print(f"成功加载并复权 {len(stocks_data)} 只股票的数据")
+        delist_count = sum(1 for v in delist_map.values() if v is not None)
+        print(f"成功加载并复权 {len(stocks_data)} 只股票的数据 (其中 {delist_count} 只含退市日期)")
         return stocks_data
     
     def calculate_and_save_factors(self, code: str, data: pd.DataFrame, 
@@ -569,6 +599,17 @@ class MLModelTrainer:
                                                    f_high_idx.values, f_low_idx.values, 
                                                    atr_raw, next_open.values, atr_rel)
                 
+                # 退市临近惩罚：对 30 个自然日内将退市的样本，将标签压至极低值
+                # 模型不会在推理时看到 days_to_delist，但会从其他特征（量价、ST状态等）
+                # 中学到"临近退市股票的共性模式 → 规避"
+                if 'days_to_delist' in data.columns:
+                    dtd = data['days_to_delist'].values  # -1 表示无退市计划
+                    delist_penalty_mask = (dtd >= 0) & (dtd <= getattr(TrainingConfig, 'DELIST_PENALTY_DAYS', 30))
+                    if delist_penalty_mask.any():
+                        y = y.copy() if isinstance(y, np.ndarray) else np.array(y, dtype=np.float32)
+                        # 压到接近 0 的极低分，远低于正常股票的均值（约 1.0）
+                        y[delist_penalty_mask] = getattr(TrainingConfig, 'DELIST_PENALTY_SCORE', 0.01)
+                
                 # 用于计算 IC 的参考收益率 (使用最终涨幅)
                 ref_returns = f_returns.values
                 target_returns = f_returns.values
@@ -960,8 +1001,8 @@ class MLModelTrainer:
         # 使用各模块的精确列名进行匹配，而非关键词启发式匹配
         remaining_all = set(all_cols)
         
-        # 1. 状态因子 (comprehensive_factor_calculator 中硬编码的3个)
-        _status_known = {'is_limit_up', 'is_suspended', 'market_type'}
+        # 1. 状态因子 (comprehensive_factor_calculator 中硬编码的3个 + 退市特征)
+        _status_known = {'is_limit_up', 'is_suspended', 'market_type', 'days_to_delist'}
         status_cols = [c for c in all_cols if c in _status_known]
         remaining_all -= set(status_cols)
         
@@ -1085,30 +1126,39 @@ class MLModelTrainer:
             X[split_idx:], dates[split_idx:], factor_names
         )
         
-        # Default sample_weight (for XGBM and others)
-        default_sample_weight = None
-        if self.punish_unbuyable:
-            if limit_groups is not None:
-                ref_limit = 0.10
-                default_sample_weight = np.abs(returns / np.clip(limit_groups, 0.04, 0.3))
-                default_sample_weight = default_sample_weight * (limit_groups / ref_limit)
-            else:
-                raise ValueError("limit_groups is required when punish_unbuyable is True")
-            default_sample_weight = default_sample_weight / (default_sample_weight.mean() + 1e-6)
-        
         ST_WEIGHT_FACTOR = getattr(TrainingConfig, 'ST_WEIGHT_FACTOR', 1.0)
         if is_st_arr is not None and ST_WEIGHT_FACTOR < 1.0:
-            st_weight = np.ones(len(is_st_arr), dtype=np.float32)
-            st_weight[is_st_arr] = ST_WEIGHT_FACTOR
-            if default_sample_weight is not None:
-                default_sample_weight = default_sample_weight * st_weight
-            else:
-                default_sample_weight = st_weight
-            default_sample_weight = default_sample_weight / (default_sample_weight.mean() + 1e-6)
             st_count = np.sum(is_st_arr)
             if st_count > 0:
                 print(f"  - ST 样本权重降低因子: {ST_WEIGHT_FACTOR} (ST 样本数: {st_count})")
         
+        # ---------------------------------------------------------------
+        # 正交标签/权重设计（两模型共享，互补互易）
+        # 标签(y)  = 路径质量分 → 回答"这条路径好不好"（稳定性）
+        # 权重(w)  = 原始收益   → 回答"这个收益值不值得重点学"（幅度）
+        # ---------------------------------------------------------------
+        # 参考阈值：用各板块涨停幅度的中位数作为收益基准
+        if limit_groups is not None:
+            ref_threshold = float(np.median(limit_groups))
+        else:
+            ref_threshold = 0.10  # 默认主板涨停幅度
+        
+        # 权重 = clip(returns / ref_threshold, 0.1, 2.0)
+        # 既不过分惩罚低收益，也不过分放大高收益
+        returns_weight = np.clip(
+            np.abs(returns) / (ref_threshold + 1e-8),
+            0.1, 2.0
+        ).astype(np.float32)
+        # 归一化，保持总梯度规模稳定
+        returns_weight = returns_weight / (returns_weight.mean() + 1e-8)
+        
+        # 叠加 ST 降权（如果已计算）
+        if is_st_arr is not None and ST_WEIGHT_FACTOR < 1.0:
+            st_weight = np.ones(len(is_st_arr), dtype=np.float32)
+            st_weight[is_st_arr] = ST_WEIGHT_FACTOR
+            returns_weight = returns_weight * st_weight
+            returns_weight = returns_weight / (returns_weight.mean() + 1e-8)
+
         results = {}
         for model_type in model_types:
             print(f"\n训练 {model_type.upper()} 模型")
@@ -1116,33 +1166,26 @@ class MLModelTrainer:
                 task = 'ranking' if model_type == 'lightgbm' else 'regression'
                 model = MLFactorModel(model_type=model_type, task=task)
                 
-                # LGBM 特殊逻辑：使用原始收益作为排序标准，路径得分变换为权重
-                current_y = y
-                current_weight = default_sample_weight
+                # [正交设计]
+                # 标签：路径质量分（稳定性）
+                #   - LGBM ranking：使用原始路径质量分(path_scores)排序，保留分布形态
+                #   - XGB regression：使用每日板块中性化归一化后的路径质量分(y)
+                # 权重：基于原始收益率，强调高收益样本
+                current_weight = returns_weight
                 
                 if model_type == 'lightgbm':
-                    # [LGBM 标签/权重分离]
-                    # 训练目标：用原始收益率(returns)作为排序标准，让模型直接优化收益排名
-                    # 样本权重：用路径质量分(path_scores)变换为权重，让高质量路径的样本梯度更大
-                    # 评估基准：_evaluate 中 reference=y=returns，与训练目标一致
-                    print("  [LGBM 优化] 使用原始收益率(returns)作为标签，路径质量分变换为权重")
-                    current_y = returns # 使用原始收益作为排序标准
-                    
+                    # LGBM ranking：标签用原始路径质量分，保留跨日绝对大小信息
+                    # ranking loss 本身只关心组内相对顺序，原始分比归一化分更稳定
                     if path_scores is not None:
-                        # 1. 取绝对值并处理异常值
-                        processed_scores = np.abs(np.nan_to_num(path_scores, nan=0.0))
-                        
-                        # 2. 稳健的中位数平移
-                        median_val = np.nanmedian(processed_scores)
-                        shifted_scores = processed_scores - median_val
-                        
-                        # 3. 限制极端权重 (建议缩减 clip 范围)
-                        log_weight = np.clip(shifted_scores * 1, -1, 1) 
-                        current_weight = np.exp(log_weight)
-                        
-                        # 4. 归一化：保持总梯度规模不变
-                        # 这一步非常重要，防止因为加了权重导致整体 Learning Rate 失效
-                        current_weight = current_weight / (current_weight.mean() + 1e-8)
+                        current_y = path_scores.astype(np.float32)
+                        print("  [LGBM] 标签=原始路径质量分(ranking), 权重=收益归一化权重")
+                    else:
+                        current_y = y  # fallback
+                        print("  [LGBM] 标签=归一化路径质量分(fallback), 权重=收益归一化权重")
+                else:
+                    # XGB regression：标签用每日板块中性化归一化后的路径质量分
+                    current_y = y
+                    print("  [XGB] 标签=归一化路径质量分(regression), 权重=收益归一化权重")
                 
                 # 统一计算分组信息（所有任务通用，用于按组评估）
                 # 注意：对于 LightGBM Ranking 任务，group 信息是必须的
@@ -1388,7 +1431,7 @@ class MLModelTrainer:
             'downside_risk', 'drawdown', 'max_drawdown_20', 'sharpe_ratio',
             'return_skewness', 'return_kurtosis',
         }
-        _status_known = {'is_limit_up', 'is_suspended', 'market_type'}
+        _status_known = {'is_limit_up', 'is_suspended', 'market_type', 'days_to_delist'}
         
         tech_names = sorted(all_set & _tech_set)
         candle_names = sorted(all_set & _candle_set)

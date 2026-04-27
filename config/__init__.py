@@ -5,7 +5,6 @@ from .baostock_config import *
 from .strategy_config import *
 from .factor_config import (
     ModelConfig, TrainingConfig, FactorConfig, OptimizationConfig,
-    FactorModelConfig
 )
 
 __all__ = [
@@ -20,5 +19,4 @@ __all__ = [
     
     # 从 factor_config.py 导出
     'ModelConfig', 'TrainingConfig', 'FactorConfig', 'OptimizationConfig',
-    'FactorModelConfig'
 ]

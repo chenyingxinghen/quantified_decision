@@ -57,7 +57,7 @@ class ModelConfig:
         'label_gain': [float(i**2+1) for i in range(100)], 
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 100,
+        'lambdarank_truncation_level': 512,
 
         'ndcg_eval_at': [i for i in range(1, 5)],  # 评估 ndcg@100'
         'n_jobs': 15,
@@ -106,6 +106,11 @@ class TrainingConfig:
     ST_WEIGHT_FACTOR = 0.5       # ST 股票样本权重降低因子 (0.5 表示权重减半)
     UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
     
+    # 退市临近惩罚：对距退市日 N 个自然日以内的样本，将标签压至极低值
+    # 模型推理时不依赖此特征，而是从量价/ST等共性模式中泛化学习
+    DELIST_PENALTY_DAYS = 30     # 退市前多少天内的样本触发惩罚
+    DELIST_PENALTY_SCORE = 0.01  # 惩罚后的标签值（远低于正常均值 ~1.0）
+    
     # XGB标签构造参数 LGB样本权重构造参数
     LABEL_TARGET_SCALE = 2
     LABEL_LAMBDA = 1           # 损失厌恶系数 (惩罚回撤)
@@ -144,65 +149,86 @@ class FactorConfig:
     """因子计算参数配置（优化为短线策略，适合1-5日持仓）"""
     
     # ========== 动量因子参数 ==========
-    RSI_PERIOD = 9            # 原42，短线常用7~14，取9平衡灵敏度与稳定性
-    ROC_PERIOD = 10           # 原60，10日变动率捕捉短期加速
-    MTM_PERIOD = 8            # 原40，8日动量适应快速转折
-    CMO_PERIOD = 14           # 原42，钱德指标缩短至14日
-    STOCHRSI_PERIOD = 12      # 原28，随机RSI缩短至12
-    RVI_PERIOD = 7            # 原14，相对活力指数更短以快速确认方向
+    RSI_PERIOD = 9            # 短线常用7~14，取9平衡灵敏度与稳定性
+    ROC_PERIOD = 10           # 10日变动率捕捉短期加速
+    MTM_PERIOD = 8            # 8日动量适应快速转折
+    CMO_PERIOD = 14           # 钱德指标缩短至14日
+    STOCHRSI_PERIOD = 12      # 随机RSI缩短至12
+    RVI_PERIOD = 7            # 相对活力指数更短以快速确认方向
     
     # ========== 趋势因子参数 ==========
-    MACD_FAST = 6             # 原25，快线缩短提高交叉频率
-    MACD_SLOW = 13            # 原90，慢线大幅缩短
-    MACD_SIGNAL = 5           # 原20，信号线同步缩短
-    ADX_PERIOD = 14           # 原35，14日ADX识别短期趋势强度
-    DMI_PERIOD = 14           # 原35，与ADX保持一致
-    AROON_PERIOD = 14         # 原50，阿隆周期缩短，更快捕捉新高低点
-    TRIX_PERIOD = 12          # 原30，三重指数均线缩短至12
+    MACD_FAST = 6             # 快线缩短提高交叉频率
+    MACD_SLOW = 13            # 慢线大幅缩短
+    MACD_SIGNAL = 5           # 信号线同步缩短
+    ADX_PERIOD = 14           # 14日ADX识别短期趋势强度
+    DMI_PERIOD = 14           # 与ADX保持一致
+    AROON_PERIOD = 14         # 阿隆周期缩短，更快捕捉新高低点
+    TRIX_PERIOD = 12          # 三重指数均线缩短至12
     
     # ========== 均线参数 ==========
-    MA_RATIO_PERIOD = 20      # 原120，使用20日均线衡量短期偏离
-    MA_SLOPE_PERIOD = 8       # 原30，8日均线斜率判断短期方向
+    MA_RATIO_PERIOD = 20      # 使用20日均线衡量短期偏离
+    MA_SLOPE_PERIOD = 8       # 8日均线斜率判断短期方向
     
     # ========== 波动率因子参数 ==========
-    ATR_PERIOD = 10           # 原30，10日ATR快速反映近期波幅
-    NATR_PERIOD = 10          # 原28，归一化ATR同周期
-    BB_PERIOD = 20            # 原100，布林带中轨20日均线，短线标准
-    BB_STD = 1.5              # 保持不变，1.5倍标准差带略宽过滤噪音
-    CCI_PERIOD = 14           # 原35，14日CCI捕捉短期超买超卖
-    ULCER_PERIOD = 14         # 原35，溃疡指数缩短
-    PRICE_VAR_PERIOD = 10     # 原30，价格方差窗口缩短
+    ATR_PERIOD = 10           # 10日ATR快速反映近期波幅
+    NATR_PERIOD = 10          # 归一化ATR同周期
+    BB_PERIOD = 20            # 布林带中轨20日均线，短线标准
+    BB_STD = 1.5              # 1.5倍标准差带略宽过滤噪音
+    CCI_PERIOD = 14           # 14日CCI捕捉短期超买超卖
+    ULCER_PERIOD = 14         # 溃疡指数缩短
+    PRICE_VAR_PERIOD = 10     # 价格方差窗口缩短
     
     # ========== 成交量因子参数 ==========
-    VOLUME_MA_PERIOD = 5      # 原5，短线维持5日均量
-    VOLUME_STD_PERIOD = 8     # 原10，略微缩短量标准差周期
-    VOLUME_MA_SHORT = 3       # 原5，快量线改为3日
-    VOLUME_MA_LONG = 8        # 原10，慢量线改为8日
-    AMOUNT_MA_PERIOD = 5      # 原5，成交额均线保持
-    AMOUNT_STD_PERIOD = 8     # 原10，成交额标准差缩短
-    MFI_PERIOD = 14           # 原35，资金流向指标缩短至14
-    VR_PERIOD = 12            # 原52，量比率缩短至12
-    VROC_PERIOD = 10          # 原36，量变动速率缩短至10
-    VRSI_PERIOD = 9           # 原21，量RSI缩短至9
-    VMACD_FAST = 6            # 原25，量MACD参数与价格MACD近似
-    VMACD_SLOW = 13           # 原60
-    VMACD_SIGNAL = 5          # 原20
-    ADOSC_FAST = 2            # 原3，佳庆振荡器快线缩短
-    ADOSC_SLOW = 5            # 原7，慢线缩短，信号更灵敏
+    VOLUME_MA_PERIOD = 5      # 短线维持5日均量
+    VOLUME_STD_PERIOD = 8     # 略微缩短量标准差周期
+    VOLUME_MA_SHORT = 3       # 快量线改为3日
+    VOLUME_MA_LONG = 8        # 慢量线改为8日
+    AMOUNT_MA_PERIOD = 5      # 成交额均线保持
+    AMOUNT_STD_PERIOD = 8     # 成交额标准差缩短
+    MFI_PERIOD = 14           # 资金流向指标缩短至14
+    VR_PERIOD = 12            # 量比率缩短至12
+    VROC_PERIOD = 10          # 量变动速率缩短至10
+    VRSI_PERIOD = 9           # 量RSI缩短至9
+    VMACD_FAST = 6            # 量MACD参数与价格MACD近似
+    VMACD_SLOW = 13           
+    VMACD_SIGNAL = 5          
+    ADOSC_FAST = 2            # 佳庆振荡器快线缩短
+    ADOSC_SLOW = 5            # 慢线缩短，信号更灵敏
     
     # ========== 摆动指标参数 ==========
-    KDJ_N = 9                 # 原28，KDJ周期常用9
-    WILLR_PERIOD = 14         # 原35，威廉指标14日标准短线
-    BIAS_PERIOD = 8           # 原36，乖离率缩短到8日
-    PSY_PERIOD = 12           # 原30，心理线12日
-    AR_BR_PERIOD = 13         # 原52，人气意愿指标缩短至13
-    CR_PERIOD = 13            # 原52，中间意愿指标一致
+    KDJ_N = 9                 # KDJ周期常用9
+    WILLR_PERIOD = 14         # 威廉指标14日标准短线
+    BIAS_PERIOD = 8           # 乖离率缩短到8日
+    PSY_PERIOD = 12           # 心理线12日
+    AR_BR_PERIOD = 13         # 人气意愿指标缩短至13
+    CR_PERIOD = 13            # 中间意愿指标一致
     
     # ========== K线形态参数 ==========
-    BODY_SIZE_THRESHOLD_LARGE = 0.012   # 原0.015，短线中等波动即可视为大实体
-    BODY_SIZE_THRESHOLD_SMALL = 0.0025  # 原0.003，微调小实体识别精度
-    HAMMER_LOWER_SHADOW_RATIO = 1.5     # 保持
-    HAMMER_UPPER_SHADOW_RATIO = 0.5     # 保持
+    BODY_SIZE_THRESHOLD_LARGE = 0.012   # 短线中等波动即可视为大实体
+    BODY_SIZE_THRESHOLD_SMALL = 0.0025  # 微调小实体识别精度
+    HAMMER_LOWER_SHADOW_RATIO = 2.0     # 锤子线/上吊线下影线与实体的最小倍数
+    HAMMER_UPPER_SHADOW_RATIO = 0.15     # 锤子线/上吊线上影线与实体的最大倍数
+    SHOOTING_STAR_UPPER_RATIO = 2.0     # 射击之星/倒锤线上影线与实体的最小倍数
+    SHOOTING_STAR_LOWER_RATIO = 0.15     # 射击之星/倒锤线下影线与实体的最大倍数
+    DOJI_THRESHOLD = 0.003              # 十字星实体阈值（相对价格比例）
+    MARUBOZU_SHADOW_RATIO = 0.002       # 光头光脚影线阈值（相对价格比例）
+    MARUBOZU_MIN_BODY_RATIO = 0.015     # 光头光脚最小实体比例
+    SPINNING_TOP_BODY_RATIO = 0.1       # 纺锤线实体/全幅最大比例
+    SPINNING_TOP_SHADOW_SYMMETRY = 0.3  # 纺锤线上下影线对称性阈值
+    ENGULFING_SIGNIFICANCE = 0.003      # 吞没形态显著性（超出前根实体的比例）
+    STAR_SECOND_BODY_RATIO = 0.15        # 晨星/暮星第二根实体相对第一根的最大比例
+    HARAMI_BODY_RATIO = 2.0             # 孕线外包实体相对内包实体的最小倍数
+    CONTEXT_WINDOW = 20                # 上下文计算滚动窗口（天）
+    CONTEXT_SIDEWAYS_MA_DEVIATION = 0.05  # 横盘判断：收盘价偏离均线的最大比例
+    CONTEXT_SIDEWAYS_RANGE_PCT = 0.10   # 横盘判断：区间波动幅度最大比例
+    # 价格位置阈值（0=低位, 1=高位）
+    PRICE_POS_LOW = 0.25                 # 低位阈值（锤子线、晨星等看涨形态）
+    PRICE_POS_HIGH = 0.75               # 高位阈值（射击之星、上吊线等看跌形态）
+    PRICE_POS_LOW_STRICT = 0.25         # 严格低位阈值（倒锤线）
+    PRICE_POS_HIGH_STRICT = 0.75         # 严格高位阈值（暮星）
+    PRICE_POS_LOW_ENGULF = 0.25          # 吞没/刺穿线低位阈值
+    PRICE_POS_HIGH_ENGULF = 0.8         # 吞没/乌云盖顶高位阈值
+    PRICE_POS_SOLDIERS_CROWS = 0.25      # 三白兵/三乌鸦位置阈值
 
 
 # ============================================================================
@@ -235,45 +261,3 @@ class OptimizationConfig:
     # 因子工程优化
     OPTIMIZE_FACTOR_PERIODS = False
 
-
-# ============================================================================
-# 5. 配置管理
-# ============================================================================
-
-class FactorModelConfig:
-    """因子模型统一配置管理"""
-    
-    model = ModelConfig
-    training = TrainingConfig
-    factor = FactorConfig
-    optimization = OptimizationConfig
-    
-    @classmethod
-    def print_config(cls):
-        """打印配置信息"""
-        print("=" * 80)
-        print("因子模型配置信息")
-        print("=" * 80)
-        
-        print("\n[模型配置]")
-        print(f"XGBoost树数量: {cls.model.XGBOOST_PARAMS['n_estimators']}")
-        print(f"学习率: {cls.model.XGBOOST_PARAMS['learning_rate']}")
-        
-        print("\n[训练配置]")
-        print(f"训练集比例: {cls.training.TRAIN_TEST_SPLIT}")
-        print(f"预测天数: {cls.training.FUTURE_DAYS}")
-        
-        print("\n[因子配置]")
-        print(f"RSI周期: {cls.factor.RSI_PERIOD}")
-        print(f"MACD参数: ({cls.factor.MACD_FAST}, {cls.factor.MACD_SLOW}, {cls.factor.MACD_SIGNAL})")
-        print(f"ATR周期: {cls.factor.ATR_PERIOD}")
-        
-        print("\n[优化配置]")
-        print(f"特征选择方法: {cls.optimization.FEATURE_SELECTION_METHOD}")
-        print(f"选择特征数: {cls.optimization.N_FEATURES_TO_SELECT}")
-        
-        print("=" * 80)
-
-
-if __name__ == '__main__':
-    FactorModelConfig.print_config()

@@ -40,114 +40,177 @@ class CandlestickPatternFactors:
     def calculate_doji(self, data: pd.DataFrame, threshold: float = 0.001) -> np.ndarray:
         """十字星"""
         if threshold == 0.001:
-            threshold = self.config.BODY_SIZE_THRESHOLD_SMALL
+            threshold = self.config.DOJI_THRESHOLD
         return self.analyzer.identify_doji(data, threshold=threshold)
     
     def calculate_hammer(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """锤子线"""
         if context is None:
-            context = self.analyzer.calculate_context(data)
+            context = self.analyzer.calculate_context(
+                data,
+                window=self.config.CONTEXT_WINDOW,
+                sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+                sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+            )
         return self.analyzer.identify_hammer(
             data, context, 
-            lower_ratio=getattr(self.config, 'HAMMER_LOWER_SHADOW_RATIO', 2.0),
-            upper_ratio=getattr(self.config, 'HAMMER_UPPER_SHADOW_RATIO', 1.0)
+            lower_ratio=self.config.HAMMER_LOWER_SHADOW_RATIO,
+            upper_ratio=self.config.HAMMER_UPPER_SHADOW_RATIO,
+            price_pos_threshold=self.config.PRICE_POS_LOW,
         )
     
     def calculate_hanging_man(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """上吊线"""
         if context is None:
-            context = self.analyzer.calculate_context(data)
+            context = self.analyzer.calculate_context(
+                data,
+                window=self.config.CONTEXT_WINDOW,
+                sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+                sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+            )
         return self.analyzer.identify_hanging_man(
             data, context,
-            lower_ratio=getattr(self.config, 'HAMMER_LOWER_SHADOW_RATIO', 2.0),
-            upper_ratio=getattr(self.config, 'HAMMER_UPPER_SHADOW_RATIO', 1.0)
+            lower_ratio=self.config.HAMMER_LOWER_SHADOW_RATIO,
+            upper_ratio=self.config.HAMMER_UPPER_SHADOW_RATIO,
+            price_pos_threshold=self.config.PRICE_POS_HIGH,
         )
     
     def calculate_shooting_star(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """射击之星"""
         if context is None:
-            context = self.analyzer.calculate_context(data)
+            context = self.analyzer.calculate_context(
+                data,
+                window=self.config.CONTEXT_WINDOW,
+                sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+                sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+            )
         return self.analyzer.identify_shooting_star(
             data, context,
-            upper_ratio=getattr(self.config, 'HAMMER_LOWER_SHADOW_RATIO', 2.0),
-            lower_ratio=getattr(self.config, 'HAMMER_UPPER_SHADOW_RATIO', 1.0)
+            upper_ratio=self.config.SHOOTING_STAR_UPPER_RATIO,
+            lower_ratio=self.config.SHOOTING_STAR_LOWER_RATIO,
+            price_pos_threshold=self.config.PRICE_POS_HIGH,
         )
     
     def calculate_inverted_hammer(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """倒锤线"""
         if context is None:
-            context = self.analyzer.calculate_context(data)
+            context = self.analyzer.calculate_context(
+                data,
+                window=self.config.CONTEXT_WINDOW,
+                sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+                sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+            )
         return self.analyzer.identify_inverted_hammer(
             data, context,
-            upper_ratio=getattr(self.config, 'HAMMER_LOWER_SHADOW_RATIO', 2.0),
-            lower_ratio=getattr(self.config, 'HAMMER_UPPER_SHADOW_RATIO', 1.0)
+            upper_ratio=self.config.SHOOTING_STAR_UPPER_RATIO,
+            lower_ratio=self.config.SHOOTING_STAR_LOWER_RATIO,
+            price_pos_threshold=self.config.PRICE_POS_LOW_STRICT,
         )
     
     def calculate_marubozu(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """光头光脚线"""
         if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_marubozu(data, context=context, threshold_ratio=self.config.BODY_SIZE_THRESHOLD_SMALL)
+            context = self.analyzer.calculate_context(
+                data,
+                window=self.config.CONTEXT_WINDOW,
+                sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+                sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+            )
+        return self.analyzer.identify_marubozu(
+            data, context=context,
+            threshold_ratio=self.config.MARUBOZU_SHADOW_RATIO,
+            min_body_ratio=self.config.MARUBOZU_MIN_BODY_RATIO,
+        )
     
     def calculate_spinning_top(self, data: pd.DataFrame) -> np.ndarray:
         """纺锤线"""
-        return self.analyzer.identify_spinning_top(data)
+        return self.analyzer.identify_spinning_top(
+            data,
+            body_ratio_max=self.config.SPINNING_TOP_BODY_RATIO,
+            shadow_symmetry_max=self.config.SPINNING_TOP_SHADOW_SYMMETRY,
+        )
     
     # ==================== 多根K线形态 ====================
     
+    def _get_context(self, data: pd.DataFrame, context: pd.DataFrame = None) -> pd.DataFrame:
+        """统一获取上下文，避免重复代码"""
+        if context is None:
+            return self.analyzer.calculate_context(
+                data,
+                window=self.config.CONTEXT_WINDOW,
+                sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+                sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+            )
+        return context
+
     def calculate_bullish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """看涨吞没"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_bullish_engulfing(data, context)
+        return self.analyzer.identify_bullish_engulfing(
+            data, self._get_context(data, context),
+            significance=self.config.ENGULFING_SIGNIFICANCE,
+            price_pos_threshold=self.config.PRICE_POS_LOW_ENGULF,
+        )
     
     def calculate_bearish_engulfing(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """看跌吞没"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_bearish_engulfing(data, context)
+        return self.analyzer.identify_bearish_engulfing(
+            data, self._get_context(data, context),
+            significance=self.config.ENGULFING_SIGNIFICANCE,
+            price_pos_threshold=self.config.PRICE_POS_HIGH_ENGULF,
+        )
     
     def calculate_piercing_line(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """刺穿线"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_piercing_line(data, context=context)
+        return self.analyzer.identify_piercing_line(
+            data, context=self._get_context(data, context),
+            price_pos_threshold=self.config.PRICE_POS_LOW_ENGULF,
+        )
     
     def calculate_dark_cloud_cover(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """乌云盖顶"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_dark_cloud_cover(data, context=context)
+        return self.analyzer.identify_dark_cloud_cover(
+            data, context=self._get_context(data, context),
+            price_pos_threshold=self.config.PRICE_POS_HIGH_ENGULF,
+        )
     
     def calculate_morning_star(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """晨星"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_morning_star(data, context)
+        return self.analyzer.identify_morning_star(
+            data, self._get_context(data, context),
+            second_body_ratio=self.config.STAR_SECOND_BODY_RATIO,
+            price_pos_threshold=self.config.PRICE_POS_LOW,
+        )
     
     def calculate_evening_star(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """暮星"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_evening_star(data, context)
+        return self.analyzer.identify_evening_star(
+            data, self._get_context(data, context),
+            second_body_ratio=self.config.STAR_SECOND_BODY_RATIO,
+            price_pos_threshold=self.config.PRICE_POS_HIGH_STRICT,
+        )
     
     def calculate_harami(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """孕线"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_harami(data, context=context)
+        return self.analyzer.identify_harami(
+            data, context=self._get_context(data, context),
+            body_ratio=self.config.HARAMI_BODY_RATIO,
+            price_pos_low=self.config.PRICE_POS_LOW,
+            price_pos_high=self.config.PRICE_POS_HIGH_STRICT,
+        )
     
     def calculate_three_white_soldiers(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """三个白兵"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_three_white_soldiers(data, context=context)
+        return self.analyzer.identify_three_white_soldiers(
+            data, context=self._get_context(data, context),
+            price_pos_threshold=self.config.PRICE_POS_SOLDIERS_CROWS,
+        )
     
     def calculate_three_black_crows(self, data: pd.DataFrame, context: pd.DataFrame = None) -> np.ndarray:
         """三只乌鸦"""
-        if context is None:
-            context = self.analyzer.calculate_context(data)
-        return self.analyzer.identify_three_black_crows(data, context=context)
+        return self.analyzer.identify_three_black_crows(
+            data, context=self._get_context(data, context),
+            price_pos_threshold=self.config.PRICE_POS_SOLDIERS_CROWS,
+        )
     
     # ==================== K线形态强度指标 ====================
     
@@ -184,7 +247,12 @@ class CandlestickPatternFactors:
         factors = pd.DataFrame(index=data.index)
         
         # 统一计算背景上下文
-        context = self.analyzer.calculate_context(data)
+        context = self.analyzer.calculate_context(
+            data,
+            window=self.config.CONTEXT_WINDOW,
+            sideways_ma_deviation=self.config.CONTEXT_SIDEWAYS_MA_DEVIATION,
+            sideways_range_pct=self.config.CONTEXT_SIDEWAYS_RANGE_PCT,
+        )
         
         # 单根K线形态
         factors['white_candle'] = self.calculate_white_candle(data)

@@ -96,9 +96,13 @@ class BaostockDataManager(BaostockFetcher):
                 # 如果是空且不是因为日期范围问题，可能需要警告，但 fetch_kline_data 已经打印了错误
                 pass
             
-            # 获取复权因子
-            adjust_df = fetch_adjust_factor(code, start_str, end_str)
+            # 获取复权因子（前复权因子历史会随除权除息全量重算，最新日值恒为1）
+            # 必须全量覆盖：先删除该股票所有历史记录，再写入完整序列
+            full_start = '2009-03-03'
+            adjust_df = fetch_adjust_factor(code, full_start, end_str)
             if not adjust_df.empty:
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM adjust_factor WHERE code = ?", (code,))
                 self._save_adjust_factor(adjust_df)
             
             # 填补数据缺口

@@ -396,7 +396,15 @@ class BaostockFetcher:
             return pd.DataFrame()
 
     def _save_stock_basic_to_db(self, df: pd.DataFrame):
-        """将股票列表保存到元数据库"""
+        """将股票列表保存到元数据库（仅保存 type=1 的普通股票）"""
+        if df.empty: return
+        # 过滤非股票证券（基金/债券/指数等），避免误存
+        if 'type' in df.columns:
+            before = len(df)
+            df = df[df['type'] == '1'].copy()
+            removed = before - len(df)
+            if removed > 0:
+                print(f"  ℹ _save_stock_basic_to_db: 过滤 {removed} 条 type!=1 的非股票记录")
         if df.empty: return
         cursor = self.conn.cursor()
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

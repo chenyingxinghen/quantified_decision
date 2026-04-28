@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--stocks', type=int, default=TrainingConfig.STOCK_NUM,
                         help=f'训练选取的股票数量 (默认{TrainingConfig.STOCK_NUM})')
     parser.add_argument('--force',  action='store_true', help='强制重新计算所有因子')
-    parser.add_argument('--workers', type=int, default=12, help='并行线程数')
+    parser.add_argument('--workers', type=int, default=15, help='并行线程数')
 
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
@@ -69,9 +69,22 @@ def main():
         
         # 优化：预先检查已经是最新的缓存，避免全量加载行情数据到内存
         import pyarrow.parquet as pq
+        import sqlite3 as _sqlite3
         cache_dir = TrainingConfig.CACHE_DIR
         stocks_to_update = []
         skipped_count = 0
+
+        # 用数据库中实际最新交易日作为跳过基准，而非"今天"
+        # 避免非交易日/盘后运行时，缓存日期永远 < 今天，导致所有缓存被误判为需要更新
+        _actual_latest_date = cache_end_date  # 兜底：若查询失败则退回原逻辑
+        try:
+            _conn = _sqlite3.connect(DATABASE_PATH)
+            _row = _conn.execute("SELECT MAX(date) FROM daily_data").fetchone()
+            _conn.close()
+            if _row and _row[0]:
+                _actual_latest_date = str(_row[0])
+        except Exception:
+            pass
         
         print(f"  正在扫描 {len(trainer_stocks)} 只股票的缓存状态...")
         for code in trainer_stocks:
@@ -82,7 +95,7 @@ def main():
                     last_row = pq.read_table(cache_file, columns=['date']).to_pandas().tail(1)
                     if not last_row.empty:
                         cache_last_date = str(last_row['date'].iloc[0])
-                        if cache_last_date >= cache_end_date:
+                        if cache_last_date >= _actual_latest_date:
                             skipped_count += 1
                             continue
                 except Exception:

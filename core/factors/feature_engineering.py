@@ -377,35 +377,55 @@ class FeatureEngineer:
             # 自动检测分类列
             categorical_cols = [col for col in df.columns if col in ['sector', 'industry']]
         
+        # 全局固定的行业列表（A股 Baostock 行业分类，顺序固定确保编码一致）
+        # 编码规则: 0=Unknown, 1=制造业, 2=金融业, ... 与股票数量无关
+        GLOBAL_INDUSTRY_MAPPING = {
+            '农、林、牧、渔业': 1,
+            '采矿业': 2,
+            '制造业': 3,
+            '电力、热力、燃气及水生产和供应业': 4,
+            '建筑业': 5,
+            '批发和零售业': 6,
+            '交通运输、仓储和邮政业': 7,
+            '住宿和餐饮业': 8,
+            '信息传输、软件和信息技术服务业': 9,
+            '金融业': 10,
+            '房地产业': 11,
+            '租赁和商务服务业': 12,
+            '科学研究和技术服务业': 13,
+            '水利、环境和公共设施管理业': 14,
+            '居民服务、修理和其他服务业': 15,
+            '教育': 16,
+            '卫生和社会工作': 17,
+            '文化、体育和娱乐业': 18,
+            '公共管理、社会保障和社会组织': 19,
+            'Unknown': 0,
+        }
+        # One-Hot 列表与映射保持一致（排除 Unknown）
+        GLOBAL_TOP_INDUSTRIES = [k for k in GLOBAL_INDUSTRY_MAPPING if k != 'Unknown']
+
         for col in categorical_cols:
             if col not in df.columns:
                 continue
                 
             try:
-                # 动态生成映射表 (基于列中的现有类别)
-                # 这比硬编码更灵活，能适应 Baostock 返回的所有行业
-                unique_categories = df[col].dropna().unique()
-                mapping = {cat: i + 1 for i, cat in enumerate(sorted(unique_categories))}
-                mapping['Unknown'] = 0
-                
-                # 执行编码
                 col_data = df[col].fillna('Unknown').astype(str)
-                encoded = col_data.map(mapping).fillna(0).astype(int)
-                
+
+                # 使用全局固定映射，不依赖当前数据中出现的类别
+                # 修复：动态映射在单股处理时只有1个类别，导致所有股票 encoded=1
+                encoded = col_data.map(GLOBAL_INDUSTRY_MAPPING).fillna(0).astype(int)
+
                 feature_name = f'{col}_encoded'
                 new_features[feature_name] = encoded
                 self.generated_features.append(feature_name)
-                
-                # 如果分类列在 top 10，则进行 One-Hot 编码
-                top_cats = df[col].value_counts().head(10).index.tolist()
-                for cat in top_cats:
-                    if pd.isna(cat) or cat == 'Unknown': continue
-                    # 清理分类名称用于列名
-                    safe_cat_name = str(cat).replace(' ', '_').replace('&', 'and').replace('-', '_')
+
+                # One-Hot 编码（全局固定列，确保所有股票生成相同的列名）
+                for cat in GLOBAL_TOP_INDUSTRIES:
+                    safe_cat_name = str(cat).replace(' ', '_').replace('&', 'and').replace('-', '_').replace('、', '_').replace('，', '_')
                     oh_feature_name = f'{col}_{safe_cat_name}'
                     new_features[oh_feature_name] = (col_data == cat).astype(int)
                     self.generated_features.append(oh_feature_name)
-                    
+
             except Exception as e:
                 pass
         
@@ -457,20 +477,22 @@ class FeatureEngineer:
                               and not any(x in col.lower() for x in ['slope', 'sharpe'])][:60]
         
         # 2. 批量生成各类特征并存入 collected_features
-        import random
-        random.seed(42)
+        # 注意：使用确定性的固定索引选取，而非 random.sample，
+        # 确保不同股票（列集合可能不同）生成相同名称的特征，避免 target_features 对齐时出现大量缺失。
 
         if config.get('ratio') and len(fundamental_factors) > 1:
             pre_count = len(self.generated_features)
             sorted_factors = sorted(fundamental_factors)
-            selected_factors = random.sample(sorted_factors, min(10, len(sorted_factors)))
+            # 均匀间隔取 10 个，保证列名确定
+            step = max(1, len(sorted_factors) // 10)
+            selected_factors = sorted_factors[::step][:10]
             collected_features.update(self.create_ratio_features(df, selected_factors[:5], selected_factors[5:10], return_dict=True))
             stats['比率特征'] = len(self.generated_features) - pre_count
 
         if config.get('product') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
             sorted_tech = sorted(tech_indicators)
-            selected_tech = random.sample(sorted_tech, min(4, len(sorted_tech)))
+            selected_tech = sorted_tech[:4]
             pairs = [(selected_tech[i], selected_tech[j]) for i in range(len(selected_tech)) for j in range(i+1, len(selected_tech))]
             collected_features.update(self.create_product_features(df, pairs, return_dict=True))
             stats['乘积特征'] = len(self.generated_features) - pre_count
@@ -478,7 +500,7 @@ class FeatureEngineer:
         if config.get('difference') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
             sorted_tech = sorted(tech_indicators)
-            selected_tech = random.sample(sorted_tech, min(6, len(sorted_tech)))
+            selected_tech = sorted_tech[:6]
             diff_pairs = [(selected_tech[i], selected_tech[j]) for i in range(len(selected_tech)) for j in range(i+1, len(selected_tech))]
             collected_features.update(self.create_difference_features(df, diff_pairs, return_dict=True))
             stats['差分特征'] = len(self.generated_features) - pre_count
@@ -491,7 +513,7 @@ class FeatureEngineer:
             log_cols += [col for col in tech_indicators if 'vol' in col.lower() or 'amount' in col.lower()]
             if log_cols:
                 sorted_cols = sorted(list(set(log_cols)))
-                selected_cols = random.sample(sorted_cols, min(8, len(sorted_cols)))
+                selected_cols = sorted_cols[:8]
                 collected_features.update(self.create_log_features(df, selected_cols, return_dict=True))
             stats['对数变换'] = len(self.generated_features) - pre_count
 
@@ -500,14 +522,14 @@ class FeatureEngineer:
             sqrt_cols = [col for col in tech_indicators if any(kw in col.lower() for kw in ['volatility', 'atr', 'vol', 'amount'])]
             if sqrt_cols:
                 sorted_cols = sorted(list(set(sqrt_cols)))
-                selected_cols = random.sample(sorted_cols, min(5, len(sorted_cols)))
+                selected_cols = sorted_cols[:5]
                 collected_features.update(self.create_sqrt_features(df, selected_cols, return_dict=True))
             stats['平方根变换'] = len(self.generated_features) - pre_count
 
         if config.get('rank'):
             pre_count = len(self.generated_features)
             sorted_factors = sorted(fundamental_factors)
-            selected_factors = random.sample(sorted_factors, min(15, len(sorted_factors)))
+            selected_factors = sorted_factors[:15]
             collected_features.update(self.create_rank_features(df, selected_factors, return_dict=True))
             stats['滚动排名'] = len(self.generated_features) - pre_count
 
@@ -515,8 +537,8 @@ class FeatureEngineer:
             pre_count = len(self.generated_features)
             sorted_tech = sorted(tech_indicators)
             sorted_fund = sorted(fundamental_factors)
-            selected_tech = random.sample(sorted_tech, min(6, len(sorted_tech)))
-            selected_fund = random.sample(sorted_fund, min(5, len(sorted_fund)))
+            selected_tech = sorted_tech[:6]
+            selected_fund = sorted_fund[:5]
             collected_features.update(self.create_interaction_features(df, selected_tech, selected_fund, return_dict=True))
             stats['交互特征'] = len(self.generated_features) - pre_count
 

@@ -100,7 +100,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 优先使用实时传入的 criteria，如果传入了则强制开启过滤
         if hasattr(self, '_custom_criteria'):
             filter_criteria = self._custom_criteria
-            should_apply_filter = True if not self._custom_criteria else False
+            should_apply_filter = True if self._custom_criteria else False
         else:
             filter_criteria = {
                 'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,
@@ -367,7 +367,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     conn = sqlite3.connect(self._db_path)
                     df = pd.read_sql_query(
                         """SELECT k.date, k.open, k.high, k.low, k.close, k.volume,
-                                  k.amount, k.turnover_rate, a.fore_adjust_factor
+                                  k.amount, k.turnover_rate, k.is_st, a.fore_adjust_factor
                            FROM daily_data k
                            LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
                            WHERE k.code = ? AND k.date >= ? AND k.date <= ?
@@ -391,7 +391,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     return None
                 row = df.iloc[-1]
                 bar = {c: row[c] for c in df.columns}
-                bar['is_st'] = 0  # 实盘时 ST 信息由 _pre_filter_stocks 处理
+                # is_st 已从数据库读取，无需覆盖
                 self._bar_cache[code] = bar
                 return bar
 

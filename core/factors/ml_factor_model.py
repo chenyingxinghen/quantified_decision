@@ -49,6 +49,7 @@ class MLFactorModel:
         self.feature_importance = {}
         self.is_trained = False
         self.optimal_threshold = 0.5
+        self._evals_result = {}  # 训练曲线，用于过拟合诊断
         self._init_model()
     
     def _init_model(self):
@@ -60,8 +61,8 @@ class MLFactorModel:
         if self.model_type == 'xgboost' and HAS_XGB:
             try:
                 if self.task == 'regression':
-                    # 回归方案优化：使用 reg:logistic 确保输出在 0-1 之间
-                    if 'objective' not in model_params: model_params['objective'] = 'reg:logistic'
+                    # 回归方案：使用 reg:squarederror 拟合连续排名标签
+                    if 'objective' not in model_params: model_params['objective'] = 'reg:squarederror'
                     self.model = xgb.XGBRegressor(**model_params)
                 else:
                     self.model = xgb.XGBClassifier(**model_params)
@@ -266,15 +267,15 @@ class MLFactorModel:
                 'device':           params.get('device', 'cuda'),
                 'learning_rate':    params.get('learning_rate', 0.03),
                 'max_depth':        params.get('max_depth', 6),
-                'min_child_weight': params.get('min_child_weight', 250),
-                'subsample':        params.get('subsample', 1),
-                'colsample_bytree': params.get('colsample_bytree', 0.7),
-                'colsample_bylevel':params.get('colsample_bylevel', 0.7),
-                'gamma':            params.get('gamma', 0.17),
-                'reg_alpha':        params.get('reg_alpha', 11),
-                'reg_lambda':       params.get('reg_lambda', 23),
-                'objective':        params.get('objective', 'reg:logistic'),
-                'eval_metric':      params.get('eval_metric', 'auc'),
+                'min_child_weight': params.get('min_child_weight', 50),
+                'subsample':        params.get('subsample', 0.8),
+                'colsample_bytree': params.get('colsample_bytree', 0.8),
+                'colsample_bylevel':params.get('colsample_bylevel', 0.8),
+                'gamma':            params.get('gamma', 0.0),
+                'reg_alpha':        params.get('reg_alpha', 0.1),
+                'reg_lambda':       params.get('reg_lambda', 1.0),
+                'objective':        params.get('objective', 'reg:squarederror'),
+                'eval_metric':      params.get('eval_metric', 'rmse'),
                 'nthread':          params.get('n_jobs', -1),
                 'verbosity':        params.get('verbosity', 0),
             }
@@ -289,18 +290,29 @@ class MLFactorModel:
                 ref=dtrain,
             )
 
+            # 用小样本训练集做过拟合监控，避免全量推理
+            monitor_size = min(50000, len(X_train_raw))
+            monitor_idx = np.random.choice(len(X_train_raw), monitor_size, replace=False)
+            dtrain_monitor = xgb.QuantileDMatrix(
+                X_train_raw[monitor_idx], label=y_train[monitor_idx],
+                feature_names=self.feature_names, ref=dtrain,
+            )
+
+            evals_result = {}
             verbose_eval = 50
             self.model = xgb.train(
                 xgb_params,
                 dtrain,
                 num_boost_round=params.get('n_estimators', 3000),
-                evals=[(dtrain, 'train'), (dval, 'validation')],
+                evals=[(dtrain_monitor, 'train_monitor'), (dval, 'validation')],
+                evals_result=evals_result,
                 early_stopping_rounds=params.get('early_stopping_rounds', 20),
                 verbose_eval=verbose_eval,
             )
+            self._evals_result = evals_result
 
             # 内存回收
-            del dtrain, dval
+            del dtrain, dval, dtrain_monitor
             X_train = X_train_raw  # 仅用于后续评估
             X_val = X_val_raw
 
@@ -312,20 +324,37 @@ class MLFactorModel:
             X_val = X_val_raw
             
             fit_params = {'sample_weight': w_train}
+            # 抽样训练集用于过拟合监控（仅非ranking任务，ranking需要group信息无法简单抽样）
+            monitor_size = min(50000, len(X_train))
+            monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
+            X_train_monitor = X_train[monitor_idx]
+            y_train_monitor = y_train[monitor_idx]
             if self.task == 'ranking':
                 if 'group' in kwargs: fit_params['group'] = kwargs['group']
-                if 'eval_group' in kwargs: 
-                    fit_params.update({'eval_set': [(X_val, y_val)], 'eval_group': [kwargs['eval_group']]})
+                if 'eval_group' in kwargs:
+                    fit_params.update({
+                        'eval_set': [(X_val, y_val)],
+                        'eval_group': [kwargs['eval_group']],
+                    })
                 else:
                     fit_params['eval_set'] = [(X_val, y_val)]
             else:
-                fit_params['eval_set'] = [(X_val, y_val)]
+                fit_params.update({
+                    'eval_set': [(X_train_monitor, y_train_monitor), (X_val, y_val)],
+                    'eval_names': ['train_monitor', 'valid'],
+                })
 
-            from lightgbm import early_stopping, log_evaluation
+            from lightgbm import early_stopping, log_evaluation, record_evaluation
             es_rounds = getattr(self, 'early_stopping_rounds', 100)
-            callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True),log_evaluation(50)]
+            lgb_evals_result = {}
+            callbacks = [
+                early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
+                log_evaluation(50),
+                record_evaluation(lgb_evals_result),
+            ]
             
             self.model.fit(X_train, y_train, callbacks=callbacks, feature_name=self.feature_names, **fit_params)
+            self._evals_result = lgb_evals_result
 
         # ---------------------------------------------------------------------
         # 情况 C: 标准流程 (不符合分批条件或非优化模式)
@@ -354,12 +383,26 @@ class MLFactorModel:
             if self.model_type == 'xgboost':
                 self.model.fit(X_train, y_train, verbose=False, **fit_params)
             elif self.model_type == 'lightgbm':
-                from lightgbm import early_stopping, log_evaluation
+                from lightgbm import early_stopping, log_evaluation, record_evaluation
                 es_rounds = getattr(self, 'early_stopping_rounds', 100)
-                callbacks = [early_stopping(stopping_rounds=es_rounds, first_metric_only=True)]
+                lgb_evals_result = {}
+                if self.task != 'ranking':
+                    monitor_size = min(50000, len(X_train))
+                    monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
+                    X_train_monitor = X_train[monitor_idx] if isinstance(X_train, np.ndarray) else X_train.iloc[monitor_idx]
+                    y_train_monitor = y_train[monitor_idx]
+                    fit_params.update({
+                        'eval_set': [(X_train_monitor, y_train_monitor), (X_val, y_val)],
+                        'eval_names': ['train_monitor', 'valid'],
+                    })
+                callbacks = [
+                    early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
+                    record_evaluation(lgb_evals_result),
+                ]
                 if self.task == 'ranking':
                     callbacks.append(log_evaluation(period=50))
                 self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
+                self._evals_result = lgb_evals_result
             else:
                 self.model.fit(X_train, y_train, sample_weight=w_train)
             
@@ -369,10 +412,13 @@ class MLFactorModel:
         
         import gc
         gc.collect()
+
+        # 从训练曲线提取过拟合诊断（零推理开销）
+        train_metrics = self._overfitting_diagnosis()
         
         return {
-            'train_metrics': self._evaluate(X_train, y_train, "训练集", returns=r_train, dates=dates_train, sample_ratio=0.05),
-            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val, sample_ratio=0.3)
+            'train_metrics': train_metrics,
+            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val, sample_ratio=1.0)
         }
 
     def _get_predict_proba(self, X: Any) -> np.ndarray:
@@ -425,6 +471,79 @@ class MLFactorModel:
         
         return preds
 
+    def _overfitting_diagnosis(self) -> Dict:
+        """从训练曲线直接读取过拟合诊断，零推理开销"""
+        evals = getattr(self, '_evals_result', {})
+        if not evals:
+            return {}
+
+        # XGBoost: {'train_monitor': {'rmse': [...]}, 'validation': {'rmse': [...]}}
+        # LightGBM: {'train_monitor': {'ndcg@1': [...]}, 'valid': {'ndcg@1': [...]}}
+        train_key = next((k for k in evals if 'train' in k.lower()), None)
+        val_key   = next((k for k in evals if 'train' not in k.lower()), None)
+
+        metrics = {}
+
+        # 只有验证集曲线时（ranking 任务 group 信息缺失导致训练集监控被跳过）
+        if val_key and not train_key:
+            val_curves  = evals[val_key]
+            metric_name = next(iter(val_curves))
+            val_series  = val_curves[metric_name]
+            is_loss     = any(x in metric_name for x in ('loss', 'rmse', 'error', 'logloss'))
+            best_val    = min(val_series) if is_loss else max(val_series)
+            final_val   = val_series[-1]
+            best_round  = val_series.index(best_val) + 1
+            degradation = abs(final_val - best_val) / (abs(best_val) + 1e-8)
+
+            print(f"\n  [过拟合诊断 - 训练曲线] 指标: {metric_name}  (仅验证集，ranking任务)")
+            print(f"    验证集最终值:  {final_val:.5f}")
+            print(f"    验证集最优值:  {best_val:.5f} (第 {best_round} 轮，共 {len(val_series)} 轮)")
+            print(f"    Early Stop 后退化: {degradation:.2%}")
+            metrics = {'val_final': final_val, 'best_val': best_val, 'best_round': best_round,
+                       'metric_name': metric_name, 'rank_ic': 0.0}
+            return metrics
+
+        if not (train_key and val_key):
+            return {}
+
+        train_curves = evals[train_key]
+        val_curves   = evals[val_key]
+        metric_name  = next(iter(train_curves))
+        # val 可能用不同 metric key，取第一个
+        val_metric   = next(iter(val_curves))
+
+        train_series = train_curves[metric_name]
+        val_series   = val_curves[val_metric]
+        is_loss      = any(x in metric_name for x in ('loss', 'rmse', 'error', 'logloss'))
+
+        train_final = train_series[-1]
+        val_final   = val_series[-1]
+        best_val    = min(val_series) if is_loss else max(val_series)
+        best_round  = val_series.index(best_val) + 1
+        gap         = abs(train_final - val_final)
+        overfit_ratio = gap / (abs(train_final) + 1e-8)
+
+        print(f"\n  [过拟合诊断 - 训练曲线] 指标: {metric_name}")
+        print(f"    训练集最终值:  {train_final:.5f}")
+        print(f"    验证集最终值:  {val_final:.5f}")
+        print(f"    验证集最优值:  {best_val:.5f} (第 {best_round} 轮，共 {len(val_series)} 轮)")
+        print(f"    Train/Val 差距: {gap:.5f}  (过拟合比率: {overfit_ratio:.2%})")
+        if overfit_ratio > 0.15:
+            print(f"    ⚠️  过拟合风险较高，建议增大正则化或减少树深度")
+        else:
+            print(f"    ✅  Train/Val 差距在合理范围内")
+
+        metrics = {
+            'train_final': train_final,
+            'val_final': val_final,
+            'best_val': best_val,
+            'best_round': best_round,
+            'overfit_ratio': overfit_ratio,
+            'metric_name': metric_name,
+            'rank_ic': 0.0,
+        }
+        return metrics
+
     def _evaluate(self, X: Any, y: np.ndarray, dataset_name: str, returns: np.ndarray = None, 
                  dates: np.ndarray = None, sample_ratio: float = 1.0) -> Dict:
         y_prob = self._get_predict_proba(X)
@@ -444,9 +563,18 @@ class MLFactorModel:
         }
         
         # 2. 核心选股指标 (Top-N 精度 & 按组 Rank IC)
-        # 核心改进：优先使用 soft label y 作为评估基准 (y 已经过板块中性化排名处理)
-        # 这样评估出的 IC 才是真实的“在同板块内选出龙头”的能力
-        reference = y if y is not None else (returns if returns is not None else y_prob)
+        # 评估基准优先用 returns（真实收益率），避免 y 因归一化方式变化导致 percentile 阈值偏移
+        # 例如验证集用 z-score->sigmoid 归一化后，y 不再是排名分布，Top-N 精度会失真
+        if returns is not None:
+            reference = returns
+        elif y is not None:
+            reference = y
+        else:
+            reference = y_prob
+        if isinstance(reference, pd.Series):
+            reference = reference.to_numpy()
+        if isinstance(reference, np.ndarray) and reference.dtype != np.float32:
+            reference = reference.astype(np.float32)
         
         if dates is not None:
             # 获取日期分组

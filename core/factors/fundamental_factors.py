@@ -244,7 +244,22 @@ class FundamentalFactors:
         raw = self.fetcher.get_pit_series(code, dates)
         
         if raw.empty or len(raw) == 0:
-            return pd.DataFrame(index=daily_data.index)
+            # 无财务数据时返回全 NaN 的占位 DataFrame，保证列结构与有数据的股票一致
+            # 这样特征工程阶段能匹配到相同的基本面列名，避免衍生特征集合不一致
+            placeholder = pd.DataFrame(index=daily_data.index)
+            for col in self.NUMERIC_COLS:
+                placeholder[col] = np.nan
+            placeholder['dynamic_pe']  = pd.to_numeric(daily_data.get('peTTM'),  errors='coerce') if 'peTTM'  in daily_data.columns else np.nan
+            placeholder['dynamic_pb']  = pd.to_numeric(daily_data.get('pbMRQ'),  errors='coerce') if 'pbMRQ'  in daily_data.columns else np.nan
+            placeholder['inv_pe']      = np.nan
+            placeholder['inv_pb']      = np.nan
+            placeholder['market_cap']  = np.nan
+            placeholder['roe_x_np_growth'] = np.nan
+            placeholder['roe_to_pb']   = np.nan
+            placeholder['peg']         = np.nan
+            placeholder['sue']         = np.nan
+            placeholder['eav']         = np.nan
+            return placeholder
 
         # 2. 构建因子
         factors = pd.DataFrame(index=daily_data.index)

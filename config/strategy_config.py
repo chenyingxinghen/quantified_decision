@@ -15,7 +15,7 @@
 
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
-ML_FACTOR_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
 
 
 # ==============================================================================
@@ -48,7 +48,7 @@ ENABLE_TIME_STOP_EXIT = True        # 是否启用时间止损卖出
 
 # 时间止损参数
 TIME_STOP_DAYS = 15                 # 增加时间止损天数，匹配预测周期
-TIME_STOP_MIN_LOSS_PCT = 0.05      # 时间止损最小亏损比例（2%）
+TIME_STOP_MIN_LOSS_PCT = 0.02      # 时间止损最小亏损比例（2%）
 
 # ==============================================================================
 # 趋势线分析参数

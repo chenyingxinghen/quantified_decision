@@ -206,12 +206,10 @@ class ComprehensiveFactorCalculator:
             # 停牌检测：成交量为 0
             status_factors['is_suspended'] = (data['volume'] == 0).astype(int)
 
-            # 合并所有
-            factors_list = [tech_factors, candlestick_factors, sentiment_factors, status_factors]
-            if not fundamental_factors.empty:
-                factors_list.append(fundamental_factors)
-            if not adv_factors.empty:
-                factors_list.append(adv_factors)
+            # 合并所有（基本面因子现在始终包含占位列，不再条件跳过）
+            factors_list = [tech_factors, candlestick_factors, sentiment_factors, status_factors,
+                            fundamental_factors, adv_factors]
+            factors_list = [f for f in factors_list if not f.empty]
                 
             # 确保索引对齐
             for i in range(len(factors_list)):

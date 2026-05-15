@@ -97,8 +97,10 @@ class BaostockDataManager(BaostockFetcher):
                 pass
             
             # 获取复权因子（前复权因子历史会随除权除息全量重算，最新日值恒为1）
-            # 必须全量覆盖：先删除该股票所有历史记录，再写入完整序列
-            full_start = '2009-03-03'
+            if time.strptime(sync_info['daily']) - time.strptime(today_str)<=timedelta(days=30): # 兜底逻辑
+                full_start = '2009-03-03'
+            else:
+                full_start = start_str
             adjust_df = fetch_adjust_factor(code, full_start, end_str)
             if not adjust_df.empty:
                 cursor = self.conn.cursor()

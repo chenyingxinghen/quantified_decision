@@ -18,7 +18,7 @@ from core.factors.ml_factor_model import MLFactorModel
 from core.factors.feature_engineering import FeatureEngineer
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller
-from config import DATABASE_PATH, FactorConfig
+from config import DATABASE_PATH, FactorConfig, TrainingConfig
 
 class ComprehensiveFactorCalculator:
     """综合因子计算器，整合所有因子计算模块"""
@@ -109,8 +109,11 @@ class ComprehensiveFactorCalculator:
             # A. 技术指标 (MA, RSI, MACD 等)
             tech_factors = self.factor_calculator.calculate_all_factors(data)
             
-            # B. K线形态
-            candlestick_factors = self.candlestick_calculator.calculate_all_candlestick_patterns(data)
+            # B. K线形态（受 INCLUDE_CANDLE_PATTERN 开关控制）
+            if getattr(TrainingConfig, 'INCLUDE_CANDLE_PATTERN', False):
+                candlestick_factors = self.candlestick_calculator.calculate_all_candlestick_patterns(data)
+            else:
+                candlestick_factors = pd.DataFrame(index=data.index)
             
             # C. 市场情绪因子 (基于量价数据, 无前视偏差)
             try:

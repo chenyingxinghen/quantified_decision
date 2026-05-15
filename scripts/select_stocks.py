@@ -374,6 +374,7 @@ def select_stocks(
             'max_price':      max_price,
             'include_st':     include_st,
             'markets':        markets,
+            'apply_filter':   apply_filter,
         }
 
     strategy = MLFactorBacktestStrategy(
@@ -541,7 +542,7 @@ def main():
         model_path=args.model,
         min_confidence=args.min_confidence,
         top_n=args.top,
-        apply_filter=True,
+        apply_filter=args.filter,
         workers=args.workers,
         cache_dir=args.cache_dir,
         only_cache=args.only_cache,

@@ -58,8 +58,10 @@ class MLFactorStrategy:
         if not valid_adj.empty:
             base_val = float(valid_adj.iloc[-1])
             if base_val != 0:
-                ratio = df['fore_adjust_factor'].ffill().fillna(1.0) / base_val
-                for col in ['open', 'high', 'low', 'close']:
+                # bfill 先向后填充（处理开头缺失），再 ffill 向前填充（处理中间缺失）
+                # 避免纯 ffill 在序列开头缺失时回退到 fillna(1.0) 导致价格跳变
+                ratio = df['fore_adjust_factor'].bfill().ffill().fillna(1.0) / base_val
+                for col in ['open', 'high', 'low', 'close', 'preclose']:
                     if col in df.columns:
                         df[col] = df[col] * ratio
         return df
@@ -80,7 +82,7 @@ class MLFactorStrategy:
             # 从数据库查询
             conn = sqlite3.connect(DATABASE_PATH)
             query = '''
-                SELECT k.date, k.open, k.high, k.low, k.close, k.volume, k.amount, k.turnover_rate, a.fore_adjust_factor
+                SELECT k.date, k.open, k.high, k.low, k.close, k.preclose, k.volume, k.amount, k.turnover_rate, k.is_st, a.fore_adjust_factor
                 FROM daily_data k
                 LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
                 WHERE k.code = ? AND k.date >= ? AND k.date <= ?
@@ -151,9 +153,12 @@ class MLFactorStrategy:
             # 使用最新的因子数据进行预测
             latest_factors = factors.tail(1)
             
-            # 检查最新因子是否有效
-            if latest_factors.isna().all().any():
-                return None
+            # 警告：单只股票预测缺少横截面归一化上下文，可能导致置信度失真
+            # 建议使用 batch_screen 进行批量预测以获得准确的排名分
+            import warnings
+            warnings.warn(f"Warning: Single stock prediction for {stock_code} lacks cross-sectional context. "
+                          f"Model trained on ranks may produce unreliable results for raw values. "
+                          f"Consider using batch_screen for accurate results.", RuntimeWarning)
             
             # 生成信号
             signal_result = self.model.predict_signal(latest_factors)
@@ -269,9 +274,8 @@ class MLFactorStrategy:
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            # 同步 train_ml_model 豁免逻辑
-            sentiment_keys = ['up_ratio', 'down_ratio', 'mean_return', 'adv_vol', 'breadth_', 'sentiment_', 'mkt_', 'market_type']
-            rank_cols = [col for col in all_X.columns if not any(k in col.lower() for k in sentiment_keys)]
+            # 使用 TrainingConfig 中统一的豁免逻辑
+            rank_cols = [col for col in all_X.columns if not TrainingConfig.should_skip_rank(col)]
             
             if rank_cols and len(all_X) > 1:
                 all_X[rank_cols] = all_X[rank_cols].rank(pct=True).fillna(0.5)
@@ -282,14 +286,50 @@ class MLFactorStrategy:
         print(f"  正在执行批量预测 [数量: {len(valid_codes)}]...")
         probs = self.model.predict(all_X)
         
-        # 4. 汇总结果
+        # 4. 汇总结果与不可买入过滤
         results = []
         top_factor_names = self.model.get_top_factors(n=10)
 
+        # 准备涨跌停判定参数
+        from config.baostock_config import MARKET_LIMITS, MARKET_PREFIXES
+        
         for i, code in enumerate(valid_codes):
             prob = float(probs[i])
             confidence = prob * 100
             
+            # --- T日不可买入过滤 (一字涨停/停牌) ---
+            data = self._get_stock_data_from_db(code, days=5)
+            if data is not None and not data.empty:
+                last_row = data.iloc[-1]
+                # 停牌判定
+                if last_row['volume'] == 0: continue
+                
+                # 一字涨停判定
+                # 确定该股票的涨停阈值
+                limit_threshold = MARKET_LIMITS['main']
+                if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
+                    limit_threshold = MARKET_LIMITS['gem_star']
+                elif code.startswith(MARKET_PREFIXES['bj']):
+                    limit_threshold = MARKET_LIMITS['bj']
+                
+                # 主板 ST 5% 限制
+                if last_row.get('is_st') == 1:
+                    is_main_board = ~(code.startswith(MARKET_PREFIXES['sz_gem']) or 
+                                      code.startswith(MARKET_PREFIXES['star']) or 
+                                      code.startswith(MARKET_PREFIXES['bj']))
+                    if is_main_board:
+                        limit_threshold = MARKET_LIMITS['st']
+                
+                preclose = last_row.get('preclose')
+                if preclose is None or preclose == 0: # 数据库可能没存 preclose，通过 close 反推
+                    # 注意：如果 preclose 缺失，一字涨停判定会受限
+                    pass
+                else:
+                    is_limit_up = (last_row['open'] == last_row['high']) and \
+                                 (last_row['open'] == last_row['low']) and \
+                                 (last_row['open'] >= preclose * (1 + limit_threshold) - 0.002)
+                    if is_limit_up: continue
+
             if confidence >= min_confidence:
                 current_price = stock_prices[code]
                 atr = stock_atrs[code]

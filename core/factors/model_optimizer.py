@@ -499,7 +499,9 @@ class EnsembleOptimizer:
             delayed(eval_weight)(w) for w in tqdm(all_weights, desc="权重优化进度")
         )
         
-        # 记录结果
+        # 记录结果（修复：初始化 best_score/best_weights，避免 NameError）
+        best_score = -np.inf
+        best_weights = [1.0 / n_models] * n_models  # 默认等权
         for w, score in zip(all_weights, scores):
             if score > best_score:
                 best_score = score
@@ -656,7 +658,8 @@ class ModelOptimizer:
                              y_val: np.ndarray = None,
                              dates: np.ndarray = None,
                              returns: np.ndarray = None,
-                             path_scores: np.ndarray = None) -> Dict:
+                             path_scores: np.ndarray = None,
+                             w_sig: np.ndarray = None) -> Dict:
         """
         运行完整优化流程
         
@@ -693,6 +696,7 @@ class ModelOptimizer:
                 # 同步切分辅助变量
                 dates_val = dates[actual_split_idx:]
                 returns_val = returns[actual_split_idx:] if returns is not None else None
+                w_sig_train = w_sig[:actual_split_idx] if w_sig is not None else None
             else:
                 from sklearn.model_selection import train_test_split
                 X_train, X_val, y_train, y_val = train_test_split(
@@ -759,7 +763,8 @@ class ModelOptimizer:
                 'feature_names': selected_features,
                 'returns': returns,
                 'dates': dates,
-                'split_idx': actual_split_idx # 强制对齐分割索引
+                'split_idx': actual_split_idx, # 强制对齐分割索引
+                'sample_weight': w_sig # 传入正交重要性权重
             }
             
             # 【关键修复】针对 Ranking 任务通过 dates 动态还原分组信息

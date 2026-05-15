@@ -77,10 +77,15 @@ class MLFactorBacktestStrategy(BaseStrategy):
     def generate_signals(self,
                         current_date: str,
                         market_data: Any,
-                        portfolio_state: Dict[str, Any]) -> List[StrategySignal]:
+                        portfolio_state: Dict[str, Any],
+                        criteria: Optional[Dict] = None,
+                        min_confidence: Optional[float] = None) -> List[StrategySignal]:
         """生成交易信号 (极速版)"""
         signals = []
         existing_positions = portfolio_state.get('positions', {})
+        
+        # 确定置信度阈值：优先使用参数，其次使用实例属性
+        effective_min_confidence = min_confidence if min_confidence is not None else self.min_confidence
         
         # 优先使用 portfolio_state 中的 available_slots (用于实盘选股指定数量)
         # 如果未指定，则根据最大仓位限制计算剩余空位
@@ -97,10 +102,14 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 2. 预筛选 (利用内存快照，无 SQL)
         info_map = self._get_optimized_info_map(current_date, market_data)
         
-        # 优先使用实时传入的 criteria，如果传入了则强制开启过滤
-        if hasattr(self, '_custom_criteria'):
-            filter_criteria = self._custom_criteria
-            should_apply_filter = True if self._custom_criteria else False
+        # 筛选逻辑：
+        # 1. 如果显式传入了 criteria，则使用它。
+        #    - 若 criteria 中包含 'apply_filter' 键，则以此为准；
+        #    - 否则，以全局配置 sc.ENABLE_FUNDAMENTAL_FILTER 为准。
+        # 2. 如果未传入 criteria (回测场景)，则完全遵循 sc 全局配置。
+        if criteria is not None:
+            filter_criteria = criteria
+            should_apply_filter = criteria.get('apply_filter', sc.ENABLE_FUNDAMENTAL_FILTER)
         else:
             filter_criteria = {
                 'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,
@@ -108,11 +117,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 'markets': sc.SELECTOR_MARKETS
             }
             should_apply_filter = sc.ENABLE_FUNDAMENTAL_FILTER
-        if filter_criteria:
+
+        if should_apply_filter:
             predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
-                                                 apply_filter=should_apply_filter, 
+                                                 apply_filter=True, 
                                                  criteria=filter_criteria)
-        else: predict_codes = all_codes
+        else:
+            predict_codes = all_codes
         
         if not predict_codes: return signals
 
@@ -138,16 +149,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
         all_X = pd.DataFrame(raw_rows, columns=self.model.feature_names)
         
         # 横截面归一化 (与训练时精确匹配逻辑保持一致)
-        _sentiment_exact = {
-            'up_ratio', 'strong_up_ratio', 'down_ratio',
-            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
-            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
-            'market_type',
-        }
-        rank_cols = [col for col in all_X.columns if col not in _sentiment_exact]
+        rank_cols = [col for col in all_X.columns if not fc.TrainingConfig.should_skip_rank(col)]
+        
         if rank_cols and len(all_X) > 1:
             from scipy.stats import rankdata as _rankdata
             arr = all_X[rank_cols].values
+            # 逐列进行横截面排名
             ranked = _rankdata(arr, method='average', axis=0) / (len(all_X) + 1)
             all_X[rank_cols] = ranked.astype(np.float32)
 
@@ -157,7 +164,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         candidates = []
         for i, code in enumerate(stock_codes_with_data):
             confidence = float(probs[i] * 100)
-            if confidence < self.min_confidence or code in existing_positions: continue
+            if confidence < effective_min_confidence or code in existing_positions: continue
             
             # 使用 md5 哈希在概率相同时保持排序稳定
             tie_breaker = int(hashlib.md5(code.encode()).hexdigest(), 16) % 1000 / 100000.0
@@ -308,7 +315,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
             # 填充缺失列为0，保持特征列顺序与模型一致
             missing = [f for f in self.model.feature_names if f not in factors.columns]
             if missing:
-                missing_df = pd.DataFrame(0.0, index=factors.index, columns=missing)
+                missing_df = pd.DataFrame(0.5, index=factors.index, columns=missing)
                 factors = pd.concat([factors, missing_df], axis=1)
             f_cols = self.model.feature_names + (['date'] if 'date' not in self.model.feature_names else [])
             factors = factors[[c for c in f_cols if c in factors.columns]]
@@ -343,8 +350,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
         """
         import sqlite3
         from datetime import datetime, timedelta
-
-        self._custom_criteria = criteria
 
         today = datetime.now().strftime('%Y-%m-%d')
 
@@ -417,17 +422,16 @@ class MLFactorBacktestStrategy(BaseStrategy):
 
         # 复用 generate_signals，portfolio_state 传空持仓、足够的 slots
         portfolio_state = {'positions': {}, 'available_slots': top_n}
-        # 临时覆盖 min_confidence 为 0，让所有信号通过，由调用方自行过滤
-        orig_min = self.min_confidence
-        self.min_confidence = 0.0
-        signals = self.generate_signals(today, market_data, portfolio_state)
-        self.min_confidence = orig_min
+        
+        # 调用信号生成逻辑，显式传递 criteria
+        # 内部会优先使用传入的 criteria 进行筛选，且不使用 sc 中的默认覆盖值
+        signals = self.generate_signals(today, market_data, portfolio_state, 
+                                        criteria=criteria)
 
         # 转换为与 select_stocks 兼容的字典格式
         results = []
-        for sig in sorted(signals, key=lambda s: s.confidence, reverse=True):
-            if sig.confidence < orig_min:
-                continue
+        # signals 已经是经过排序和 top_n 截取的了 (通过 available_slots)
+        for sig in signals:
             results.append({
                 'stock_code': sig.stock_code,
                 'confidence': sig.confidence,
@@ -435,8 +439,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 'stop_loss': sig.stop_loss,
                 'take_profit': sig.take_profit,
             })
-            if len(results) >= top_n:
-                break
         return results
 
     def cleanup(self):

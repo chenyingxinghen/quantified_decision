@@ -18,14 +18,7 @@ ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
 ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
 
 
-# ==============================================================================
-# 风险控制参数
-# ==============================================================================
 
-# ATR相关参数（用于止损止盈计算）
-ATR_PERIOD = 7                     # ATR计算周期
-ATR_STOP_MULTIPLIER = 1.0           # ATR止损倍数 (与训练一致)
-ATR_TARGET_MULTIPLIER = 4.0         # ATR目标倍数 (与训练一致)
 
 # 交易费率
 COMMISSION_RATE = 0.005           
@@ -36,19 +29,24 @@ COMMISSION_RATE = 0.005
 
 # 基础参数
 INITIAL_CAPITAL = 1.0          # 初始资金
-MAX_POSITIONS = 1                   # 最大持仓数量，分散风险
+MAX_POSITIONS = 1               
 
-
+# ATR相关参数（用于止损止盈计算）
+ATR_PERIOD = 14                     # ATR计算周期
+ATR_STOP_MULTIPLIER = 1.0           # ATR止损倍数 (放宽，减少噪音震出)
+ATR_TARGET_MULTIPLIER = 3         # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
+                                    # 4xATR(8%)在7天内Top20%样本中只有50%能触发
+                                    # 2.5xATR(5%)在7天内Top20%样本中有97%能触发
+# 时间止损参数
+TIME_STOP_DAYS = 7                 # 与FUTURE_DAYS对齐：持满预测周期再评估
+TIME_STOP_MIN_LOSS_PCT = 0.20     # 时间止损，20%的高要求，确保超时直接卖出或锁定利润
 
 # 卖出控制参数
-ENABLE_STOP_LOSS_EXIT = True        # 是否启用止损卖出
+ENABLE_STOP_LOSS_EXIT = False        # 是否启用止损卖出
 ENABLE_TAKE_PROFIT_EXIT = True     # 是否启用止盈卖出
 ENABLE_SUPPORT_BREAK_EXIT = False    # 是否启用跌破支撑卖出
 ENABLE_TIME_STOP_EXIT = True        # 是否启用时间止损卖出
 
-# 时间止损参数
-TIME_STOP_DAYS = 15                 # 增加时间止损天数，匹配预测周期
-TIME_STOP_MIN_LOSS_PCT = 0.02      # 时间止损最小亏损比例（2%）
 
 # ==============================================================================
 # 趋势线分析参数
@@ -72,7 +70,7 @@ ENABLE_FUNDAMENTAL_FILTER = True
 MIN_MARKET_CAP = 0
 MAX_PE = None
 MAX_ZCFZL = None
-MIN_PRICE = 0
+MIN_PRICE = 1
 MAX_PRICE = 20
 INCLUDE_ST = True
 SELECTOR_MARKETS = ['sh_main', 'sz_main']

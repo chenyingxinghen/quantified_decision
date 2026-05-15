@@ -98,8 +98,13 @@ class TimeSeriesFactors:
         price_returns = close.pct_change()
         features['price_volume_corr'] = price_returns.rolling(20).corr(vol_returns)
         
-        # 4. 单位成交金额 (均值)
-        features['amount_per_volume'] = amount.rolling(20).mean() / vol_ma20
+        # 4. 单位成交金额变化率 (当前均价 vs 历史均价的相对变化)
+        # 修复：原始 amount/volume = 均价（元/股），横截面排名后等价于"股价排名"，
+        # 这是价格水平偏差而非预测信号。改为计算均价的相对变化率，
+        # 捕捉"成交均价是否在抬升/下降"这一有意义的量价信号。
+        avg_price_20 = amount.rolling(20).mean() / vol_ma20.replace(0, np.nan)
+        avg_price_60 = amount.rolling(60).mean() / volume.rolling(60).mean().replace(0, np.nan)
+        features['amount_per_volume'] = (avg_price_20 / avg_price_60.replace(0, np.nan) - 1).fillna(0)
         
         # 5. 成交金额变化率
         amt_ma20 = amount.rolling(20).mean()
@@ -141,8 +146,32 @@ class TimeSeriesFactors:
         features['momentum_10d'] = returns.rolling(10).sum()
         features['momentum_20d'] = returns.rolling(20).sum()
         
-        # 3. 加速度（动量的差值）
-        features['acceleration'] = features['momentum_10d'] - features['momentum_20d'].shift(10)
+        # 3. 加速度（动量的二阶导数）
+        features['acceleration_5d'] = features['return_5d'] - features['return_5d'].shift(5)
+        features['acceleration_10d'] = features['return_10d'] - features['return_10d'].shift(10)
+        
+        # 4. 状态持续期 (Duration Factors - 极其关键，解决时间盲区)
+        # 连续上涨天数
+        is_up = (close > close.shift(1)).astype(int)
+        # 利用 groupby 巧妙计算连续为 1 的次数
+        consecutive_up = is_up * (is_up.groupby((is_up != is_up.shift()).cumsum()).cumcount() + 1)
+        features['consecutive_up_days'] = consecutive_up
+
+        # 站在 20 日均线上方的天数
+        ma20 = close.rolling(20).mean()
+        above_ma20 = (close > ma20).astype(int)
+        consecutive_above_ma20 = above_ma20 * (above_ma20.groupby((above_ma20 != above_ma20.shift()).cumsum()).cumcount() + 1)
+        features['days_above_ma20'] = consecutive_above_ma20
+
+        # 5. 相对位置 (Micro-structure)
+        # 过去60天价格分位数，刻画当前处于高位还是低位
+        min_60d = close.rolling(60).min()
+        max_60d = close.rolling(60).max()
+        features['price_percentile_60d'] = (close - min_60d) / (max_60d - min_60d + 1e-8)
+        
+        # 过去5天的日内最大回撤（最高价到收盘价跌幅）均值，刻画高位震荡
+        intraday_drawdown = (data['high'] - close) / data['high']
+        features['intraday_drawdown_avg_5d'] = intraday_drawdown.rolling(5).mean()
         
         # 补充处理
         features = features.replace([np.inf, -np.inf], 0).fillna(0)

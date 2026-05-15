@@ -12,6 +12,7 @@ if project_root not in sys.path:
 from core.factors.train_ml_model import MLModelTrainer
 from config.baostock_config import DATABASE_PATH
 from config.factor_config import TrainingConfig
+import pandas as pd
 
 
 def main():
@@ -50,10 +51,10 @@ def main():
     print(f"训练数据范围: {train_start_date} 至 {train_end_date}")
     print(f"缓存更新截止: {train_start_date} 至 {cache_end_date}")
     print(f"股票样本: 前 {args.stocks} 只")
-    print(f"涨停板/停牌样本惩罚加权: {'是' if TrainingConfig.PUNISH_UNBUYABLE else '否'}")
+    print(f"不可买入样本处理: {TrainingConfig.UNBUYABLE_HANDLING}")
 
     # ── 2. 初始化训练器 ──────────────────────────────────────────────────
-    trainer = MLModelTrainer(db_path=DATABASE_PATH, punish_unbuyable=TrainingConfig.PUNISH_UNBUYABLE)
+    trainer = MLModelTrainer(db_path=DATABASE_PATH)
 
     # ── 3. 获取股票列表 ──────────────────────────────────────────────────
     from core.data.baostock_main import BaostockDataManager
@@ -61,6 +62,73 @@ def main():
     stock_list = manager.get_stock_list_from_db()
     trainer_stocks = stock_list['code'].tolist()[:args.stocks]
     manager.close()
+
+    # ── 3b. 按策略条件过滤训练股票池（可选）────────────────────────────
+    if TrainingConfig.FILTER_BY_STRATEGY:
+        import config.strategy_config as sc
+        from config import SUPPORTED_MARKETS
+
+        # 确定各过滤参数（TrainingConfig 中的覆盖值优先，None 则回退到 strategy_config）
+        filter_markets  = TrainingConfig.TRAIN_FILTER_MARKETS  if TrainingConfig.TRAIN_FILTER_MARKETS  is not None else sc.SELECTOR_MARKETS
+        filter_max_price = TrainingConfig.TRAIN_FILTER_MAX_PRICE if TrainingConfig.TRAIN_FILTER_MAX_PRICE is not None else sc.MAX_PRICE
+        filter_min_price = TrainingConfig.TRAIN_FILTER_MIN_PRICE if TrainingConfig.TRAIN_FILTER_MIN_PRICE is not None else sc.MIN_PRICE
+        filter_include_st = TrainingConfig.TRAIN_FILTER_INCLUDE_ST if TrainingConfig.TRAIN_FILTER_INCLUDE_ST is not None else sc.INCLUDE_ST
+
+        before = len(trainer_stocks)
+
+        # 1. 市场前缀过滤
+        if filter_markets:
+            allowed_prefixes = []
+            for m in filter_markets:
+                info = SUPPORTED_MARKETS.get(m, {})
+                allowed_prefixes.extend(info.get('prefixes', []))
+            if allowed_prefixes:
+                trainer_stocks = [c for c in trainer_stocks if c.startswith(tuple(allowed_prefixes))]
+
+        # 2. 价格过滤（需要查数据库最新收盘价）
+        if filter_max_price is not None or filter_min_price is not None:
+            import sqlite3 as _sqlite3
+            _conn = _sqlite3.connect(DATABASE_PATH)
+            placeholders = ','.join(['?' for _ in trainer_stocks])
+            price_df = pd.read_sql_query(
+                f"SELECT code, close FROM daily_data WHERE code IN ({placeholders})"
+                f" AND date = (SELECT MAX(date) FROM daily_data)",
+                _conn, params=trainer_stocks
+            )
+            _conn.close()
+            price_map = dict(zip(price_df['code'], price_df['close']))
+            filtered = []
+            for c in trainer_stocks:
+                p = price_map.get(c)
+                if p is None:
+                    filtered.append(c)  # 无价格数据的保留（历史样本）
+                    continue
+                if filter_min_price is not None and p < filter_min_price:
+                    continue
+                if filter_max_price is not None and p > filter_max_price:
+                    continue
+                filtered.append(c)
+            trainer_stocks = filtered
+
+        # 3. ST 过滤（排除当前为 ST 的股票）
+        if not filter_include_st:
+            import sqlite3 as _sqlite3
+            _conn = _sqlite3.connect(DATABASE_PATH)
+            placeholders = ','.join(['?' for _ in trainer_stocks])
+            st_df = pd.read_sql_query(
+                f"SELECT code, is_st FROM daily_data WHERE code IN ({placeholders})"
+                f" AND date = (SELECT MAX(date) FROM daily_data)",
+                _conn, params=trainer_stocks
+            )
+            _conn.close()
+            st_map = dict(zip(st_df['code'], st_df['is_st']))
+            trainer_stocks = [c for c in trainer_stocks if st_map.get(c, 0) != 1]
+
+        after = len(trainer_stocks)
+        print(f"[策略过滤] 股票池: {before} → {after} 只"
+              f" (市场={filter_markets}, 价格=[{filter_min_price},{filter_max_price}], ST={filter_include_st})")
+    else:
+        print(f"[策略过滤] 已关闭，使用全市场 {len(trainer_stocks)} 只股票训练")
 
     # ── 4. 增量更新因子缓存（到最新日期）────────────────────────────────
     target_features = None  # 特征集，Step 0 发现后供 Step 2 复用
@@ -151,16 +219,15 @@ def main():
     print(f"\n[Step 3] 训练机器学习模型...")
     
     # 解析数据集
-    X, y, returns, factor_names, dates, unbuyable_mask, limit_groups = full_dataset[:7]
-    path_scores = full_dataset[7] if len(full_dataset) > 7 else None
-    is_st_arr = full_dataset[8] if len(full_dataset) > 8 else None
+    X, y, returns, factor_names, dates, unbuyable_mask, limit_groups, path_scores, is_st_arr, w_sig_arr = full_dataset
     
     results = trainer.train_models(
         X, y, returns, factor_names, dates,
         unbuyable_mask=unbuyable_mask,
         limit_groups=limit_groups,
         path_scores=path_scores,
-        is_st_arr=is_st_arr
+        is_st_arr=is_st_arr,
+        w_sig_arr=w_sig_arr
     )
 
     # ── 8. 对比与保存 ────────────────────────────────────────────────────

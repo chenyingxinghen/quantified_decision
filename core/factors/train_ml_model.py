@@ -32,6 +32,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from scipy.stats import spearmanr, rankdata
 from time import time
 from tqdm import tqdm
+import gc
 
 from core.factors.quantitative_factors import QuantitativeFactors
 from core.factors.candlestick_pattern_factors import CandlestickPatternFactors
@@ -41,23 +42,87 @@ from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalc
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller, fill_factors_with_defaults
 from core.data.market_sentiment_calculator import MarketSentimentCalculator
-from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, MARKET_PREFIXES,strategy_config
+from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, MARKET_PREFIXES,ModelConfig
+
+
+# ============================================================================
+# 顶层 worker 函数（进程池要求 picklable，必须定义在模块顶层）
+# ============================================================================
+
+def _cache_worker(args):
+    """
+    进程池 worker：在独立子进程中计算并保存单只股票的因子缓存。
+    
+    使用顶层函数而非实例方法，是因为 ProcessPoolExecutor 要求参数可 pickle，
+    而含有 SQLite 连接的对象无法跨进程序列化。
+    每个子进程独立创建计算器实例，避免共享状态。
+    """
+    code, data, db_path, factors_cache_dir, target_features, include_fundamentals = args
+    try:
+        import io, contextlib
+        # 子进程内直接构建轻量计算器，避免 MLModelTrainer.__init__ 的打印输出
+        from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
+        
+        # 复用 calculate_and_save_factors 的逻辑，但不依赖完整的 MLModelTrainer
+        # 直接构造一个最小化的 trainer-like 对象
+        trainer = MLModelTrainer.__new__(MLModelTrainer)
+        trainer.db_path = db_path
+        trainer.task = 'hybrid'
+        trainer.punish_unbuyable = False
+        trainer.factors_cache_dir = factors_cache_dir
+        trainer.models = {}
+        trainer.factor_calculator = ComprehensiveFactorCalculator(db_path)
+        
+        with contextlib.redirect_stdout(io.StringIO()):
+            trainer.calculate_and_save_factors(
+                code, data,
+                target_features=target_features,
+                include_fundamentals=include_fundamentals,
+                verbose=False
+            )
+        return code, True, None
+    except Exception as e:
+        return code, False, str(e)
+
+
+def _scan_cache_file(args):
+    """并行扫描单个缓存文件状态，返回 (code, needs_update: bool)"""
+    code, data_last_date, cache_file, target_features = args
+    try:
+        import pyarrow.parquet as pq
+        if not os.path.exists(cache_file):
+            return code, True
+        pf = pq.read_table(cache_file, columns=['date'])
+        last_row = pf.to_pandas().tail(1)
+        if last_row.empty:
+            return code, True
+        cache_last_date = str(last_row['date'].iloc[0])
+        if cache_last_date < data_last_date:
+            return code, True
+        # 日期已是最新，检查列是否匹配
+        if target_features is not None:
+            cached_cols = set(pq.read_schema(cache_file).names)
+            missing = [f for f in target_features if f not in cached_cols]
+            if missing:
+                return code, True
+        return code, False
+    except Exception:
+        return code, True
+
+
 class MLModelTrainer:
     """机器学习模型训练器"""
     
     def __init__(self, db_path: str = DATABASE_PATH, punish_unbuyable: bool = False):
         """
         初始化训练器
-        
+
         参数:
             db_path: 数据库路径
-            punish_unbuyable: 是否使用样本权重（方案2）
+            punish_unbuyable: 保留参数，用于归档目录命名（实际处理逻辑由 UNBUYABLE_HANDLING 控制）
         """
         self.db_path = db_path
-        # 任务类型固定为 hybrid，模型内部会根据类型自动分配任务
         self.task = 'hybrid'
-        print(f"模型训练任务类型已固定为: {self.task} (LGBM: ranking, XGB: regression)")
-            
         self.punish_unbuyable = punish_unbuyable
         self.factor_calculator = ComprehensiveFactorCalculator(db_path)
         self.models = {}
@@ -160,7 +225,9 @@ class MLModelTrainer:
                         base_factor = float(valid_adj.iloc[-1])
                         # 仅在基准非零时处理
                         if base_factor != 0:
-                            ratio = stock_df['fore_adjust_factor'].ffill().fillna(1.0) / base_factor
+                            # bfill 先向后填充（处理开头缺失），再 ffill 向前填充（处理中间缺失）
+                            # 避免纯 ffill 在序列开头缺失时回退到 fillna(1.0) 导致价格跳变
+                            ratio = stock_df['fore_adjust_factor'].bfill().ffill().fillna(1.0) / base_factor
                             for col in ['open', 'high', 'low', 'close', 'preclose']:
                                 if col in stock_df.columns:
                                     stock_df[col] = stock_df[col] * ratio
@@ -387,52 +454,38 @@ class MLModelTrainer:
         参数:
             stocks_data: {code: DataFrame} (应包含到最新日期的行情)
             include_fundamentals: 是否包含基本面
-            n_jobs: 并打数
+            n_jobs: 并行进程数（使用 ProcessPoolExecutor 实现真正的多核并行）
             verbose: 是否输出详细信息
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import os
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
         
         # 1. 快速去重与预扫描
         all_codes = list(stocks_data.keys())
-        total_initial = len(all_codes)
         
-        # 2. 增量跳过：快速检查哪些缓存已经是最新
+        # 2. 增量跳过：并行扫描磁盘缓存状态（I/O 密集，用线程池加速）
+        from concurrent.futures import ThreadPoolExecutor
         to_update = {}
         skipped = 0
         
-        print(f"\n[因子缓存同步] 正在扫描磁盘缓存状态...")
+        print(f"\n[因子缓存同步] 正在并行扫描磁盘缓存状态 ({len(all_codes)} 只)...")
+        scan_args = []
         for code in all_codes:
             data = stocks_data[code]
             if data.empty:
                 continue
-                
             cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
-            if os.path.exists(cache_file):
-                try:
-                    import pyarrow.parquet as pq
-                    pf = pq.read_table(cache_file, columns=['date'])
-                    last_row = pf.to_pandas().tail(1)
-                    
-                    if not last_row.empty:
-                        cache_last_date = str(last_row['date'].iloc[0])
-                        data_last_date = str(data['date'].max())
-                        
-                        if cache_last_date >= data_last_date:
-                            # 日期已是最新，还需检查列是否与 target_features 一致
-                            if target_features is not None:
-                                cached_cols = set(pq.read_schema(cache_file).names)
-                                missing = [f for f in target_features if f not in cached_cols]
-                                if missing:
-                                    # 列不匹配，需要重算
-                                    to_update[code] = data
-                                    continue
-                            skipped += 1
-                            continue
-                except Exception:
-                    pass
-            
-            to_update[code] = data
+            data_last_date = str(data['date'].max())
+            scan_args.append((code, data_last_date, cache_file, target_features))
+        
+        # 用线程池并行扫描（I/O 密集型，线程足够）
+        scan_workers = min(32, len(scan_args))
+        with ThreadPoolExecutor(max_workers=scan_workers) as scan_executor:
+            for code, needs_update in scan_executor.map(_scan_cache_file, scan_args):
+                if needs_update:
+                    to_update[code] = stocks_data[code]
+                else:
+                    skipped += 1
 
         if skipped > 0:
             print(f"  已跳过 {skipped} 只已同步的股票缓存")
@@ -441,32 +494,36 @@ class MLModelTrainer:
             print(f"✓ 缓存已是最新，无需更新。")
             return
 
-        print(f"  正在并行更新 {len(to_update)} 只股票的缓存 (workers={n_jobs})...")
+        # 3. 使用 ProcessPoolExecutor 实现真正的多核并行（绕过 GIL）
+        # 因子计算是 CPU 密集型（talib、pandas rolling、numpy），多进程可充分利用多核
+        effective_jobs = min(n_jobs, multiprocessing.cpu_count(), len(to_update))
+        print(f"  正在多进程并行更新 {len(to_update)} 只股票的缓存 (进程数={effective_jobs})...")
+        
+        worker_args = [
+            (code, data, self.db_path, self.factors_cache_dir, target_features, include_fundamentals)
+            for code, data in to_update.items()
+        ]
         
         start_time = time()
         success = 0
         failed = 0
         is_atty = sys.stdout.isatty()
-        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
-            futures = {
-                executor.submit(
-                    self.calculate_and_save_factors, 
-                    code, data, 
-                    target_features=target_features,
-                    include_fundamentals=include_fundamentals,
-                    verbose=verbose
-                ): code 
-                for code, data in to_update.items()
-            }
+        
+        with ProcessPoolExecutor(max_workers=effective_jobs) as executor:
+            futures = {executor.submit(_cache_worker, arg): arg[0] for arg in worker_args}
             
             with tqdm(total=len(futures), desc="更新因子缓存", disable=not is_atty) as pbar:
                 for future in as_completed(futures):
-                    code = futures[future]
                     try:
-                        future.result()
-                        success += 1
+                        code, ok, err = future.result()
+                        if ok:
+                            success += 1
+                        else:
+                            tqdm.write(f"  ✗ {code} 缓存更新失败: {err}")
+                            failed += 1
                     except Exception as e:
-                        tqdm.write(f"  ✗ {code} 缓存更新失败: {e}")
+                        code = futures[future]
+                        tqdm.write(f"  ✗ {code} 进程异常: {e}")
                         failed += 1
                     pbar.set_postfix({"成功": success, "失败": failed})
                     pbar.update(1)
@@ -475,316 +532,271 @@ class MLModelTrainer:
         print(f"✓ 缓存同步完成: 成功 {success}, 失败 {failed} | 已跳过 {skipped} | 耗时 {elapsed:.1f}s")
     
 
-    def _load_or_compute_factors(self, code: str, data: pd.DataFrame, 
-                                apply_feature_engineering: bool = True,
-                                target_features: Optional[List[str]] = None,
-                                verbose: bool = False,
-                                include_fundamentals: bool = True) -> pd.DataFrame:
+
+
+    def _compute_path_quality_score(self, f_returns_norm, f_low_min_norm, f_high_idx, f_low_idx, atr_raw, next_open, rel_atr, f_high_max_norm=None, limits=0.1, intraday_intensity=1.0, volume_ratio=1.0, relative_intensity=1.0):
         """
-        加载缓存的因子或计算新因子（包括特征工程）
+        爆发力评分 (Explosive Power Score) V6 - 风险调整版。
+        波动奖励 * (破位惩罚+上升空间+最终收益)
+        """
+        if f_high_max_norm is None:
+            raise ValueError('f_high_max_norm is None')
+
+        # 1. 动态回撤阈值 (1.5 倍 ATR)
+        dynamic_threshold = (rel_atr * 1.5) / (limits + 1e-6)
         
-        参数:
-            code: 股票代码
-            data: 股票数据
-            apply_feature_engineering: 是否应用特征工程
-            target_features: 目标特征列表
-            verbose: 是否输出详细日志
-            include_fundamentals: 是否包含基本面因子
+        upside = f_high_max_norm
+        downside = np.abs(f_low_min_norm)
         
-        返回:
-            因子DataFrame或None
-        """
-        return self.calculate_and_save_factors(code, data, apply_feature_engineering, target_features, verbose, include_fundamentals)
+        # 从配置中读取权重（或使用默认合理的比例）
+        w_upside = getattr(TrainingConfig, 'UPSIDE_WEIGHT', 2.0)
+        w_downside = getattr(TrainingConfig, 'DOWNSIDE_WEIGHT', 3.0)  # 下行惩罚更重
+        w_final = getattr(TrainingConfig, 'FINAL_RETURN_WEIGHT', 1.5)
+        
+        # 2. 基础得分：真实落袋收益 + 空间预期 - 破位真实伤害
+        base_score = (f_returns_norm * w_final) + (upside * w_upside) - (downside * w_downside)
 
-    def _compute_path_quality_score(self, f_returns, f_low_min, f_high_idx, f_low_idx, atr_raw, next_open, rel_atr):
-        """
-        路径质量评分函数，综合评估持仓期间的收益、回撤风险和路径质量。
 
-        设计目标：
-          - 标签截面均值接近 0，正负各半，便于模型学习相对排序
-          - 低波动稳涨 > 高波动暴涨（波动率归一化）
-          - 大幅回撤受非线性惩罚（小回撤线性，破位后二次方放大）
-          - V型反转（先大跌后拉回）额外打折
-          - 高点早出现给予小幅奖励
-
-        参数:
-            f_returns:  未来 N 日收益率（相对 T+1 开盘）
-            f_low_min:  未来 N 日最低价
-            f_high_idx: 未来 N 日最高点所在日索引
-            f_low_idx:  未来 N 日最低点所在日索引
-            atr_raw:    当前 ATR（绝对值，单位：元）
-            next_open:  T+1 开盘价（买入价）
-            rel_atr:    相对 ATR = atr_raw / close
-        """
-        eps = 1e-4
-
-        # ---------------------------------------------------------
-        # 1. 核心收益项（波动率归一化，类夏普思路）
-        #    除以 rel_atr**0.5 使低波动稳涨得分更高
-        # ---------------------------------------------------------
-        core_term = f_returns / (rel_atr ** 0.5) * getattr(TrainingConfig, 'LABEL_TARGET_SCALE', 2.0)
-
-        # ---------------------------------------------------------
-        # 2. 损失厌恶项（非线性穿透惩罚）
-        #    downside_gap: 买入价到最低价的距离，以 ATR 为单位（仅计正向回撤）
-        #    <= 1 ATR：线性惩罚（正常波动范围内）
-        #    >  1 ATR：超出部分二次方放大（破位惩罚）
-        # ---------------------------------------------------------
-        lambda_val   = getattr(TrainingConfig, 'LABEL_LAMBDA', 0.35)
-        downside_gap = np.maximum(next_open - f_low_min, 0) / (atr_raw + eps)
-
-        linear_part    = np.minimum(downside_gap, 1.0)
-        nonlinear_part = np.maximum(downside_gap - 1.0, 0.0) ** 2
-        loss_aversion  = -lambda_val * (linear_part + nonlinear_part)
-
-        # ---------------------------------------------------------
-        # 3. 路径保护惩罚（V型反转过滤）
-        #    条件：低点早于高点 且 下跌超过 1 ATR
-        #    对正收益按超出 1 ATR 的深度打折，避免先大跌再拉回的票得高分
-        # ---------------------------------------------------------
-        path_punish_coef = getattr(TrainingConfig, 'LABEL_PATH_PUNISH', 0.4)
-        is_v_shape   = (f_low_idx < f_high_idx) & (downside_gap > 1.0)
-        path_penalty = np.where(
-            is_v_shape & (core_term > 0),
-            -path_punish_coef * np.clip(downside_gap - 1.0, 0, 1.5),
-            0
-        )
-
-        # ---------------------------------------------------------
-        # 4. 资金效率奖励（高点早出现）
-        #    条件：高点在前 3 日内 且 核心收益 > 0.5（避免对微涨票过度奖励）
-        #    奖励幅度较小，仅作为同等收益下的微弱加分
-        # ---------------------------------------------------------
-        time_bonus = np.where(
-            (f_high_idx < 3) & (core_term > 0.5),
-            getattr(TrainingConfig, 'LABEL_TIME_BONUS', 0.15) * core_term,
-            0
-        )
-
-        final_score = core_term + loss_aversion + path_penalty + time_bonus
-
+        # 3. 波动率调整：短线交易必须有足够的 ATR 才有爆发力和资金利用率
+        vol_booster = 1.0 + (rel_atr * 5.0)  
+        final_score = break_score * vol_booster
+        
         return final_score
 
-    def _process_single_stock(self, code: str, data: pd.DataFrame, 
-                             forward_days: int,
-                             apply_feature_engineering: bool = False,
-                             target_features: Optional[List[str]] = None,
-                             verbose: bool = False,
-                             train_start_date: str = None,
-                             train_end_date: str = None,
-                             include_fundamentals: bool = True) -> tuple:
+    def _extract_stock_components(self, code: str, data: pd.DataFrame, 
+                                 forward_days: int,
+                                 apply_feature_engineering: bool = False,
+                                 target_features: Optional[List[str]] = None,
+                                 verbose: bool = False,
+                                 train_start_date: str = None,
+                                 train_end_date: str = None,
+                                 include_fundamentals: bool = True) -> Optional[dict]:
         """
-        处理单只股票的因子计算和标签生成
+        提取单只股票的特征和用于构造标签的原始组件。
         """
         try:
-            # 1. 加载或计算因子
-            factors = self._load_or_compute_factors(code, data, apply_feature_engineering, target_features, verbose, include_fundamentals)
+            # 1. 因子计算 (逻辑保持不变)
+            if train_end_date is not None and 'date' in data.columns:
+                max_lookback = 300 # 保守回看
+                data_for_factors = data[data['date'] <= train_end_date].copy()
+                if len(data_for_factors) < 100:
+                    data_for_factors = data
+            else:
+                data_for_factors = data
+
+            factors = self.calculate_and_save_factors(code, data_for_factors, apply_feature_engineering, target_features, verbose, include_fundamentals)
             
             if factors is not None:
                 if 'date' in factors.columns and 'date' in data.columns:
                     factors = pd.merge(data[['date']], factors, on='date', how='left')
-                elif len(factors) != len(data):
-                    raise ValueError(f"Length mismatch: factors({len(factors)}) != data({len(data)}) for {code}")
-
-            if factors is not None and len(factors) > forward_days:
-
-                # 获取价格序列
-                close = data['close']
-                high = data['high']
-                low = data['low']
+                    factors = factors.reset_index(drop=True)
                 
-                # A. 收益率计算 (避免偷价：假设 T+1 日开盘买入)
-                next_open = data['open'].shift(-1)
-                f_close = close.shift(-forward_days)
-                f_returns = (f_close / next_open - 1)
+                # 过滤有效行 (因子不为 NaN)
+                valid_factor_idx = ~factors.isna().any(axis=1)
                 
-                # 获取未来 n 日内的最大涨幅 (Max Run-up)，基于 T+1 到 T+n，相对于买入价
-                f_high_max = high.rolling(window=forward_days).max().shift(-forward_days)
-                f_max_returns = (f_high_max / next_open - 1)
+                # 2. 构造标签所需的原始组件 (向量化计算)
+                close = data['close'].values
+                high = data['high'].values
+                low = data['low'].values
+                open_val = data['open'].values
                 
-                # 获取未来 n 日内的最大跌幅 (Max Drawdown/Pain)，基于 T+1 到 T+n，相对于买入价
-                f_low_min = low.rolling(window=forward_days).min().shift(-forward_days)
-                f_min_returns = (f_low_min / next_open - 1)
+                next_open = data['open'].shift(-1).values
+                f_close = data['close'].shift(-forward_days).values
                 
-                # 获取极值位置 (用于路径保护惩罚)
-                # 向量化实现：用 stride_tricks 替代 rolling().apply(np.argmax/argmin)
-                # 避免逐行 Python 回调，速度提升 10-50x
-                #
-                # 原逻辑：rolling(w).apply(argmax, raw=True).shift(-w)
-                #   → 索引 i 对应窗口 arr[i-w+1:i+1] 的 argmax，shift(-w) 后
-                #     索引 i 拿到的是 arr[i+1:i+w+1]（T+1 起的未来 w 行）的 argmax
-                # 等价实现：对 arr[1:] 做 sliding_window_view，窗口大小 w
-                #   → view[i] = arr[i+1 : i+w+1]，argmax 结果直接对应索引 i
-                _n = len(high)
-                _w = forward_days
-                _high_arr = high.values.astype(np.float64)
-                _low_arr  = low.values.astype(np.float64)
-
-                # 从 arr[1:] 开始，view[i] = arr[i+1 : i+w+1]，长度 = _n - _w
-                _high_wins = sliding_window_view(_high_arr[1:], _w)
-                _low_wins  = sliding_window_view(_low_arr[1:],  _w)
-
-                _high_idx_raw = np.argmax(_high_wins, axis=1).astype(np.float64)  # 长度 _n - _w
-                _low_idx_raw  = np.argmin(_low_wins,  axis=1).astype(np.float64)
-
-                # 末尾 _w 行没有完整未来窗口，填 NaN
-                _pad = np.full(_w, np.nan)
-                _high_idx_aligned = np.concatenate([_high_idx_raw, _pad])[:_n]
-                _low_idx_aligned  = np.concatenate([_low_idx_raw,  _pad])[:_n]
-
-                f_high_idx = pd.Series(_high_idx_aligned, index=high.index)
-                f_low_idx  = pd.Series(_low_idx_aligned,  index=low.index)
-
-                # 计算当前波动率 (ATR) 作为分母，衡量收益的“性价比”
-                # 使用相对 ATR (ATR / close)
-                atr_raw = talib.ATR(high.values, low.values, close.values, timeperiod=strategy_config.ATR_PERIOD)
-                atr_rel = atr_raw / close.values
+                # 滑动窗口计算期内极值
+                if len(data) > forward_days:
+                    _high_wins = sliding_window_view(high[1:], forward_days)
+                    _low_wins  = sliding_window_view(low[1:],  forward_days)
                     
+                    f_high_max = np.concatenate([np.max(_high_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                    f_low_min  = np.concatenate([np.min(_low_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                    f_high_idx = np.concatenate([np.argmax(_high_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                    f_low_idx  = np.concatenate([np.argmin(_low_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                else:
+                    f_high_max = f_low_min = f_high_idx = f_low_idx = np.full(len(data), np.nan)
 
-                y = self._compute_path_quality_score(f_returns.values, f_low_min.values, 
-                                                   f_high_idx.values, f_low_idx.values, 
-                                                   atr_raw, next_open.values, atr_rel)
+                # 计算 ATR
+                atr_raw = talib.ATR(high, low, close, timeperiod=FactorConfig.ATR_PERIOD)
+                atr_rel = atr_raw / (close + 1e-6)
+
+                # 涨跌停阈值计算
+                limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
+                if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
+                    limit_thresholds[:] = MARKET_LIMITS['gem_star']
+                elif code.startswith(MARKET_PREFIXES['bj']):
+                    limit_thresholds[:] = MARKET_LIMITS['bj']
                 
-                # 退市临近惩罚：对 30 个自然日内将退市的样本，将标签压至极低值
-                # 模型不会在推理时看到 days_to_delist，但会从其他特征（量价、ST状态等）
-                # 中学到"临近退市股票的共性模式 → 规避"
-                if 'days_to_delist' in data.columns:
-                    dtd = data['days_to_delist'].values  # -1 表示无退市计划
-                    delist_penalty_mask = (dtd >= 0) & (dtd <= getattr(TrainingConfig, 'DELIST_PENALTY_DAYS', 30))
-                    if delist_penalty_mask.any():
-                        y = y.copy() if isinstance(y, np.ndarray) else np.array(y, dtype=np.float32)
-                        # 压到接近 0 的极低分，远低于正常股票的均值（约 1.0）
-                        y[delist_penalty_mask] = getattr(TrainingConfig, 'DELIST_PENALTY_SCORE', 0.01)
+                if 'is_st' in data.columns:
+                    is_main_board = ~(code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']) or code.startswith(MARKET_PREFIXES['bj']))
+                    if is_main_board:
+                        limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
 
-                # ST 标签惩罚：直接压低 ST 样本的标签，让模型从标签层面学到"ST = 低质量"
-                # 仅靠 sample_weight 降权不够，因为 ST 股票炒作时收益排名靠前，
-                # 降权后绝对权重仍高，模型仍会学到"ST 特征 → 高分"的错误映射
-                st_label_score = getattr(TrainingConfig, 'ST_LABEL_SCORE', None)
-                if st_label_score is not None and 'is_st' in data.columns:
-                    st_mask = data['is_st'].values == 1
-                    if st_mask.any():
-                        y = y.copy() if isinstance(y, np.ndarray) else np.array(y, dtype=np.float32)
-                        # 只压低标签，不完全清零，保留少量信号避免模型对 ST 特征过拟合到极端值
-                        y[st_mask] = np.minimum(y[st_mask], st_label_score)
+                # 不可买入判定 (T+1日一字涨停或停牌，即预测生成后的执行日能否买入)
+                epsilon = 0.002
+                t_plus_1_preclose = data['close'].values # T日收盘价即为T+1日昨收
+                t_plus_1_open = data['open'].shift(-1).values
+                t_plus_1_high = data['high'].shift(-1).values
+                t_plus_1_low = data['low'].shift(-1).values
+                t_plus_1_vol = data['volume'].shift(-1).values
                 
-                # 用于计算 IC 的参考收益率 (使用最终涨幅)
-                ref_returns = f_returns.values
-                target_returns = f_returns.values
+                is_one_word_up = (t_plus_1_open == t_plus_1_high) & (t_plus_1_open == t_plus_1_low) & \
+                                 (t_plus_1_open >= t_plus_1_preclose * (1 + limit_thresholds) - epsilon)
+                is_suspended = t_plus_1_vol == 0
+                unbuyable = is_one_word_up | is_suspended
 
-                # 3. 对齐数据
-                # 必须过滤掉因子 NaN、目标收益率 NaN 以及标签 y 中的 NaN (ATR 可能产生前置 NaN)
-                y_series = pd.Series(y, index=data.index)
-                target_series = pd.Series(target_returns, index=data.index)
+                # 收集组件
+                comp_df = pd.DataFrame({
+                    'date': data['date'],
+                    'code': code,
+                    'next_open': next_open,
+                    'f_close': f_close,
+                    'f_high_max': f_high_max,
+                    'f_low_min': f_low_min,
+                    'f_high_idx': f_high_idx,
+                    'f_low_idx': f_low_idx,
+                    'atr_raw': atr_raw,
+                    'atr_rel': atr_rel,
+                    'intraday_intensity': (data['high'].values - data['low'].values) / (atr_raw + 1e-6),
+                    'volume_ratio': data['volume'].values / (data['volume'].rolling(20).mean().values + 1e-6),
+                    'relative_intensity': ((data['high'].values - data['low'].values) / (atr_raw + 1e-6)) / \
+                                          (pd.Series((data['high'].values - data['low'].values) / (atr_raw + 1e-6)).rolling(5).mean().values + 1e-6),
+                    'limit_thresholds': limit_thresholds,
+                    'unbuyable': unbuyable,
+                    'is_st': data['is_st'] if 'is_st' in data.columns else 0,
+                    'days_to_delist': data['days_to_delist'] if 'days_to_delist' in data.columns else -1
+                })
+
+                # 过滤掉标签组件中含 NaN 的行
+                # 重要修复：必须包含 atr_raw 和 atr_rel，否则会产生 NaN 标签导致 LightGBM 分档异常（全入第0档）
+                label_valid_idx = ~comp_df[['next_open', 'f_close', 'f_high_max', 'f_low_min', 'atr_raw', 'atr_rel']].isna().any(axis=1)
+                final_valid_idx = valid_factor_idx & label_valid_idx
                 
-                valid_idx = ~(factors.isna().any(axis=1) | 
-                              pd.Series(ref_returns, index=data.index).isna() | 
-                              y_series.isna() | 
-                              target_series.isna())
-                
-                # 4. 时间窗口切片
-                if train_start_date or train_end_date:
-                    date_series = data['date']
-                    if train_start_date:
-                        valid_idx = valid_idx & (date_series >= train_start_date)
-                    if train_end_date:
-                        valid_idx = valid_idx & (date_series <= train_end_date)
-                
-                if valid_idx.sum() > 0:
-                    X_df = factors[valid_idx].copy()
-                    dates = data['date'][valid_idx].values
+                # 时间窗口过滤
+                if train_start_date:
+                    final_valid_idx = final_valid_idx & (data['date'] >= train_start_date)
+                if train_end_date:
+                    final_valid_idx = final_valid_idx & (data['date'] <= train_end_date)
+
+                if final_valid_idx.sum() > 0:
+                    # 准备 X
+                    drop_cols = ['date', 'is_st', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate']
                     
-                    # 最终使用的标签和收益率
-                    y_val = y[valid_idx] if isinstance(y, pd.Series) else y[valid_idx]
-                    final_y = pd.Series(y_val) if not isinstance(y_val, pd.Series) else y_val
                     
-                    final_returns = target_returns[valid_idx] if isinstance(target_returns, pd.Series) else target_returns[valid_idx]
+                    X_df = factors[final_valid_idx].drop(columns=[c for c in drop_cols if c in factors.columns], errors='ignore')
                     
-                    # 涨跌停判定增强：兼容主板(10%)、创业板/科创板(20%)、北交所(30%)
-                    # 修复：使用当前行的 is_st 状态而非首行，因为 ST 状态会随时间变化
-                    is_st_series = data['is_st'][valid_idx] == 1 if 'is_st' in data.columns else pd.Series(False, index=data.index[valid_idx])
-                    
-                    # 为每一行计算对应的涨停阈值
-                    limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
-                    
-                    if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
-                        limit_thresholds[:] = MARKET_LIMITS['gem_star']
-                    elif code.startswith(MARKET_PREFIXES['bj']):
-                        limit_thresholds[:] = MARKET_LIMITS['bj']
-                    
-                    # 只有主板ST才是5%；创业板/科创板ST仍是20%，北交所ST仍是30%
-                    if 'is_st' in data.columns:
-                        is_main_board = ~(
-                            code.startswith(MARKET_PREFIXES['sz_gem']) or
-                            code.startswith(MARKET_PREFIXES['star']) or
-                            code.startswith(MARKET_PREFIXES['bj'])
-                        )
-                        if is_main_board:
-                            limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
-                    
-                    # 使用逐行的阈值判断涨停 (引入 epsilon 容差防止浮点数和四舍五入判定失效)
-                    pct_change = data['close'].pct_change()
-                    epsilon = 0.002
-                    is_limit_up = (data['close'] == data['high']) & (pct_change >= pd.Series(limit_thresholds, index=data.index) - epsilon)
-                    is_suspended = data['volume'] == 0
-                    unbuyable_mask = (is_limit_up | is_suspended)[valid_idx].values
-                    
-                    # 提取有效行的涨停阈值用于后续分组
-                    limit_groups = limit_thresholds[valid_idx]
-                    
-                    # 5. 显式剔除元数据列 (确保 is_st, date 不进入模型)
-                    drop_cols = ['date', 'is_st', 'code', 'fore_adjust_factor', 'back_adjust_factor']
-                    if not getattr(TrainingConfig, 'USE_AMOUNT_TURNOVER', False):
-                        drop_cols.extend(['amount', 'turnover_rate'])
-                    X_df = X_df.drop(columns=[c for c in drop_cols if c in X_df.columns], errors='ignore')
-                    is_st_mask = is_st_series.values
-                    
-                    if len(X_df) > 0:
-                        return X_df, final_y, final_returns, dates, unbuyable_mask, limit_groups, is_st_mask
+                    return {
+                        'X': X_df,
+                        'components': comp_df[final_valid_idx]
+                    }
             
-            return None, None, None, None, None, None, None
-        
+            return None
         except Exception as e:
-            import traceback
-            print(f"  警告: 处理股票 {code} 失败: {e}")
-            print(traceback.format_exc())
-            return None, None, None, None, None, None, None
+            if verbose:
+                import traceback
+                print(f"  Extraction error for {code}: {e}\n{traceback.format_exc()}")
+            return None
+
+    def _calculate_vectorized_labels(self, components: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        执行批量化、向量化的标签计算和截面排名。
+        """
+        eps = 1e-8
+        
+        # 1. 收益率标准化
+        next_open = components['next_open'].values
+        limits = components['limit_thresholds'].values
+        
+        f_returns_raw = (components['f_close'].values / (next_open + eps)) - 1
+        f_high_max_raw = (components['f_high_max'].values / (next_open + eps)) - 1
+        f_low_min_raw = (components['f_low_min'].values / (next_open + eps)) - 1
+        
+        # 标准化 (除以涨跌停阈值)
+        f_returns_norm = f_returns_raw / limits
+        f_high_max_norm = f_high_max_raw / limits
+        f_low_min_norm = f_low_min_raw / limits
+        
+        # 2. 计算路径质量原始分
+        raw_scores = self._compute_path_quality_score(
+            f_returns_norm, f_low_min_norm, 
+            components['f_high_idx'].values, components['f_low_idx'].values,
+            components['atr_raw'].values, next_open, components['atr_rel'].values,
+            f_high_max_norm,
+            limits,
+            components['intraday_intensity'].values,
+            components['volume_ratio'].values,
+            components['relative_intensity'].values
+        )
+        
+        # 修复：确保 raw_scores 无 NaN/Inf，防止后续 rankdata 产生异常
+        if np.isnan(raw_scores).any():
+            raw_scores = np.nan_to_num(raw_scores, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # 3. 风险样本惩罚 (ST & 退市)
+        # 退市惩罚
+        dtd = components['days_to_delist'].values
+        delist_mask = (dtd >= 0) & (dtd <= getattr(TrainingConfig, 'DELIST_PENALTY_DAYS', 30))
+        raw_scores[delist_mask] = getattr(TrainingConfig, 'DELIST_PENALTY_SCORE', -100)
+        
+        # ST 惩罚
+        st_label_score = getattr(TrainingConfig, 'ST_LABEL_SCORE', None)
+        if st_label_score is not None:
+            st_mask = components['is_st'].values == 1
+            raw_scores[st_mask] = np.minimum(raw_scores[st_mask], st_label_score)
+            
+        # 4. 截面排名 (Cross-sectional Ranking)
+        # 优化：使用 numpy 矢量化计算替代 pandas groupby.rank，性能更高
+        dates = components['date'].values
+        sort_idx = np.argsort(dates)
+        sorted_dates = dates[sort_idx]
+        sorted_scores = raw_scores[sort_idx]
+        
+        unique_dates, group_start, group_counts = np.unique(sorted_dates, return_index=True, return_counts=True)
+        y_final_sorted = np.zeros_like(sorted_scores, dtype=np.float32)
+        
+        for start, count in zip(group_start, group_counts):
+            if count > 1:
+                # 组内百分位排名
+                y_final_sorted[start:start+count] = rankdata(sorted_scores[start:start+count], method='average') / (count + 1)
+            else:
+                y_final_sorted[start:start+count] = 0.5
+        
+        # 还原到原始顺序
+        y_final = y_final_sorted[np.argsort(sort_idx)]
+        
+        # 重要性权重计算 (使用标准化最高收益率作为权重参考)
+        # 使用 f_high_max_norm（已除以涨跌停阈值）而非原始收益率，
+        # 消除板块间的权重偏差（创业板20%限制 vs 主板10%限制）
+        w_sig = f_high_max_norm.astype(np.float32)
+        
+        return y_final, raw_scores, f_returns_raw, w_sig
+                    
+
 
     def _validate_and_filter_stocks(self, stocks_data: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict]:
         """
         验证缓存特征完整性，过滤掉缓存损坏的股票（触发重算），统计需要重算的数量。
-        注意：特征不匹配的股票仍会保留（后续会触发重算），只有无法恢复的损坏缓存才被标记。
-        
-        参数:
-            stocks_data: 股票数据字典
-        
-        返回:
-            (处理后的股票数据, 验证统计信息)
+        特征不匹配的股票仍会保留（后续会触发重算），只有无法恢复的损坏缓存才被标记删除。
         """
         print("\n验证缓存特征完整性...")
-        
-        # 加载模型特征
-        model_features = set(self.model.feature_names) if hasattr(self, 'model') and self.model else None
-        
-        if not model_features:
-            # 如果没有模型，从第一个缓存文件推断
-            cache_files = [f for f in os.listdir(self.factors_cache_dir) if f.endswith('.parquet')]
-            if cache_files:
-                try:
-                    sample_factors = pd.read_parquet(os.path.join(self.factors_cache_dir, cache_files[0]))
-                    # 排除非数值列（如 date）进行特征匹配
-                    numeric_cols = sample_factors.select_dtypes(include=[np.number]).columns
-                    model_features = set(numeric_cols)
-                except:
-                    model_features = None
-        
+
+        # 从第一个可读的缓存文件推断期望的特征集
+        model_features = None
+        cache_files = [f for f in os.listdir(self.factors_cache_dir) if f.endswith('.parquet')]
+        if cache_files:
+            try:
+                sample_factors = pd.read_parquet(os.path.join(self.factors_cache_dir, cache_files[0]))
+                numeric_cols = sample_factors.select_dtypes(include=[np.number]).columns
+                model_features = set(numeric_cols)
+            except Exception:
+                model_features = None
+
         if not model_features:
             print("  警告: 无法获取模型特征，跳过验证")
-            return stocks_data, {'filtered': 0, 'kept': len(stocks_data)}
-        
+            return stocks_data, {'recomputed': 0, 'kept': len(stocks_data)}
+
         filtered_stocks = {}
-        filtered_count = 0
         recomputed_count = 0
-        
+
         for code, data in tqdm(stocks_data.items(), desc="验证缓存完整性"):
             cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
             
@@ -817,8 +829,8 @@ class MLModelTrainer:
         print(f"  验证完成: {kept_count} 只股票待处理")
         if recomputed_count > 0:
             print(f"  其中 {recomputed_count} 只股票的缓存无效或不匹配，将重新计算")
-        
-        return filtered_stocks, {'filtered': filtered_count, 'recomputed': recomputed_count, 'kept': kept_count}
+
+        return filtered_stocks, {'recomputed': recomputed_count, 'kept': kept_count}
     
     def discover_target_features(self, stocks_data: Dict[str, pd.DataFrame],
                                   include_fundamentals: bool = True,
@@ -830,7 +842,10 @@ class MLModelTrainer:
         """
         print(f"  正在识别完整特征集（采样 {n_discovery} 只股票）...")
         all_possible_features: set = set()
-        discovery_codes = list(stocks_data.keys())[:n_discovery]
+        all_codes = list(stocks_data.keys())
+        import random
+        random.seed(42)
+        discovery_codes = random.sample(all_codes, min(len(all_codes), n_discovery))
         for code in discovery_codes:
             try:
                 discovery_data = stocks_data[code]
@@ -874,7 +889,7 @@ class MLModelTrainer:
                              与 batch_update_factor_cache 共享同一列表以保证缓存命中
         
         返回:
-            (X, y, returns, factor_names, dates, unbuyable, limit_groups)
+            (X, y, returns, factor_names, dates, unbuyable, limit_groups, y_raw, is_st, w_sig)
         """
 
         # print("\n正在计算量化因子（技术指标 + K线形态 + 基本面）...")
@@ -918,139 +933,98 @@ class MLModelTrainer:
         stock_list = list(stocks_data.items())
         
         def process_with_logging(idx, code, data):
-            """处理单只股票，第一个输出日志"""
+            """提取单只股票组件，第一个输出日志"""
             verbose = (idx == 0) and cache_engineered_features
-            return self._process_single_stock(code, data, forward_days, 
-                                             cache_engineered_features, target_features, verbose,
-                                             train_start_date, train_end_date, include_fundamentals)
+            return self._extract_stock_components(code, data, forward_days, 
+                                                 cache_engineered_features, target_features, verbose,
+                                                 train_start_date, train_end_date, include_fundamentals)
         
         results = Parallel(n_jobs=n_jobs, verbose=1)(
             delayed(process_with_logging)(i, code, data)
             for i, (code, data) in enumerate(stock_list)
         )
         
-        # 释放输入数据以腾出空间
+        # 释放输入数据
         del stock_list
-        import gc; gc.collect()
-
-        # 1. 第一遍扫描：统计实际有效行数和特征数
-        print("  - 统计有效样本量...")
-        actual_rows = 0
-        num_features = 0
-        col_names = None
-        valid_results_indices = []
-        
-        for i, res in enumerate(results):
-            if res is not None and res[0] is not None:
-                actual_rows += len(res[0])
-                if col_names is None:
-                    col_names = res[0].columns.tolist()
-                    num_features = len(col_names)
-                valid_results_indices.append(i)
-        
-        if actual_rows == 0:
-            raise ValueError("没有生成的有效样本")
-            
-        print(f"  - 实际有效行数: {actual_rows}, 特征数: {num_features}")
-        
-        # 2. 预分配最终的内存空间
-        X_arr = np.empty((actual_rows, num_features), dtype=np.float32)
-        y_raw_arr = np.empty(actual_rows, dtype=np.float32) # 原始路径质量分
-        returns_arr = np.empty(actual_rows, dtype=np.float32)
-        dates_arr = np.empty(actual_rows, dtype=object)
-        unbuyable_arr = np.empty(actual_rows, dtype=bool)
-        limit_groups_arr = np.empty(actual_rows, dtype=np.float32)
-        is_st_arr = np.empty(actual_rows, dtype=bool)
-        
-        # 3. 填充数据并立即从 results 中剔除已处理对象
-        print("  - 正在合并数据 (Incremental Fill)...")
-        cursor = 0
-        for idx in valid_results_indices:
-            res = results[idx]
-            n = len(res[0])
-            
-            # 分解结果
-            if len(res) == 7:
-                X, y, r, d, u, l, is_st = res
-            elif len(res) == 6:
-                X, y, r, d, u, l = res
-                is_st = np.zeros(n, dtype=bool)
-            else:
-                X, y, r, d, u = res
-                l = np.full(n, 0.1, dtype=np.float32)
-                is_st = np.zeros(n, dtype=bool)
-
-            X_arr[cursor:cursor+n] = X.values.astype(np.float32, copy=False)
-            y_raw_arr[cursor:cursor+n] = y.values if isinstance(y, pd.Series) else y
-            returns_arr[cursor:cursor+n] = r
-            dates_arr[cursor:cursor+n] = d
-            unbuyable_arr[cursor:cursor+n] = u
-            limit_groups_arr[cursor:cursor+n] = l
-            is_st_arr[cursor:cursor+n] = is_st
-            
-            # 手动销毁 results 中的引用，释放 DataFrame 内存
-            results[idx] = None
-            cursor += n
-            
-        # 清理结果列表和索引
-        del results, valid_results_indices
         gc.collect()
 
-        # 4. 全局时间排序
-        print("  - 全局时间排序...")
+        # 1. 第一遍扫描：收集所有有效的 X 和 组件
+        print("  - 合并特征与标签组件...")
+        all_X = []
+        all_comps = []
+        for res in results:
+            if res is not None:
+                all_X.append(res['X'])
+                all_comps.append(res['components'])
+        
+        if not all_X:
+            raise ValueError("没有生成的有效样本")
+            
+        # 2. 批量合并 (Vectorized)
+        X_df = pd.concat(all_X, ignore_index=True)
+        comps_df = pd.concat(all_comps, ignore_index=True)
+        
+        # 释放中间列表
+        del all_X, all_comps, results
+        gc.collect()
+        
+        print(f"  - 原始样本量: {len(X_df)}, 特征数: {X_df.shape[1]}")
+        
+        # 3. 向量化计算标签
+        print("  - 向量化生成标签 (标准化 + 截面排名)...")
+        y_ranked, raw_scores, returns_raw, w_sig = self._calculate_vectorized_labels(comps_df)
+        
+        # 提取其他必要数组
+        dates_arr = comps_df['date'].values
+        unbuyable_arr = comps_df['unbuyable'].values
+        limit_groups_arr = comps_df['limit_thresholds'].values
+        is_st_arr = (comps_df['is_st'] == 1).values
+        
+        factor_names = X_df.columns.tolist()
+
+        # 全局时间排序与转换为 numpy
+        print("  - 全局时间排序与转换为 numpy...")
         sort_idx = np.argsort(dates_arr)
         
-        # 排序所有数组
         dates_arr = dates_arr[sort_idx]
-        y_raw_arr = y_raw_arr[sort_idx]
-        returns_arr = returns_arr[sort_idx]
+        y_final_arr = y_ranked[sort_idx]
+        raw_scores_arr = raw_scores[sort_idx]  # 同步排序原始分
+        returns_arr = returns_raw[sort_idx]
         unbuyable_arr = unbuyable_arr[sort_idx]
         limit_groups_arr = limit_groups_arr[sort_idx]
         is_st_arr = is_st_arr[sort_idx]
+        w_sig_arr = w_sig[sort_idx]
+        X_arr = X_df.values[sort_idx].astype(np.float32)
         
-        # X_arr 排序
-        X_sorted = X_arr[sort_idx] 
-        del X_arr, sort_idx
-        X_arr = X_sorted
-        del X_sorted
+        # 释放 DataFrame
+        del X_df, comps_df, sort_idx
         gc.collect()
-        all_cols = col_names
-        # 3. 不可买入样本处理 (涨停/停牌) - 提前到归一化之前，确保排序不含涨停股
+
+        # 5. 不可买入样本处理（涨停/停牌）——在归一化之前剔除，确保排序不含涨停股
         penalty_count = np.sum(unbuyable_arr)
         if penalty_count > 0:
             handling = getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'remove')
             if handling == 'remove':
-                print(f"  - 剔除不可买入样本 (排序前): 正在剔除 {penalty_count} 个涨停/停牌样本")
+                print(f"  - 剔除不可买入样本: 正在剔除 {penalty_count} 个涨停/停牌样本")
                 keep_mask = ~unbuyable_arr
-                X_arr        = X_arr[keep_mask]
-                y_raw_arr    = y_raw_arr[keep_mask]
-                returns_arr  = returns_arr[keep_mask]
-                dates_arr    = dates_arr[keep_mask]
+                X_arr            = X_arr[keep_mask]
+                y_final_arr      = y_final_arr[keep_mask]
+                returns_arr      = returns_arr[keep_mask]
+                dates_arr        = dates_arr[keep_mask]
                 limit_groups_arr = limit_groups_arr[keep_mask]
-                is_st_arr    = is_st_arr[keep_mask]
+                is_st_arr        = is_st_arr[keep_mask]
+                w_sig_arr        = w_sig_arr[keep_mask]
             else:
-                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的标签强制设为 0.05")
-                y_raw_arr[unbuyable_arr] = 0.05
+                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的权重强制设为 0.2")
+                w_sig_arr[unbuyable_arr] = 0.2
 
         # 日期分组信息（仅计算一次，供后续归一化和 group 划分共用）
         _, date_group_start, date_group_counts = np.unique(dates_arr, return_index=True, return_counts=True)
 
-        # 2. 标签值映射 (Cross-Section Rank Normalization)
-        # 每日全市场横截面排名归一化，跨板块统一尺度，输出 (0, 1)
-        # 注意：此处生成的 y_norm_arr 仅供 XGB 等回归模型默认使用
-        y_norm_arr = np.empty_like(y_raw_arr)
-        print("  - 正在进行每日全市场横截面排名归一化标签...")
-        for start, count in zip(date_group_start, date_group_counts):
-            end = start + count
-            if count > 1:
-                y_norm_arr[start:end] = rankdata(y_raw_arr[start:end], method='average') / (count + 1)
-            else:
-                y_norm_arr[start:end] = 0.5
+        # 6. 标签归一化已移至 train_models，在 train/val 分割后分别执行，避免标签泄漏。
 
-
-        
-        # 统计因子分类详情 (Factor Audit Report)
-        # 使用各模块的精确列名进行匹配，而非关键词启发式匹配
+        # 7. 因子分类审计报告（精确匹配各模块列名，非关键词启发式匹配）
+        all_cols = factor_names
         remaining_all = set(all_cols)
         
         # 1. 状态因子 (comprehensive_factor_calculator 中硬编码的3个 + 退市特征)
@@ -1128,7 +1102,34 @@ class MLModelTrainer:
         print("="*50 + "\n")
         
         # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
-        return X_arr, y_norm_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, y_raw_arr, is_st_arr
+        return X_arr, y_final_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, raw_scores_arr, is_st_arr, w_sig_arr
+
+    def _apply_cross_sectional_normalization(self, X_df: pd.DataFrame, dates: np.ndarray) -> pd.DataFrame:
+        """
+        对特征进行横截面归一化 (Cross-sectional Ranking)
+        使用 numpy 矢量化计算替代 pandas groupby.rank，在大数据集上提速约 20-50 倍。
+        """
+        # 1. 提取特征名
+        factor_names = X_df.columns.tolist()
+        
+        # 2. 转换为 numpy 数组进行计算 (float32 节省内存且满足精度)
+        X_values = X_df.values.astype(np.float32)
+        
+        # 3. 性能优化关键：对日期进行排序并按块处理
+        # 相比 groupby.rank()，手动切片 + scipy.stats.rankdata(axis=0) 可以极大减少 Python 循环开销
+        sort_idx = np.argsort(dates)
+        sorted_dates = dates[sort_idx]
+        sorted_X = X_values[sort_idx]
+        
+        # 4. 调用已有的高效 inplace 版本执行归一化
+        self._apply_cross_sectional_normalization_inplace(sorted_X, sorted_dates, factor_names)
+        
+        # 5. 还原原始顺序并写回 DataFrame
+        rev_idx = np.argsort(sort_idx)
+        # 注意：此处使用 iloc 覆盖值，保持 DataFrame 索引不变
+        X_df.iloc[:, :] = sorted_X[rev_idx]
+        
+        return X_df
     
     def train_models(self, X: np.ndarray, y: np.ndarray, 
                     returns: np.ndarray,
@@ -1138,7 +1139,8 @@ class MLModelTrainer:
                     limit_groups: np.ndarray = None,
                     model_types: List[str] = TrainingConfig.MODEL_TYPES,
                     path_scores: np.ndarray = None,
-                    is_st_arr: np.ndarray = None) -> Dict:
+                    is_st_arr: np.ndarray = None,
+                    w_sig_arr: np.ndarray = None) -> Dict:
         """
         训练多个模型
         """
@@ -1150,141 +1152,238 @@ class MLModelTrainer:
         y = y.astype(np.float32, copy=False)
         
         # 最后一次NaN/inf检查和替换
+        # 对于排名后的特征(0-1)，0.5是中性值。确保 X 为 float32。
         if np.isnan(X).any():
-            np.nan_to_num(X, copy=False, nan=0.0)
+            X = np.nan_to_num(X, copy=False, nan=0.5, posinf=1.0, neginf=0.0)
         
         print(f"  数据验证完成: {X.shape[0]} 行, {X.shape[1]} 列")
         
-        # 先进行时间序列划分
+        # 先进行时间序列划分 (增加 Embargo 阻隔期，防止数据泄漏)
+        forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
         raw_split_idx = int(len(dates) * TrainingConfig.TRAIN_TEST_SPLIT)
         split_date = dates[raw_split_idx]
+        
+        # 训练集：[0, split_idx)
         split_idx = np.searchsorted(dates, split_date, side='left')
         
-        print(f"  划分点: {split_date}, 索引: {split_idx}")
-        print(f"  训练集: {split_idx} 样本, 验证集: {len(dates) - split_idx} 样本")
+        # 验证集：[val_start_idx, len(dates))
+        # 阻隔期逻辑：由于样本标签包含未来 forward_days 的信息，
+        # 验证集的特征必须在训练集标签所涉及的最晚日期之后。
+        unique_dates = np.unique(dates)
+        split_date_idx = np.searchsorted(unique_dates, split_date)
+        # 验证集开始日期推迟 forward_days 个交易日
+        val_start_date = unique_dates[min(split_date_idx + forward_days, len(unique_dates)-1)]
+        val_start_idx = np.searchsorted(dates, val_start_date, side='left')
         
-        # 训练集：正常横截面排名归一化，同时收集每日统计量
-        print("\n  对训练样本进行横截面归一化，并收集统计量...")
-        train_daily_stats = self._apply_cross_sectional_normalization_inplace(
-            X[:split_idx], dates[:split_idx], factor_names, collect_stats=True
-        )
-        # 验证集用训练集统计量做参考（ref_stats 传入但归一化方式与训练集保持一致）
-        # 避免验证集用自己的横截面排名（look-ahead bias：推理时不知道当天全市场分布）
-        print("  对验证样本进行归一化（与训练集保持相同的横截面排名方式）...")
+        print(f"  划分点 (Embargo): {split_date}, 阻隔期后起: {val_start_date}")
+        print(f"  训练集: {split_idx} 样本, 验证集: {len(dates) - val_start_idx} 样本")
+        print(f"  已剔除阻隔期重叠样本: {val_start_idx - split_idx} 个")
+        
+        # 重新定义切片范围
+        X_train, X_val = X[:split_idx], X[val_start_idx:]
+        y_train_full, y_val_full = y[:split_idx], y[val_start_idx:]
+        dates_train, dates_val = dates[:split_idx], dates[val_start_idx:]
+        returns_train, returns_val = returns[:split_idx], returns[val_start_idx:]
+        is_st_train, is_st_val = is_st_arr[:split_idx], is_st_arr[val_start_idx:]
+        w_sig_train, w_sig_val = w_sig_arr[:split_idx], w_sig_arr[val_start_idx:]
+        
+        # 训练集：正常横截面排名归一化
+        print("\n  对训练样本进行横截面归一化...")
         self._apply_cross_sectional_normalization_inplace(
-            X[split_idx:], dates[split_idx:], factor_names,
-            ref_stats=train_daily_stats, ref_window=60
+            X[:split_idx], dates[:split_idx], factor_names
+        )
+        
+        # 修复 Bug 1：使用 val_start_idx 而非 split_idx，排除阻隔期样本对验证集归一化的污染。
+        # 阻隔期内的样本（split_idx ~ val_start_idx）标签含未来信息，不应参与任何处理。
+        print("  对验证样本进行归一化...")
+        self._apply_cross_sectional_normalization_inplace(
+            X[val_start_idx:], dates[val_start_idx:], factor_names
         )
 
-        # 分组信息（dates 已全局排序，unique 结果直接用于 group 参数）
-        _, train_group = np.unique(dates[:split_idx], return_counts=True)
-        _, val_group   = np.unique(dates[split_idx:], return_counts=True)
+        # 分组信息
+        _, train_group = np.unique(dates_train, return_counts=True)
+        _, val_group   = np.unique(dates_val, return_counts=True)
 
-        # 修复标签泄漏：y 是全量数据上的横截面排名归一化，验证集参与了全局排名
-        # 需要在 split 之后，对训练集和验证集分别重新做每日横截面排名归一化
+        # 修复标签泄漏：需要在 split 之后，对训练集和验证集分别重新做每日横截面排名归一化
         _label_source = path_scores if path_scores is not None else y
-        y_clean = np.empty(len(dates), dtype=np.float32)
-        for _start, _end in [(0, split_idx), (split_idx, len(dates))]:
-            _dates_sub = dates[_start:_end]
-            _scores_sub = _label_source[_start:_end]
+        # 强制清理：确保用于排名的标签源无 NaN
+        if np.isnan(_label_source).any():
+            _label_source = np.nan_to_num(_label_source, nan=0.5)
+        y_train = np.empty(len(dates_train), dtype=np.float32)
+        y_val   = np.empty(len(dates_val),   dtype=np.float32)
+        
+        # 离散档位标签：XGBoost 和 LightGBM 共用同一档位数（N_BINS）。
+        # N_BINS 由 ModelConfig.get_n_bins() 统一获取（以 LIGHTGBM_PARAMS.label_gain 长度为准）。
+        # 设计原则：档位数 × truncation_level ≈ 股票池大小，确保 lambdarank 有效 pair 密度。
+        _n_bins = ModelConfig.get_n_bins()
+        _mid_bin = _n_bins // 2  # 单样本日期的默认档位（中间档）
+        y_train_discrete = np.empty(len(dates_train), dtype=np.int32)
+        y_val_discrete = np.empty(len(dates_val), dtype=np.int32)
+        
+        for _dates_sub, _scores_sub, _y_sub, _y_discrete in [
+            (dates_train, _label_source[:split_idx], y_train, y_train_discrete), 
+            (dates_val, _label_source[val_start_idx:], y_val, y_val_discrete)
+        ]:
             _, _d_starts, _d_counts = np.unique(_dates_sub, return_index=True, return_counts=True)
             for _ds, _dc in zip(_d_starts, _d_counts):
                 _de = _ds + _dc
                 if _dc > 1:
-                    y_clean[_start + _ds:_start + _de] = rankdata(_scores_sub[_ds:_de], method='average') / (_dc + 1)
+                    # 获取当前截面的原始分数
+                    scores = _scores_sub[_ds:_de]
+                    
+                    # # 1. 连续标签：排名归一化到 0-1 (所有样本参与排名)
+                    ranks = rankdata(scores, method='average') / (_dc + 1)
+                    _y_sub[_ds:_de] = ranks.astype(np.float32)       
+                                 
+                    # 2. 离散标签改进版
+                    # 使用动态的 _n_bins 等分，避免硬编码 10 导致分布极其倾斜
+                    bins = np.clip((ranks * _n_bins).astype(np.int32), 0, _n_bins-1)
+                    _y_discrete[_ds:_de] = bins
                 else:
-                    y_clean[_start + _ds:_start + _de] = 0.5
-        y = y_clean
+                    _y_discrete[_ds:_de] = _mid_bin
+                    _y_sub[_ds:_de] = 0.5
+        
         print(f"  [标签] 已在 train/val 分割后分别重新做横截面排名归一化，消除标签泄漏")
-
-        # === 排名权重方案 (全市场中性化排名) ===
-        # 1. 中性化：消除板块差异
-        returns_normalized = returns / (limit_groups + 1e-8)
         
-        # 2. 在 train/val 分割后分别计算排名权重，避免验证集权重包含训练集收益分布信息
-        rank_scores = np.full(len(returns), np.nan, dtype=np.float32)
-        for _w_start, _w_end in [(0, split_idx), (split_idx, len(returns))]:
-            _ret_sub = returns_normalized[_w_start:_w_end]
-            _valid = ~np.isnan(_ret_sub)
-            if _valid.any():
-                _ranks = rankdata(_ret_sub[_valid], method='average')
-                _n = np.sum(_valid)
-                _scores = np.full(len(_ret_sub), np.nan, dtype=np.float32)
-                _scores[_valid] = (_ranks - 1.0) / (_n - 1.0) if _n > 1 else 0.5
-                rank_scores[_w_start:_w_end] = _scores
-        
-        returns_weight = rank_scores
-        
-        # 叠加 ST 降权（如果已计算）
-        ST_WEIGHT_FACTOR = getattr(TrainingConfig, 'ST_WEIGHT_FACTOR', None)
-        if is_st_arr is not None and ST_WEIGHT_FACTOR is not None and ST_WEIGHT_FACTOR < 1.0:
-            st_weight = np.ones(len(is_st_arr), dtype=np.float32)
-            st_weight[is_st_arr] = st_weight[is_st_arr] * ST_WEIGHT_FACTOR
-            returns_weight = returns_weight * st_weight
 
-        # 统一归一化到均值 1.0，无论是否有 ST 降权，保证权重尺度稳定
-        _valid_w = ~np.isnan(returns_weight)
-        if _valid_w.any():
-            returns_weight = returns_weight / (returns_weight[_valid_w].mean() + 1e-8)
+        # 1. 初始化基础权重
+        sample_weight_train = np.ones(len(y_train), dtype=np.float32)
 
-        # 开关：是否使用自定义样本权重
-        use_sample_weight = getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', True)
-        if not use_sample_weight:
-            returns_weight = None
-            print("  [样本权重] 已禁用自定义样本权重，使用均匀权重")
-        else:
-            print("  [样本权重] 已启用自定义样本权重（收益率排名 + ST 降权）")
+        # 2. 叠加 ST 降权
+        st_weight_factor = getattr(TrainingConfig, 'ST_WEIGHT_FACTOR', None)
+        if is_st_train is not None and st_weight_factor is not None and st_weight_factor < 1.0:
+            sample_weight_train *= np.where(is_st_train, st_weight_factor, 1.0).astype(np.float32)
+
+        # 3. 叠加正交优化权重 (改为每日排名分档逻辑)
+        if w_sig_arr is not None and getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', True):
+            # 获取训练集和验证集的权重数据
+            w_sig_train = w_sig_arr[:split_idx]
+            w_sig_val = w_sig_arr[val_start_idx:]
+            
+            # 初始化处理后的权重数组
+            w_sig_processed_train = np.empty_like(w_sig_train)
+            w_sig_processed_val = np.empty_like(w_sig_val)
+            
+            # 使用相同的每日循环进行权重排名和离散化
+            # 逻辑：权重 = 组内未来收益率的分位点 (0-1) -> 映射为离散等级 (如 1-5)
+            # 这样保证了：
+            # 1. 免疫极端大涨/大跌个股的过拟合 (只看排名)
+            # 2. 与 lambdarank 的 top-K 优化目标天然匹配 (Top 样本权重更高)
+            for _dates_sub, _w_raw, _w_processed in [
+                (dates_train, w_sig_train, w_sig_processed_train),
+                (dates_val, w_sig_val, w_sig_processed_val)
+            ]:
+                _, _d_starts, _d_counts = np.unique(_dates_sub, return_index=True, return_counts=True)
+                for _ds, _dc in zip(_d_starts, _d_counts):
+                    _de = _ds + _dc
+                    if _dc > 1:
+                        # 计算组内分位排名 (0 到 1)
+                        # 注意：此处 w_raw 为原始收益率，值越大排名越靠前
+                        w_ranks = rankdata(_w_raw[_ds:_de], method='average') / (_dc + 1)
+                        
+                        # 映射公式: 指数型头部权重 (Exponential Head Weighting)
+                        # 让排名越靠前的样本权重呈指数级暴增，而非之前的线性增长
+                        w_exp = getattr(TrainingConfig, 'WEIGHT_EXPONENT', 3.0)
+                        
+                        # 方案一：指数法 (e的几次幂)。如果 w_power=3，头部权重约等于尾部的 20 倍 (e^3 vs e^0)
+                        _w_processed[_ds:_de] = np.exp(w_ranks * w_exp)
+                    else:
+                        raise ValueError(f"正交优化样本数量为1，请检查数据")
+            
+            # 更新训练集权重 (仅训练集需要权重)
+            sample_weight_train *= w_sig_processed_train
+
+        sample_weight_train = np.nan_to_num(sample_weight_train, nan=1.0, posinf=1.0, neginf=1.0)
+        sample_weight_train /= (sample_weight_train.mean() + 1e-8)
+        
+        # 5. 特征选择：减少冗余和高度相关的特征 (New)
+        selection_cache_file = os.path.join(TrainingConfig.SAVE_DIR, "selected_features.json")
+        os.makedirs(TrainingConfig.SAVE_DIR, exist_ok=True)
+        
+        # 记录原始特征列表，用于同步过滤 X_val
+        original_factor_names = list(factor_names)
+        
+        # 尝试从缓存读取特征选择结果
+        loaded_from_cache = False
+        if os.path.exists(selection_cache_file):
+            try:
+                import json
+                with open(selection_cache_file, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                    # 只有当原始特征集完全一致时，才复用缓存
+                    if set(cached_data.get('original_features', [])) == set(original_factor_names):
+                        factor_names = cached_data['selected_features']
+                        print(f"\n[特征优化] 从缓存加载特征选择结果 (保留 {len(factor_names)} 个核心特征)")
+                        loaded_from_cache = True
+            except Exception as e:
+                print(f"  读取特征选择缓存失败: {e}")
+
+        if not loaded_from_cache:
+            print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
+            # 使用相关性过滤
+            X_train, factor_names = self._select_features(
+                X_train, factor_names
+            )
+            # 保存特征选择结果到缓存
+            try:
+                import json
+                with open(selection_cache_file, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'original_features': original_factor_names,
+                        'selected_features': factor_names,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }, f, ensure_ascii=False, indent=4)
+            except Exception as e:
+                print(f"  保存特征选择结果失败: {e}")
+        
+        # 同步更新数据矩阵 (无论是否来自缓存，都要确保矩阵列数对齐)
+        if len(factor_names) < len(original_factor_names):
+            keep_indices = [original_factor_names.index(f) for f in factor_names]
+            if loaded_from_cache:
+                X_train = X_train[:, keep_indices] if not isinstance(X_train, pd.DataFrame) else X_train[factor_names]
+            
+            if isinstance(X_val, pd.DataFrame):
+                X_val = X_val[factor_names]
+            else:
+                X_val = X_val[:, keep_indices]
+            
+        if not loaded_from_cache:
+            print(f"  特征优化完成: 保留 {len(factor_names)} 个核心特征")
+
+
 
         results = {}
         for model_type in model_types:
-            print(f"\n训练 {model_type.upper()} 模型")
+            print(f"\n训练 {model_type.upper()} 模型 (ranking)")
             try:
-                task = 'ranking' if model_type == 'lightgbm' else 'regression'
-                model = MLFactorModel(model_type=model_type, task=task)
+                # 两个模型均使用 ranking 任务：
+                #   - XGBoost: XGBRanker (rank:ndcg)，标签为离散档位 (0~N_BINS-1)
+                #   - LightGBM: LGBMRanker (lambdarank)，标签为离散档位 (0~N_BINS-1)
+                model = MLFactorModel(model_type=model_type, task='ranking')
+
+                # 内部二次切分（训练集内部的 early stopping 验证集）
+                # 取训练集前 70% 作为内训练，后 30% 作为内验证，并对齐到日期边界
+                inner_split_ratio = 0.7
+                raw_inner_split = int(len(X_train) * inner_split_ratio)
+                inner_split_date = dates_train[raw_inner_split] if raw_inner_split < len(dates_train) else dates_train[-1]
+                inner_split_idx = int(np.searchsorted(dates_train, inner_split_date, side='left'))
+
+                train_result = model.train(
+                    X_train, y_train_discrete,
+                    validation_split=1.0 - inner_split_ratio,
+                    use_time_series_split=True,
+                    feature_names=factor_names,
+                    sample_weight=sample_weight_train,  # 两模型均支持 sample_weight
+                    returns=returns_train,
+                    split_idx=inner_split_idx,          # 日期边界对齐的内部分割点
+                    dates=dates_train,
+                    group=train_group,
+                    eval_group=val_group,
+                )
                 
-                # [正交设计]
-                # 标签：路径质量分（稳定性）
-                #   - LGBM ranking：使用原始路径质量分(path_scores)排序，保留分布形态
-                #   - XGB regression：使用每日板块中性化归一化后的路径质量分(y)
-                # 权重：基于原始收益率，强调高收益样本
-                swap_label_weight = getattr(TrainingConfig, 'SWAP_LABEL_WEIGHT', False)
-                if swap_label_weight and returns_weight is not None:
-                    # 交换：标签←收益排名权重，权重←路径质量分（平移归一化为非负）
-                    _rw = returns_weight.astype(np.float32) if isinstance(returns_weight, np.ndarray) else np.array(returns_weight, dtype=np.float32)
-                    # LGBM lambdarank 要求标签为非负整数（relevance grade）
-                    # 将 [0,1] 的排名分数量化为 0~9 的整数 grade
-                    if model_type == 'lightgbm':
-                        current_y = np.floor(_rw * 9).clip(0, 9).astype(np.int32)
-                    else:
-                        current_y = _rw
-                    path_as_weight = np.array(y, dtype=np.float32)
-                    path_as_weight = path_as_weight - path_as_weight.min()  # 平移至非负
-                    path_as_weight = path_as_weight / (path_as_weight.mean() + 1e-8)
-                    current_weight = path_as_weight
-                    print(f"  [{model_type.upper()}] [SWAP] 标签=收益排名权重{'(整数grade)' if model_type == 'lightgbm' else ''}, 权重=路径质量分(归一化)")
-                else:
-                    current_weight = returns_weight
-                    if model_type == 'lightgbm':
-                        # LGBM ranking：用原始路径质量分（非均匀分布）做分档依据
-                        # 避免对已均匀化的 y_clean 再做百分位分档导致 label_gain 失效
-                        lgbm_label_source = path_scores if path_scores is not None else y
-                        current_y = lgbm_label_source
-                        print("  [LGBM] 标签=原始路径质量分(ranking分档), 权重=收益归一化权重")
-                    else:
-                        # XGB regression：标签用每日板块中性化归一化后的路径质量分
-                        current_y = y
-                        print("  [XGB] 标签=归一化路径质量分(regression), 权重=收益归一化权重")
-                
-                # 训练模型（直接传入 X 的视图，减少内存拷贝）
-                train_result = model.train(X, current_y, validation_split=0.2, 
-                                          use_time_series_split=True,
-                                          feature_names=factor_names,
-                                          sample_weight=current_weight,
-                                          returns=returns,
-                                          split_idx=split_idx,
-                                          dates=dates,
-                                          group=train_group,
-                                          eval_group=val_group)
+                # 在外部纯净验证集上做最终评估（阻隔期后）
+                val_eval = model._evaluate(X_val, y_val, "验证集(阻隔期后)", returns=returns_val, dates=dates_val)
+                train_result['val_metrics'] = val_eval
                 
                 self.models[model_type] = model
                 results[model_type] = train_result
@@ -1296,39 +1395,22 @@ class MLModelTrainer:
         
         return results
 
+
     def _apply_cross_sectional_normalization_inplace(self, X: np.ndarray, dates: np.ndarray, 
-                                                   factor_names: List[str],
-                                                   collect_stats: bool = False,
-                                                   ref_stats: dict = None,
-                                                   ref_window: int = 60):
+                                                   factor_names: List[str]):
         """
         原位对特征矩阵进行横截面归一化（按日期分组），降低内存占用。
-
-        参数:
-            collect_stats: 若为 True，收集每日的均值/标准差并返回，供验证集使用
-            ref_stats: 若提供，则用该统计量（训练集末尾 ref_window 天的均值/std）
-                       对当前数据做 z-score 归一化，而非用自身横截面排名
-                       这消除了验证集的 look-ahead bias（推理时不知道当天全市场分布）
-            ref_window: 从 ref_stats 中取最后多少个交易日的统计量做平均
         """
         # 跳过横截面排名归一化的特征集合
         # 原则：以下类型的特征不具备"今日全市场排名"的语义，归一化会破坏其信息：
-        #   1. 全市场情绪因子 —— 所有股票当天值相同，排名无意义
-        #   2. 类别/枚举特征 —— market_type, industry_encoded 等整数编码
-        #   3. 0/1 二值标志位 —— is_limit_up, is_suspended, K线形态信号, One-Hot 行业列
-        #   4. 绝对天数 —— days_to_delist（排名会把"还有500天退市"和"还有1天退市"混在一起）
         _skip_normalization = {
             # 全市场情绪因子（所有股票当天值相同）
-            'up_ratio', 'strong_up_ratio', 'down_ratio',
-            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
-            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
-            # 类别/枚举特征
-            'market_type', 'industry_encoded',
-            # 绝对天数
-            'days_to_delist',
-            # 0/1 交易状态标志位
+            'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio', 
+            'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio', 
+            'breadth_ma20', 'market_type',
+            # 交易状态标志位
             'is_limit_up', 'is_suspended',
-            # K线形态 0/1 信号（19个形态 + 强度指标不是0/1但也是有界的，保留归一化）
+            # K线形态 0/1 信号
             'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
             'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
             'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
@@ -1337,65 +1419,63 @@ class MLModelTrainer:
         }
         # One-Hot 行业列（前缀匹配）
         def _should_skip(col: str) -> bool:
-            if col in _skip_normalization:
+            if col in _skip_normalization: return True
+            # 行业、个股状态、退市天数等不参与横截面排名
+            if col.startswith(('industry_', 'sector_', 'is_', 'days_to_')):
+                if col.endswith('_encoded'): return False
                 return True
-            # industry_农、林、牧、渔业 等 One-Hot 列
-            if col.startswith('industry_') and not col.endswith('_encoded'):
+            # 关键改进：全市场维度因子（大盘指标、情绪指标）不参与横截面排名
+            # 这些指标在同一天对所有股票是相同的，排名后会全部变成 0.5，导致模型丢失大盘环境信息
+            if col.startswith(('mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
                 return True
             return False
 
         rank_cols_mask = np.array([not _should_skip(col) for col in factor_names])
+    def _select_features(self, X: np.ndarray, feature_names: List[str], 
+                       corr_threshold: float = 0.9,
+                       method: str = 'correlation') -> Tuple[np.ndarray, List[str]]:
+        """
+        特征选择：过滤高度相关的特征
+        """
+        if method == 'none' or len(feature_names) <= 50:
+            return X, feature_names
+            
+        df_temp = pd.DataFrame(X, columns=feature_names)
+        
+        # 1. 简单相关性过滤
+        corr_matrix = df_temp.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        
+        to_drop = [column for column in upper.columns if any(upper[column] > corr_threshold)]
+        
+        if to_drop:
+            print(f"  - 发现 {len(to_drop)} 个高度相关特征 (corr > {corr_threshold})，已剔除")
+            df_temp = df_temp.drop(columns=to_drop)
+            new_feature_names = df_temp.columns.tolist()
+            return df_temp.values, new_feature_names
+            
+        return X, feature_names
+
         rank_cols_idx = np.where(rank_cols_mask)[0]
         
         if len(rank_cols_idx) == 0:
-            return {} if collect_stats else None
+            return None
 
         unique_dates, group_start, group_counts = np.unique(
             dates, return_index=True, return_counts=True
         )
 
-        # 模式A：验证集同样使用横截面排名归一化，保持与训练集一致的特征分布
-        # 注意：之前用 z-score → sigmoid 会导致验证集特征分布与训练集不一致，
-        # 是验证集损失无法下降的根本原因。ref_stats 参数保留但不再用于改变归一化方式。
-        if ref_stats is not None:
-            for start, count in zip(group_start, group_counts):
-                if count <= 1:
-                    X[start:start+count, rank_cols_idx] = 0.5
-                    continue
-                day_data = X[start:start+count, rank_cols_idx]
-                day_ranks = rankdata(day_data, method='average', axis=0) / (count + 1)
-                X[start:start+count, rank_cols_idx] = day_ranks.astype(np.float32)
-
-            import gc; gc.collect()
-            return None
-
-        # 模式B：正常横截面排名归一化（训练集使用）
-        daily_stats = {} if collect_stats else None
-
         for start, count in zip(group_start, group_counts):
             if count <= 1:
                 X[start:start+count, rank_cols_idx] = 0.5
-                if collect_stats:
-                    daily_stats[unique_dates[np.searchsorted(group_start, start)]] = {
-                        'mean': X[start, rank_cols_idx].copy(),
-                        'std':  np.ones(len(rank_cols_idx), dtype=np.float32),
-                    }
                 continue
 
             day_data = X[start:start+count, rank_cols_idx]
-
-            if collect_stats:
-                # 收集归一化前的原始统计量，供验证集 z-score 使用
-                d_mean = np.nanmean(day_data, axis=0).astype(np.float32)
-                d_std  = np.nanstd(day_data,  axis=0).astype(np.float32)
-                date_key = unique_dates[np.searchsorted(group_start, start)]
-                daily_stats[date_key] = {'mean': d_mean, 'std': d_std}
-
             day_ranks = rankdata(day_data, method='average', axis=0) / (count + 1)
             X[start:start+count, rank_cols_idx] = day_ranks.astype(np.float32)
 
-        import gc; gc.collect()
-        return daily_stats if collect_stats else None
+        gc.collect()
+        return None
     
     def compare_models(self, results: Dict):
         """对比模型性能"""
@@ -1414,17 +1494,14 @@ class MLModelTrainer:
             # 基础指标
             row = {
                 '模型': model_type,
-                '任务': '排序' if model_type == 'lightgbm' else '回归(软标签)',
+                '任务': '排序',
                 'Rank IC': f"{val_metrics.get('rank_ic', 0.0):.4f}",
                 'Top-1精度': f"{val_metrics.get('top1_precision', 0.0):.2%}",
                 'Top-5精度': f"{val_metrics.get('top5_precision', 0.0):.2%}",
             }
             
             # 补充任务特有指标
-            if model_type == 'lightgbm':
-                row['辅助指标'] = f"IC_Std: {val_metrics.get('rank_ic_std', 0.0):.4f}"
-            else:
-                row['辅助指标'] = f"AUC: {val_metrics.get('auc', 0.0):.4f}"
+            row['辅助指标'] = f"IC_Std: {val_metrics.get('rank_ic_std', 0.0):.4f} | AUC: {val_metrics.get('auc', 0.0):.4f}"
             
             comparison.append(row)
         
@@ -1438,59 +1515,6 @@ class MLModelTrainer:
         print(f"\n最佳选股模型: {best_model[0].upper()} (Rank IC: {best_model[1]['val_metrics'].get('rank_ic', 0.0):.4f})")
         
         return best_model[0]
-    
-    def _apply_cross_sectional_normalization(self, X: np.ndarray, dates: np.ndarray, 
-                                            factor_names: List[str]) -> np.ndarray:
-        """
-        对特征矩阵进行横截面归一化（按日期分组）
-        
-        参数:
-            X: 特征矩阵
-            dates: 日期数组
-            factor_names: 特征名称列表
-        
-        返回:
-            归一化后的特征矩阵
-        """
-        X_normalized = X.copy()
-        
-        # 获取日期分组
-        _, date_group_start, date_group_counts = np.unique(
-            dates, return_index=True, return_counts=True
-        )
-        
-        # 识别需要进行横截面排名的因子索引
-        # 排除市场情绪因子，因为它们在同一天对所有股票相同
-        # 使用精确集合匹配，避免关键词匹配误伤同名技术因子（如 mean_return_20d）
-        _sentiment_exact = {
-            'up_ratio', 'strong_up_ratio', 'down_ratio',
-            'limit_up_ratio', 'limit_down_ratio', 'mean_return',
-            'total_volume', 'adv_vol_ratio', 'breadth_ma20',
-            'market_type',
-        }
-        rank_cols_mask = np.array([col not in _sentiment_exact for col in factor_names])
-        rank_cols_idx = np.where(rank_cols_mask)[0]
-        
-        if len(rank_cols_idx) > 0:
-            print(f"    - 正在对 {len(rank_cols_idx)} 个特征进行向量化横截面归一化...")
-            # 优化：使用 pandas 分组排序，极大提升大规模数据的处理速度（由数分钟缩短至数秒）
-            # 注意：此处必须保持 input X 的原始索引顺序，pandas groupby.rank 默认满足
-            rank_df = pd.DataFrame(X_normalized[:, rank_cols_idx], columns=[factor_names[i] for i in rank_cols_idx])
-            rank_df['date'] = dates
-            
-            # 使用更加稳健的归一化映射 (rank / (n + 1))
-            # groupby().rank() 返回与原 DataFrame 同形状且索引对齐的排名
-            ranked_values = rank_df.groupby('date', sort=False).rank(method='average')
-            
-            # 映射到 (0, 1) 空间
-            # transform('count') 会将每组的数量扩展到所有行，实现矢量化除法
-            counts = rank_df.groupby('date', sort=False)['date'].transform('count')
-            X_normalized[:, rank_cols_idx] = (ranked_values.values / (counts.values[:, np.newaxis] + 1)).astype(np.float32)
-            
-            del rank_df, ranked_values, counts
-            import gc; gc.collect()
-        
-        return X_normalized
     
     def save_models(self, save_dir: str = 'models', years: int = 5, stocks: int = 5000):
         """
@@ -1507,31 +1531,14 @@ class MLModelTrainer:
         if not self.models:
             print("警告: 没有已训练的模型可以保存。")
             return None
-            
-        # 1. 任务类型 (分类/回归/排序)
-        task_str = self.task
-        
-        # 2. 预测天数
-        forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 3)
-        
 
-        
-        # 4. 标签类型 (软标签/硬标签)
-        label_type = 'soft' if getattr(TrainingConfig, 'LABEL_SOFTENING', False) else 'hard'
-        
-        # 5. 权重状态
-        weight_status = 'punish' if self.punish_unbuyable else 'unpunish'
-        
-        # 6. 数据体量
-        data_volume = f"{years}y_{stocks}s"
-        
-        # 7. 当前时间戳 (增加唯一性)
-        timestamp = datetime.now().strftime('%m%d_%H%M')
-        
-        # 例如: train_classification_3d_5pct_punish_soft_5y_500s_0213_2130
-        archive_name = f"train_{task_str}_{forward_days}d_{weight_status}_{label_type}_{data_volume}_{timestamp}"
-        
-        archive_dir = os.path.join(save_dir, archive_name)
+        forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
+        data_volume  = f"{years}y_{stocks}s"
+        timestamp    = datetime.now().strftime('%m%d_%H%M')
+
+        # 归档目录名示例：train_hybrid_7d_6y_6000s_0429_1530
+        archive_name = f"train_{self.task}_{forward_days}d_{data_volume}_{timestamp}"
+        archive_dir  = os.path.join(save_dir, archive_name)
         os.makedirs(archive_dir, exist_ok=True)
         
         for model_type, model in self.models.items():

@@ -26,8 +26,6 @@ class StrategySignal:
         """验证信号有效性"""
         if self.signal_type not in ['buy', 'sell', 'hold']:
             raise ValueError(f"Invalid signal type: {self.signal_type}")
-        if not 0 <= self.confidence <= 100:
-            raise ValueError(f"Confidence must be between 0 and 100, got {self.confidence}")
 
 
 class BaseStrategy(ABC):

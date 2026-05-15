@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Any
 from sklearn.preprocessing import PolynomialFeatures
+from config import TrainingConfig
 
 
 class FeatureEngineer:
@@ -462,19 +463,41 @@ class FeatureEngineer:
         
         # 识别技术指标和基本面因子
         def fuzzy_match(col_name, keywords):
-            clean_col = col_name.lower().replace('_', '')
+            # 改进：不再暴力替换所有下划线，而是按词匹配
+            # 避免 'pe' 匹配到 'is_suspended'
+            parts = col_name.lower().split('_')
             for kw in keywords:
-                if kw.lower().replace('_', '') in clean_col:
-                    return True
+                kw_l = kw.lower().replace('_', '')
+                # 如果关键词包含在任何一部分中，或者整列名（去下划线）包含关键词
+                # 但排除掉一些极短的关键词在长单词中间的匹配
+                if len(kw_l) <= 2:
+                    # 对于 pe, pb 等短关键词，要求必须是独立的单词部分
+                    if any(kw_l == p for p in parts):
+                        return True
+                else:
+                    if kw_l in col_name.lower().replace('_', ''):
+                        return True
             return False
 
-        tech_keywords = ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 'willr', 'bias', 'psy', 'boll', 'ma', 'ema', 'vol', 'amount', 'turnover']
-        tech_indicators = [col for col in df.columns if fuzzy_match(col, tech_keywords)][:100]
+        # 技术指标关键词：仅匹配纯技术指标，排除成交量/金额类（避免与高级时序因子混淆）
+        # 注意：不包含 'amount'/'vol'/'turnover'，这些属于高级时序因子，量纲与技术指标不同，
+        # 混入差分/乘积特征会产生无经济意义的组合（如 adx_14_sub_amount_per_volume）
+        tech_keywords = ['rsi', 'macd', 'kdj', 'adx', 'atr', 'cci', 'mfi', 'obv', 'willr', 'bias', 'psy', 'boll', 'natr', 'cmo', 'roc', 'trix', 'aroon']
+        # 排除高级时序因子（amount_per_volume, price_volatility 等）和状态列
+        tech_exclude = ['amount_per_volume', 'amount_change_rate', 'volume_change_rate', 'volume_volatility',
+                        'price_volume_corr', 'price_volatility', 'price_skewness', 'price_kurtosis',
+                        'hl_range', 'oc_ratio', 'high_position', 'low_position', 'return_', 'momentum_',
+                        'downside_risk', 'drawdown', 'sharpe', 'is_', 'days_to_', 'market_']
+        tech_indicators = [col for col in df.columns 
+                           if fuzzy_match(col, tech_keywords)
+                           and not any(col.startswith(ex) or ex in col for ex in tech_exclude)
+                           and not TrainingConfig.should_skip_transform(col)][:100]
 
         fund_keywords = ['pe', 'pb', 'roe', 'roa', 'margin', 'growth', 'yield', 'beta', 'market_cap', 'marketcap', 
                          'peg', 'sue', 'eav', 'revenue', 'share', 'ttm', 'yoy', 'ratio', 'equity', 'asset', 'profit']
         fundamental_factors = [col for col in df.columns if fuzzy_match(col, fund_keywords) 
-                              and not any(x in col.lower() for x in ['slope', 'sharpe'])][:60]
+                              and not any(x in col.lower() for x in ['slope', 'sharpe'])
+                              and not TrainingConfig.should_skip_transform(col)][:60]
         
         # 2. 批量生成各类特征并存入 collected_features
         # 注意：使用确定性的固定索引选取，而非 random.sample，
@@ -491,17 +514,29 @@ class FeatureEngineer:
 
         if config.get('product') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            sorted_tech = sorted(tech_indicators)
-            selected_tech = sorted_tech[:4]
-            pairs = [(selected_tech[i], selected_tech[j]) for i in range(len(selected_tech)) for j in range(i+1, len(selected_tech))]
+            # 乘积特征：选取趋势强度类指标（ADX、ATR 等），与动量类组合有经济意义
+            trend_kws = ['adx', 'atr', 'natr', 'cci', 'mfi']
+            trend_cols = [col for col in tech_indicators if any(kw in col.lower() for kw in trend_kws)]
+            if len(trend_cols) < 2:
+                trend_cols = sorted(tech_indicators)[:4]
+            else:
+                trend_cols = sorted(trend_cols)[:4]
+            pairs = [(trend_cols[i], trend_cols[j]) for i in range(len(trend_cols)) for j in range(i+1, len(trend_cols))]
             collected_features.update(self.create_product_features(df, pairs, return_dict=True))
             stats['乘积特征'] = len(self.generated_features) - pre_count
         
         if config.get('difference') and len(tech_indicators) > 1:
             pre_count = len(self.generated_features)
-            sorted_tech = sorted(tech_indicators)
-            selected_tech = sorted_tech[:6]
-            diff_pairs = [(selected_tech[i], selected_tech[j]) for i in range(len(selected_tech)) for j in range(i+1, len(selected_tech))]
+            # 差分特征：只在同类量纲的指标间做差分，避免无意义的跨量纲组合
+            # 优先选取动量/趋势类指标（RSI、ROC、CMO、WILLR 等都在 0-100 或 -100~100 范围）
+            momentum_trend_kws = ['rsi', 'roc', 'cmo', 'willr', 'bias', 'aroon', 'trix']
+            momentum_cols = [col for col in tech_indicators if any(kw in col.lower() for kw in momentum_trend_kws)]
+            # 如果动量类不足，补充其他技术指标
+            if len(momentum_cols) < 4:
+                momentum_cols = sorted(tech_indicators)[:6]
+            else:
+                momentum_cols = sorted(momentum_cols)[:6]
+            diff_pairs = [(momentum_cols[i], momentum_cols[j]) for i in range(len(momentum_cols)) for j in range(i+1, len(momentum_cols))]
             collected_features.update(self.create_difference_features(df, diff_pairs, return_dict=True))
             stats['差分特征'] = len(self.generated_features) - pre_count
 
@@ -541,6 +576,31 @@ class FeatureEngineer:
             selected_fund = sorted_fund[:5]
             collected_features.update(self.create_interaction_features(df, selected_tech, selected_fund, return_dict=True))
             stats['交互特征'] = len(self.generated_features) - pre_count
+
+        # === 新增：长短线强制交叉特征 (Long-Short Divergence) ===
+        pre_count = len(self.generated_features)
+        cross_features = {}
+        # 1. 高位量能背离: vroc_36 / bias_36
+        if 'vroc_36' in df.columns and 'bias_36' in df.columns:
+            bias_val = df['bias_36'].astype(np.float32).replace(0, 1e-4) # 防止除零
+            cross_features['vroc36_div_bias36'] = (df['vroc_36'].astype(np.float32) / bias_val).replace([np.inf, -np.inf], 0).fillna(0)
+            self.generated_features.append('vroc36_div_bias36')
+            
+        # 2. 短线高位滞涨: return_5d / vol_std_60
+        if 'return_5d' in df.columns and 'vol_std_60' in df.columns:
+            vol_val = df['vol_std_60'].astype(np.float32).replace(0, 1e-4)
+            cross_features['return5d_div_volstd60'] = (df['return_5d'].astype(np.float32) / vol_val).replace([np.inf, -np.inf], 0).fillna(0)
+            self.generated_features.append('return5d_div_volstd60')
+
+        # 3. 相对动能衰竭: momentum_5d / bias_36
+        if 'momentum_5d' in df.columns and 'bias_36' in df.columns:
+            bias_val = df['bias_36'].astype(np.float32).replace(0, 1e-4)
+            cross_features['momentum5d_div_bias36'] = (df['momentum_5d'].astype(np.float32) / bias_val).replace([np.inf, -np.inf], 0).fillna(0)
+            self.generated_features.append('momentum5d_div_bias36')
+            
+        if cross_features:
+            collected_features.update(cross_features)
+            stats['长短线背离交叉特征'] = len(self.generated_features) - pre_count
 
         # 3. 最终合并 (仅一次)
         if collected_features:

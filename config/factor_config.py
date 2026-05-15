@@ -18,81 +18,87 @@ from config import baostock_config
 
 class ModelConfig:
     """模型超参数配置"""
-    
-    # XGBoost配置
-    XGBOOST_PARAMS = {
-        'n_estimators': 3000,
-        'max_depth': 8,              
-        'learning_rate': 0.02, 
-      
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'colsample_bylevel': 0.8, 
 
-        'min_child_weight': 1,      # 显式设置
-        'gamma': 0.1,    
-        'reg_alpha': 0.5,            
-        'reg_lambda': 1,           
-        'objective': 'reg:squarederror',
-        'eval_metric': 'rmse',      
+    XGBOOST_PARAMS: Dict[str, Any] = {
+        'n_estimators': 3000,
+        'max_depth': 3,
+        'learning_rate': 0.005,
+
+        'subsample': 0.8,
+        'colsample_bytree': 0.4,
+
+        # XGBoost 专属正则参数
+        'min_child_weight': 0,
+        'gamma': 0.0,
+        'reg_alpha': 0.0,
+        'reg_lambda': 0.0,
+
+        # Ranking 专属配置
+        'objective': 'rank:ndcg',
+        'eval_metric': 'ndcg',
+        'ndcg_exp_gain': True,  
+
         'n_jobs': 15,
-        'early_stopping_rounds': 50,
+        'early_stopping_rounds': 10,
         'verbosity': 0,
     }
-    
-    # LightGBM配置
-    LIGHTGBM_PARAMS = {
-        'n_estimators': 3000,
-        'max_depth': 8,
-        'num_leaves': 127,
-        'learning_rate': 0.02,
-        
-        'min_data_in_leaf': 150,   
-        'max_bin': 511,          
-        'min_child_weight': 0.5,
-        'min_gain_to_split': 0.05,
-        'reg_alpha': 0.5,
-        'reg_lambda': 1,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
 
-        'label_gain': [float(i**2+1) for i in range(10)],
+    # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
+    LIGHTGBM_PARAMS: Dict[str, Any] = {
+        'n_estimators': 3000,
+        'max_depth': 3,             
+        'learning_rate': 0.005,      
+        'label_gain': [float(2**i) for i in range(11)], # 增强 Top 样本的区分度
+
+        'min_child_samples': 0,    
+        'min_gain_to_split': 0.0,
+        'reg_alpha': 0,
+        'reg_lambda': 0,
+
+        'subsample': 0.8,           # 引入随机性
+        'colsample_bytree': 0.4,
+
+        # Ranking 专属配置
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'lambdarank_truncation_level': 10,
+        'eval_at': [1, 5, 10],
+        'lambdarank_truncation_level': 128, # 聚焦于头部股票的排序
 
+        'early_stopping_rounds': 10,
         'n_jobs': 15,
         'verbosity': -1,
-        'early_stopping_rounds': 50,
-    }
-    
-
-    # GPU 专用配置增量 (如果 USE_GPU = True)
-    GPU_PARAMS_XGB = {
-        'tree_method': 'hist',      # XGBoost 2.0+ 推荐使用 hist + device=cuda
-        'device': 'cuda',           # 显式指定使用 CUDA
-        'n_jobs': 1,                # GPU模式下CPU线程数设为1，避免与GPU争资源
     }
 
-    GPU_PARAMS_LGB = {
+    # ── GPU 专用配置增量（XGBoost，当 USE_GPU=True 时叠加）───────────────
+    GPU_PARAMS_XGB: Dict[str, Any] = {
+        'tree_method': 'hist',   # XGBoost 2.0+ 推荐 hist + device=cuda
+        'device': 'cuda',
+        'n_jobs': 1,             # GPU 模式下 CPU 线程数设为 1，避免与 GPU 争资源
     }
 
+    # ── 统一接口 ──────────────────────────────────────────────────────────
     @classmethod
     def get_model_params(cls, model_type: str) -> Dict[str, Any]:
-        """获取指定模型的参数"""
+        """获取指定模型的超参数（XGBoost 自动叠加 GPU 配置）"""
         params_map = {
             'xgboost': cls.XGBOOST_PARAMS,
             'lightgbm': cls.LIGHTGBM_PARAMS,
         }
         params = params_map.get(model_type, {}).copy()
-        
-        # 如果启用了 GPU 加速
         if model_type == 'xgboost':
             params.update(cls.GPU_PARAMS_XGB)
-        elif model_type == 'lightgbm':
-            params.update(cls.GPU_PARAMS_LGB)
-                
         return params
+
+    @classmethod
+    def get_n_bins(cls) -> int:
+        """
+        返回两模型统一使用的标签档位数（N_BINS）。
+
+        设计原则：
+        - LightGBM 以 label_gain 长度为准（决定 lambdarank 的增益曲线）。
+        - XGBoost 复用相同档位数，保证两者离散标签的语义一致。
+        """
+        return len(cls.LIGHTGBM_PARAMS.get('label_gain', list(range(10))))
 
 
 # ============================================================================
@@ -101,48 +107,133 @@ class ModelConfig:
 
 class TrainingConfig:
     """训练参数配置"""
-    # 模型训练任务类型 (LGBM固定为ranking, XGB固定为regression拟合软化标签)
-    TASK_TYPE = 'hybrid' 
-    MODEL_TYPES = ['xgboost','lightgbm']
-    SAMPLE_EVAL = True    # 是否使用随机采样评估
 
-    INCLUDE_FUNDAMENTALS = True  # 是否包含基本面因子
-    PUNISH_UNBUYABLE = True      # 涨停板、停牌样本惩罚 (兼容旧逻辑)
-    USE_SAMPLE_WEIGHT = True     # 是否使用自定义样本权重（基于收益率排名 + ST 降权）
-    SWAP_LABEL_WEIGHT = False    # 是否交换标签与样本权重（标签←收益排名权重，权重←路径质量分）
-    ST_WEIGHT_FACTOR = 0.5       # ST 股票样本权重降低因子 (0.3 表示权重降至30%)
-    ST_LABEL_SCORE = 0.5       # ST 股票标签上限：直接压低标签，让模型从标签层面学到"ST = 低质量"
-    UNBUYABLE_HANDLING = 'remove' # 'remove' (推荐，剔除样本) 或 'punish' (惩罚，软标签设为 0.05)
-    
-    # 退市临近惩罚：对距退市日 N 个自然日以内的样本，将标签压至极低值
-    DELIST_PENALTY_DAYS = 30     # 退市前多少天内的样本触发惩罚
-    DELIST_PENALTY_SCORE = 0.01  # 惩罚后的标签值（远低于正常均值 ~1.0）
-    
-    LABEL_TARGET_SCALE = 2.0
-    LABEL_LAMBDA = 0.2          # 损失厌恶系数：<=1ATR线性，>1ATR二次方放大
-    
-    USE_GPU = True               # 是否启用 GPU 加速
-    MEMORY_EFFICIENT = True      # 是否启用内存优化模式 (针对大规模数据集)
-    GPU_BATCH_SIZE = 1000000      # GPU 分批训练的批大小 (增加此值可提高 GPU 利用率，减少 CPU-GPU 传输次数)
+    # ── 模型 ──────────────────────────────────────────────────────────────
+    MODEL_TYPES          = ['lightgbm', 'xgboost']
 
-    YEARS=baostock_config.HISTORY_YEARS
+    # ── 数据范围 ───────────────────────────────────────────────────────────
+    YEARS                = baostock_config.HISTORY_YEARS
+    YEARS_FOR_TRAINING   = 6         # 训练数据年数
+    YEARS_FOR_BACKTEST   = 1         # 回测数据年数
+    STOCK_NUM            = 6000      # 参与训练的股票数量上限
+    FUTURE_DAYS          = 5         # 预测未来 N 个交易日
 
-    YEARS_FOR_BACKTEST=1         # 回测年数
-    YEARS_FOR_TRAINING=6         # 训练年数（只用近5年，避免引入过时的市场结构数据）
-    STOCK_NUM = 6000             # 股票数量
-    # 数据集划分
-    TRAIN_TEST_SPLIT = 0.8
+    # ── 数据集划分 ─────────────────────────────────────────────────────────
+    TRAIN_TEST_SPLIT     = 0.8       # 训练集占比
+    # —— 抽样评估比例 ───────────────────────────────────────────────────────
+    SAMPLE_EVAL          = 0.2
+
+    # ── 因子与基本面 ───────────────────────────────────────────────────────
+    INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
+    INCLUDE_CANDLE_PATTERN = True
+
+    # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
+    UPSIDE_WEIGHT        = 1.0       
+    DOWNSIDE_WEIGHT      = 1.0       
+    FINAL_RETURN_WEIGHT  = 3.0       
     
 
-    # 预测天数 (用于分类、回归和排序任务)
-    FUTURE_DAYS = 7
-    
+    WEIGHT_EXPONENT      = 0.5
+    USE_SAMPLE_WEIGHT    = True      # 开启样本权重，让收益高的样本更有影响力
 
-    # 缓存目录
-    CACHE_DIR = 'database/system_data/factors_cache'
-    # 模型保存目录
-    SAVE_DIR = 'models'
+    # ST 股票处理
+    ST_LABEL_SCORE       = -50         # ST 样本原始分上限（0=中性）
+    ST_WEIGHT_FACTOR     = 0.1       # ST 样本权重降低因子
     
+    # 退市预警处理
+    DELIST_PENALTY_DAYS  = 30      
+    DELIST_PENALTY_SCORE = -100      # 退市样本直接给最低分
+    UNBUYABLE_HANDLING   = 'punish'  
+    
+        
+
+    # ── 基础设施与计算性能 (Infrastructure) ────────────────────────────────
+    USE_GPU              = True          # 是否启用 GPU 加速（XGBoost/LightGBM）
+    MEMORY_EFFICIENT     = True          # 是否启用分批训练/流式加载
+    GPU_BATCH_SIZE       = 1_000_000     # GPU 批次大小
+
+    # ── 因子归一化 (Feature Normalization) ────────────────────────────────
+    # 在进行横截面排名时，跳过这些特定类型的因子
+    FEATURE_RANK_SKIP_LIST = {
+        # 1. 全市场/宏观因子 (所有股票值都一样，排名无意义)
+        'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio', 
+        'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio', 
+        'breadth_ma20',
+        
+        # 2. 状态/类型因子 (离散值)
+        'market_type', 'is_limit_up', 'is_suspended', 'is_st',
+        
+        # 3. K线形态 (0/1 二元标记)
+        'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
+        'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
+        'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
+        'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
+        'three_white_soldiers', 'three_black_crows',
+        
+        # 4. 行业/板块 (One-hot 编码)
+        # 逻辑：以 industry_ 或 sector_ 开头，且不以 _encoded 结尾的（通常是原始字符串或ID）
+    }
+
+    # ── 特征工程衍生过滤 (Feature Engineering Transformation Filtering) ──────
+    # 在自动生成比率、乘积、差值等衍生特征时，严禁使用以下类型的原始特征作为分母或交互项
+    # 避免产生无意义的"除以状态位"导致的虚假重要性（如 adv_vol_ratio_div_is_suspended）
+    FEATURE_TRANSFORM_EXCLUDE_LIST = {
+        'market_type', 'is_limit_up', 'is_suspended', 'is_st',
+        'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
+        'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
+        'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
+        'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
+        'three_white_soldiers', 'three_black_crows',
+        'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio',
+        'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio',
+        'breadth_ma20', 'days_to_delist',
+        
+        # 4. 绝对规模因子 (防止在特征工程中产生"因子 x 规模"导致的严重 Size Bias)
+        'MBRevenue', 'totalShare', 'liqaShare', 'netProfit', 'market_cap', 
+        'totalAssets', 'totalLiabilities', 'epsTTM', 'cashFlow', 'log_mkt_cap'
+    }
+
+    @staticmethod
+    def should_skip_transform(col: str) -> bool:
+        """判定该因子是否应跳过特征工程变换 (如比率、交互项等)"""
+        if col in TrainingConfig.FEATURE_TRANSFORM_EXCLUDE_LIST:
+            return True
+        col_l = col.lower()
+        # 排除所有状态位、K线形态、宏观指标
+        if col_l.startswith(('industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
+            return True
+        return False
+
+    @staticmethod
+    def should_skip_rank(col: str) -> bool:
+        """判定该因子是否应跳过横截面排名"""
+        if col in TrainingConfig.FEATURE_RANK_SKIP_LIST:
+            return True
+        col_l = col.lower()
+        # 行业、板块分类、退市天数、二元标记、市场/指标前缀
+        if col_l.startswith(('industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
+            # 如果是已经 label encoding 过的行业因子，可以参与排名（保持分布一致）
+            if col_l.endswith('_encoded'):
+                return False
+            return True
+        return False
+
+    # ── 路径 ───────────────────────────────────────────────────────────────
+    CACHE_DIR            = 'database/system_data/factors_cache'  # 因子缓存目录
+    SAVE_DIR             = 'models'                              # 模型保存目录
+
+    # ── 训练股票池过滤（与 strategy_config 中的选股条件对齐）──────────────
+    # 开启后，训练数据只包含满足策略选股条件的股票，使训练分布与推理分布一致。
+    # 关闭后，使用全市场股票训练，模型具备更强的跨股票池泛化能力（推荐）。
+    # 注意：开启此选项会显著减少训练样本量，可能导致过拟合。
+    FILTER_BY_STRATEGY   = False
+
+    # 当 FILTER_BY_STRATEGY=True 时生效的具体过滤条件
+    # None 表示不限制该条件，与 strategy_config 中的语义一致
+    TRAIN_FILTER_MARKETS  = None   # None = 使用 strategy_config.SELECTOR_MARKETS
+    TRAIN_FILTER_MAX_PRICE = None  # None = 使用 strategy_config.MAX_PRICE
+    TRAIN_FILTER_MIN_PRICE = None  # None = 使用 strategy_config.MIN_PRICE
+    TRAIN_FILTER_INCLUDE_ST = None # None = 使用 strategy_config.INCLUDE_ST
 
 
 # ============================================================================
@@ -150,118 +241,123 @@ class TrainingConfig:
 # ============================================================================
 
 class FactorConfig:
-    """因子计算参数配置"""
-    
+    """
+    因子计算参数配置
+    定义各类技术指标与 K 线形态的计算窗口与阈值
+    """
+
     # ========== 动量因子参数 ==========
-    RSI_PERIOD = 14            # 短线常用7~14
-    ROC_PERIOD = 15           # 变动率捕捉短期加速
-    MTM_PERIOD = 8            # 8日动量适应快速转折
-    CMO_PERIOD = 14           # 钱德指标
-    STOCHRSI_PERIOD = 12      # 随机RSI
-    RVI_PERIOD = 7            # 相对活力指数
-    
+    RSI_PERIOD = 21
+    ROC_PERIOD = 30
+    MTM_PERIOD = 10
+    CMO_PERIOD = 21
+    STOCHRSI_PERIOD = 20
+    RVI_PERIOD = 7             # 相对活力指数
+
     # ========== 趋势因子参数 ==========
-    MACD_FAST = 20             # 快线缩短提高交叉频率
-    MACD_SLOW = 50            # 慢线大幅缩短
-    MACD_SIGNAL = 5           # 信号线同步缩短
-    ADX_PERIOD = 14           # 14日ADX识别短期趋势强度
-    DMI_PERIOD = 14           # 与ADX保持一致
-    AROON_PERIOD = 14         # 阿隆周期缩短，更快捕捉新高低点
-    TRIX_PERIOD = 14          # 三重指数均线缩短至12
-    
+    MACD_FAST = 20
+    MACD_SLOW = 60
+    MACD_SIGNAL = 2
+    ADX_PERIOD = 20
+    DMI_PERIOD = 20
+    AROON_PERIOD = 50
+    TRIX_PERIOD = 30
+
     # ========== 均线参数 ==========
-    MA_RATIO_PERIOD = 20      # 使用20日均线衡量短期偏离
-    MA_SLOPE_PERIOD = 10       # 8日均线斜率判断短期方向
-    
+    MA_RATIO_PERIOD = 50
+    MA_SLOPE_PERIOD = 14
+
     # ========== 波动率因子参数 ==========
-    ATR_PERIOD = 10           # 10日ATR快速反映近期波幅
-    NATR_PERIOD = 10          # 归一化ATR同周期
-    BB_PERIOD = 20            # 布林带中轨20日均线，短线标准
-    BB_STD = 1.5              # 1.5倍标准差带略宽过滤噪音
-    CCI_PERIOD = 14           # 14日CCI捕捉短期超买超卖
-    ULCER_PERIOD = 14         # 溃疡指数缩短
-    PRICE_VAR_PERIOD = 10     # 价格方差窗口缩短
-    
+    ATR_PERIOD = 7
+    NATR_PERIOD = 28
+    BB_PERIOD = 50
+    BB_STD = 1.5               # 1.5倍标准差带略宽过滤噪音
+    CCI_PERIOD = 20
+    ULCER_PERIOD = 7
+    PRICE_VAR_PERIOD = 30
+
     # ========== 成交量因子参数 ==========
-    VOLUME_MA_PERIOD = 5      # 短线维持5日均量
-    VOLUME_STD_PERIOD = 8     # 略微缩短量标准差周期
-    VOLUME_MA_SHORT = 5       # 快量线
+    VOLUME_MA_PERIOD = 14
+    VOLUME_STD_PERIOD = 30
+    VOLUME_MA_SHORT = 5        # 快量线
     VOLUME_MA_LONG = 14        # 慢量线
-    AMOUNT_MA_PERIOD = 5      # 成交额均线
-    AMOUNT_STD_PERIOD = 14     # 成交额标准差
-    MFI_PERIOD = 14           # 资金流向指标
-    VR_PERIOD = 12            # 量比率
-    VROC_PERIOD = 7          # 量变动速率
-    VRSI_PERIOD = 7           # 量RSI
-    VMACD_FAST = 5            # 量MACD
-    VMACD_SLOW = 30           
-    VMACD_SIGNAL = 10          
-    ADOSC_FAST = 5            # 佳庆振荡器
-    ADOSC_SLOW = 10            
-    
+    AMOUNT_MA_PERIOD = 10
+    AMOUNT_STD_PERIOD = 30
+    MFI_PERIOD = 15
+    VR_PERIOD = 30
+    VROC_PERIOD = 18
+    VRSI_PERIOD = 21
+    VMACD_FAST = 25
+    VMACD_SLOW = 18
+    VMACD_SIGNAL = 20
+    ADOSC_FAST = 2
+    ADOSC_SLOW = 7
+
     # ========== 摆动指标参数 ==========
-    KDJ_N = 9                 # KDJ周期常用9
-    WILLR_PERIOD = 14         # 威廉指标14日标准短线
-    BIAS_PERIOD = 8           # 乖离率
-    PSY_PERIOD = 12           # 心理线12日
-    AR_BR_PERIOD = 13         # 人气意愿指标
-    CR_PERIOD = 13            # 中间意愿指标一致
-    
+    KDJ_N = 14
+    WILLR_PERIOD = 20
+    BIAS_PERIOD = 18
+    PSY_PERIOD = 30
+    AR_BR_PERIOD = 26
+    CR_PERIOD = 52
+
     # ========== K线形态参数 ==========
     BODY_SIZE_THRESHOLD_LARGE = 0.012   # 短线中等波动即可视为大实体
     BODY_SIZE_THRESHOLD_SMALL = 0.0025  # 微调小实体识别精度
     HAMMER_LOWER_SHADOW_RATIO = 2.0     # 锤子线/上吊线下影线与实体的最小倍数
-    HAMMER_UPPER_SHADOW_RATIO = 0.15     # 锤子线/上吊线上影线与实体的最大倍数
+    HAMMER_UPPER_SHADOW_RATIO = 0.15    # 锤子线/上吊线上影线与实体的最大倍数
     SHOOTING_STAR_UPPER_RATIO = 2.0     # 射击之星/倒锤线上影线与实体的最小倍数
-    SHOOTING_STAR_LOWER_RATIO = 0.15     # 射击之星/倒锤线下影线与实体的最大倍数
+    SHOOTING_STAR_LOWER_RATIO = 0.15    # 射击之星/倒锤线下影线与实体的最大倍数
     DOJI_THRESHOLD = 0.003              # 十字星实体阈值（相对价格比例）
     MARUBOZU_SHADOW_RATIO = 0.002       # 光头光脚影线阈值（相对价格比例）
     MARUBOZU_MIN_BODY_RATIO = 0.015     # 光头光脚最小实体比例
     SPINNING_TOP_BODY_RATIO = 0.1       # 纺锤线实体/全幅最大比例
     SPINNING_TOP_SHADOW_SYMMETRY = 0.3  # 纺锤线上下影线对称性阈值
     ENGULFING_SIGNIFICANCE = 0.003      # 吞没形态显著性（超出前根实体的比例）
-    STAR_SECOND_BODY_RATIO = 0.15        # 晨星/暮星第二根实体相对第一根的最大比例
+    STAR_SECOND_BODY_RATIO = 0.15       # 晨星/暮星第二根实体相对第一根的最大比例
     HARAMI_BODY_RATIO = 2.0             # 孕线外包实体相对内包实体的最小倍数
-    CONTEXT_WINDOW = 20                # 上下文计算滚动窗口（天）
-    CONTEXT_SIDEWAYS_MA_DEVIATION = 0.05  # 横盘判断：收盘价偏离均线的最大比例
-    CONTEXT_SIDEWAYS_RANGE_PCT = 0.10   # 横盘判断：区间波动幅度最大比例
+    CONTEXT_WINDOW = 20                 # 上下文计算滚动窗口（天）
+    CONTEXT_SIDEWAYS_MA_DEVIATION = 0.05   # 横盘判断：收盘价偏离均线的最大比例
+    CONTEXT_SIDEWAYS_RANGE_PCT = 0.10      # 横盘判断：区间波动幅度最大比例
     # 价格位置阈值（0=低位, 1=高位）
-    PRICE_POS_LOW = 0.25                 # 低位阈值（锤子线、晨星等看涨形态）
+    PRICE_POS_LOW = 0.25                # 低位阈值（锤子线、晨星等看涨形态）
     PRICE_POS_HIGH = 0.75               # 高位阈值（射击之星、上吊线等看跌形态）
     PRICE_POS_LOW_STRICT = 0.25         # 严格低位阈值（倒锤线）
-    PRICE_POS_HIGH_STRICT = 0.75         # 严格高位阈值（暮星）
-    PRICE_POS_LOW_ENGULF = 0.25          # 吞没/刺穿线低位阈值
+    PRICE_POS_HIGH_STRICT = 0.75        # 严格高位阈值（暮星）
+    PRICE_POS_LOW_ENGULF = 0.25         # 吞没/刺穿线低位阈值
     PRICE_POS_HIGH_ENGULF = 0.8         # 吞没/乌云盖顶高位阈值
-    PRICE_POS_SOLDIERS_CROWS = 0.25      # 三白兵/三乌鸦位置阈值
+    PRICE_POS_SOLDIERS_CROWS = 0.25     # 三白兵/三乌鸦位置阈值
 
 
 # ============================================================================
-# 4. 优化参数配置
+# 4. 自动化优化与特征工程配置
 # ============================================================================
 
 class OptimizationConfig:
-    """优化参数配置"""
-    
+    """
+    优化参数配置
+    定义特征选择、超参数搜索与集成学习的策略
+    """
+
     # 特征选择方法
     FEATURE_SELECTION_METHOD = 'hybrid'  # 'importance', 'correlation', 'mutual_info', 'rfe', 'hybrid'
-    N_FEATURES_TO_SELECT = 60  # 增加特征数，由 40 提高到 60，保留更多有潜在价值的因子
-    
+    N_FEATURES_TO_SELECT = 80  # 进一步增加特征数，给模型更多信息
+
     # 特征选择阈值
     FEATURE_IMPORTANCE_THRESHOLD = 0.001
     CORRELATION_THRESHOLD = 0.95
     CORRELATION_THRESHOLD_LOW = 0.05
-    
+
     # 因子参数优化设置
     FACTOR_TUNING_METRIC = 'ic'  # 'ic', 'rank_ic', 'auc'
     FACTOR_TUNING_METHOD = 'coordinate_descent'
     N_ITER = 50
     CV_FOLDS = 3
-    
+
     # 集成学习优化
     ENSEMBLE_OPTIMIZATION_METHOD = 'grid'
     ENSEMBLE_GRID_RESOLUTION = 21
     USE_STACKING = False
-    
+
     # 因子工程优化
     OPTIMIZE_FACTOR_PERIODS = False
-

@@ -19,7 +19,7 @@ from config.strategy_config import (
     INITIAL_CAPITAL,
     COMMISSION_RATE,
     MAX_POSITIONS,
-    SELECTOR_MARKETS
+    SELECTOR_MARKETS, ENABLE_FUNDAMENTAL_FILTER
 )
 import pandas as pd
 import sqlite3
@@ -86,14 +86,11 @@ def main():
         max_positions=MAX_POSITIONS
     )
     
-    # 4. 运行回测
-    print("\n开始回测...")
-    
     # 提前获取股票代码
     stock_codes = None # 这里可以指定，不指定则从DB获取
     if stock_codes is None:
         bdm = BaostockDataManager()
-        df_stocks = bdm.get_stock_list_from_db(markets=SELECTOR_MARKETS)
+        df_stocks = bdm.get_stock_list_from_db(SELECTOR_MARKETS if ENABLE_FUNDAMENTAL_FILTER else None)
         stock_codes = df_stocks['code'].tolist()
         bdm.close()
 

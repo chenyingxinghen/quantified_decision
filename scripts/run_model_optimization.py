@@ -93,7 +93,7 @@ def main():
     # ---------------------------------------------------------
     logger.info("\n[步骤 1/6] 加载并预处理训练数据")
     
-    trainer = MLModelTrainer(db_path=DATABASE_PATH, punish_unbuyable=TrainingConfig.PUNISH_UNBUYABLE)
+    trainer = MLModelTrainer(db_path=DATABASE_PATH)
     
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=365 * 3)).strftime('%Y-%m-%d')
@@ -119,9 +119,7 @@ def main():
         n_jobs=-1,
         include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
     )
-    X, y, returns, factor_names, dates, unbuyable, limit_groups = full_dataset[:7]
-    path_scores = full_dataset[7] if len(full_dataset) > 7 else None
-    is_st_arr = full_dataset[8] if len(full_dataset) > 8 else None
+    X, y, returns, factor_names, dates, unbuyable, limit_groups, path_scores, is_st_arr, w_sig_arr = full_dataset
     
     logger.info(f"特征矩阵规模: {X.shape[0]} 样本 x {X.shape[1]} 特征")
     logger.info(f"正样本率: {np.mean(y >= 0.5):.2%} (软标签均值: {np.mean(y):.4f})")
@@ -189,7 +187,8 @@ def main():
             X, y, returns, factor_names, dates, unbuyable, limit_groups, 
             model_types=model_types,
             path_scores=path_scores,
-            is_st_arr=is_st_arr
+            is_st_arr=is_st_arr,
+            w_sig_arr=w_sig_arr
         )
     
     if not trainer.models:
@@ -211,7 +210,8 @@ def main():
         feature_names=factor_names,
         dates=dates,       # 传递日期以支持排序任务分组
         returns=returns,    # 传递收益率以支持评估
-        path_scores=path_scores
+        path_scores=path_scores,
+        w_sig=w_sig_arr
     )
     
     # ---------------------------------------------------------

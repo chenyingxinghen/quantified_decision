@@ -190,7 +190,7 @@ def main():
             del cache_data  # 释放内存
             import gc; gc.collect()
         else:
-            print(f"✓ 所有股票缓存均已是最新的 ({cache_end_date})")
+            print(f"[OK] 所有股票缓存均已是最新的 ({cache_end_date})")
             
     else:
         print("\n[Step 0] 跳过增量缓存更新 (--skip-cache-update)")

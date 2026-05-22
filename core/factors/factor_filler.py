@@ -230,14 +230,22 @@ class FactorFiller:
         result_df = factors_df.copy()
         
         for col in result_df.columns:
+            # 跳过非数值列（如 date、code），np.isinf 对 object 类型会抛 TypeError
+            if not pd.api.types.is_numeric_dtype(result_df[col]):
+                continue
+            
             # 使用 np.isfinite 处理所有非有限值 (inf, -inf, nan)
             # 这里我们专门处理 inf
-            inf_mask = np.isinf(result_df[col])
-            inf_count = inf_mask.sum()
-            
-            if inf_count > 0:
-                result_df.loc[inf_mask, col] = fill_value
-                logger.debug(f"填充 {col}: {inf_count} 个无穷大值")
+            try:
+                inf_mask = np.isinf(result_df[col])
+                inf_count = inf_mask.sum()
+                
+                if inf_count > 0:
+                    result_df.loc[inf_mask, col] = fill_value
+                    logger.debug(f"填充 {col}: {inf_count} 个无穷大值")
+            except (TypeError, ValueError):
+                # 兜底：对无法判断 inf 的列跳过
+                pass
         
         return result_df
     

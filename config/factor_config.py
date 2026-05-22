@@ -19,55 +19,59 @@ from config import baostock_config
 class ModelConfig:
     """模型超参数配置"""
 
-    XGBOOST_PARAMS: Dict[str, Any] = {
-        'n_estimators': 3000,
-        'max_depth': 3,
-        'learning_rate': 0.005,
-
-        'subsample': 0.8,
-        'colsample_bytree': 0.4,
-
-        # XGBoost 专属正则参数
-        'min_child_weight': 0,
-        'gamma': 0.0,
-        'reg_alpha': 0.0,
-        'reg_lambda': 0.0,
-
-        # Ranking 专属配置
-        'objective': 'rank:ndcg',
-        'eval_metric': 'ndcg',
-        'ndcg_exp_gain': True,  
-
-        'n_jobs': 15,
-        'early_stopping_rounds': 10,
-        'verbosity': 0,
-    }
 
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
-        'n_estimators': 3000,
-        'max_depth': 3,             
-        'learning_rate': 0.005,      
-        'label_gain': [float(2**i) for i in range(11)], # 增强 Top 样本的区分度
+        'n_estimators': 2000,
+        'max_depth': 3,           # 适当加深，配合强正则化
+        'learning_rate': 0.01,    
 
-        'min_child_samples': 0,    
-        'min_gain_to_split': 0.0,
-        'reg_alpha': 0,
-        'reg_lambda': 0,
+        'min_child_samples': 500,  # 叶节点最少样本数，防止在小样本上过拟合
+        'min_gain_to_split': 0.01, # 最小分裂增益，剪掉无意义的分裂
+        'reg_alpha': 0.1,          # L1 正则，促进稀疏性
+        'reg_lambda': 1.0,         # L2 正则，平滑权重
 
-        'subsample': 0.8,           # 引入随机性
-        'colsample_bytree': 0.4,
+        'subsample': 0.7,          # 降低行采样率，增加随机性
+        'subsample_freq': 1,
+        'colsample_bytree': 0.8,   # 降低列采样率，减少特征依赖
 
         # Ranking 专属配置
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'eval_at': [1, 5, 10],
-        'lambdarank_truncation_level': 128, # 聚焦于头部股票的排序
+        'eval_at': [5,10],
+        'lambdarank_truncation_level': 100,
+        'label_gain': [i**2 for i in range(8)],
 
-        'early_stopping_rounds': 10,
+        'early_stopping_rounds': 100,
         'n_jobs': 15,
         'verbosity': -1,
     }
+
+
+    XGBOOST_PARAMS: Dict[str, Any] = {
+        'n_estimators': 2000,
+        'max_depth': 3,
+        'learning_rate': 0.01,
+
+        'subsample': 0.7,
+        'colsample_bytree': 0.8,
+
+        'min_child_weight': 10,    # 叶节点最小样本权重，防止小样本过拟合
+        'gamma': 0.1,              # 最小分裂损失，剪掉无意义的分裂
+        'reg_alpha': 0.1,          # L1 正则
+        'reg_lambda': 1.0,         # L2 正则
+
+        # Ranking 专属配置
+        'objective': 'rank:ndcg',
+        'eval_metric': 'ndcg@5',
+        'label_gain': [i**2 for i in range(8)],
+
+        'n_jobs': 15,
+        'early_stopping_rounds': 100,
+        'verbosity': 0,
+    }
+
+
 
     # ── GPU 专用配置增量（XGBoost，当 USE_GPU=True 时叠加）───────────────
     GPU_PARAMS_XGB: Dict[str, Any] = {
@@ -116,7 +120,9 @@ class TrainingConfig:
     YEARS_FOR_TRAINING   = 6         # 训练数据年数
     YEARS_FOR_BACKTEST   = 1         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
-    FUTURE_DAYS          = 5         # 预测未来 N 个交易日
+    SHORT_PREDICTION     = False
+    FUTURE_DAYS          = 5 if SHORT_PREDICTION else 20         # 预测未来 N 个交易日
+
 
     # ── 数据集划分 ─────────────────────────────────────────────────────────
     TRAIN_TEST_SPLIT     = 0.8       # 训练集占比
@@ -125,16 +131,30 @@ class TrainingConfig:
 
     # ── 因子与基本面 ───────────────────────────────────────────────────────
     INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
-    INCLUDE_CANDLE_PATTERN = True
+    INCLUDE_CANDLE_PATTERN = False
 
     # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
     UPSIDE_WEIGHT        = 1.0       
     DOWNSIDE_WEIGHT      = 1.0       
-    FINAL_RETURN_WEIGHT  = 3.0       
+    FINAL_RETURN_WEIGHT  = 2.0       
+
+    # ── 入场日动能乘数 (intraday_intensity × relative_intensity) ──────────
+    # momentum_mult = clip(BASE + SCALE * clip(intensity * rel_intensity, 0, 4), 0.5, 2.0)
+    MOMENTUM_MULT_BASE   = 0.5       # 动能乘数基础值（无动能时的下限）
+    MOMENTUM_MULT_SCALE  = 0.5       # 动能乘数缩放系数
+
+    # ── 资金参与度乘数 (volume_ratio) ─────────────────────────────────────
+    # volume_mult = clip(BASE + SCALE * clip(vol_ratio, 0, 3) / 3, 0.5, 1.5)
+    VOLUME_MULT_BASE     = 0.5       # 量能乘数基础值（无量时的下限）
+    VOLUME_MULT_SCALE    = 0.5       # 量能乘数缩放系数
+
+    # ── 路径形态奖惩 (f_high_idx vs f_low_idx) ───────────────────────────
+    PATH_BONUS           = 0.15      # 先涨后跌路径奖励幅度（+15%）
+    PATH_PENALTY         = 0.10      # 先跌后涨路径惩罚幅度（-10%）
     
 
-    WEIGHT_EXPONENT      = 0.5
-    USE_SAMPLE_WEIGHT    = True      # 开启样本权重，让收益高的样本更有影响力
+    WEIGHT_EXPONENT      = 1.5       # 适度头部加权，让模型更关注真正的强势股信号
+    USE_SAMPLE_WEIGHT    = False      # 开启样本加权，引导模型关注高质量预测目标
 
     # ST 股票处理
     ST_LABEL_SCORE       = -50         # ST 样本原始分上限（0=中性）
@@ -190,7 +210,7 @@ class TrainingConfig:
         
         # 4. 绝对规模因子 (防止在特征工程中产生"因子 x 规模"导致的严重 Size Bias)
         'MBRevenue', 'totalShare', 'liqaShare', 'netProfit', 'market_cap', 
-        'totalAssets', 'totalLiabilities', 'epsTTM', 'cashFlow', 'log_mkt_cap'
+        'totalAssets', 'totalLiabilities', 'epsTTM', 'cashFlow', 'log_mkt_cap','liabilityToAsset','aroon'
     }
 
     @staticmethod
@@ -202,6 +222,10 @@ class TrainingConfig:
         # 排除所有状态位、K线形态、宏观指标
         if col_l.startswith(('industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
             return True
+        # 排除 FEATURE_TRANSFORM_EXCLUDE_LIST 中以前缀方式匹配的条目（如 'aroon' 匹配 'aroon_up'）
+        for excl in TrainingConfig.FEATURE_TRANSFORM_EXCLUDE_LIST:
+            if col_l.startswith(excl.lower() + '_'):
+                return True
         return False
 
     @staticmethod
@@ -252,7 +276,7 @@ class FactorConfig:
     MTM_PERIOD = 10
     CMO_PERIOD = 21
     STOCHRSI_PERIOD = 20
-    RVI_PERIOD = 7             # 相对活力指数
+    RVI_PERIOD = 14            # 相对活力指数（14 比 7 更稳定，避免短窗口内全 NaN 导致零方差）
 
     # ========== 趋势因子参数 ==========
     MACD_FAST = 20
@@ -268,7 +292,7 @@ class FactorConfig:
     MA_SLOPE_PERIOD = 14
 
     # ========== 波动率因子参数 ==========
-    ATR_PERIOD = 7
+    ATR_PERIOD = 14
     NATR_PERIOD = 28
     BB_PERIOD = 50
     BB_STD = 1.5               # 1.5倍标准差带略宽过滤噪音
@@ -287,8 +311,8 @@ class FactorConfig:
     VR_PERIOD = 30
     VROC_PERIOD = 18
     VRSI_PERIOD = 21
-    VMACD_FAST = 25
-    VMACD_SLOW = 18
+    VMACD_FAST = 18
+    VMACD_SLOW = 25
     VMACD_SIGNAL = 20
     ADOSC_FAST = 2
     ADOSC_SLOW = 7

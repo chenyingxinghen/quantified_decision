@@ -71,6 +71,21 @@ class MLFactorBacktestStrategy(BaseStrategy):
 
         self.model = _load_smart_model(self.model_path)
         if self.model is None: raise ValueError(f"无法加载模型: {self.model_path}")
+
+        # 加载归一化统计量（与模型同目录的 norm_stats.pkl）
+        import pickle as _pickle
+        _model_dir = os.path.dirname(os.path.abspath(self.model_path)) if os.path.isfile(self.model_path) else os.path.abspath(self.model_path)
+        _norm_path = os.path.join(_model_dir, 'norm_stats.pkl')
+        if os.path.exists(_norm_path):
+            try:
+                with open(_norm_path, 'rb') as _f:
+                    self.norm_stats = _pickle.load(_f)
+                print(f"  已加载归一化统计量: norm_stats.pkl")
+            except Exception as _e:
+                print(f"  警告: 加载归一化统计量失败: {_e}")
+                self.norm_stats = None
+        else:
+            self.norm_stats = None
         
         print(f"策略初始化完成: {self.name} (已启用 PIT 预缓存 ✓)")
     
@@ -150,14 +165,38 @@ class MLFactorBacktestStrategy(BaseStrategy):
         
         # 横截面归一化 (与训练时精确匹配逻辑保持一致)
         rank_cols = [col for col in all_X.columns if not fc.TrainingConfig.should_skip_rank(col)]
-        
+
         if rank_cols and len(all_X) > 1:
             from scipy.stats import rankdata as _rankdata
             arr = all_X[rank_cols].values
-            # 逐列进行横截面排名
             ranked = _rankdata(arr, method='average', axis=0) / (len(all_X) + 1)
             all_X[rank_cols] = ranked.astype(np.float32)
 
+        # skip_cols：复用训练集 robust 统计量（仅连续型，二值列保留原值）
+        norm_stats = getattr(self, 'norm_stats', None)
+        if norm_stats is not None:
+            import numpy as _np
+            skip_col_stats = norm_stats.get('skip_col_stats')
+            if skip_col_stats is not None and skip_col_stats.get('robust_global_idx', _np.array([])).size > 0:
+                train_factor_names = norm_stats.get('factor_names', [])
+                robust_global_idx  = skip_col_stats['robust_global_idx']
+                robust_col_names   = [train_factor_names[i] for i in robust_global_idx
+                                      if i < len(train_factor_names)]
+                present_robust = [c for c in robust_col_names if c in all_X.columns]
+                if present_robust:
+                    col_to_idx = {train_factor_names[i]: j
+                                  for j, i in enumerate(robust_global_idx)
+                                  if i < len(train_factor_names)}
+                    median    = skip_col_stats['median']
+                    iqr       = skip_col_stats['iqr']
+                    valid_iqr = skip_col_stats['valid_iqr']
+                    for col in present_robust:
+                        j = col_to_idx[col]
+                        if valid_iqr[j]:
+                            z = (all_X[col].values.astype(float) - median[j]) / iqr[j]
+                            all_X[col] = (1.0 / (1.0 + _np.exp(-_np.clip(z, -10, 10)))).astype(_np.float32)
+                        else:
+                            all_X[col] = 0.5  # 零方差列，置中性值
         probs = self.model.predict(all_X.fillna(0.5))
         
         # 5. 生成信号

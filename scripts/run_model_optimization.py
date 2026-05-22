@@ -169,7 +169,7 @@ def main():
                         model_obj.load_model(str(path))
                         
                         trainer.models[name] = model_obj
-                        logger.info(f"✓ 成功加载模型: {name} (路径: {path})")
+                        logger.info(f"[OK] 成功加载模型: {name} (路径: {path})")
                         
                         # 简单验证获取指标
                         train_results[name] = {
@@ -227,7 +227,7 @@ def main():
     feature_file = project_root / 'models' / 'selected_features.txt'
     with open(feature_file, 'w', encoding='utf-8') as f:
         f.write('\n'.join(selected_features))
-    logger.info(f"✓ 特征清单已持久化: {feature_file} (数量: {len(selected_features)})")
+    logger.info(f"[OK] 特征清单已持久化: {feature_file} (数量: {len(selected_features)})")
     
     # 构建最终集成模型
     if ensemble_weights:
@@ -236,7 +236,7 @@ def main():
         
         ensemble_path = project_root / 'models' / 'optimized_ensemble_model.pkl'
         optimized_ensemble.save_model(str(ensemble_path))
-        logger.info(f"✓ 集成模型已保存: {ensemble_path}")
+        logger.info(f"[OK] 集成模型已保存: {ensemble_path}")
 
     # 保存元数据结果
     results_json = project_root / 'models' / 'optimization_results.json'
@@ -342,7 +342,7 @@ def generate_comprehensive_report(results: dict, original_features: list, train_
     report_file = project_root / 'models' / 'optimization_report.txt'
     with open(report_file, 'w', encoding='utf-8') as f:
         f.write(report_text)
-    logger.info(f"✓ 深度分析报告已生成: {report_file}")
+    logger.info(f"[OK] 深度分析报告已生成: {report_file}")
 
 if __name__ == '__main__':
     try:

@@ -216,7 +216,8 @@ class RiskFactors:
         # 3. 风险调整收益
         roll_mean = returns.rolling(20).mean()
         roll_std = returns.rolling(20).std()
-        features['sharpe_ratio'] = (roll_mean / roll_std) * np.sqrt(252)
+        # roll_std=0 时（价格完全不动）会产生 inf，用 replace 预防
+        features['sharpe_ratio'] = (roll_mean / roll_std.replace(0, np.nan)) * np.sqrt(252)
         
         # 4. 收益率偏度与峰度
         features['return_skewness'] = returns.rolling(60).skew()

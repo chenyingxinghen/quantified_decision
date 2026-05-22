@@ -117,7 +117,7 @@ class MLFactorModel:
         # pop ranking 专用参数，避免传入 LGBMRanker 构造器时冲突
         self.early_stopping_rounds = model_params.pop('early_stopping_rounds', 100)
         # eval_at：用于 fit 时指定 ndcg 的截断位置
-        self.eval_at = model_params.pop('eval_at', [1, 5, 10, 20])
+        self.eval_at = model_params.pop('eval_at', [10])
 
         def _build_lgb(params: dict):
             if self.task == 'ranking':
@@ -176,29 +176,54 @@ class MLFactorModel:
                 split_idx = kwargs['split_idx']
             else:
                 split_idx = int(len(X) * (1 - validation_split))
-                
-            X_train_raw, X_val_raw = X[:split_idx], X[split_idx:]
-            y_train, y_val = y[:split_idx], y[split_idx:]
-            w_train = sample_weight[:split_idx] if sample_weight is not None else None
-            r_val = returns[split_idx:] if returns is not None else None
-            r_train = returns[:split_idx] if returns is not None else None
-            
-            # 提取 dates 用于按组评估
-            dates = kwargs.get('dates', None)
-            dates_train = dates[:split_idx] if dates is not None else None
-            dates_val = dates[split_idx:] if dates is not None else None
+
+            # 支持外部验证集直接传入（X_val_external / y_val_external）
+            # 优先使用外部验证集做 early stopping，时间分布与真实推理场景一致
+            X_val_ext = kwargs.get('X_val_external', None)
+            y_val_ext = kwargs.get('y_val_external', None)
+
+            if X_val_ext is not None and y_val_ext is not None:
+                # 使用全量训练集 + 外部验证集
+                X_train_raw = X[:split_idx]
+                y_train     = y[:split_idx]
+                X_val_raw   = X_val_ext
+                y_val       = y_val_ext
+                w_train     = sample_weight[:split_idx] if sample_weight is not None else None
+                r_train     = returns[:split_idx] if returns is not None else None
+                r_val       = None
+                dates       = kwargs.get('dates', None)
+                dates_train = dates[:split_idx] if dates is not None else None
+                # 外部验证集的日期由调用方通过 dates_val_external 传入
+                dates_val   = kwargs.get('dates_val_external', None)
+            else:
+                # 原有逻辑：内部切分
+                val_start_idx = kwargs.get('val_start_idx', split_idx)
+                X_train_raw, X_val_raw = X[:split_idx], X[val_start_idx:]
+                y_train, y_val = y[:split_idx], y[val_start_idx:]
+                w_train = sample_weight[:split_idx] if sample_weight is not None else None
+                r_val = returns[val_start_idx:] if returns is not None else None
+                r_train = returns[:split_idx] if returns is not None else None
+                dates = kwargs.get('dates', None)
+                dates_train = dates[:split_idx] if dates is not None else None
+                dates_val = dates[val_start_idx:] if dates is not None else None
 
             # ── 排序任务：关键修复 ──
             # 由于内部执行了 split_idx 划分，必须同步将 group (query counts) 也切分为
             # 内部训练组和内部验证组，否则 LightGBM 会报 "Sum of query counts differs from data length"
             if self.task == 'ranking' and 'group' in kwargs:
-                group = np.array(kwargs['group'])
-                group_cumsum = np.cumsum(group)
-                # 找到对应 split_idx 的组索引 (使用 side='right' 确保 split_idx 正好是某组结尾时包含该组)
-                split_group_count = np.searchsorted(group_cumsum, split_idx, side='right')
-                group_train = group[:split_group_count]
-                group_val = group[split_group_count:]
-                
+                group_train = np.array(kwargs['group'])
+                # eval_group 由外层直接传入（已按 val_start_idx 对齐），优先使用
+                if 'eval_group' in kwargs and kwargs['eval_group'] is not None:
+                    group_val = np.array(kwargs['eval_group'])
+                    # group_train 已由调用方按 split_idx 对齐，直接使用，无需再切分
+                else:
+                    # 没有外部 eval_group：按 split_idx 从 group 中切分
+                    group = np.array(kwargs['group'])
+                    group_cumsum = np.cumsum(group)
+                    split_group_count = np.searchsorted(group_cumsum, split_idx, side='right')
+                    group_train = group[:split_group_count]
+                    group_val = group[split_group_count:]
+
                 # 校验：sum(group_train) 必须等于 split_idx
                 actual_train_len = np.sum(group_train)
                 if actual_train_len != split_idx:
@@ -328,12 +353,12 @@ class MLFactorModel:
                     fit_params.update({
                         'eval_set': [(X_val, y_val)],
                         'eval_group': [group_val],
-                        'eval_at': getattr(self, 'eval_at', [1, 5, 10, 20]),
+                        'eval_at': getattr(self, 'eval_at', [10]),
                     })
                 else:
                     fit_params.update({
                         'eval_set': [(X_val, y_val)],
-                        'eval_at': getattr(self, 'eval_at', [1, 5, 10, 20]),
+                        'eval_at': getattr(self, 'eval_at', [10]),
                     })
             else:
                 fit_params.update({
@@ -344,8 +369,25 @@ class MLFactorModel:
             from lightgbm import early_stopping, log_evaluation, record_evaluation
             es_rounds = getattr(self, 'early_stopping_rounds', 100)
             lgb_evals_result = {}
+
+            # 防御性检查：确保 eval_set 已设置，否则 early_stopping callback 会报错
+            if 'eval_set' not in fit_params:
+                raise RuntimeError(
+                    f"LightGBM ranking: fit_params 缺少 eval_set。"
+                    f"group_val={group_val is not None}, X_val shape={X_val.shape}, y_val len={len(y_val)}, "
+                    f"fit_params keys={list(fit_params.keys())}"
+                )
+            # 校验 eval_group sum 与 y_val 长度一致
+            if 'eval_group' in fit_params:
+                eg = fit_params['eval_group'][0]
+                ev = fit_params['eval_set'][0][1]
+                if np.sum(eg) != len(ev):
+                    raise RuntimeError(
+                        f"LightGBM eval_group sum ({np.sum(eg)}) != eval_set y len ({len(ev)})"
+                    )
+
             callbacks = [
-                early_stopping(stopping_rounds=es_rounds, first_metric_only=True),  # 修复：只监控第一个指标(ndcg@1)
+                early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
                 log_evaluation(50),
                 record_evaluation(lgb_evals_result),
             ]
@@ -385,7 +427,7 @@ class MLFactorModel:
                     })
                     
                 if self.model_type == 'lightgbm':
-                    fit_params['eval_at'] = getattr(self, 'eval_at', [1, 5, 10, 20])
+                    fit_params['eval_at'] = getattr(self, 'eval_at', [10])
             else:
                 fit_params['eval_set'] = [(X_val, y_val)]
 
@@ -480,6 +522,27 @@ class MLFactorModel:
         
         return preds
 
+    def _primary_metric_name(self, curves: Dict) -> str:
+        """
+        从 evals_result 的某个数据集曲线字典中，选出主监控指标名。
+
+        优先级：
+        1. 与 eval_at[0] 对应的 ndcg@N（early stopping 实际监控的指标）
+        2. 任意包含 'ndcg' 的指标
+        3. 字典第一个 key（兜底）
+        """
+        if not curves:
+            return ''
+        eval_at = getattr(self, 'eval_at', None)
+        if eval_at:
+            primary_k = f'ndcg@{eval_at[0]}'
+            if primary_k in curves:
+                return primary_k
+        ndcg_keys = [k for k in curves if 'ndcg' in k.lower()]
+        if ndcg_keys:
+            return ndcg_keys[0]
+        return next(iter(curves))
+
     def _overfitting_diagnosis(self) -> Dict:
         """从训练曲线直接读取过拟合诊断，零推理开销"""
         evals = getattr(self, '_evals_result', {})
@@ -487,16 +550,16 @@ class MLFactorModel:
             return {}
 
         # XGBoost: {'train_monitor': {'rmse': [...]}, 'validation': {'rmse': [...]}}
-        # LightGBM: {'train_monitor': {'ndcg@1': [...]}, 'valid': {'ndcg@1': [...]}}
+        # LightGBM ranking: {'valid_0': {'ndcg@10': [...], 'ndcg@1': [...], ...}}
         train_key = next((k for k in evals if 'train' in k.lower()), None)
         val_key   = next((k for k in evals if 'train' not in k.lower()), None)
 
         metrics = {}
 
-        # 只有验证集曲线时（ranking 任务 group 信息缺失导致训练集监控被跳过）
+        # 只有验证集曲线时（ranking 任务不监控训练集）
         if val_key and not train_key:
             val_curves  = evals[val_key]
-            metric_name = next(iter(val_curves))
+            metric_name = self._primary_metric_name(val_curves)
             val_series  = val_curves[metric_name]
             is_loss     = any(x in metric_name for x in ('loss', 'rmse', 'error', 'logloss'))
             best_val    = min(val_series) if is_loss else max(val_series)
@@ -517,9 +580,8 @@ class MLFactorModel:
 
         train_curves = evals[train_key]
         val_curves   = evals[val_key]
-        metric_name  = next(iter(train_curves))
-        # val 可能用不同 metric key，取第一个
-        val_metric   = next(iter(val_curves))
+        metric_name  = self._primary_metric_name(train_curves)
+        val_metric   = self._primary_metric_name(val_curves)
 
         train_series = train_curves[metric_name]
         val_series   = val_curves[val_metric]

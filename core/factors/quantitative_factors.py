@@ -78,19 +78,32 @@ class QuantitativeFactors:
         return fastk, fastd
     
     def calculate_rvi(self, data: pd.DataFrame, period: int = 10) -> np.ndarray:
-        """RVI - 相对波动率指数 (向量化版)"""
+        """RVI - 相对波动率指数 (向量化版)
+        
+        修复：使用 min_periods=2 避免窗口内上涨/下跌日不足导致全列 NaN，
+        再 fillna(50.0) 只填充真正无法计算的边界值，而非整列常数。
+        """
         close = data['close']
         daily_range = data['high'] - data['low']
         price_change = close.diff()
         
         # 分别计算上涨日和下跌日的波动的滚动标准差
-        up_std = daily_range.where(price_change > 0).rolling(window=period).std()
-        down_std = daily_range.where(price_change < 0).rolling(window=period).std()
+        # min_periods=2：窗口内至少 2 个有效值才计算 std，避免单值 std=NaN
+        up_std   = daily_range.where(price_change > 0).rolling(window=period, min_periods=2).std()
+        down_std = daily_range.where(price_change < 0).rolling(window=period, min_periods=2).std()
         
+        # 当 up_std 或 down_std 为 NaN 时，用对方的值兜底（单边市场）
+        # 当两者都为 NaN 时（数据不足），填 50（中性值）
+        up_std_filled   = up_std.fillna(down_std).fillna(0.0)
+        down_std_filled = down_std.fillna(up_std).fillna(0.0)
+        
+        denom = up_std_filled + down_std_filled
         with np.errstate(divide='ignore', invalid='ignore'):
-            rvi = 100 * up_std / (up_std + down_std)
+            rvi = np.where(denom > 1e-8, 100.0 * up_std_filled / denom, 50.0)
             
-        return rvi.fillna(50.0).values
+        # 前 period 行因窗口不足仍可能为 NaN，填中性值 50
+        result = pd.Series(rvi, index=close.index).fillna(50.0)
+        return result.values
 
     def calculate_ulcer_index(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """Ulcer指标 (向量化版)"""
@@ -380,10 +393,13 @@ class QuantitativeFactors:
         up_vol = volume.where(price_diff > 0, 0).rolling(window=period).sum()
         down_vol = volume.where(price_diff < 0, 0).rolling(window=period).sum()
         
+        # 用 replace(0, np.nan) 避免除以零产生 inf，再用 nan_to_num 统一清理
+        # 注意：posinf 不能填充为 up_vol.max()（成交量绝对值），应填充为有意义的中性值
+        # VR 正常范围约 0~500，全上涨时无下跌量，填充为 500（极强多头信号上限）
         with np.errstate(divide='ignore', invalid='ignore'):
-            vr = up_vol / down_vol
+            vr = up_vol / down_vol.replace(0, np.nan)
             
-        return np.nan_to_num(vr.values, nan=0.0, posinf=up_vol.max() if not up_vol.empty else 0.0)
+        return np.nan_to_num(vr.values, nan=0.0, posinf=500.0, neginf=0.0)
 
     def calculate_psy(self, data: pd.DataFrame, period: int = 12) -> np.ndarray:
         """PSY - 心理线 (向量化版)"""
@@ -407,17 +423,21 @@ class QuantitativeFactors:
         ho_sum = (high - open_p).rolling(window=period).sum()
         ol_sum = (open_p - low).rolling(window=period).sum()
         
+        # 用 replace(0, np.nan) 避免除以零，再用 nan_to_num 清理 inf
+        # fillna(0) 对 pandas Series 中的 inf 无效，必须显式替换
         with np.errstate(divide='ignore', invalid='ignore'):
-            ar = (ho_sum / ol_sum) * 100
+            ar = (ho_sum / ol_sum.replace(0, np.nan)) * 100
             
         # BR: (H-Cy) / (Cy-L)
         hc_sum = (high - prev_close).rolling(window=period).sum()
         cl_sum = (prev_close - low).rolling(window=period).sum()
         
         with np.errstate(divide='ignore', invalid='ignore'):
-            br = (hc_sum / cl_sum) * 100
+            br = (hc_sum / cl_sum.replace(0, np.nan)) * 100
             
-        return ar.fillna(0).values, br.fillna(0).values
+        ar_clean = np.nan_to_num(ar.values, nan=100.0, posinf=500.0, neginf=0.0)
+        br_clean = np.nan_to_num(br.values, nan=100.0, posinf=500.0, neginf=0.0)
+        return ar_clean, br_clean
 
     def calculate_cr(self, data: pd.DataFrame, period: int = 26) -> np.ndarray:
         """CR - 能量指标 (向量化版)"""
@@ -432,10 +452,12 @@ class QuantitativeFactors:
         p1 = (high - prev_mid).clip(lower=0).rolling(window=period).sum()
         p2 = (prev_mid - low).clip(lower=0).rolling(window=period).sum()
         
+        # 用 replace(0, np.nan) 避免除以零，再用 nan_to_num 清理 inf
+        # fillna(0) 对 pandas Series 中的 inf 无效，必须显式替换
         with np.errstate(divide='ignore', invalid='ignore'):
-            cr = (p1 / p2) * 100
+            cr = (p1 / p2.replace(0, np.nan)) * 100
             
-        return cr.fillna(0).values
+        return np.nan_to_num(cr.values, nan=100.0, posinf=500.0, neginf=0.0)
     
     # ==================== 综合计算方法 ====================
     

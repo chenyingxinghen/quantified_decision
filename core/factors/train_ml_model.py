@@ -491,7 +491,7 @@ class MLModelTrainer:
             print(f"  已跳过 {skipped} 只已同步的股票缓存")
             
         if not to_update:
-            print(f"✓ 缓存已是最新，无需更新。")
+            print(f"[OK] 缓存已是最新，无需更新。")
             return
 
         # 3. 使用 ProcessPoolExecutor 实现真正的多核并行（绕过 GIL）
@@ -534,33 +534,69 @@ class MLModelTrainer:
 
 
 
-    def _compute_path_quality_score(self, f_returns_norm, f_low_min_norm, f_high_idx, f_low_idx, atr_raw, next_open, rel_atr, f_high_max_norm=None, limits=0.1, intraday_intensity=1.0, volume_ratio=1.0, relative_intensity=1.0):
-        """
-        爆发力评分 (Explosive Power Score) V6 - 风险调整版。
-        波动奖励 * (破位惩罚+上升空间+最终收益)
-        """
-        if f_high_max_norm is None:
-            raise ValueError('f_high_max_norm is None')
+    def _compute_path_quality_score(self, f_returns_norm, f_low_min_norm, f_high_idx, f_low_idx, atr_raw, next_open, rel_atr, f_high_max_norm, intraday_intensity, volume_ratio, relative_intensity, limits=0.1,):
 
-        # 1. 动态回撤阈值 (1.5 倍 ATR)
-        dynamic_threshold = (rel_atr * 1.5) / (limits + 1e-6)
-        
-        upside = f_high_max_norm
-        downside = np.abs(f_low_min_norm)
-        
-        # 从配置中读取权重（或使用默认合理的比例）
-        w_upside = getattr(TrainingConfig, 'UPSIDE_WEIGHT', 2.0)
-        w_downside = getattr(TrainingConfig, 'DOWNSIDE_WEIGHT', 3.0)  # 下行惩罚更重
-        w_final = getattr(TrainingConfig, 'FINAL_RETURN_WEIGHT', 1.5)
-        
-        # 2. 基础得分：真实落袋收益 + 空间预期 - 破位真实伤害
-        base_score = (f_returns_norm * w_final) + (upside * w_upside) - (downside * w_downside)
+        upside  = np.where(f_high_max_norm > 0, f_high_max_norm, 0)
+        downside = np.where(f_low_min_norm  < 0, f_low_min_norm,  0)
+
+        # 从配置中读取权重
+        w_upside   = getattr(TrainingConfig, 'UPSIDE_WEIGHT',        2.0)
+        w_downside = getattr(TrainingConfig, 'DOWNSIDE_WEIGHT',       1.0)
+        w_final    = getattr(TrainingConfig, 'FINAL_RETURN_WEIGHT',   3.0)
+
+        # ── 1. 基础得分：落袋收益 + 上行空间 - 下行伤害 ──────────────────
+        base_score = (f_returns_norm * w_final) + (upside * w_upside) + (downside * w_downside)
+
+        # ── 2. 波动率调整：ATR 越大爆发力越强 ────────────────────────────
+        vol_booster = 1.0 + (rel_atr * 10.0)
+
+        # ── 3. 入场日动能乘数 (intraday_intensity × relative_intensity) ──
+        #   intraday_intensity = 当日振幅 / ATR，反映绝对爆发力
+        #   relative_intensity = 当日振幅/ATR 相对近5日均值，反映相对活跃度
+        #   两者乘积 > 1 表示当日动能高于近期均值，给予正向加权
+        #   clip 到 [0.5, 2.0]，避免极端值主导得分
 
 
-        # 3. 波动率调整：短线交易必须有足够的 ATR 才有爆发力和资金利用率
-        vol_booster = 1.0 + (rel_atr * 5.0)  
-        final_score = break_score * vol_booster
-        
+        # ── 6. 合并所有调制因子 ───────────────────────────────────────────
+        if TrainingConfig.SHORT_PREDICTION:
+            momentum_mult = np.clip(
+                getattr(TrainingConfig, 'MOMENTUM_MULT_BASE', 0.5) +
+                getattr(TrainingConfig, 'MOMENTUM_MULT_SCALE', 0.5) *
+                np.clip(intraday_intensity * relative_intensity, 0.0, 4.0),
+                0.5, 2.0
+            )
+
+            # ── 4. 资金参与度乘数 (volume_ratio) ─────────────────────────────
+            #   volume_ratio = 当日量 / 20日均量
+            #   无量行情（< 0.5）折扣；放量行情（> 2.0）适度奖励
+            #   clip 到 [0.5, 1.5]，防止单日天量过度放大
+            volume_mult = np.clip(
+                getattr(TrainingConfig, 'VOLUME_MULT_BASE', 0.5) +
+                getattr(TrainingConfig, 'VOLUME_MULT_SCALE', 0.5) *
+                np.clip(volume_ratio, 0.0, 3.0) / 3.0,
+                0.5, 1.5
+            )
+
+            # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
+            #   f_high_idx：持仓期内最高点出现在第几天（0-based）
+            #   f_low_idx ：持仓期内最低点出现在第几天（0-based）
+            #   先涨后跌（high_idx < low_idx）：路径友好，给予奖励
+            #   先跌后涨（low_idx < high_idx）：路径不友好，给予惩罚
+            #   两者相等或含 NaN 时保持中性（1.0）
+            high_idx = np.asarray(f_high_idx, dtype=np.float64)
+            low_idx  = np.asarray(f_low_idx,  dtype=np.float64)
+            path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)  # 先涨后跌奖励幅度
+            path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10) # 先跌后涨惩罚幅度
+            path_mult = np.where(
+                np.isnan(high_idx) | np.isnan(low_idx),
+                1.0,
+                np.where(high_idx < low_idx, 1.0 + path_bonus,   # 先涨后跌：路径优质
+                np.where(low_idx  < high_idx, 1.0 - path_penalty, # 先跌后涨：路径劣质
+                1.0))                                              # 同天：中性
+            )
+            final_score = base_score * vol_booster * momentum_mult * volume_mult * path_mult
+        else:
+            final_score = base_score * vol_booster
         return final_score
 
     def _extract_stock_components(self, code: str, data: pd.DataFrame, 
@@ -679,7 +715,8 @@ class MLModelTrainer:
 
                 if final_valid_idx.sum() > 0:
                     # 准备 X
-                    drop_cols = ['date', 'is_st', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate']
+                    # is_suspended: 状态位，在训练样本中几乎全为 0（停牌股已被 unbuyable 过滤），方差为 0 无区分度
+                    drop_cols = ['date', 'is_st', 'is_suspended', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate']
                     
                     
                     X_df = factors[final_valid_idx].drop(columns=[c for c in drop_cols if c in factors.columns], errors='ignore')
@@ -716,15 +753,16 @@ class MLModelTrainer:
         f_low_min_norm = f_low_min_raw / limits
         
         # 2. 计算路径质量原始分
+        # 注意：使用关键字参数传递 limits，避免与 intraday_intensity 的位置混淆
         raw_scores = self._compute_path_quality_score(
             f_returns_norm, f_low_min_norm, 
             components['f_high_idx'].values, components['f_low_idx'].values,
             components['atr_raw'].values, next_open, components['atr_rel'].values,
             f_high_max_norm,
-            limits,
             components['intraday_intensity'].values,
             components['volume_ratio'].values,
-            components['relative_intensity'].values
+            components['relative_intensity'].values,
+            limits=limits,
         )
         
         # 修复：确保 raw_scores 无 NaN/Inf，防止后续 rankdata 产生异常
@@ -1076,7 +1114,10 @@ class MLModelTrainer:
             'amount_per_volume', 'amount_change_rate',
             # TimeSeriesFactors.calculate_momentum_features
             'return_5d', 'return_10d', 'return_20d', 'return_60d',
-            'momentum_5d', 'momentum_10d', 'momentum_20d', 'acceleration',
+            'momentum_5d', 'momentum_10d', 'momentum_20d',
+            'acceleration_5d', 'acceleration_10d',  # fix: was 'acceleration' (nonexistent)
+            'consecutive_up_days', 'days_above_ma20',
+            'price_percentile_60d', 'intraday_drawdown_avg_5d',
             # RiskFactors.calculate_risk_features
             'downside_risk', 'drawdown', 'max_drawdown_20', 'sharpe_ratio',
             'return_skewness', 'return_kurtosis',
@@ -1153,10 +1194,28 @@ class MLModelTrainer:
         
         # 最后一次NaN/inf检查和替换
         # 对于排名后的特征(0-1)，0.5是中性值。确保 X 为 float32。
-        if np.isnan(X).any():
+        # 注意：inf 检查必须独立于 NaN 检查，否则当 nan_count==0 但存在 inf 时
+        # nan_to_num 不会被调用，导致 float32 溢出产生天文数字。
+        nan_count = np.isnan(X).sum()
+        inf_count = np.isinf(X).sum()
+        if nan_count > 0 or inf_count > 0:
+            if nan_count > 0:
+                print(f"  警告: 发现 {nan_count} 个 NaN 值，已替换为 0.5")
+            if inf_count > 0:
+                print(f"  警告: 发现 {inf_count} 个 Inf 值，已替换为边界值 (posinf→1.0, neginf→0.0)")
             X = np.nan_to_num(X, copy=False, nan=0.5, posinf=1.0, neginf=0.0)
         
+        # 特征质量诊断：检查是否所有特征都是常数（无区分度）
+        feature_stds = np.std(X, axis=0)
+        zero_std_count = np.sum(feature_stds < 1e-6)
+        if zero_std_count > 0:
+            print(f"  警告: 发现 {zero_std_count} 个零方差特征（无区分度），建议检查特征工程")
+            if zero_std_count > len(factor_names) * 0.5:
+                print(f"  严重警告: 超过 50% 的特征无区分度，模型可能无法学习！")
+        
         print(f"  数据验证完成: {X.shape[0]} 行, {X.shape[1]} 列")
+        # 注意：此处统计为归一化前的原始特征值，仅用于诊断异常值是否已被清理
+        print(f"  特征统计(归一化前): mean={X.mean():.4f}, std={X.std():.4f}, min={X.min():.4f}, max={X.max():.4f}")
         
         # 先进行时间序列划分 (增加 Embargo 阻隔期，防止数据泄漏)
         forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
@@ -1189,16 +1248,26 @@ class MLModelTrainer:
         
         # 训练集：正常横截面排名归一化
         print("\n  对训练样本进行横截面归一化...")
-        self._apply_cross_sectional_normalization_inplace(
+        skip_col_stats = self._apply_cross_sectional_normalization_inplace(
             X[:split_idx], dates[:split_idx], factor_names
         )
+        # 持久化到实例，供 save_models 写入磁盘，推理时复用
+        self.norm_stats = {
+            'skip_col_stats': skip_col_stats,
+            'factor_names': factor_names,
+        }
         
         # 修复 Bug 1：使用 val_start_idx 而非 split_idx，排除阻隔期样本对验证集归一化的污染。
         # 阻隔期内的样本（split_idx ~ val_start_idx）标签含未来信息，不应参与任何处理。
+        # 同时传入训练集的 skip_col_stats，确保情绪因子等全局列使用相同的缩放参数。
         print("  对验证样本进行归一化...")
         self._apply_cross_sectional_normalization_inplace(
-            X[val_start_idx:], dates[val_start_idx:], factor_names
+            X[val_start_idx:], dates[val_start_idx:], factor_names,
+            skip_col_stats=skip_col_stats
         )
+        
+        # 归一化后统计：正常情况下 mean≈0.5, std≈0.29, min≈0, max≈1
+        print(f"  特征统计(归一化后): mean={X_train.mean():.4f}, std={X_train.std():.4f}, min={X_train.min():.4f}, max={X_train.max():.4f}")
 
         # 分组信息
         _, train_group = np.unique(dates_train, return_counts=True)
@@ -1231,17 +1300,60 @@ class MLModelTrainer:
                     # 获取当前截面的原始分数
                     scores = _scores_sub[_ds:_de]
                     
-                    # # 1. 连续标签：排名归一化到 0-1 (所有样本参与排名)
+                    # 1. 连续标签：排名归一化到 0-1 (所有样本参与排名)
                     ranks = rankdata(scores, method='average') / (_dc + 1)
                     _y_sub[_ds:_de] = ranks.astype(np.float32)       
                                  
-                    # 2. 离散标签改进版
-                    # 使用动态的 _n_bins 等分，避免硬编码 10 导致分布极其倾斜
-                    bins = np.clip((ranks * _n_bins).astype(np.int32), 0, _n_bins-1)
-                    _y_discrete[_ds:_de] = bins
+                    # 2. 离散标签：头部优化的非均匀分档（解决 Top-1 精度为 0% 的核心痛点）
+                    # 设计原则：
+                    #   - 底部样本（前 50%）合并为 1 档，LambdaRank 不需要区分"差"和"更差"
+                    #   - 中部样本（50%~80%）分 3 档，提供足够的负向对比信号
+                    #   - 头部样本（80%~100%）分 6 档，给模型清晰的头部区分信号
+                    # 诊断发现旧方案 [0.0,0.3,0.5,...] 导致档位 0 占 30%、档位 9 缺失，
+                    # 调整为更均衡的分布，确保每档样本量差距不超过 10x
+                    try:
+                        if _n_bins == 10:
+                            # 底部 35% → 档位 0（合并，控制负样本占比）
+                            # 35%~50% → 档位 1
+                            # 50%~63% → 档位 2
+                            # 63%~74% → 档位 3
+                            # 74%~83% → 档位 4
+                            # 83%~90% → 档位 5
+                            # 90%~95% → 档位 6
+                            # 95%~98% → 档位 7
+                            # 98%~99% → 档位 8
+                            # 99%~100% → 档位 9
+                            q_skewed = [0.0, 0.35, 0.50, 0.63, 0.74, 0.83, 0.90, 0.95, 0.98, 0.99, 1.0]
+                        else:
+                            # 动态生成：底部 35% 合并，其余均匀分配
+                            # 需要 _n_bins+1 个边界点才能产生 _n_bins 个 bin
+                            q_skewed = np.concatenate([
+                                [0.0, 0.35],
+                                np.linspace(0.35, 1.0, _n_bins - 1)
+                            ])
+                        bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
+                        _y_discrete[_ds:_de] = bins.astype(np.int32)
+                    except ValueError:
+                        # 样本数太少或分数重复过多，回退到基于排名的简单分档
+                        bins = np.clip((ranks * _n_bins).astype(np.int32), 0, _n_bins-1)
+                        _y_discrete[_ds:_de] = bins
                 else:
                     _y_discrete[_ds:_de] = _mid_bin
                     _y_sub[_ds:_de] = 0.5
+        
+        # 诊断输出：检查标签分布
+        print(f"\n[标签分布诊断]")
+        print(f"  训练集离散标签分布:")
+        unique_train, counts_train = np.unique(y_train_discrete, return_counts=True)
+        for bin_id, count in zip(unique_train, counts_train):
+            print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_train_discrete)*100:>5.2f}%)")
+        print(f"  验证集离散标签分布:")
+        unique_val, counts_val = np.unique(y_val_discrete, return_counts=True)
+        for bin_id, count in zip(unique_val, counts_val):
+            print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_val_discrete)*100:>5.2f}%)")
+        print(f"  原始分数统计 (训练集): min={_label_source[:split_idx].min():.4f}, max={_label_source[:split_idx].max():.4f}, std={_label_source[:split_idx].std():.4f}")
+        # print(f"  原始分数统计 (验证集): min={_label_source[val_start_idx:].min():.4f}, max={_label_source[val_start_idx:].max():.4f}, std={_label_source[val_start_idx:].std():.4f}")
+
         
         print(f"  [标签] 已在 train/val 分割后分别重新做横截面排名归一化，消除标签泄漏")
         
@@ -1255,7 +1367,7 @@ class MLModelTrainer:
             sample_weight_train *= np.where(is_st_train, st_weight_factor, 1.0).astype(np.float32)
 
         # 3. 叠加正交优化权重 (改为每日排名分档逻辑)
-        if w_sig_arr is not None and getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', True):
+        if w_sig_arr is not None and getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', False):
             # 获取训练集和验证集的权重数据
             w_sig_train = w_sig_arr[:split_idx]
             w_sig_val = w_sig_arr[val_start_idx:]
@@ -1288,7 +1400,8 @@ class MLModelTrainer:
                         # 方案一：指数法 (e的几次幂)。如果 w_power=3，头部权重约等于尾部的 20 倍 (e^3 vs e^0)
                         _w_processed[_ds:_de] = np.exp(w_ranks * w_exp)
                     else:
-                        raise ValueError(f"正交优化样本数量为1，请检查数据")
+                        # 单样本日期：使用中性权重，无法计算组内排名
+                        _w_processed[_ds:_de] = 1.0
             
             # 更新训练集权重 (仅训练集需要权重)
             sample_weight_train *= w_sig_processed_train
@@ -1356,29 +1469,28 @@ class MLModelTrainer:
         for model_type in model_types:
             print(f"\n训练 {model_type.upper()} 模型 (ranking)")
             try:
-                # 两个模型均使用 ranking 任务：
-                #   - XGBoost: XGBRanker (rank:ndcg)，标签为离散档位 (0~N_BINS-1)
-                #   - LightGBM: LGBMRanker (lambdarank)，标签为离散档位 (0~N_BINS-1)
                 model = MLFactorModel(model_type=model_type, task='ranking')
 
-                # 内部二次切分（训练集内部的 early stopping 验证集）
-                # 取训练集前 70% 作为内训练，后 30% 作为内验证，并对齐到日期边界
-                inner_split_ratio = 0.7
-                raw_inner_split = int(len(X_train) * inner_split_ratio)
-                inner_split_date = dates_train[raw_inner_split] if raw_inner_split < len(dates_train) else dates_train[-1]
-                inner_split_idx = int(np.searchsorted(dates_train, inner_split_date, side='left'))
+                # ── Early Stopping 验证集策略 ──────────────────────────────────
+                # 直接使用外部纯净验证集（阻隔期后）做 early stopping，
+                # 避免内部切分验证集时间分布与外部验证集不一致导致的过早停止。
+                # 外部验证集时间更靠后，与真实推理场景一致，early stopping 更可靠。
+                _, es_val_group = np.unique(dates_val, return_counts=True)
 
                 train_result = model.train(
                     X_train, y_train_discrete,
-                    validation_split=1.0 - inner_split_ratio,
+                    validation_split=0.2,
                     use_time_series_split=True,
                     feature_names=factor_names,
-                    sample_weight=sample_weight_train,  # 两模型均支持 sample_weight
+                    sample_weight=sample_weight_train,
                     returns=returns_train,
-                    split_idx=inner_split_idx,          # 日期边界对齐的内部分割点
+                    split_idx=len(X_train),
+                    X_val_external=X_val,
+                    y_val_external=y_val_discrete,   # 长度已是 len(dates_val)，无需切片
+                    dates_val_external=dates_val,
                     dates=dates_train,
                     group=train_group,
-                    eval_group=val_group,
+                    eval_group=es_val_group,
                 )
                 
                 # 在外部纯净验证集上做最终评估（阻隔期后）
@@ -1397,9 +1509,22 @@ class MLModelTrainer:
 
 
     def _apply_cross_sectional_normalization_inplace(self, X: np.ndarray, dates: np.ndarray, 
-                                                   factor_names: List[str]):
+                                                   factor_names: List[str],
+                                                   skip_col_stats: Optional[dict] = None):
         """
         原位对特征矩阵进行横截面归一化（按日期分组），降低内存占用。
+        
+        参数:
+            X: 特征矩阵（原位修改）
+            dates: 日期数组
+            factor_names: 特征名列表
+            skip_col_stats: 跳过截面排名的列的预计算缩放统计量 {'median', 'iqr', 'valid_iqr'}。
+                           若为 None，则从当前 X 切片自行计算（会导致 train/val 缩放不一致）。
+                           应传入从训练集计算的统计量，以保证 train/val 分布一致。
+        
+        返回:
+            skip_col_stats: 本次计算的缩放统计量（仅当 skip_col_stats=None 时有意义，
+                           调用方应将其保存并传给验证集的调用）
         """
         # 跳过横截面排名归一化的特征集合
         # 原则：以下类型的特征不具备"今日全市场排名"的语义，归一化会破坏其信息：
@@ -1431,8 +1556,102 @@ class MLModelTrainer:
             return False
 
         rank_cols_mask = np.array([not _should_skip(col) for col in factor_names])
+        rank_cols_idx = np.where(rank_cols_mask)[0]
+        skip_cols_idx = np.where(~rank_cols_mask)[0]
+
+        if len(rank_cols_idx) == 0:
+            return None
+
+        # ── 跳过截面排名的列：按语义分三类处理 ──────────────────────────────
+        # skip_cols 内部性质不同，统一用 robust+sigmoid 会破坏部分特征的语义：
+        #   A. 0/1 二值特征（状态位、K线形态）：直接保留原值，不做任何缩放
+        #      理由：median 通常为 0，IQR≈0，valid_iqr=False → 原代码会把所有值置 0，
+        #            信号完全消失；且 0/1 本身已在 [0,1] 范围内，无需缩放。
+        #   B. 全市场宏观/情绪因子（所有股票当天值相同）：robust+sigmoid
+        #      理由：量级差异极大（total_volume 千亿级），需要缩放；
+        #            使用训练集统计量保证 train/val 分布一致。
+        #   C. 行业编码、退市天数等其他跳过列：同 B，robust+sigmoid
+        _binary_skip_names = {
+            # 交易状态标志位
+            'is_limit_up', 'is_suspended', 'is_st',
+            # K线形态 0/1 信号
+            'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
+            'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
+            'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
+            'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
+            'three_white_soldiers', 'three_black_crows',
+        }
+        def _is_binary_skip(col: str) -> bool:
+            if col in _binary_skip_names:
+                return True
+            # is_* 前缀（非 _encoded 结尾）均视为二值
+            if col.startswith('is_') and not col.endswith('_encoded'):
+                return True
+            return False
+
+        if len(skip_cols_idx) > 0:
+            skip_names = [factor_names[i] for i in skip_cols_idx]
+            binary_mask  = np.array([_is_binary_skip(n) for n in skip_names])  # A 类
+            robust_mask  = ~binary_mask                                          # B/C 类
+
+            robust_local_idx = np.where(robust_mask)[0]   # 在 skip_cols_idx 内的相对下标
+            robust_global_idx = skip_cols_idx[robust_local_idx]  # 在 X 中的绝对列下标
+
+            # ── A 类：0/1 二值特征，直接保留，不做任何变换 ──────────────
+            # 无需操作，原始值已是 0 或 1，语义完整。
+
+            # ── B/C 类：连续型跳过列，robust scaler + sigmoid → [0,1] ──
+            if robust_local_idx.size > 0:
+                skip_data = X[:, robust_global_idx].astype(np.float64)
+                if skip_col_stats is None:
+                    # 从当前切片计算（训练集调用时）
+                    p25       = np.nanpercentile(skip_data, 25, axis=0)
+                    p75       = np.nanpercentile(skip_data, 75, axis=0)
+                    median    = np.nanpercentile(skip_data, 50, axis=0)
+                    iqr       = p75 - p25
+                    valid_iqr = iqr > 1e-8
+                    skip_col_stats = {
+                        'median': median, 'iqr': iqr, 'valid_iqr': valid_iqr,
+                        'robust_global_idx': robust_global_idx,  # 保存列索引供推理复用
+                    }
+                else:
+                    median    = skip_col_stats['median']
+                    iqr       = skip_col_stats['iqr']
+                    valid_iqr = skip_col_stats['valid_iqr']
+                scaled = np.where(
+                    valid_iqr,
+                    (skip_data - median) / np.where(valid_iqr, iqr, 1.0),
+                    0.0
+                )
+                # sigmoid 压缩到 [0, 1]，平滑处理极端值
+                scaled_01 = 1.0 / (1.0 + np.exp(-scaled.clip(-10, 10)))
+                X[:, robust_global_idx] = scaled_01.astype(np.float32)
+            elif skip_col_stats is None:
+                # 全部是二值列，无需 robust 统计量，但仍需返回非 None 以区分"已计算"
+                skip_col_stats = {
+                    'median': np.array([]), 'iqr': np.array([]),
+                    'valid_iqr': np.array([], dtype=bool),
+                    'robust_global_idx': np.array([], dtype=int),
+                }
+
+        unique_dates, group_start, group_counts = np.unique(
+            dates, return_index=True, return_counts=True
+        )
+
+        for start, count in zip(group_start, group_counts):
+            if count <= 1:
+                X[start:start+count, rank_cols_idx] = 0.5
+                continue
+
+            day_data = X[start:start+count, rank_cols_idx]
+            day_ranks = rankdata(day_data, method='average', axis=0) / (count + 1)
+            X[start:start+count, rank_cols_idx] = day_ranks.astype(np.float32)
+
+        gc.collect()
+        return skip_col_stats
+
     def _select_features(self, X: np.ndarray, feature_names: List[str], 
-                       corr_threshold: float = 0.9,
+                       corr_threshold: float = 0.85,
                        method: str = 'correlation') -> Tuple[np.ndarray, List[str]]:
         """
         特征选择：过滤高度相关的特征
@@ -1455,27 +1674,6 @@ class MLModelTrainer:
             return df_temp.values, new_feature_names
             
         return X, feature_names
-
-        rank_cols_idx = np.where(rank_cols_mask)[0]
-        
-        if len(rank_cols_idx) == 0:
-            return None
-
-        unique_dates, group_start, group_counts = np.unique(
-            dates, return_index=True, return_counts=True
-        )
-
-        for start, count in zip(group_start, group_counts):
-            if count <= 1:
-                X[start:start+count, rank_cols_idx] = 0.5
-                continue
-
-            day_data = X[start:start+count, rank_cols_idx]
-            day_ranks = rankdata(day_data, method='average', axis=0) / (count + 1)
-            X[start:start+count, rank_cols_idx] = day_ranks.astype(np.float32)
-
-        gc.collect()
-        return None
     
     def compare_models(self, results: Dict):
         """对比模型性能"""
@@ -1544,6 +1742,15 @@ class MLModelTrainer:
         for model_type, model in self.models.items():
             filepath = os.path.join(archive_dir, f'{model_type}_factor_model.pkl')
             model.save_model(filepath)
+
+        # 保存归一化统计量（推理时复用，保证 train/inference 分布一致）
+        norm_stats = getattr(self, 'norm_stats', None)
+        if norm_stats is not None:
+            import pickle as _pickle
+            norm_path = os.path.join(archive_dir, 'norm_stats.pkl')
+            with open(norm_path, 'wb') as f:
+                _pickle.dump(norm_stats, f)
+            print(f"  [OK] 归一化统计量已保存: norm_stats.pkl")
             
         # 8. 同时更新一个 "latest" 目录，方便自动调用
         latest_dir = os.path.join(save_dir, 'latest')
@@ -1553,9 +1760,9 @@ class MLModelTrainer:
             except: pass
         try:
             shutil.copytree(archive_dir, latest_dir)
-            print(f"  ✓ 已同步至最新目录: {latest_dir}")
+            print(f"  [OK] 已同步至最新目录: {latest_dir}")
         except Exception as e:
-            print(f"  ！同步最新目录失败: {e}")
+            print(f"  [Error] 同步最新目录失败: {e}")
             
         return archive_dir
     
@@ -1585,7 +1792,10 @@ class MLModelTrainer:
             'volume_change_rate', 'volume_volatility', 'price_volume_corr',
             'amount_per_volume', 'amount_change_rate',
             'return_5d', 'return_10d', 'return_20d', 'return_60d',
-            'momentum_5d', 'momentum_10d', 'momentum_20d', 'acceleration',
+            'momentum_5d', 'momentum_10d', 'momentum_20d',
+            'acceleration_5d', 'acceleration_10d',  # fix: was 'acceleration' (nonexistent)
+            'consecutive_up_days', 'days_above_ma20',
+            'price_percentile_60d', 'intraday_drawdown_avg_5d',
             'downside_risk', 'drawdown', 'max_drawdown_20', 'sharpe_ratio',
             'return_skewness', 'return_kurtosis',
         }

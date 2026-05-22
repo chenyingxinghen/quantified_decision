@@ -102,7 +102,7 @@ class MLFactorStrategy:
             return None
     
     def load_model(self, model_path: str):
-        """加载训练好的模型"""
+        """加载训练好的模型，同时加载归一化统计量"""
         try:
             self.model = MLFactorModel()
             self.model.load_model(model_path)
@@ -110,6 +110,22 @@ class MLFactorStrategy:
         except Exception as e:
             print(f"加载模型失败: {e}")
             self.model = None
+            return
+
+        # 加载归一化统计量（与模型同目录的 norm_stats.pkl）
+        import pickle as _pickle
+        model_dir = os.path.dirname(model_path)
+        norm_path = os.path.join(model_dir, 'norm_stats.pkl')
+        if os.path.exists(norm_path):
+            try:
+                with open(norm_path, 'rb') as f:
+                    self.norm_stats = _pickle.load(f)
+                print(f"  已加载归一化统计量: norm_stats.pkl")
+            except Exception as e:
+                print(f"  警告: 加载归一化统计量失败: {e}")
+                self.norm_stats = None
+        else:
+            self.norm_stats = None
     
     def screen_stock(self, stock_code: str, min_confidence: float = 60.0) -> Optional[Dict]:
         """
@@ -270,16 +286,41 @@ class MLFactorStrategy:
         # 2. 合并并进行横截面归一化
         all_X = pd.concat(all_latest_factors, axis=0, ignore_index=True)
         all_X = all_X.astype(np.float64)
-        
+
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            # 使用 TrainingConfig 中统一的豁免逻辑
+            # rank_cols：横截面百分位排名
             rank_cols = [col for col in all_X.columns if not TrainingConfig.should_skip_rank(col)]
-            
             if rank_cols and len(all_X) > 1:
                 all_X[rank_cols] = all_X[rank_cols].rank(pct=True).fillna(0.5)
-        
+
+            # skip_cols：复用训练集 robust 统计量（仅连续型，二值列保留原值）
+            norm_stats = getattr(self, 'norm_stats', None)
+            if norm_stats is not None:
+                skip_col_stats = norm_stats.get('skip_col_stats')
+                if skip_col_stats is not None and skip_col_stats.get('robust_global_idx', np.array([])).size > 0:
+                    train_factor_names = norm_stats.get('factor_names', [])
+                    robust_global_idx  = skip_col_stats['robust_global_idx']
+                    robust_col_names   = [train_factor_names[i] for i in robust_global_idx
+                                          if i < len(train_factor_names)]
+                    present_robust = [c for c in robust_col_names if c in all_X.columns]
+                    if present_robust:
+                        col_to_idx = {train_factor_names[i]: j
+                                      for j, i in enumerate(robust_global_idx)
+                                      if i < len(train_factor_names)}
+                        median    = skip_col_stats['median']
+                        iqr       = skip_col_stats['iqr']
+                        valid_iqr = skip_col_stats['valid_iqr']
+                        for col in present_robust:
+                            j = col_to_idx[col]
+                            if valid_iqr[j]:
+                                z = (all_X[col].values - median[j]) / iqr[j]
+                                all_X[col] = (1.0 / (1.0 + np.exp(-np.clip(z, -10, 10)))).astype(np.float32)
+                            else:
+                                all_X[col] = 0.5  # 零方差列，置中性值
+
+        all_X = all_X.fillna(0.5)
         all_X = all_X.fillna(0.5)
 
         # 3. 批量预测

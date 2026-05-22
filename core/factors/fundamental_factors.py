@@ -275,7 +275,8 @@ class FundamentalFactors:
         if 'peTTM' in daily_data.columns:
             factors['dynamic_pe'] = pd.to_numeric(daily_data['peTTM'], errors='coerce')
         else:
-            factors['dynamic_pe'] = (daily_data['close'] / factors['epsTTM'])
+            # epsTTM 可能为 0 或负数，用 replace(0, np.nan) 避免除以零产生 inf
+            factors['dynamic_pe'] = (daily_data['close'] / factors['epsTTM'].replace(0, np.nan))
 
         if 'pbMRQ' in daily_data.columns:
             factors['dynamic_pb'] = pd.to_numeric(daily_data['pbMRQ'], errors='coerce')

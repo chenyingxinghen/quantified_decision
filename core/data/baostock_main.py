@@ -97,7 +97,7 @@ class BaostockDataManager(BaostockFetcher):
                 pass
             
             # 获取复权因子（前复权因子历史会随除权除息全量重算，最新日值恒为1）
-            if time.strptime(sync_info['daily']) - time.strptime(today_str)<=timedelta(days=30): # 兜底逻辑
+            if sync_info['daily'] is None or datetime.strptime(sync_info['daily'],'%Y-%m-%d') - datetime.strptime(today_str,'%Y-%m-%d')>=timedelta(days=30): # 兜底逻辑
                 full_start = '2009-03-03'
             else:
                 full_start = start_str
@@ -192,7 +192,7 @@ class BaostockDataManager(BaostockFetcher):
             if ipo_year:
                 base_year = max(base_year, ipo_year)
                 
-            end_year = current_year-1
+            end_year = current_year
             if out_year:
                 end_year = min(end_year, out_year)
 
@@ -296,6 +296,9 @@ class BaostockDataManager(BaostockFetcher):
                 _drain_futures(futures, pbar, task_label=mode)
         finally:
             try:
+                for proc in executor._processes.values():
+                    try: proc.terminate()
+                    except Exception: pass
                 executor.shutdown(wait=False, cancel_futures=True)
             except (BrokenExecutor, KeyboardInterrupt, OSError):
                 pass
@@ -325,6 +328,9 @@ class BaostockDataManager(BaostockFetcher):
                 _drain_futures(futures, pbar, task_label=mode)
         finally:
             try:
+                for proc in executor._processes.values():
+                    try: proc.terminate()
+                    except Exception: pass
                 executor.shutdown(wait=False, cancel_futures=True)
             except (BrokenExecutor, KeyboardInterrupt, OSError):
                 pass

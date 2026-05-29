@@ -21,7 +21,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*invalid value.*')
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*divide by zero.*')
 
+# 启用 numexpr 加速 pandas 数值计算（3-5倍提速）
 import pandas as pd
+try:
+    import numexpr
+    pd.set_option('compute.use_numexpr', True)
+    pd.set_option('compute.use_bottleneck', True)
+except ImportError:
+    pass
+
+
 import numpy as np
 import talib
 from datetime import datetime, timedelta
@@ -108,6 +117,62 @@ def _scan_cache_file(args):
         return code, False
     except Exception:
         return code, True
+
+
+def _fast_rankdata_1d(a):
+    """
+    使用 numpy argsort 实现的超快速 rankdata (等价于 scipy.stats.rankdata(..., method='average'))。
+    在没有重复值（Ties）时快数倍，在有重复值时也极其高效。
+    """
+    n = len(a)
+    if n <= 1:
+        return np.array([1.0], dtype=np.float32)
+    
+    sorter = np.argsort(a)
+    
+    # 检查是否有重复值
+    a_sorted = a[sorter]
+    obs = np.empty(n, dtype=bool)
+    obs[0] = True
+    obs[1:] = a_sorted[1:] != a_sorted[:-1]
+    
+    if np.all(obs):
+        # 无重复值：直接使用 argsort 的逆作为排名
+        inv = np.empty(n, dtype=np.float32)
+        inv[sorter] = np.arange(1.0, n + 1.0, dtype=np.float32)
+        return inv
+        
+    # 有重复值：计算平均排名
+    obs_idx = np.where(obs)[0]
+    repeats = np.diff(np.append(obs_idx, n))
+    
+    avg_ranks = obs_idx + (repeats + 1) / 2.0
+    sorted_ranks = np.repeat(avg_ranks, repeats)
+    
+    ranks = np.empty(n, dtype=np.float32)
+    ranks[sorter] = sorted_ranks
+    return ranks
+
+
+def _normalize_chunk_worker(X_sub, group_starts, group_counts):
+    """
+    进程池/线程池中的子工作任务：
+    contiguously 归一化特征子矩阵中的一组日期。
+    """
+    result_sub = np.empty_like(X_sub)
+    F = X_sub.shape[1]
+    
+    for start, count in zip(group_starts, group_counts):
+        if count <= 1:
+            result_sub[start:start+count, :] = 0.5
+            continue
+            
+        day_data = X_sub[start:start+count, :]
+        for j in range(F):
+            col_data = day_data[:, j]
+            result_sub[start:start+count, j] = _fast_rankdata_1d(col_data) / (count + 1)
+            
+    return result_sub
 
 
 class MLModelTrainer:
@@ -446,7 +511,7 @@ class MLModelTrainer:
     def batch_update_factor_cache(self, stocks_data: Dict[str, pd.DataFrame], 
                                  include_fundamentals: bool = True,
                                  target_features: Optional[List[str]] = None,
-                                 n_jobs: int = 15,
+                                 n_jobs: int = None,  # 默认使用配置值
                                  verbose: bool = False):
         """
         并行批量更新因子的持久化缓存到最新行情日期。
@@ -496,7 +561,11 @@ class MLModelTrainer:
 
         # 3. 使用 ProcessPoolExecutor 实现真正的多核并行（绕过 GIL）
         # 因子计算是 CPU 密集型（talib、pandas rolling、numpy），多进程可充分利用多核
-        effective_jobs = min(n_jobs, multiprocessing.cpu_count(), len(to_update))
+        # 默认使用配置中的 N_JOBS_FACTOR_CALC，-1 表示使用所有核心
+        if n_jobs is None:
+            n_jobs = getattr(TrainingConfig, 'N_JOBS_FACTOR_CALC', -1)
+        effective_jobs = min(n_jobs if n_jobs > 0 else multiprocessing.cpu_count(), 
+                             multiprocessing.cpu_count(), len(to_update))
         print(f"  正在多进程并行更新 {len(to_update)} 只股票的缓存 (进程数={effective_jobs})...")
         
         worker_args = [
@@ -509,7 +578,8 @@ class MLModelTrainer:
         failed = 0
         is_atty = sys.stdout.isatty()
         
-        with ProcessPoolExecutor(max_workers=effective_jobs) as executor:
+        executor = ProcessPoolExecutor(max_workers=effective_jobs)
+        try:
             futures = {executor.submit(_cache_worker, arg): arg[0] for arg in worker_args}
             
             with tqdm(total=len(futures), desc="更新因子缓存", disable=not is_atty) as pbar:
@@ -527,6 +597,19 @@ class MLModelTrainer:
                         failed += 1
                     pbar.set_postfix({"成功": success, "失败": failed})
                     pbar.update(1)
+        finally:
+            # Windows 上 atexit 会通过管理线程 t.join() 等待所有子进程退出，
+            # 即使 shutdown(wait=False) 也无法绕过。
+            # 唯一可靠的方式是直接 terminate() 所有子进程，再 shutdown。
+            try:
+                for pid, proc in executor._processes.items():
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
                     
         elapsed = time() - start_time
         print(f"✓ 缓存同步完成: 成功 {success}, 失败 {failed} | 已跳过 {skipped} | 耗时 {elapsed:.1f}s")
@@ -793,8 +876,8 @@ class MLModelTrainer:
         
         for start, count in zip(group_start, group_counts):
             if count > 1:
-                # 组内百分位排名
-                y_final_sorted[start:start+count] = rankdata(sorted_scores[start:start+count], method='average') / (count + 1)
+                # 组内百分位排名，使用超快速 numpy argsort 实现
+                y_final_sorted[start:start+count] = _fast_rankdata_1d(sorted_scores[start:start+count]) / (count + 1)
             else:
                 y_final_sorted[start:start+count] = 0.5
         
@@ -998,21 +1081,25 @@ class MLModelTrainer:
         if not all_X:
             raise ValueError("没有生成的有效样本")
             
-        # 2. 批量合并 (Vectorized)
-        X_df = pd.concat(all_X, ignore_index=True)
+        # 2. 批量合并 (Vectorized) 并按日期进行一次性的全局时间排序，消除后续的所有重排与拷贝
         comps_df = pd.concat(all_comps, ignore_index=True)
+        sort_idx = np.argsort(comps_df['date'].values)
+        
+        # 按排序索引原地覆盖或重排 DataFrame (采用 views 或单次排序拷贝)
+        comps_df = comps_df.iloc[sort_idx].reset_index(drop=True)
+        X_df = pd.concat(all_X, ignore_index=True).iloc[sort_idx].reset_index(drop=True)
         
         # 释放中间列表
-        del all_X, all_comps, results
+        del all_X, all_comps, results, sort_idx
         gc.collect()
         
         print(f"  - 原始样本量: {len(X_df)}, 特征数: {X_df.shape[1]}")
         
-        # 3. 向量化计算标签
+        # 3. 向量化计算标签 (此时输入已是有序，截面排序速度最快，返回的标签和分数天然有序)
         print("  - 向量化生成标签 (标准化 + 截面排名)...")
         y_ranked, raw_scores, returns_raw, w_sig = self._calculate_vectorized_labels(comps_df)
         
-        # 提取其他必要数组
+        # 全局时间已是有序状态，直接提取和转换 numpy，完全避免了多次复制和多重排序！
         dates_arr = comps_df['date'].values
         unbuyable_arr = comps_df['unbuyable'].values
         limit_groups_arr = comps_df['limit_thresholds'].values
@@ -1020,22 +1107,17 @@ class MLModelTrainer:
         
         factor_names = X_df.columns.tolist()
 
-        # 全局时间排序与转换为 numpy
-        print("  - 全局时间排序与转换为 numpy...")
-        sort_idx = np.argsort(dates_arr)
+        y_final_arr = y_ranked
+        raw_scores_arr = raw_scores
+        returns_arr = returns_raw
+        w_sig_arr = w_sig
         
-        dates_arr = dates_arr[sort_idx]
-        y_final_arr = y_ranked[sort_idx]
-        raw_scores_arr = raw_scores[sort_idx]  # 同步排序原始分
-        returns_arr = returns_raw[sort_idx]
-        unbuyable_arr = unbuyable_arr[sort_idx]
-        limit_groups_arr = limit_groups_arr[sort_idx]
-        is_st_arr = is_st_arr[sort_idx]
-        w_sig_arr = w_sig[sort_idx]
-        X_arr = X_df.values[sort_idx].astype(np.float32)
+        # DataFrame -> numpy 仅在最后做一次单次转换，避免多次复制和 values 高级索引复制。
+        # 此处使用 copy=True 确保生成的 numpy 数组是可写 (writeable) 的，以支持原地归一化。
+        X_arr = X_df.to_numpy(dtype=np.float32, copy=True)
         
         # 释放 DataFrame
-        del X_df, comps_df, sort_idx
+        del X_df, comps_df
         gc.collect()
 
         # 5. 不可买入样本处理（涨停/停牌）——在归一化之前剔除，确保排序不含涨停股
@@ -1301,38 +1383,19 @@ class MLModelTrainer:
                     scores = _scores_sub[_ds:_de]
                     
                     # 1. 连续标签：排名归一化到 0-1 (所有样本参与排名)
-                    ranks = rankdata(scores, method='average') / (_dc + 1)
+                    ranks = _fast_rankdata_1d(scores) / (_dc + 1)
                     _y_sub[_ds:_de] = ranks.astype(np.float32)       
                                  
-                    # 2. 离散标签：头部优化的非均匀分档（解决 Top-1 精度为 0% 的核心痛点）
-                    # 设计原则：
-                    #   - 底部样本（前 50%）合并为 1 档，LambdaRank 不需要区分"差"和"更差"
-                    #   - 中部样本（50%~80%）分 3 档，提供足够的负向对比信号
-                    #   - 头部样本（80%~100%）分 6 档，给模型清晰的头部区分信号
-                    # 诊断发现旧方案 [0.0,0.3,0.5,...] 导致档位 0 占 30%、档位 9 缺失，
-                    # 调整为更均衡的分布，确保每档样本量差距不超过 10x
                     try:
-                        if _n_bins == 10:
-                            # 底部 35% → 档位 0（合并，控制负样本占比）
-                            # 35%~50% → 档位 1
-                            # 50%~63% → 档位 2
-                            # 63%~74% → 档位 3
-                            # 74%~83% → 档位 4
-                            # 83%~90% → 档位 5
-                            # 90%~95% → 档位 6
-                            # 95%~98% → 档位 7
-                            # 98%~99% → 档位 8
-                            # 99%~100% → 档位 9
-                            q_skewed = [0.0, 0.35, 0.50, 0.63, 0.74, 0.83, 0.90, 0.95, 0.98, 0.99, 1.0]
-                        else:
-                            # 动态生成：底部 35% 合并，其余均匀分配
-                            # 需要 _n_bins+1 个边界点才能产生 _n_bins 个 bin
-                            q_skewed = np.concatenate([
-                                [0.0, 0.35],
-                                np.linspace(0.35, 1.0, _n_bins - 1)
-                            ])
+                        # 需要 _n_bins+1 个边界点才能产生 _n_bins 个 bin
+                        bin_0_watershed = 0.2
+                        q_skewed = np.concatenate([
+                            [0.0, bin_0_watershed],
+                            np.linspace(bin_0_watershed, 1.0, _n_bins - 1)
+                        ])
                         bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
                         _y_discrete[_ds:_de] = bins.astype(np.int32)
+
                     except ValueError:
                         # 样本数太少或分数重复过多，回退到基于排名的简单分档
                         bins = np.clip((ranks * _n_bins).astype(np.int32), 0, _n_bins-1)
@@ -1391,7 +1454,7 @@ class MLModelTrainer:
                     if _dc > 1:
                         # 计算组内分位排名 (0 到 1)
                         # 注意：此处 w_raw 为原始收益率，值越大排名越靠前
-                        w_ranks = rankdata(_w_raw[_ds:_de], method='average') / (_dc + 1)
+                        w_ranks = _fast_rankdata_1d(_w_raw[_ds:_de]) / (_dc + 1)
                         
                         # 映射公式: 指数型头部权重 (Exponential Head Weighting)
                         # 让排名越靠前的样本权重呈指数级暴增，而非之前的线性增长
@@ -1435,7 +1498,7 @@ class MLModelTrainer:
             print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
             # 使用相关性过滤
             X_train, factor_names = self._select_features(
-                X_train, factor_names
+                X_train, factor_names, 0.9
             )
             # 保存特征选择结果到缓存
             try:
@@ -1476,25 +1539,44 @@ class MLModelTrainer:
                 # 避免内部切分验证集时间分布与外部验证集不一致导致的过早停止。
                 # 外部验证集时间更靠后，与真实推理场景一致，early stopping 更可靠。
                 _, es_val_group = np.unique(dates_val, return_counts=True)
+                if model_type == 'lightgbm':
+                    train_result = model.train(
+                        X_train, y_train_discrete,
+                        validation_split=0.2,
+                        use_time_series_split=True,
+                        feature_names=factor_names,
+                        sample_weight=sample_weight_train,
+                        returns=returns_train,
+                        split_idx=len(X_train),
+                        X_val_external=X_val,
+                        y_val_external=y_val_discrete,   # 长度已是 len(dates_val)，无需切片
+                        dates_val_external=dates_val,
+                        dates=dates_train,
+                        group=train_group,
+                        eval_group=es_val_group,
+                    )
+                elif model_type == 'xgboost':
+                    train_result = model.train(
+                        X_train, y_train_discrete,
+                        validation_split=0.2,
+                        use_time_series_split=True,
+                        feature_names=factor_names,
+                        sample_weight=sample_weight_train,
+                        returns=returns_train,
+                        split_idx=len(X_train),
+                        X_val_external=X_val,
+                        y_val_external=y_val_discrete,   # 长度已是 len(dates_val)，无需切片
+                        dates_val_external=dates_val,
+                        dates=dates_train,
+                        group=train_group,
+                        eval_group=es_val_group,
+                    )                
+                # 训练集评估（采样，用于与验证集对比学习效果）
+                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.1)
+                train_result['train_metrics'] = train_eval
 
-                train_result = model.train(
-                    X_train, y_train_discrete,
-                    validation_split=0.2,
-                    use_time_series_split=True,
-                    feature_names=factor_names,
-                    sample_weight=sample_weight_train,
-                    returns=returns_train,
-                    split_idx=len(X_train),
-                    X_val_external=X_val,
-                    y_val_external=y_val_discrete,   # 长度已是 len(dates_val)，无需切片
-                    dates_val_external=dates_val,
-                    dates=dates_train,
-                    group=train_group,
-                    eval_group=es_val_group,
-                )
-                
-                # 在外部纯净验证集上做最终评估（阻隔期后）
-                val_eval = model._evaluate(X_val, y_val, "验证集(阻隔期后)", returns=returns_val, dates=dates_val)
+                # 在验证集（阻隔期后）上做最终评估
+                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.2)
                 train_result['val_metrics'] = val_eval
                 
                 self.models[model_type] = model
@@ -1512,45 +1594,26 @@ class MLModelTrainer:
                                                    factor_names: List[str],
                                                    skip_col_stats: Optional[dict] = None):
         """
-        原位对特征矩阵进行横截面归一化（按日期分组），降低内存占用。
-        
-        参数:
-            X: 特征矩阵（原位修改）
-            dates: 日期数组
-            factor_names: 特征名列表
-            skip_col_stats: 跳过截面排名的列的预计算缩放统计量 {'median', 'iqr', 'valid_iqr'}。
-                           若为 None，则从当前 X 切片自行计算（会导致 train/val 缩放不一致）。
-                           应传入从训练集计算的统计量，以保证 train/val 分布一致。
-        
-        返回:
-            skip_col_stats: 本次计算的缩放统计量（仅当 skip_col_stats=None 时有意义，
-                           调用方应将其保存并传给验证集的调用）
+        使用并行化处理和内存视图，原位对特征矩阵进行横截面归一化，降低内存占用并大幅提升性能。
         """
         # 跳过横截面排名归一化的特征集合
-        # 原则：以下类型的特征不具备"今日全市场排名"的语义，归一化会破坏其信息：
         _skip_normalization = {
-            # 全市场情绪因子（所有股票当天值相同）
             'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio', 
             'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio', 
             'breadth_ma20', 'market_type',
-            # 交易状态标志位
             'is_limit_up', 'is_suspended',
-            # K线形态 0/1 信号
             'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
             'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
             'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
             'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
             'three_white_soldiers', 'three_black_crows',
         }
-        # One-Hot 行业列（前缀匹配）
+        
         def _should_skip(col: str) -> bool:
             if col in _skip_normalization: return True
-            # 行业、个股状态、退市天数等不参与横截面排名
             if col.startswith(('industry_', 'sector_', 'is_', 'days_to_')):
                 if col.endswith('_encoded'): return False
                 return True
-            # 关键改进：全市场维度因子（大盘指标、情绪指标）不参与横截面排名
-            # 这些指标在同一天对所有股票是相同的，排名后会全部变成 0.5，导致模型丢失大盘环境信息
             if col.startswith(('mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
                 return True
             return False
@@ -1562,19 +1625,10 @@ class MLModelTrainer:
         if len(rank_cols_idx) == 0:
             return None
 
-        # ── 跳过截面排名的列：按语义分三类处理 ──────────────────────────────
-        # skip_cols 内部性质不同，统一用 robust+sigmoid 会破坏部分特征的语义：
-        #   A. 0/1 二值特征（状态位、K线形态）：直接保留原值，不做任何缩放
-        #      理由：median 通常为 0，IQR≈0，valid_iqr=False → 原代码会把所有值置 0，
-        #            信号完全消失；且 0/1 本身已在 [0,1] 范围内，无需缩放。
-        #   B. 全市场宏观/情绪因子（所有股票当天值相同）：robust+sigmoid
-        #      理由：量级差异极大（total_volume 千亿级），需要缩放；
-        #            使用训练集统计量保证 train/val 分布一致。
-        #   C. 行业编码、退市天数等其他跳过列：同 B，robust+sigmoid
+        # ── B/C 类：连续型跳过列，robust scaler + sigmoid → [0,1] ──
+        # 优化：采用单列内存视图处理，完全避免生成大面积临时 2D 矩阵的复制
         _binary_skip_names = {
-            # 交易状态标志位
             'is_limit_up', 'is_suspended', 'is_st',
-            # K线形态 0/1 信号
             'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
             'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
             'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
@@ -1584,7 +1638,6 @@ class MLModelTrainer:
         def _is_binary_skip(col: str) -> bool:
             if col in _binary_skip_names:
                 return True
-            # is_* 前缀（非 _encoded 结尾）均视为二值
             if col.startswith('is_') and not col.endswith('_encoded'):
                 return True
             return False
@@ -1597,55 +1650,103 @@ class MLModelTrainer:
             robust_local_idx = np.where(robust_mask)[0]   # 在 skip_cols_idx 内的相对下标
             robust_global_idx = skip_cols_idx[robust_local_idx]  # 在 X 中的绝对列下标
 
-            # ── A 类：0/1 二值特征，直接保留，不做任何变换 ──────────────
-            # 无需操作，原始值已是 0 或 1，语义完整。
-
-            # ── B/C 类：连续型跳过列，robust scaler + sigmoid → [0,1] ──
             if robust_local_idx.size > 0:
-                skip_data = X[:, robust_global_idx].astype(np.float64)
                 if skip_col_stats is None:
-                    # 从当前切片计算（训练集调用时）
-                    p25       = np.nanpercentile(skip_data, 25, axis=0)
-                    p75       = np.nanpercentile(skip_data, 75, axis=0)
-                    median    = np.nanpercentile(skip_data, 50, axis=0)
-                    iqr       = p75 - p25
-                    valid_iqr = iqr > 1e-8
+                    # 单列视图 Robust 统计量计算以降低拷贝
+                    median = np.empty(len(robust_global_idx), dtype=np.float32)
+                    iqr = np.empty(len(robust_global_idx), dtype=np.float32)
+                    valid_iqr = np.empty(len(robust_global_idx), dtype=bool)
+                    
+                    for idx, col in enumerate(robust_global_idx):
+                        col_view = X[:, col]
+                        p25 = np.nanpercentile(col_view, 25)
+                        p75 = np.nanpercentile(col_view, 75)
+                        median[idx] = np.nanpercentile(col_view, 50)
+                        iqr[idx] = p75 - p25
+                        valid_iqr[idx] = iqr[idx] > 1e-8
+                        
                     skip_col_stats = {
                         'median': median, 'iqr': iqr, 'valid_iqr': valid_iqr,
-                        'robust_global_idx': robust_global_idx,  # 保存列索引供推理复用
+                        'robust_global_idx': robust_global_idx,
                     }
                 else:
                     median    = skip_col_stats['median']
                     iqr       = skip_col_stats['iqr']
                     valid_iqr = skip_col_stats['valid_iqr']
-                scaled = np.where(
-                    valid_iqr,
-                    (skip_data - median) / np.where(valid_iqr, iqr, 1.0),
-                    0.0
-                )
-                # sigmoid 压缩到 [0, 1]，平滑处理极端值
-                scaled_01 = 1.0 / (1.0 + np.exp(-scaled.clip(-10, 10)))
-                X[:, robust_global_idx] = scaled_01.astype(np.float32)
+                
+                # 原地鲁棒标准化 + sigmoid，无多余临时数组分配
+                for idx, col in enumerate(robust_global_idx):
+                    col_view = X[:, col]
+                    if valid_iqr[idx]:
+                        scaled = (col_view - median[idx]) / iqr[idx]
+                        np.clip(scaled, -10.0, 10.0, out=scaled)
+                        scaled_01 = 1.0 / (1.0 + np.exp(-scaled))
+                        X[:, col] = scaled_01
+                    else:
+                        X[:, col] = 0.0
             elif skip_col_stats is None:
-                # 全部是二值列，无需 robust 统计量，但仍需返回非 None 以区分"已计算"
                 skip_col_stats = {
                     'median': np.array([]), 'iqr': np.array([]),
                     'valid_iqr': np.array([], dtype=bool),
                     'robust_global_idx': np.array([], dtype=int),
                 }
 
+        # ── 横截面归一化优化：使用 Joblib 并行化处理日期分组 ──
         unique_dates, group_start, group_counts = np.unique(
             dates, return_index=True, return_counts=True
         )
-
-        for start, count in zip(group_start, group_counts):
-            if count <= 1:
-                X[start:start+count, rank_cols_idx] = 0.5
-                continue
-
-            day_data = X[start:start+count, rank_cols_idx]
-            day_ranks = rankdata(day_data, method='average', axis=0) / (count + 1)
-            X[start:start+count, rank_cols_idx] = day_ranks.astype(np.float32)
+        
+        # 确定并行任务的 CPU 核心数
+        n_jobs = getattr(TrainingConfig, 'N_JOBS_FACTOR_CALC', -1)
+        if n_jobs <= 0:
+            import multiprocessing
+            n_jobs = multiprocessing.cpu_count()
+        
+        num_dates = len(unique_dates)
+        n_jobs = min(n_jobs, num_dates)
+        
+        if n_jobs > 1 and num_dates > 5:
+            # 采用大规模日期切片，将大矩阵分割为核心数个连续子块，避免大量小数组序列化开销
+            date_chunks = np.array_split(np.arange(num_dates), n_jobs)
+            
+            tasks = []
+            for chunk in date_chunks:
+                if len(chunk) == 0:
+                    continue
+                first_date_idx = chunk[0]
+                last_date_idx = chunk[-1]
+                
+                chunk_start_row = group_start[first_date_idx]
+                chunk_end_row = group_start[last_date_idx] + group_counts[last_date_idx]
+                
+                # Contiguous sub-matrix slice (memory views)
+                X_sub = X[chunk_start_row:chunk_end_row, rank_cols_idx]
+                rel_starts = group_start[chunk] - chunk_start_row
+                counts = group_counts[chunk]
+                
+                tasks.append((X_sub, rel_starts, counts, chunk_start_row, chunk_end_row))
+                
+            # 执行多核并行计算 (Loky/Multiprocessing)
+            from joblib import Parallel, delayed
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(_normalize_chunk_worker)(X_sub, rel_starts, counts)
+                for X_sub, rel_starts, counts, _, _ in tasks
+            )
+            
+            # 原地赋回原矩阵
+            for (_, _, _, chunk_start_row, chunk_end_row), res_sub in zip(tasks, results):
+                X[chunk_start_row:chunk_end_row, rank_cols_idx] = res_sub
+        else:
+            # 串行备用方案，利用 _fast_rankdata_1d 依然极快
+            for start, count in zip(group_start, group_counts):
+                if count <= 1:
+                    X[start:start+count, rank_cols_idx] = 0.5
+                    continue
+                
+                day_data = X[start:start+count, rank_cols_idx]
+                for j in range(len(rank_cols_idx)):
+                    col_data = day_data[:, j]
+                    X[start:start+count, rank_cols_idx[j]] = _fast_rankdata_1d(col_data) / (count + 1)
 
         gc.collect()
         return skip_col_stats

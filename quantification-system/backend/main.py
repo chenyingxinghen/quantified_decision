@@ -17,6 +17,52 @@ from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
 
+# 配置日志
+import logging
+from logging.handlers import RotatingFileHandler
+import time
+
+# 禁用tqdm的进度条输出（如果导入的话）
+try:
+    from tqdm import auto as tqdm_lib
+    # 通过环境变量禁用tqdm
+    os.environ['TQDM_DISABLE'] = '1'
+except ImportError:
+    pass
+
+# 创建日志目录
+log_dir = os.path.join(PROJECT_ROOT, 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
+# 配置日志格式和处理器
+log_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# 创建文件处理器，使用RotatingFileHandler避免日志文件过大
+file_handler = RotatingFileHandler(
+    os.path.join(log_dir, 'api_server.log'),
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5,
+    encoding='utf-8'
+)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(log_formatter)
+
+# 配置根日志记录器
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(file_handler)
+
+# 添加控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(log_formatter)
+root_logger.addHandler(console_handler)
+
+logger = logging.getLogger(__name__)
+
 from app.scheduler import start_scheduler, stop_scheduler
 
 from app.routers import stock_selector, paper_trading, analysis, config_center, auth, fundamentals, data_center
@@ -24,9 +70,11 @@ from app.routers import stock_selector, paper_trading, analysis, config_center, 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    logger.info("量化系统启动中...")
     start_scheduler()
     yield
     # Shutdown
+    logger.info("量化系统关闭中...")
     stop_scheduler()
 
 app = FastAPI(

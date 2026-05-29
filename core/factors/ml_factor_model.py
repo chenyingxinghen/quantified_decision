@@ -81,7 +81,7 @@ class MLFactorModel:
         参数已在 ModelConfig.XGBOOST_PARAMS 中完整定义，此处仅做 pop 处理。
         """
         # early_stopping_rounds 由训练器（xgb.train 或 fit）管理，不传入构造器
-        self.early_stopping_rounds = model_params.pop('early_stopping_rounds', 50)
+        self.early_stopping_rounds = model_params.pop('early_stopping_rounds', None)
 
         def _build_xgb(params: dict):
             if self.task == 'ranking':
@@ -115,7 +115,7 @@ class MLFactorModel:
         参数已在 ModelConfig.LIGHTGBM_PARAMS 中完整定义，此处仅做 pop 处理。
         """
         # pop ranking 专用参数，避免传入 LGBMRanker 构造器时冲突
-        self.early_stopping_rounds = model_params.pop('early_stopping_rounds', 100)
+        self.early_stopping_rounds = model_params.pop('early_stopping_rounds', None)
         # eval_at：用于 fit 时指定 ndcg 的截断位置
         self.eval_at = model_params.pop('eval_at', [10])
 
@@ -297,18 +297,34 @@ class MLFactorModel:
             if self.task == 'ranking' and group_val is not None:
                 dval.set_group(group_val)
 
-            # ranking 模式：仅监控验证集（训练集 group 信息复用困难，且 ranking 不依赖 train 曲线判断过拟合）
-            # 非 ranking 模式：加入训练集采样监控，用于过拟合诊断
-            if self.task == 'ranking':
-                evals_list = [(dval, 'validation')]
+            # 所有任务均加入训练集采样监控，用于过拟合诊断（训练集 vs 验证集曲线对比）
+            # ranking 任务：按日期采样完整 group，保证 NDCG 计算有意义
+            _dates_train_xgb = kwargs.get('dates', None)
+            if _dates_train_xgb is not None:
+                _dates_train_xgb = _dates_train_xgb[:split_idx]
+            if self.task == 'ranking' and _dates_train_xgb is not None and group_train is not None:
+                _unique_td = np.unique(_dates_train_xgb)
+                _n_mon_days = max(50, int(len(_unique_td) * 0.2))
+                _rng = np.random.default_rng(42)
+                _mon_dates = _rng.choice(_unique_td, size=min(_n_mon_days, len(_unique_td)), replace=False)
+                _mon_mask = np.isin(_dates_train_xgb, _mon_dates)
+                _X_mon = X_train_raw[_mon_mask]
+                _y_mon = y_train[_mon_mask]
+                _, _mon_group = np.unique(_dates_train_xgb[_mon_mask], return_counts=True)
             else:
-                monitor_size = min(50000, len(X_train_raw))
-                monitor_idx = np.random.choice(len(X_train_raw), monitor_size, replace=False)
-                dtrain_monitor = xgb.QuantileDMatrix(
-                    X_train_raw[monitor_idx], label=y_train[monitor_idx],
-                    feature_names=self.feature_names, ref=dtrain,
-                )
-                evals_list = [(dtrain_monitor, 'train_monitor'), (dval, 'validation')]
+                _mon_size = min(50000, len(X_train_raw))
+                _mon_idx = np.random.choice(len(X_train_raw), _mon_size, replace=False)
+                _X_mon = X_train_raw[_mon_idx]
+                _y_mon = y_train[_mon_idx]
+                _mon_group = None
+
+            dtrain_monitor = xgb.QuantileDMatrix(
+                _X_mon, label=_y_mon,
+                feature_names=self.feature_names, ref=dtrain,
+            )
+            if self.task == 'ranking':
+                dtrain_monitor.set_group(_mon_group if _mon_group is not None else np.ones(len(_y_mon), dtype=np.int32))
+            evals_list = [(dtrain_monitor, 'train_monitor'), (dval, 'validation')]
 
             evals_result = {}
             self.model = xgb.train(
@@ -324,8 +340,7 @@ class MLFactorModel:
             self._evals_result = evals_result
 
             # 内存回收
-            if self.task != 'ranking':
-                del dtrain_monitor
+            del dtrain_monitor
             del dtrain, dval
             X_train = X_train_raw  # 仅用于后续评估
             X_val = X_val_raw
@@ -339,35 +354,49 @@ class MLFactorModel:
             X_val = X_val_raw
 
             fit_params = {'sample_weight': w_train}
-            # 抽样训练集用于过拟合监控（仅非ranking任务，ranking需要group信息无法简单抽样）
-            monitor_size = min(50000, len(X_train))
-            monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
-            X_train_monitor = X_train[monitor_idx]
-            y_train_monitor = y_train[monitor_idx]
+            # 训练集监控：按日期采样完整 group，保证 NDCG 计算有意义（训练集 vs 验证集曲线对比）
             if self.task == 'ranking':
                 if group_train is not None:
                     fit_params['group'] = group_train
 
-                # 设置内部验证集及其对应的 group
-                if group_val is not None:
-                    fit_params.update({
-                        'eval_set': [(X_val, y_val)],
-                        'eval_group': [group_val],
-                        'eval_at': getattr(self, 'eval_at', [10]),
-                    })
+                eval_at = getattr(self, 'eval_at', [10])
+                # ranking 训练集监控：从 dates_train 中随机采样若干天，保留每天完整的 group 结构
+                if dates_train is not None and group_train is not None:
+                    unique_train_dates = np.unique(dates_train)
+                    n_monitor_days = max(50, int(len(unique_train_dates) * 0.2))
+                    rng = np.random.default_rng(42)
+                    monitor_dates = rng.choice(unique_train_dates, size=min(n_monitor_days, len(unique_train_dates)), replace=False)
+                    monitor_date_mask = np.isin(dates_train, monitor_dates)
+                    X_train_monitor = X_train[monitor_date_mask]
+                    y_train_monitor = y_train[monitor_date_mask]
+                    _, monitor_group = np.unique(dates_train[monitor_date_mask], return_counts=True)
                 else:
-                    fit_params.update({
-                        'eval_set': [(X_val, y_val)],
-                        'eval_at': getattr(self, 'eval_at', [10]),
-                    })
+                    # 无日期信息时回退：随机采样，每行独立查询
+                    monitor_size = min(50000, len(X_train))
+                    monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
+                    X_train_monitor = X_train[monitor_idx]
+                    y_train_monitor = y_train[monitor_idx]
+                    monitor_group = np.ones(len(y_train_monitor), dtype=np.int32)
+
+                val_group = group_val if group_val is not None else np.ones(len(y_val), dtype=np.int32)
+                fit_params.update({
+                    'eval_set': [(X_train_monitor, y_train_monitor), (X_val, y_val)],
+                    'eval_names': ['train_monitor', 'valid'],
+                    'eval_group': [monitor_group, val_group],
+                    'eval_at': eval_at,
+                })
             else:
+                monitor_size = min(50000, len(X_train))
+                monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
+                X_train_monitor = X_train[monitor_idx]
+                y_train_monitor = y_train[monitor_idx]
                 fit_params.update({
                     'eval_set': [(X_train_monitor, y_train_monitor), (X_val, y_val)],
                     'eval_names': ['train_monitor', 'valid'],
                 })
 
             from lightgbm import early_stopping, log_evaluation, record_evaluation
-            es_rounds = getattr(self, 'early_stopping_rounds', 100)
+            es_rounds = getattr(self, 'early_stopping_rounds', None)
             lgb_evals_result = {}
 
             # 防御性检查：确保 eval_set 已设置，否则 early_stopping callback 会报错
@@ -377,14 +406,13 @@ class MLFactorModel:
                     f"group_val={group_val is not None}, X_val shape={X_val.shape}, y_val len={len(y_val)}, "
                     f"fit_params keys={list(fit_params.keys())}"
                 )
-            # 校验 eval_group sum 与 y_val 长度一致
+            # 校验 eval_group 与 eval_set 长度一致（每个 eval_set 对应一个 group）
             if 'eval_group' in fit_params:
-                eg = fit_params['eval_group'][0]
-                ev = fit_params['eval_set'][0][1]
-                if np.sum(eg) != len(ev):
-                    raise RuntimeError(
-                        f"LightGBM eval_group sum ({np.sum(eg)}) != eval_set y len ({len(ev)})"
-                    )
+                for i, (eg, (_, ev)) in enumerate(zip(fit_params['eval_group'], fit_params['eval_set'])):
+                    if np.sum(eg) != len(ev):
+                        raise RuntimeError(
+                            f"LightGBM eval_group[{i}] sum ({np.sum(eg)}) != eval_set[{i}] y len ({len(ev)})"
+                        )
 
             callbacks = [
                 early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
@@ -435,9 +463,37 @@ class MLFactorModel:
                 self.model.fit(X_train, y_train, verbose=False, **fit_params)
             elif self.model_type == 'lightgbm':
                 from lightgbm import early_stopping, log_evaluation, record_evaluation
-                es_rounds = getattr(self, 'early_stopping_rounds', 100)
+                es_rounds = getattr(self, 'early_stopping_rounds', None)
                 lgb_evals_result = {}
-                if self.task != 'ranking':
+                # 所有任务均加入训练集采样监控，用于过拟合诊断（训练集 vs 验证集曲线对比）
+                if self.task == 'ranking':
+                    eval_at = getattr(self, 'eval_at', [10])
+                    # ranking：按日期采样完整 group，保证 NDCG 计算有意义
+                    if dates_train is not None and group_train is not None:
+                        unique_train_dates = np.unique(dates_train)
+                        n_monitor_days = max(50, int(len(unique_train_dates) * 0.2))
+                        rng = np.random.default_rng(42)
+                        monitor_dates = rng.choice(unique_train_dates, size=min(n_monitor_days, len(unique_train_dates)), replace=False)
+                        monitor_date_mask = np.isin(dates_train, monitor_dates)
+                        X_train_arr = X_train if isinstance(X_train, np.ndarray) else X_train.values
+                        X_train_monitor = X_train_arr[monitor_date_mask]
+                        y_train_monitor = y_train[monitor_date_mask]
+                        _, monitor_group = np.unique(dates_train[monitor_date_mask], return_counts=True)
+                    else:
+                        monitor_size = min(50000, len(X_train))
+                        monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
+                        X_train_monitor = X_train[monitor_idx] if isinstance(X_train, np.ndarray) else X_train.iloc[monitor_idx]
+                        y_train_monitor = y_train[monitor_idx]
+                        monitor_group = np.ones(len(y_train_monitor), dtype=np.int32)
+                    existing_eval_group = fit_params.pop('eval_group', None)
+                    val_group = existing_eval_group[0] if existing_eval_group else np.ones(len(y_val), dtype=np.int32)
+                    fit_params.update({
+                        'eval_set': [(X_train_monitor, y_train_monitor), (X_val, y_val)],
+                        'eval_names': ['train_monitor', 'valid'],
+                        'eval_group': [monitor_group, val_group],
+                        'eval_at': eval_at,
+                    })
+                else:
                     monitor_size = min(50000, len(X_train))
                     monitor_idx = np.random.choice(len(X_train), monitor_size, replace=False)
                     X_train_monitor = X_train[monitor_idx] if isinstance(X_train, np.ndarray) else X_train.iloc[monitor_idx]
@@ -449,27 +505,23 @@ class MLFactorModel:
                 callbacks = [
                     early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
                     record_evaluation(lgb_evals_result),
+                    log_evaluation(period=50),
                 ]
-                if self.task == 'ranking':
-                    callbacks.append(log_evaluation(period=50))
                 self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
                 self._evals_result = lgb_evals_result
             else:
                 self.model.fit(X_train, y_train, sample_weight=w_train)
             
-        # 4. 后处理与评估
+        # 4. 后处理
         self._calculate_feature_importance()
         self.is_trained = True
         
         import gc
         gc.collect()
 
-        # 从训练曲线提取过拟合诊断（零推理开销）
-        train_metrics = self._overfitting_diagnosis()
-        
         return {
-            'train_metrics': train_metrics,
-            'val_metrics': self._evaluate(X_val, y_val, "验证集", returns=r_val, dates=dates_val)
+            'train_metrics': {},
+            'val_metrics': {},
         }
 
     def _get_predict_proba(self, X: Any) -> np.ndarray:
@@ -544,19 +596,25 @@ class MLFactorModel:
         return next(iter(curves))
 
     def _overfitting_diagnosis(self) -> Dict:
-        """从训练曲线直接读取过拟合诊断，零推理开销"""
+        """
+        从训练曲线直接读取过拟合诊断，零推理开销。
+
+        训练集监控（train_monitor）使用按日期采样的完整 group 子集，
+        与验证集使用相同的 NDCG 指标，可直接对比学习能力与泛化能力。
+        """
         evals = getattr(self, '_evals_result', {})
         if not evals:
             return {}
 
-        # XGBoost: {'train_monitor': {'rmse': [...]}, 'validation': {'rmse': [...]}}
-        # LightGBM ranking: {'valid_0': {'ndcg@10': [...], 'ndcg@1': [...], ...}}
+        # key 约定：
+        #   train_monitor → 训练集采样监控（含 'train'）
+        #   valid / validation → 验证集（不含 'train'）
         train_key = next((k for k in evals if 'train' in k.lower()), None)
         val_key   = next((k for k in evals if 'train' not in k.lower()), None)
 
         metrics = {}
 
-        # 只有验证集曲线时（ranking 任务不监控训练集）
+        # 仅有验证集曲线（兜底分支，正常情况不应触发）
         if val_key and not train_key:
             val_curves  = evals[val_key]
             metric_name = self._primary_metric_name(val_curves)
@@ -567,10 +625,9 @@ class MLFactorModel:
             best_round  = val_series.index(best_val) + 1
             degradation = abs(final_val - best_val) / (abs(best_val) + 1e-8)
 
-            print(f"\n  [过拟合诊断 - 训练曲线] 指标: {metric_name}  (仅验证集，ranking任务)")
-            print(f"    验证集最终值:  {final_val:.5f}")
+            print(f"\n  [训练曲线诊断] 指标: {metric_name}  (仅验证集)")
             print(f"    验证集最优值:  {best_val:.5f} (第 {best_round} 轮，共 {len(val_series)} 轮)")
-            print(f"    Early Stop 后退化: {degradation:.2%}")
+            print(f"    验证集最终值:  {final_val:.5f}  (Early Stop 后退化: {degradation:.2%})")
             metrics = {'val_final': final_val, 'best_val': best_val, 'best_round': best_round,
                        'metric_name': metric_name, 'rank_ic': 0.0}
             return metrics
@@ -594,14 +651,16 @@ class MLFactorModel:
         gap         = abs(train_final - val_final)
         overfit_ratio = gap / (abs(train_final) + 1e-8)
 
-        print(f"\n  [过拟合诊断 - 训练曲线] 指标: {metric_name}")
-        print(f"    训练集 (第 1 轮):    {train_series[0]:.5f}")
-        print(f"    训练集 (最终轮):    {train_final:.5f}")
-        print(f"    验证集 (最优轮):    {best_val:.5f} (第 {best_round} 轮)")
-        print(f"    验证集 (最终轮):    {val_final:.5f} (共 {len(val_series)} 轮)")
-        print(f"    最优 vs 最终退化:   {abs(val_final - best_val):.5f} ({abs(val_final - best_val)/(abs(best_val)+1e-8):.2%})")
-        print(f"    Train/Val 差距:   {gap:.5f} (过拟合度: {overfit_ratio:.2%})")
-        
+        # 学习趋势：训练集从初始到最终的提升幅度
+        train_init  = train_series[0]
+        train_gain  = train_final - train_init if not is_loss else train_init - train_final
+
+        print(f"\n  [训练曲线诊断] 指标: {metric_name}")
+        print(f"    训练集: {train_init:.5f} → {train_final:.5f}  (提升 {train_gain:+.5f})")
+        print(f"    验证集: 最优 {best_val:.5f} (第 {best_round} 轮) → 最终 {val_final:.5f}  "
+              f"(退化 {abs(val_final - best_val)/(abs(best_val)+1e-8):.2%})")
+        print(f"    Train/Val 差距: {gap:.5f}  (过拟合度: {overfit_ratio:.2%})")
+
         if overfit_ratio > 0.20:
             print(f"    ⚠️  [严重] 过拟合风险极高！Train 远强于 Val。建议减小 depth 或增加 lambda。")
         elif overfit_ratio > 0.10:
@@ -611,6 +670,8 @@ class MLFactorModel:
 
         metrics = {
             'train_final': train_final,
+            'train_init': train_init,
+            'train_gain': train_gain,
             'val_final': val_final,
             'best_val': best_val,
             'best_round': best_round,
@@ -620,7 +681,7 @@ class MLFactorModel:
         return metrics
 
     def _evaluate(self, X: Any, y: np.ndarray, dataset_name: str, returns: np.ndarray = None, 
-                 dates: np.ndarray = None, sample_ratio: float = TrainingConfig.SAMPLE_EVAL) -> Dict:
+                 dates: np.ndarray = None, sample_ratio: float = 0.2) -> Dict:
         y_prob = self._get_predict_proba(X)
         # 1. 基础指标计算 (针对类别/回归)
         # y 可能包含软标签，因此先进行二元化处理

@@ -15,7 +15,7 @@
 import sys, os, warnings, argparse
 warnings.filterwarnings('ignore')
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
@@ -531,13 +531,12 @@ def main():
         scores = raw_scores[ds:de]
         if dc > 1:
             try:
-                if n_bins == 10:
-                    q_skewed = [0.0, 0.35, 0.50, 0.63, 0.74, 0.83, 0.90, 0.95, 0.98, 0.99, 1.0]
-                else:
-                    q_skewed = np.concatenate([
-                        [0.0, 0.35],
-                        np.linspace(0.35, 1.0, n_bins)
-                    ])
+                
+                nbin0_ws = 1/n_bins
+                q_skewed = np.concatenate([
+                    [0.0, nbin0_ws],
+                    np.linspace(nbin0_ws, 1.0, n_bins)
+                ])
                 bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
                 y_discrete[ds:de] = bins.astype(np.int32)
             except ValueError:
@@ -550,27 +549,27 @@ def main():
     print(f"\n[Step 4] 标签分布分析...")
     analyze_label_distribution(raw_scores, y_ranked, y_discrete, returns, output_dir)
 
-    # ── Step 5: 因子质量检查 ──────────────────────────────────────────────
-    print(f"\n[Step 5] 因子质量检查...")
-    quality_stats = analyze_factor_quality(X, factor_names, output_dir)
+    # # ── Step 5: 因子质量检查 ──────────────────────────────────────────────
+    # print(f"\n[Step 5] 因子质量检查...")
+    # quality_stats = analyze_factor_quality(X, factor_names, output_dir)
 
-    # ── Step 6: 因子 IC 分析 ──────────────────────────────────────────────
-    print(f"\n[Step 6] 因子 IC / Rank-IC 分析...")
-    # 横截面归一化后再算 IC（与训练时一致）
-    X_norm = X.copy()
-    trainer._apply_cross_sectional_normalization_inplace(X_norm, dates, factor_names)
-    ic_df, ic_matrix, ric_matrix, unique_dates_ic = compute_factor_ic(
-        X_norm, returns, dates, factor_names, top_n=args.top_ic
-    )
+    # # ── Step 6: 因子 IC 分析 ──────────────────────────────────────────────
+    # print(f"\n[Step 6] 因子 IC / Rank-IC 分析...")
+    # # 横截面归一化后再算 IC（与训练时一致）
+    # X_norm = X.copy()
+    # trainer._apply_cross_sectional_normalization_inplace(X_norm, dates, factor_names)
+    # ic_df, ic_matrix, ric_matrix, unique_dates_ic = compute_factor_ic(
+    #     X_norm, returns, dates, factor_names, top_n=args.top_ic
+    # )
 
-    # ── Step 7: IC 时序图 ─────────────────────────────────────────────────
-    print(f"\n[Step 7] 绘制 IC 时序图...")
-    plot_ic_timeseries(ic_df, ric_matrix, unique_dates_ic, factor_names, output_dir, top_n=10)
+    # # ── Step 7: IC 时序图 ─────────────────────────────────────────────────
+    # print(f"\n[Step 7] 绘制 IC 时序图...")
+    # plot_ic_timeseries(ic_df, ric_matrix, unique_dates_ic, factor_names, output_dir, top_n=10)
 
-    # ── Step 8: 保存 IC 报告 ──────────────────────────────────────────────
-    ic_report_path = os.path.join(output_dir, 'factor_ic_report.csv')
-    ic_df.drop(columns=['abs_ric'], errors='ignore').to_csv(ic_report_path, index=False, encoding='utf-8-sig')
-    print(f"  ✓ IC 报告已保存: {ic_report_path}")
+    # # ── Step 8: 保存 IC 报告 ──────────────────────────────────────────────
+    # ic_report_path = os.path.join(output_dir, 'factor_ic_report.csv')
+    # ic_df.drop(columns=['abs_ric'], errors='ignore').to_csv(ic_report_path, index=False, encoding='utf-8-sig')
+    # print(f"  ✓ IC 报告已保存: {ic_report_path}")
 
     # ── 最终汇总 ──────────────────────────────────────────────────────────
     print("\n" + "="*60)

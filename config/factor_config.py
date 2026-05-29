@@ -16,57 +16,63 @@ from config import baostock_config
 # 1. 模型超参数配置
 # ============================================================================
 
+n_bins=10
+lgb_label_gain = [ i for i in range(n_bins)]
 class ModelConfig:
     """模型超参数配置"""
 
-
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
-        'n_estimators': 2000,
-        'max_depth': 3,           # 适当加深，配合强正则化
+        'n_estimators': 1000,
+        'max_depth': 6,
+        'num_leaves': 25,          
         'learning_rate': 0.01,    
 
-        'min_child_samples': 500,  # 叶节点最少样本数，防止在小样本上过拟合
-        'min_gain_to_split': 0.01, # 最小分裂增益，剪掉无意义的分裂
-        'reg_alpha': 0.1,          # L1 正则，促进稀疏性
-        'reg_lambda': 1.0,         # L2 正则，平滑权重
+        'min_child_weight': 100,
+        'min_gain_to_split': 0.1, # 最小分裂增益，剪掉无意义的分裂
+        'reg_alpha': 0.0,          # L1 正则，促进稀疏性
+        'reg_lambda': 7.0,         # L2 正则，平滑权重
 
-        'subsample': 0.7,          # 降低行采样率，增加随机性
+        'subsample': 0.6,
+        'colsample_bytree': 0.6,
         'subsample_freq': 1,
-        'colsample_bytree': 0.8,   # 降低列采样率，减少特征依赖
 
         # Ranking 专属配置
         'objective': 'lambdarank',
-        'metric': 'ndcg',
-        'eval_at': [5,10],
-        'lambdarank_truncation_level': 100,
-        'label_gain': [i**2 for i in range(8)],
+        'metric': 'auc',
+        'eval_at': [10,5],
+        'lambdarank_truncation_level': 3000,
+        'label_gain': lgb_label_gain,
 
         'early_stopping_rounds': 100,
-        'n_jobs': 15,
+        'n_jobs': -1,  # 使用所有CPU核心
         'verbosity': -1,
     }
 
 
     XGBOOST_PARAMS: Dict[str, Any] = {
-        'n_estimators': 2000,
-        'max_depth': 3,
+        'n_estimators': 1000,
+        'max_depth': 7,
         'learning_rate': 0.01,
+        'max_leaves': 30,
 
-        'subsample': 0.7,
-        'colsample_bytree': 0.8,
+        'subsample': 0.6,
+        'colsample_bytree': 0.6,
+        'subsample_freq': 1,
 
-        'min_child_weight': 10,    # 叶节点最小样本权重，防止小样本过拟合
+        'min_child_weight': 100,
         'gamma': 0.1,              # 最小分裂损失，剪掉无意义的分裂
-        'reg_alpha': 0.1,          # L1 正则
-        'reg_lambda': 1.0,         # L2 正则
+        'reg_alpha': 3.0,          # L1 正则
+        'reg_lambda': 7.0,         # L2 正则
 
         # Ranking 专属配置
         'objective': 'rank:ndcg',
-        'eval_metric': 'ndcg@5',
-        'label_gain': [i**2 for i in range(8)],
+        'eval_metric': 'auc',
+        'ndcg_exp_gain': False,  
+        'lambdarank_num_pair_per_sample': 200,
+        'lambdarank_pair_method':'mean',
 
-        'n_jobs': 15,
+        'n_jobs': -1,  # 使用所有CPU核心
         'early_stopping_rounds': 100,
         'verbosity': 0,
     }
@@ -102,7 +108,7 @@ class ModelConfig:
         - LightGBM 以 label_gain 长度为准（决定 lambdarank 的增益曲线）。
         - XGBoost 复用相同档位数，保证两者离散标签的语义一致。
         """
-        return len(cls.LIGHTGBM_PARAMS.get('label_gain', list(range(10))))
+        return n_bins
 
 
 # ============================================================================
@@ -117,17 +123,15 @@ class TrainingConfig:
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
     YEARS                = baostock_config.HISTORY_YEARS
-    YEARS_FOR_TRAINING   = 6         # 训练数据年数
-    YEARS_FOR_BACKTEST   = 1         # 回测数据年数
+    YEARS_FOR_TRAINING   = 16         # 训练数据年数
+    YEARS_FOR_BACKTEST   = 3         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
     SHORT_PREDICTION     = False
-    FUTURE_DAYS          = 5 if SHORT_PREDICTION else 20         # 预测未来 N 个交易日
+    FUTURE_DAYS          = 5 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
 
 
     # ── 数据集划分 ─────────────────────────────────────────────────────────
-    TRAIN_TEST_SPLIT     = 0.8       # 训练集占比
-    # —— 抽样评估比例 ───────────────────────────────────────────────────────
-    SAMPLE_EVAL          = 0.2
+    TRAIN_TEST_SPLIT     = 0.7       # 训练集占比
 
     # ── 因子与基本面 ───────────────────────────────────────────────────────
     INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
@@ -135,8 +139,8 @@ class TrainingConfig:
 
     # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
     UPSIDE_WEIGHT        = 1.0       
-    DOWNSIDE_WEIGHT      = 1.0       
-    FINAL_RETURN_WEIGHT  = 2.0       
+    DOWNSIDE_WEIGHT      = 2.0       
+    FINAL_RETURN_WEIGHT  = 1.0       
 
     # ── 入场日动能乘数 (intraday_intensity × relative_intensity) ──────────
     # momentum_mult = clip(BASE + SCALE * clip(intensity * rel_intensity, 0, 4), 0.5, 2.0)
@@ -170,7 +174,7 @@ class TrainingConfig:
     # ── 基础设施与计算性能 (Infrastructure) ────────────────────────────────
     USE_GPU              = True          # 是否启用 GPU 加速（XGBoost/LightGBM）
     MEMORY_EFFICIENT     = True          # 是否启用分批训练/流式加载
-    GPU_BATCH_SIZE       = 1_000_000     # GPU 批次大小
+    GPU_BATCH_SIZE       = 1_000     # GPU 批次大小
 
     # ── 因子归一化 (Feature Normalization) ────────────────────────────────
     # 在进行横截面排名时，跳过这些特定类型的因子

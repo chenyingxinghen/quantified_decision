@@ -61,6 +61,12 @@ def _bs_query(method_name: str, **kwargs) -> Any:
                 
                 if "接收数据异常" in last_error or "网络接收错误" in last_error or "10001001" in last_error:
                     print(f"  ⚠ {method_name} 第 {attempt+1} 次失败: {last_error}，正在重试...")
+                    try:
+                        from .baostock_fetcher import BaostockFetcher
+                        BaostockFetcher._bs_login()
+                    except Exception:
+                        pass
+                    time.sleep(2 ** attempt)
                     continue
                 else:
                     print(f"✗ {method_name} 失败: {last_error}")
@@ -72,6 +78,15 @@ def _bs_query(method_name: str, **kwargs) -> Any:
         except Exception as e:
             last_error = str(e)
             print(f"  ⚠ {method_name} 第 {attempt+1} 次异常: {last_error}")
+            # WinError 10057 / 10054 等 socket 断连错误，需要重新登录后再重试
+            socket_errors = ("10057", "10054", "10053", "套接字", "socket", "WinError")
+            if any(kw in last_error for kw in socket_errors):
+                try:
+                    from .baostock_fetcher import BaostockFetcher
+                    print(f"  [PID {os.getpid()}] ⚠ 检测到 socket 断连，正在重新登录...")
+                    BaostockFetcher._bs_login()
+                except Exception as login_err:
+                    print(f"  ⚠ 重新登录失败: {login_err}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
             continue

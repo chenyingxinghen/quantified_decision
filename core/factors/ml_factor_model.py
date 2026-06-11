@@ -32,14 +32,23 @@ from config.factor_config import TrainingConfig, ModelConfig
 class MLFactorModel:
     """机器学习因子模型"""
     
-    def __init__(self, model_type: str = 'xgboost', task: str = 'classification'):
+    def __init__(self, model_type: str = 'xgboost', task: str = None):
         self.model_type = model_type
         
-        # 任务类型映射：LGBM 和 XGBoost 现在均统一使用 ranking 任务
-        if self.model_type in ['lightgbm', 'xgboost']:
-            self.task = 'ranking'
-        else:
+        if task is None:
+            task = getattr(TrainingConfig, 'TASK', 'ranking')
+        
+        # 处理 hybrid 任务：拆解为具体模型对应的底层任务
+        if task == 'hybrid':
+            if self.model_type == 'lightgbm':
+                self.task = 'ranking'
+            else:
+                self.task = 'regression'
+        elif task in ['ranking', 'regression']:
             self.task = task
+        else:
+            print(f"警告: 任务类型 '{task}' 无效，默认使用 'ranking'")
+            self.task = 'ranking'
             
         self.model = None
         self.feature_names = []
@@ -83,12 +92,16 @@ class MLFactorModel:
         # early_stopping_rounds 由训练器（xgb.train 或 fit）管理，不传入构造器
         self.early_stopping_rounds = model_params.pop('early_stopping_rounds', None)
 
+        if model_params.get('objective') == 'regression':
+            model_params.pop('ndcg_exp_gain', None)
+            model_params.pop('lambdarank_num_pair_per_sample', None)
+            model_params.pop('lambdarank_pair_method', None)
+            model_params.pop('ndcg_exp_gain', None)
+
         def _build_xgb(params: dict):
-            if self.task == 'ranking':
+            if model_params.get('objective') == 'rank:ndcg':
                 return xgb.XGBRanker(**params)
-            elif self.task == 'regression':
-                if 'objective' not in params:
-                    params['objective'] = 'reg:logistic'
+            elif model_params.get('objective') == 'reg:squarederror':
                 return xgb.XGBRegressor(**params)
             else:
                 return xgb.XGBClassifier(**params)
@@ -119,10 +132,14 @@ class MLFactorModel:
         # eval_at：用于 fit 时指定 ndcg 的截断位置
         self.eval_at = model_params.pop('eval_at', [10])
 
+        if model_params.get('objective') == 'regression':
+            model_params.pop('label_gain', None)
+            model_params.pop('lambdarank_truncation_level', None)
+
         def _build_lgb(params: dict):
-            if self.task == 'ranking':
+            if model_params.get('objective') == 'lambdarank':
                 return lgb.LGBMRanker(**params)
-            elif self.task == 'regression':
+            elif model_params.get('objective') == 'regression':
                 return lgb.LGBMRegressor(**params)
             else:
                 return lgb.LGBMClassifier(**params)
@@ -282,8 +299,17 @@ class MLFactorModel:
             xgb_params.pop('n_estimators', None)
             xgb_params.pop('early_stopping_rounds', None)
 
+            # 回归模式：清除 ranking 专属参数，设置回归目标与评估指标
+            if self.task == 'regression':
+                xgb_params.pop('ndcg_exp_gain', None)
+                xgb_params.pop('lambdarank_num_pair_per_sample', None)
+                xgb_params.pop('lambdarank_pair_method', None)
+
+            # ranking 模式不传 weight（由 group 承担），回归/分类模式传入样本权重
+            _w_for_dtrain = None if self.task == 'ranking' else w_train
+
             dtrain = xgb.QuantileDMatrix(
-                X_train_raw, label=y_train, weight=w_train if self.task != 'ranking' else None ,
+                X_train_raw, label=y_train, weight=_w_for_dtrain,
                 feature_names=self.feature_names,
             )
             if self.task == 'ranking' and group_train is not None:
@@ -344,6 +370,7 @@ class MLFactorModel:
             del dtrain, dval
             X_train = X_train_raw  # 仅用于后续评估
             X_val = X_val_raw
+
 
 
         # ---------------------------------------------------------------------

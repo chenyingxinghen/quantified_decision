@@ -16,7 +16,7 @@ from config.factor_config import *
 
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
-ML_FACTOR_MODEL_PATH = 'models/latest/lightgbm_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_MODEL_PATH = 'models/mark/xl_15d_16y_5472s_GF_hy_0601_2228/xgboost_factor_model.pkl'  # 默认模型路径
 
 
 
@@ -34,9 +34,9 @@ INITIAL_CAPITAL = 1.0          # 初始资金
 MAX_POSITIONS = 1               
 
 # ATR相关参数（用于止损止盈计算）
-ATR_PERIOD = 14                     # ATR计算周期
+ATR_PERIOD = 28                     # ATR计算周期
 ATR_STOP_MULTIPLIER = 1.0   if TrainingConfig.SHORT_PREDICTION else 3           # ATR止损倍数 (放宽，减少噪音震出)
-ATR_TARGET_MULTIPLIER = 3 if TrainingConfig.SHORT_PREDICTION else 10           # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
+ATR_TARGET_MULTIPLIER = 3 if TrainingConfig.SHORT_PREDICTION else 9           # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
 
 # 时间止损参数
 TIME_STOP_DAYS = TrainingConfig.FUTURE_DAYS                 # 与FUTURE_DAYS对齐：持满预测周期再评估
@@ -73,5 +73,5 @@ MAX_PE = None
 MAX_ZCFZL = None
 MIN_PRICE = 1
 MAX_PRICE = 20
-INCLUDE_ST = True
+INCLUDE_ST = False
 SELECTOR_MARKETS = ['sh_main', 'sz_main']

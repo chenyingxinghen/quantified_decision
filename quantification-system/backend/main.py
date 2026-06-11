@@ -31,7 +31,7 @@ except ImportError:
     pass
 
 # 创建日志目录
-log_dir = os.path.join(PROJECT_ROOT, 'logs')
+log_dir = os.path.join(PROJECT_ROOT, 'quantification-system','backend')
 os.makedirs(log_dir, exist_ok=True)
 
 # 配置日志格式和处理器
@@ -42,7 +42,7 @@ log_formatter = logging.Formatter(
 
 # 创建文件处理器，使用RotatingFileHandler避免日志文件过大
 file_handler = RotatingFileHandler(
-    os.path.join(log_dir, 'api_server.log'),
+    os.path.join(log_dir, 'server.log'),
     maxBytes=10*1024*1024,  # 10MB
     backupCount=5,
     encoding='utf-8'

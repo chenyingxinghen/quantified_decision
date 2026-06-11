@@ -82,7 +82,7 @@ def start_scheduler():
     # Schedule to run from Monday to Friday at 19:00
     # 市场在周末及节假日通常不更新，这里只针对工作日设定单次触发
     trigger = CronTrigger(day_of_week="mon-fri", hour=18, minute=30, timezone="Asia/Shanghai")
-    scheduler.add_job(daily_data_update_job, trigger, id="daily_data_update", replace_existing=True)
+    scheduler.add_job(daily_data_update_job, trigger, id="daily_data_update", replace_existing=True, misfire_grace_time=3600)
     scheduler.start()
     logger.info("APScheduler started: Daily data update scheduled for Mon-Fri at 18:30.")
 

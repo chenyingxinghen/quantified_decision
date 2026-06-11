@@ -16,64 +16,62 @@ from config import baostock_config
 # 1. 模型超参数配置
 # ============================================================================
 
-n_bins=10
-lgb_label_gain = [ i for i in range(n_bins)]
 class ModelConfig:
     """模型超参数配置"""
 
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
-        'n_estimators': 1000,
+        'n_estimators': 500,
         'max_depth': 6,
-        'num_leaves': 25,          
+        'num_leaves': 36,          
         'learning_rate': 0.01,    
 
-        'min_child_weight': 100,
-        'min_gain_to_split': 0.1, # 最小分裂增益，剪掉无意义的分裂
-        'reg_alpha': 0.0,          # L1 正则，促进稀疏性
-        'reg_lambda': 7.0,         # L2 正则，平滑权重
+        'min_child_weight': 280,
+        'min_gain_to_split': 5, # 最小分裂增益，剪掉无意义的分裂
+        'reg_alpha': 3.0,          # L1 正则，促进稀疏性
+        'reg_lambda': 3.0,         # L2 正则，平滑权重
 
-        'subsample': 0.6,
-        'colsample_bytree': 0.6,
+        'subsample': 0.5,
+        'colsample_bytree': 0.8,
         'subsample_freq': 1,
 
         # Ranking 专属配置
         'objective': 'lambdarank',
-        'metric': 'auc',
-        'eval_at': [10,5],
-        'lambdarank_truncation_level': 3000,
-        'label_gain': lgb_label_gain,
+        'metric': 'ndcg',
+        'eval_at': [5],
+        'lambdarank_truncation_level': 20,
+        'label_gain': [i//3*i**1.5 if i>2 else i for i in range(15)],
 
-        'early_stopping_rounds': 100,
+        'early_stopping_rounds': 0,
         'n_jobs': -1,  # 使用所有CPU核心
         'verbosity': -1,
     }
 
 
     XGBOOST_PARAMS: Dict[str, Any] = {
-        'n_estimators': 1000,
-        'max_depth': 7,
-        'learning_rate': 0.01,
+        'n_estimators': 400,
+        'max_depth': 8,
+        'learning_rate': 0.02,
         'max_leaves': 30,
 
-        'subsample': 0.6,
-        'colsample_bytree': 0.6,
+        'subsample': 0.4,
+        'colsample_bytree': 0.5,
         'subsample_freq': 1,
 
-        'min_child_weight': 100,
-        'gamma': 0.1,              # 最小分裂损失，剪掉无意义的分裂
-        'reg_alpha': 3.0,          # L1 正则
-        'reg_lambda': 7.0,         # L2 正则
+        'min_child_weight': 50,
+        'gamma': 2.01,              # 最小分裂损失，剪掉无意义的分裂
+        'reg_alpha': 1.0,          # L1 正则
+        'reg_lambda': 1.0,         # L2 正则
 
         # Ranking 专属配置
-        'objective': 'rank:ndcg',
-        'eval_metric': 'auc',
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
         'ndcg_exp_gain': False,  
         'lambdarank_num_pair_per_sample': 200,
         'lambdarank_pair_method':'mean',
 
         'n_jobs': -1,  # 使用所有CPU核心
-        'early_stopping_rounds': 100,
+        'early_stopping_rounds': 50,
         'verbosity': 0,
     }
 
@@ -88,13 +86,34 @@ class ModelConfig:
 
     # ── 统一接口 ──────────────────────────────────────────────────────────
     @classmethod
-    def get_model_params(cls, model_type: str) -> Dict[str, Any]:
-        """获取指定模型的超参数（XGBoost 自动叠加 GPU 配置）"""
+    def get_model_params(cls, model_type: str, task: str = None) -> Dict[str, Any]:
+        """获取指定模型的超参数，根据任务类型动态设置目标"""
+        if task is None:
+            task = TrainingConfig.TASK
+        
         params_map = {
-            'xgboost': cls.XGBOOST_PARAMS,
-            'lightgbm': cls.LIGHTGBM_PARAMS,
+            'xgboost': cls.XGBOOST_PARAMS.copy(),
+            'lightgbm': cls.LIGHTGBM_PARAMS.copy(),
         }
-        params = params_map.get(model_type, {}).copy()
+        params = params_map.get(model_type, {})
+        
+        # 根据任务类型设置目标
+        if task == 'hybrid':
+            if model_type == 'xgboost':
+                params['objective'] = 'reg:logistic'
+            elif model_type == 'lightgbm':
+                params['objective'] = 'lambdarank'
+        elif task == 'ranking':
+            if model_type == 'xgboost':
+                params['objective'] = 'rank:ndcg'
+            elif model_type == 'lightgbm':
+                params['objective'] = 'lambdarank'
+        elif task == 'regression':
+            if model_type == 'xgboost':
+                params['objective'] = 'reg:squarederror'
+            elif model_type == 'lightgbm':
+                params['objective'] = 'regression'
+        
         if model_type == 'xgboost':
             params.update(cls.GPU_PARAMS_XGB)
         return params
@@ -120,6 +139,7 @@ class TrainingConfig:
 
     # ── 模型 ──────────────────────────────────────────────────────────────
     MODEL_TYPES          = ['lightgbm', 'xgboost']
+    TASK                 = 'hybrid' 
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
     YEARS                = baostock_config.HISTORY_YEARS
@@ -131,13 +151,16 @@ class TrainingConfig:
 
 
     # ── 数据集划分 ─────────────────────────────────────────────────────────
-    TRAIN_TEST_SPLIT     = 0.7       # 训练集占比
+    TRAIN_TEST_SPLIT     = 0.8       # 训练集占比
 
     # ── 因子与基本面 ───────────────────────────────────────────────────────
     INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
     INCLUDE_CANDLE_PATTERN = False
 
     # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
+    LABEL_WEIGHTED_FOR_REGRESSION= True
+    LABEL_WEIGHT_EXPONENT=2
+    
     UPSIDE_WEIGHT        = 1.0       
     DOWNSIDE_WEIGHT      = 2.0       
     FINAL_RETURN_WEIGHT  = 1.0       
@@ -157,7 +180,7 @@ class TrainingConfig:
     PATH_PENALTY         = 0.10      # 先跌后涨路径惩罚幅度（-10%）
     
 
-    WEIGHT_EXPONENT      = 1.5       # 适度头部加权，让模型更关注真正的强势股信号
+    WEIGHT_EXPONENT      = 2         # 适度头部加权，让模型更关注真正的强势股信号
     USE_SAMPLE_WEIGHT    = False      # 开启样本加权，引导模型关注高质量预测目标
 
     # ST 股票处理
@@ -165,7 +188,7 @@ class TrainingConfig:
     ST_WEIGHT_FACTOR     = 0.1       # ST 样本权重降低因子
     
     # 退市预警处理
-    DELIST_PENALTY_DAYS  = 30      
+    DELIST_PENALTY_DAYS  = 60      
     DELIST_PENALTY_SCORE = -100      # 退市样本直接给最低分
     UNBUYABLE_HANDLING   = 'punish'  
     
@@ -174,7 +197,7 @@ class TrainingConfig:
     # ── 基础设施与计算性能 (Infrastructure) ────────────────────────────────
     USE_GPU              = True          # 是否启用 GPU 加速（XGBoost/LightGBM）
     MEMORY_EFFICIENT     = True          # 是否启用分批训练/流式加载
-    GPU_BATCH_SIZE       = 1_000     # GPU 批次大小
+    GPU_BATCH_SIZE       = 2_000_000     # GPU 批次大小
 
     # ── 因子归一化 (Feature Normalization) ────────────────────────────────
     # 在进行横截面排名时，跳过这些特定类型的因子
@@ -280,7 +303,7 @@ class FactorConfig:
     MTM_PERIOD = 10
     CMO_PERIOD = 21
     STOCHRSI_PERIOD = 20
-    RVI_PERIOD = 14            # 相对活力指数（14 比 7 更稳定，避免短窗口内全 NaN 导致零方差）
+    RVI_PERIOD = 14           
 
     # ========== 趋势因子参数 ==========
     MACD_FAST = 20

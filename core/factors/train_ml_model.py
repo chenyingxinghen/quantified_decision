@@ -76,7 +76,7 @@ def _cache_worker(args):
         # 直接构造一个最小化的 trainer-like 对象
         trainer = MLModelTrainer.__new__(MLModelTrainer)
         trainer.db_path = db_path
-        trainer.task = 'hybrid'
+        trainer.task = TrainingConfig.TASK
         trainer.punish_unbuyable = False
         trainer.factors_cache_dir = factors_cache_dir
         trainer.models = {}
@@ -187,7 +187,7 @@ class MLModelTrainer:
             punish_unbuyable: 保留参数，用于归档目录命名（实际处理逻辑由 UNBUYABLE_HANDLING 控制）
         """
         self.db_path = db_path
-        self.task = 'hybrid'
+        self.task = TrainingConfig.TASK
         self.punish_unbuyable = punish_unbuyable
         self.factor_calculator = ComprehensiveFactorCalculator(db_path)
         self.models = {}
@@ -633,15 +633,13 @@ class MLModelTrainer:
         # ── 2. 波动率调整：ATR 越大爆发力越强 ────────────────────────────
         vol_booster = 1.0 + (rel_atr * 10.0)
 
-        # ── 3. 入场日动能乘数 (intraday_intensity × relative_intensity) ──
-        #   intraday_intensity = 当日振幅 / ATR，反映绝对爆发力
-        #   relative_intensity = 当日振幅/ATR 相对近5日均值，反映相对活跃度
-        #   两者乘积 > 1 表示当日动能高于近期均值，给予正向加权
-        #   clip 到 [0.5, 2.0]，避免极端值主导得分
 
-
-        # ── 6. 合并所有调制因子 ───────────────────────────────────────────
         if TrainingConfig.SHORT_PREDICTION:
+            # ── 3. 入场日动能乘数 (intraday_intensity × relative_intensity) ──
+            #   intraday_intensity = 当日振幅 / ATR，反映绝对爆发力
+            #   relative_intensity = 当日振幅/ATR 相对近5日均值，反映相对活跃度
+            #   两者乘积 > 1 表示当日动能高于近期均值，给予正向加权
+            #   clip 到 [0.5, 2.0]，避免极端值主导得分
             momentum_mult = np.clip(
                 getattr(TrainingConfig, 'MOMENTUM_MULT_BASE', 0.5) +
                 getattr(TrainingConfig, 'MOMENTUM_MULT_SCALE', 0.5) *
@@ -679,7 +677,24 @@ class MLModelTrainer:
             )
             final_score = base_score * vol_booster * momentum_mult * volume_mult * path_mult
         else:
-            final_score = base_score * vol_booster
+            # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
+            #   f_high_idx：持仓期内最高点出现在第几天（0-based）
+            #   f_low_idx ：持仓期内最低点出现在第几天（0-based）
+            #   先涨后跌（high_idx < low_idx）：路径友好，给予奖励
+            #   先跌后涨（low_idx < high_idx）：路径不友好，给予惩罚
+            #   两者相等或含 NaN 时保持中性（1.0）
+            high_idx = np.asarray(f_high_idx, dtype=np.float64)
+            low_idx  = np.asarray(f_low_idx,  dtype=np.float64)
+            path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)  # 先涨后跌奖励幅度
+            path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10) # 先跌后涨惩罚幅度
+            path_mult = np.where(
+                np.isnan(high_idx) | np.isnan(low_idx),
+                1.0,
+                np.where(high_idx < low_idx, 1.0 + path_bonus,   # 先涨后跌：路径优质
+                np.where(low_idx  < high_idx, 1.0 - path_penalty, # 先跌后涨：路径劣质
+                1.0))                                              # 同天：中性
+            )
+            final_score = base_score * vol_booster*path_mult
         return final_score
 
     def _extract_stock_components(self, code: str, data: pd.DataFrame, 
@@ -887,7 +902,7 @@ class MLModelTrainer:
         # 重要性权重计算 (使用标准化最高收益率作为权重参考)
         # 使用 f_high_max_norm（已除以涨跌停阈值）而非原始收益率，
         # 消除板块间的权重偏差（创业板20%限制 vs 主板10%限制）
-        w_sig = f_high_max_norm.astype(np.float32)
+        w_sig = f_returns_norm.astype(np.float32)
         
         return y_final, raw_scores, f_returns_raw, w_sig
                     
@@ -1134,9 +1149,9 @@ class MLModelTrainer:
                 limit_groups_arr = limit_groups_arr[keep_mask]
                 is_st_arr        = is_st_arr[keep_mask]
                 w_sig_arr        = w_sig_arr[keep_mask]
-            else:
-                print(f"  - 施加不可买入惩罚: 将 {penalty_count} 个涨停/停牌标的的权重强制设为 0.2")
-                w_sig_arr[unbuyable_arr] = 0.2
+                raw_scores_arr   = raw_scores_arr[keep_mask]
+                unbuyable_arr    = unbuyable_arr[keep_mask]
+
 
         # 日期分组信息（仅计算一次，供后续归一化和 group 划分共用）
         _, date_group_start, date_group_counts = np.unique(dates_arr, return_index=True, return_counts=True)
@@ -1263,10 +1278,14 @@ class MLModelTrainer:
                     model_types: List[str] = TrainingConfig.MODEL_TYPES,
                     path_scores: np.ndarray = None,
                     is_st_arr: np.ndarray = None,
-                    w_sig_arr: np.ndarray = None) -> Dict:
+                    w_sig_arr: np.ndarray = None,
+                    task: str = None) -> Dict:
         """
         训练多个模型
         """
+        if task is None:
+            task = getattr(TrainingConfig, 'TASK', 'ranking')
+
         # 数据验证和清理
         print("\n数据验证...")
         
@@ -1381,14 +1400,14 @@ class MLModelTrainer:
                 if _dc > 1:
                     # 获取当前截面的原始分数
                     scores = _scores_sub[_ds:_de]
-                    
-                    # 1. 连续标签：排名归一化到 0-1 (所有样本参与排名)
                     ranks = _fast_rankdata_1d(scores) / (_dc + 1)
-                    _y_sub[_ds:_de] = ranks.astype(np.float32)       
-                                 
+                    if TrainingConfig.LABEL_WEIGHTED_FOR_REGRESSION:
+                        _y_sub[_ds:_de] = np.power(ranks.astype(np.float32), TrainingConfig.LABEL_WEIGHT_EXPONENT)
+                    else:
+                        _y_sub[_ds:_de] = ranks
                     try:
                         # 需要 _n_bins+1 个边界点才能产生 _n_bins 个 bin
-                        bin_0_watershed = 0.2
+                        bin_0_watershed = 0.1
                         q_skewed = np.concatenate([
                             [0.0, bin_0_watershed],
                             np.linspace(bin_0_watershed, 1.0, _n_bins - 1)
@@ -1410,15 +1429,7 @@ class MLModelTrainer:
         unique_train, counts_train = np.unique(y_train_discrete, return_counts=True)
         for bin_id, count in zip(unique_train, counts_train):
             print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_train_discrete)*100:>5.2f}%)")
-        print(f"  验证集离散标签分布:")
-        unique_val, counts_val = np.unique(y_val_discrete, return_counts=True)
-        for bin_id, count in zip(unique_val, counts_val):
-            print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_val_discrete)*100:>5.2f}%)")
         print(f"  原始分数统计 (训练集): min={_label_source[:split_idx].min():.4f}, max={_label_source[:split_idx].max():.4f}, std={_label_source[:split_idx].std():.4f}")
-        # print(f"  原始分数统计 (验证集): min={_label_source[val_start_idx:].min():.4f}, max={_label_source[val_start_idx:].max():.4f}, std={_label_source[val_start_idx:].std():.4f}")
-
-        
-        print(f"  [标签] 已在 train/val 分割后分别重新做横截面排名归一化，消除标签泄漏")
         
 
         # 1. 初始化基础权重
@@ -1440,10 +1451,6 @@ class MLModelTrainer:
             w_sig_processed_val = np.empty_like(w_sig_val)
             
             # 使用相同的每日循环进行权重排名和离散化
-            # 逻辑：权重 = 组内未来收益率的分位点 (0-1) -> 映射为离散等级 (如 1-5)
-            # 这样保证了：
-            # 1. 免疫极端大涨/大跌个股的过拟合 (只看排名)
-            # 2. 与 lambdarank 的 top-K 优化目标天然匹配 (Top 样本权重更高)
             for _dates_sub, _w_raw, _w_processed in [
                 (dates_train, w_sig_train, w_sig_processed_train),
                 (dates_val, w_sig_val, w_sig_processed_val)
@@ -1452,20 +1459,18 @@ class MLModelTrainer:
                 for _ds, _dc in zip(_d_starts, _d_counts):
                     _de = _ds + _dc
                     if _dc > 1:
-                        # 计算组内分位排名 (0 到 1)
-                        # 注意：此处 w_raw 为原始收益率，值越大排名越靠前
-                        w_ranks = _fast_rankdata_1d(_w_raw[_ds:_de]) / (_dc + 1)
-                        
-                        # 映射公式: 指数型头部权重 (Exponential Head Weighting)
-                        # 让排名越靠前的样本权重呈指数级暴增，而非之前的线性增长
-                        w_exp = getattr(TrainingConfig, 'WEIGHT_EXPONENT', 3.0)
-                        
-                        # 方案一：指数法 (e的几次幂)。如果 w_power=3，头部权重约等于尾部的 20 倍 (e^3 vs e^0)
-                        _w_processed[_ds:_de] = np.exp(w_ranks * w_exp)
+                        w_norm = np.abs(_w_raw[_ds:_de]) / np.abs(_w_raw[_ds:_de]).mean()
+                        w_exp = getattr(TrainingConfig, 'WEIGHT_EXPONENT', 2.0)
+                        _w_processed[_ds:_de] = np.power(w_norm , w_exp).clip(0.0, 5.0)
                     else:
                         # 单样本日期：使用中性权重，无法计算组内排名
                         _w_processed[_ds:_de] = 1.0
             
+            # 叠加不可买入样本的惩罚（如果在配置中设置了 punish）
+            if unbuyable_mask is not None and getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'remove') == 'punish':
+                unbuyable_train = unbuyable_mask[:split_idx]
+                w_sig_processed_train = np.where(unbuyable_train, 0.2, w_sig_processed_train)
+                
             # 更新训练集权重 (仅训练集需要权重)
             sample_weight_train *= w_sig_processed_train
 
@@ -1498,7 +1503,7 @@ class MLModelTrainer:
             print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
             # 使用相关性过滤
             X_train, factor_names = self._select_features(
-                X_train, factor_names, 0.9
+                X_train, factor_names, 0.8
             )
             # 保存特征选择结果到缓存
             try:
@@ -1530,16 +1535,16 @@ class MLModelTrainer:
 
         results = {}
         for model_type in model_types:
-            print(f"\n训练 {model_type.upper()} 模型 (ranking)")
+            print(f"\n训练 {model_type.upper()} 模型 ({task})")
             try:
-                model = MLFactorModel(model_type=model_type, task='ranking')
+                model = MLFactorModel(model_type=model_type, task=task)
 
                 # ── Early Stopping 验证集策略 ──────────────────────────────────
                 # 直接使用外部纯净验证集（阻隔期后）做 early stopping，
                 # 避免内部切分验证集时间分布与外部验证集不一致导致的过早停止。
                 # 外部验证集时间更靠后，与真实推理场景一致，early stopping 更可靠。
                 _, es_val_group = np.unique(dates_val, return_counts=True)
-                if model_type == 'lightgbm':
+                if model.task == 'ranking':
                     train_result = model.train(
                         X_train, y_train_discrete,
                         validation_split=0.2,
@@ -1549,15 +1554,15 @@ class MLModelTrainer:
                         returns=returns_train,
                         split_idx=len(X_train),
                         X_val_external=X_val,
-                        y_val_external=y_val_discrete,   # 长度已是 len(dates_val)，无需切片
+                        y_val_external=y_val_discrete,
                         dates_val_external=dates_val,
                         dates=dates_train,
                         group=train_group,
                         eval_group=es_val_group,
                     )
-                elif model_type == 'xgboost':
+                else:
                     train_result = model.train(
-                        X_train, y_train_discrete,
+                        X_train, y_train,
                         validation_split=0.2,
                         use_time_series_split=True,
                         feature_names=factor_names,
@@ -1565,18 +1570,16 @@ class MLModelTrainer:
                         returns=returns_train,
                         split_idx=len(X_train),
                         X_val_external=X_val,
-                        y_val_external=y_val_discrete,   # 长度已是 len(dates_val)，无需切片
+                        y_val_external=y_val,
                         dates_val_external=dates_val,
                         dates=dates_train,
-                        group=train_group,
-                        eval_group=es_val_group,
-                    )                
+                    )
                 # 训练集评估（采样，用于与验证集对比学习效果）
-                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.1)
+                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.05)
                 train_result['train_metrics'] = train_eval
 
                 # 在验证集（阻隔期后）上做最终评估
-                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.2)
+                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.3)
                 train_result['val_metrics'] = val_eval
                 
                 self.models[model_type] = model
@@ -1832,11 +1835,43 @@ class MLModelTrainer:
             return None
 
         forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
-        data_volume  = f"{years}y_{stocks}s"
         timestamp    = datetime.now().strftime('%m%d_%H%M')
-
-        # 归档目录名示例：train_hybrid_7d_6y_6000s_0429_1530
-        archive_name = f"train_{self.task}_{forward_days}d_{data_volume}_{timestamp}"
+        
+        # 获取训练配置的重要特征
+        model_types = list(self.models.keys())
+        model_type_str = '_'.join(sorted(model_types)) if len(model_types) <= 2 else 'multi'
+        
+        # 构建简洁明了的文件夹名称
+        # 格式: {模型类型缩写}_{预测天数}d_{训练年数}y_{股票数}s_{配置标志}_{时间}
+        # 模型类型缩写: xg=xgboost, lgb=lightgbm, xl=双模型
+        if len(model_types) == 2 and 'xgboost' in model_types and 'lightgbm' in model_types:
+            model_abbr = 'xl'
+        elif 'xgboost' in model_types:
+            model_abbr = 'xg'
+        elif 'lightgbm' in model_types:
+            model_abbr = 'lgb'
+        else:
+            model_abbr = model_type_str[:3]
+        
+        # 配置标志: 使用单个字符表示重要配置
+        # G=GPU, W=加权, F=基本面, C=K线形态
+        config_flags = []
+        if getattr(TrainingConfig, 'USE_GPU', False):
+            config_flags.append('G')
+        if getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', False):
+            config_flags.append('W')
+        if getattr(TrainingConfig, 'INCLUDE_FUNDAMENTALS', True):
+            config_flags.append('F')
+        if getattr(TrainingConfig, 'INCLUDE_CANDLE_PATTERN', False):
+            config_flags.append('C')
+        
+        config_str = ''.join(config_flags) if config_flags else 'N'
+        
+        # 任务类型缩写
+        task_abbr = self.task[:2] if len(self.task) > 2 else self.task
+        
+        # 构建文件夹名称 (更简洁的格式)
+        archive_name = f"{model_abbr}_{forward_days}d_{years}y_{stocks}s_{config_str}_{task_abbr}_{timestamp}"
         archive_dir  = os.path.join(save_dir, archive_name)
         os.makedirs(archive_dir, exist_ok=True)
         
@@ -1852,6 +1887,9 @@ class MLModelTrainer:
             with open(norm_path, 'wb') as f:
                 _pickle.dump(norm_stats, f)
             print(f"  [OK] 归一化统计量已保存: norm_stats.pkl")
+        
+        # 保存训练配置信息
+        self._save_training_config(archive_dir, years, stocks, forward_days)
             
         # 8. 同时更新一个 "latest" 目录，方便自动调用
         latest_dir = os.path.join(save_dir, 'latest')
@@ -1866,6 +1904,69 @@ class MLModelTrainer:
             print(f"  [Error] 同步最新目录失败: {e}")
             
         return archive_dir
+    
+    def _save_training_config(self, save_dir: str, years: int, stocks: int, forward_days: int):
+        """
+        保存训练配置信息到JSON文件
+        
+        参数:
+            save_dir: 保存目录
+            years: 训练数据年数
+            stocks: 训练股票数量
+            forward_days: 预测天数
+        """
+        import json
+        from config.factor_config import TrainingConfig, ModelConfig
+        
+        config_info = {
+            'training_info': {
+                'model_types': list(self.models.keys()),
+                'task': self.task,
+                'forward_days': forward_days,
+                'training_years': years,
+                'stock_count': stocks,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'folder_name': os.path.basename(save_dir)
+            },
+            'training_config': {
+                'use_gpu': getattr(TrainingConfig, 'USE_GPU', False),
+                'use_sample_weight': getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', False),
+                'include_fundamentals': getattr(TrainingConfig, 'INCLUDE_FUNDAMENTALS', True),
+                'include_candle_pattern': getattr(TrainingConfig, 'INCLUDE_CANDLE_PATTERN', False),
+                'filter_by_strategy': getattr(TrainingConfig, 'FILTER_BY_STRATEGY', False),
+                'memory_efficient': getattr(TrainingConfig, 'MEMORY_EFFICIENT', True),
+                'short_prediction': getattr(TrainingConfig, 'SHORT_PREDICTION', False),
+                'train_test_split': getattr(TrainingConfig, 'TRAIN_TEST_SPLIT', 0.7),
+                'unbuyable_handling': getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'punish'),
+                'weight_exponent': getattr(TrainingConfig, 'WEIGHT_EXPONENT', 1.5)
+            },
+            'model_config': {
+                'n_bins': ModelConfig.get_n_bins(),
+                'xgboost_params': {
+                    'n_estimators': ModelConfig.XGBOOST_PARAMS.get('n_estimators'),
+                    'max_depth': ModelConfig.XGBOOST_PARAMS.get('max_depth'),
+                    'learning_rate': ModelConfig.XGBOOST_PARAMS.get('learning_rate'),
+                    'objective': ModelConfig.XGBOOST_PARAMS.get('objective')
+                },
+                'lightgbm_params': {
+                    'n_estimators': ModelConfig.LIGHTGBM_PARAMS.get('n_estimators'),
+                    'max_depth': ModelConfig.LIGHTGBM_PARAMS.get('max_depth'),
+                    'num_leaves': ModelConfig.LIGHTGBM_PARAMS.get('num_leaves'),
+                    'learning_rate': ModelConfig.LIGHTGBM_PARAMS.get('learning_rate'),
+                    'objective': ModelConfig.LIGHTGBM_PARAMS.get('objective')
+                }
+            },
+            'performance_metrics': {
+                'model_count': len(self.models),
+                'trained_models': list(self.models.keys())
+            }
+        }
+        
+        config_path = os.path.join(save_dir, 'training_config.json')
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config_info, f, ensure_ascii=False, indent=2)
+        
+        print(f"  [OK] 训练配置已保存: training_config.json")
     
     def save_factor_summary(self, factor_names: List[str], save_dir: str = 'models'):
         """保存因子汇总信息（使用精确匹配，与审计报告逻辑一致）"""

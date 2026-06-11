@@ -51,8 +51,8 @@ FONT_NAME = _setup_chinese_font()
 
 def load_sample_stocks(n_stocks: int = 200, years: float = 3.0) -> dict:
     """从数据库随机抽取 n_stocks 只股票的行情数据"""
-    end_date = datetime.today().strftime('%Y-%m-%d')
-    start_date = (datetime.today() - timedelta(days=int(years * 365))).strftime('%Y-%m-%d')
+    end_date = (datetime.today() - timedelta(days=int(years * 365))).strftime('%Y-%m-%d')
+    start_date = (datetime.today() - timedelta(days=int(years*2 * 365))).strftime('%Y-%m-%d')
 
     conn = sqlite3.connect(DATABASE_PATH)
     db_dir = os.path.dirname(DATABASE_PATH)
@@ -532,7 +532,7 @@ def main():
         if dc > 1:
             try:
                 
-                nbin0_ws = 1/n_bins
+                nbin0_ws = 0.1
                 q_skewed = np.concatenate([
                     [0.0, nbin0_ws],
                     np.linspace(nbin0_ws, 1.0, n_bins)

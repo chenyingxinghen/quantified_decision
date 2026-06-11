@@ -111,15 +111,27 @@ def main():
     print("\n保存结果...")
     
     # 自动解析模型元数据以进行归档
-    # 预期路径格式: .../models/{weight_status}_{data_volume}/{model_type}_factor_model.pkl
+    # 新格式: .../models/{model_abbr}_{forward_days}d_{years}y_{stocks}s_{config_str}_{task_abbr}_{timestamp}/
+    # 旧格式: .../models/{weight_status}_{data_volume}/
     model_dir = os.path.dirname(model_path)
     model_name = os.path.basename(model_path)
     
-    # 解析归档目录名 (如 weighted_5y_5000s)
+    # 解析归档目录名
     archive_tag = os.path.basename(model_dir)
     if archive_tag == 'models': # 如果直接放在 models 下
         archive_tag = 'default'
-        
+    elif archive_tag == 'latest': # 如果是latest目录，需要找到实际的归档目录
+        # 尝试从latest目录中找到实际的模型目录
+        models_root = os.path.dirname(model_dir)
+        # 查找所有可能的归档目录
+        import glob
+        archive_dirs = [d for d in os.listdir(models_root) 
+                       if os.path.isdir(os.path.join(models_root, d)) and d != 'latest' and d != 'mark']
+        if archive_dirs:
+            # 按修改时间排序，取最新的
+            archive_dirs.sort(key=lambda d: os.path.getmtime(os.path.join(models_root, d)), reverse=True)
+            archive_tag = archive_dirs[0]
+    
     # 解析模型类别 (如 xgboost)
     model_category = model_name.split('_')[0]
     

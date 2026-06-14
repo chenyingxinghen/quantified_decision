@@ -236,7 +236,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { stockSelector } from '@/api'
 import { ElMessage } from 'element-plus'
-import * as echarts from 'echarts'
+import echarts from '@/utils/echarts'
 import { 
   ArrowLeft, Search, Loading, InfoFilled, 
   Histogram, TrendCharts, Wallet, Connection, 

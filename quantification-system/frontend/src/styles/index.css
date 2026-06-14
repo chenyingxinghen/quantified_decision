@@ -1,13 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap');
-
 :root {
-  /* Minimal Dark Theme */
   --bg-app: #000000;
   --bg-sidebar: #0a0a0a;
   --bg-panel: #0a0a0a;
   --bg-hover: #171717;
 
-  /* Refined Accents */
   --accent-blue: #3b82f6;
   --accent-blue-rgb: 59, 130, 246;
   --accent-green: #22c55e;
@@ -15,17 +11,15 @@
   --accent-yellow: #eab308;
   --accent-purple: #a855f7;
 
-  /* Typography */
   --text-primary: #f8fafc;
   --text-secondary: #a1a1aa;
   --text-muted: #52525b;
 
-  /* Borders & Shadows */
   --border-color: #27272a;
   --border-color-hover: #3f3f46;
 
-  --font-main: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-main: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace;
 
   --radius-xl: 16px;
   --radius-lg: 12px;

@@ -149,7 +149,7 @@ import { useRoute } from 'vue-router'
 import { analysis, stockSelector } from '../api'
 import { ElMessage } from 'element-plus'
 import { TrendCharts, Loading, Monitor, Histogram } from '@element-plus/icons-vue'
-import * as echarts from 'echarts'
+import echarts from '@/utils/echarts'
 
 const route = useRoute()
 const chartRef = ref(null)

@@ -63,6 +63,10 @@ root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
+# 防止第三方库刷屏
+logging.getLogger("numexpr.utils").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+
 from app.scheduler import start_scheduler, stop_scheduler
 
 from app.routers import stock_selector, paper_trading, analysis, config_center, auth, fundamentals, data_center

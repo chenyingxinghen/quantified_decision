@@ -1,123 +1,134 @@
 <template>
-  <div class="app-layout">
-    <!-- 移动端顶部状态栏 -->
-    <header class="mobile-header">
-      <div class="mobile-logo-wrap">
-        <el-icon :size="20" color="var(--accent-blue)"><TrendCharts /></el-icon>
-        <span class="mobile-logo-text">量化决策系统</span>
-      </div>
-      <div class="mobile-actions">
-        <el-button class="mobile-menu-btn" @click="mobileMenuVisible = true">
-          <el-icon><Menu /></el-icon>
-        </el-button>
-      </div>
-    </header>
-
-    <!-- 侧边栏 (桌面端) -->
-    <aside class="sidebar desktop-only">
-      <div class="sidebar-logo">
-        <el-icon :size="24" color="var(--accent-blue)"><TrendCharts /></el-icon>
-        <h1>量化决策系统</h1>
-      </div>
-      <nav class="sidebar-nav">
-        <router-link
-          v-for="route in navRoutes"
-          :key="route.path"
-          :to="route.path"
-          class="nav-item"
-          active-class="active"
-        >
-          <el-icon class="nav-icon"><component :is="route.meta.icon" /></el-icon>
-          <span>{{ route.meta.title }}</span>
-        </router-link>
-      </nav>
-      <div class="sidebar-footer">
-        <div v-if="!isLoggedIn" class="user-block login-btn" @click="showAuth = true">
-          <el-icon><User /></el-icon>
-          <span>未登录</span>
+  <el-config-provider :locale="locale">
+    <div class="app-layout">
+      <header class="mobile-header">
+        <div class="mobile-logo-wrap">
+          <el-icon :size="20" color="var(--accent-blue)"><TrendCharts /></el-icon>
+          <span class="mobile-logo-text">量化决策系统</span>
         </div>
-        <div v-else class="user-block logged-in" @click="handleLogout">
-          <el-icon><Avatar /></el-icon>
-          <span>{{ username }}</span>
-          <el-tooltip content="退出系统" placement="right">
-            <el-icon class="logout-icon"><SwitchButton /></el-icon>
-          </el-tooltip>
+        <div class="mobile-actions">
+          <el-button class="mobile-menu-btn" @click="mobileMenuVisible = true">
+            <el-icon><Menu /></el-icon>
+          </el-button>
         </div>
-        <div class="version">v2.0.0 · AI 深度优化</div>
-      </div>
-    </aside>
+      </header>
 
-    <!-- 移动端抽屉 (Drawer) -->
-    <el-drawer
-      v-model="mobileMenuVisible"
-      direction="ltr"
-      size="260px"
-      :with-header="false"
-      class="mobile-nav-drawer"
-    >
-      <div class="drawer-header">
-        <el-icon :size="20" color="var(--accent-blue)"><TrendCharts /></el-icon>
-        <span>量化决策系统</span>
-      </div>
-      <div class="drawer-content">
-        <nav class="sidebar-nav drawer-nav">
+      <aside class="sidebar desktop-only">
+        <div class="sidebar-logo">
+          <el-icon :size="24" color="var(--accent-blue)"><TrendCharts /></el-icon>
+          <h1>量化决策系统</h1>
+        </div>
+        <nav class="sidebar-nav">
           <router-link
             v-for="route in navRoutes"
             :key="route.path"
             :to="route.path"
             class="nav-item"
             active-class="active"
-            @click="mobileMenuVisible = false"
           >
-            <el-icon class="nav-icon"><component :is="route.meta.icon" /></el-icon>
+            <el-icon class="nav-icon"><component :is="iconMap[route.meta.icon]" /></el-icon>
             <span>{{ route.meta.title }}</span>
           </router-link>
         </nav>
-      </div>
-      <div class="drawer-footer">
-        <div v-if="!isLoggedIn" class="user-block login-btn" @click="showAuth = true; mobileMenuVisible = false">
-          <el-icon><User /></el-icon>
-          <span>未登录</span>
+        <div class="sidebar-footer">
+          <div v-if="!isLoggedIn" class="user-block login-btn" @click="showAuth = true">
+            <el-icon><User /></el-icon>
+            <span>未登录</span>
+          </div>
+          <div v-else class="user-block logged-in" @click="handleLogout">
+            <el-icon><Avatar /></el-icon>
+            <span>{{ username }}</span>
+            <el-tooltip content="退出系统" placement="right">
+              <el-icon class="logout-icon"><SwitchButton /></el-icon>
+            </el-tooltip>
+          </div>
+          <div class="version">v2.0.0 · AI 深度优化</div>
         </div>
-        <div v-else class="user-block logged-in" @click="handleLogout">
-          <el-icon><Avatar /></el-icon>
-          <span>{{ username }}</span>
-          <el-icon class="logout-icon"><SwitchButton /></el-icon>
+      </aside>
+
+      <el-drawer
+        v-model="mobileMenuVisible"
+        direction="ltr"
+        size="260px"
+        :with-header="false"
+        class="mobile-nav-drawer"
+      >
+        <div class="drawer-header">
+          <el-icon :size="20" color="var(--accent-blue)"><TrendCharts /></el-icon>
+          <span>量化决策系统</span>
         </div>
-      </div>
-    </el-drawer>
+        <div class="drawer-content">
+          <nav class="sidebar-nav drawer-nav">
+            <router-link
+              v-for="route in navRoutes"
+              :key="route.path"
+              :to="route.path"
+              class="nav-item"
+              active-class="active"
+              @click="mobileMenuVisible = false"
+            >
+              <el-icon class="nav-icon"><component :is="iconMap[route.meta.icon]" /></el-icon>
+              <span>{{ route.meta.title }}</span>
+            </router-link>
+          </nav>
+        </div>
+        <div class="drawer-footer">
+          <div v-if="!isLoggedIn" class="user-block login-btn" @click="showAuth = true; mobileMenuVisible = false">
+            <el-icon><User /></el-icon>
+            <span>未登录</span>
+          </div>
+          <div v-else class="user-block logged-in" @click="handleLogout">
+            <el-icon><Avatar /></el-icon>
+            <span>{{ username }}</span>
+            <el-icon class="logout-icon"><SwitchButton /></el-icon>
+          </div>
+        </div>
+      </el-drawer>
 
-    <!-- 登录注册弹窗 -->
-    <AuthModal v-model="showAuth" @login-success="onLoginSuccess" />
+      <AuthModal v-model="showAuth" @login-success="onLoginSuccess" />
 
-    <!-- 主内容区 -->
-    <main class="main-content">
-      <router-view v-slot="{ Component }">
-        <transition name="page-fade" mode="out-in">
-          <keep-alive>
-            <component :is="Component" />
-          </keep-alive>
-        </transition>
-      </router-view>
-    </main>
-  </div>
+      <main class="main-content">
+        <div v-if="routeLoading" class="route-loading-overlay">
+          <el-icon class="loading-pulse" :size="32" color="var(--accent-blue)"><Loading /></el-icon>
+        </div>
+        <router-view v-slot="{ Component }">
+          <transition name="page-fade" mode="out-in">
+            <keep-alive :max="3">
+              <component :is="Component" />
+            </keep-alive>
+          </transition>
+        </router-view>
+      </main>
+    </div>
+  </el-config-provider>
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { authApi } from '@/api'
-import { User, Avatar, SwitchButton, Menu, TrendCharts } from '@element-plus/icons-vue'
+import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import { ElMessage } from 'element-plus'
+import { User, Avatar, SwitchButton, Menu, TrendCharts, Search, Briefcase, Histogram, Setting, Odometer, Loading } from '@element-plus/icons-vue'
 import AuthModal from '@/components/AuthModal.vue'
+import { authApi } from '@/api'
 
+const locale = zhCn
 const router = useRouter()
 const navRoutes = router.getRoutes().filter(r => r.meta?.title)
+
+const iconMap = {
+  TrendCharts, Search, Briefcase, Histogram, Setting, Odometer
+}
 
 const mobileMenuVisible = ref(false)
 const showAuth = ref(false)
 const isLoggedIn = ref(false)
 const username = ref('访客')
+const routeLoading = ref(false)
+
+router.beforeEach(() => { routeLoading.value = true })
+router.afterEach(() => { routeLoading.value = false })
+router.onError(() => { routeLoading.value = false })
 
 onMounted(async () => {
     const token = localStorage.getItem('quant_user_token')
@@ -140,7 +151,7 @@ onMounted(async () => {
 function onLoginSuccess(name) {
     isLoggedIn.value = true
     username.value = name
-    router.go(0) // Refresh the page to load configurations from backend if needed
+    router.go(0)
 }
 
 async function handleLogout(showToast = true) {
@@ -161,15 +172,29 @@ async function handleLogout(showToast = true) {
 </script>
 
 <style scoped>
-.fade-enter-active,
-.fade-leave-active {
+.route-loading-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+.page-fade-enter-active,
+.page-fade-leave-active {
   transition: opacity 0.2s ease, transform 0.2s ease;
 }
-.fade-enter-from {
+.page-fade-enter-from {
   opacity: 0;
   transform: translateY(6px);
 }
-.fade-leave-to {
+.page-fade-leave-to {
   opacity: 0;
   transform: translateY(-6px);
 }
@@ -199,7 +224,6 @@ async function handleLogout(showToast = true) {
   color: var(--accent-red);
 }
 
-/* 响应式样式补丁 */
 .mobile-header {
   display: none;
   height: 56px;

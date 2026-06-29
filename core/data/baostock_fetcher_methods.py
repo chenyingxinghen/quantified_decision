@@ -3,9 +3,34 @@ import baostock as bs
 import threading
 import time
 import os
+import sqlite3
+from datetime import datetime
 from typing import Optional, List, Any
 from config import MARKET_PREFIXES, ADJUST_FLAG, REQUEST_INTERVAL
 
+class QuotaExceededError(Exception):
+    pass
+
+def _check_and_increment_quota():
+    from config.baostock_config import META_DB_PATH
+    max_quota = 48000
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        with sqlite3.connect(META_DB_PATH, timeout=5.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT count FROM api_quota WHERE date = ?", (today,))
+            row = cursor.fetchone()
+            if row:
+                count = row[0]
+                if count >= max_quota:
+                    raise QuotaExceededError(f"Daily Baostock API quota exceeded ({count}/{max_quota})")
+                cursor.execute("UPDATE api_quota SET count = count + 1 WHERE date = ?", (today,))
+            else:
+                cursor.execute("INSERT INTO api_quota (date, count) VALUES (?, 1)", (today,))
+            conn.commit()
+    except sqlite3.OperationalError:
+        # Ignore lock timeouts to not block requests strictly
+        pass
 
 class CachedResultSet:
     """模拟 Baostock ResultSet 的对象，预抓取所有数据以保证线程安全"""
@@ -42,6 +67,8 @@ def _bs_query(method_name: str, **kwargs) -> Any:
         try:
             if REQUEST_INTERVAL > 0:
                 time.sleep(REQUEST_INTERVAL)
+            
+            _check_and_increment_quota()
                 
             rs = method(**kwargs)
             
@@ -75,6 +102,8 @@ def _bs_query(method_name: str, **kwargs) -> Any:
             # 预抓取所有数据
             return CachedResultSet(rs)
                 
+        except QuotaExceededError:
+            raise
         except Exception as e:
             last_error = str(e)
             print(f"  ⚠ {method_name} 第 {attempt+1} 次异常: {last_error}")

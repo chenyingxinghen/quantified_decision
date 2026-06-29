@@ -16,7 +16,7 @@ from config.factor_config import *
 
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
-ML_FACTOR_MODEL_PATH = 'models/mark/xl_15d_16y_5472s_GF_hy_0601_2228/xgboost_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
 
 
 
@@ -34,13 +34,13 @@ INITIAL_CAPITAL = 1.0          # 初始资金
 MAX_POSITIONS = 1               
 
 # ATR相关参数（用于止损止盈计算）
-ATR_PERIOD = 28                     # ATR计算周期
-ATR_STOP_MULTIPLIER = 1.0   if TrainingConfig.SHORT_PREDICTION else 3           # ATR止损倍数 (放宽，减少噪音震出)
-ATR_TARGET_MULTIPLIER = 3 if TrainingConfig.SHORT_PREDICTION else 9           # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
+ATR_PERIOD = 14                     # ATR计算周期
+ATR_STOP_MULTIPLIER = 2   if TrainingConfig.SHORT_PREDICTION else 3           # ATR止损倍数 (放宽，减少噪音震出)
+ATR_TARGET_MULTIPLIER = 6 if TrainingConfig.SHORT_PREDICTION else 9           # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
 
 # 时间止损参数
 TIME_STOP_DAYS = TrainingConfig.FUTURE_DAYS                 # 与FUTURE_DAYS对齐：持满预测周期再评估
-TIME_STOP_MIN_LOSS_PCT = 0.3     # 时间止损，20%的高要求，确保超时直接卖出或锁定利润
+TIME_STOP_MIN_LOSS_PCT = 0.15 if TrainingConfig.SHORT_PREDICTION else 0.3     # 时间止损，30%的高要求，确保超时直接卖出或锁定利润
 
 # 卖出控制参数
 ENABLE_STOP_LOSS_EXIT = True        # 是否启用止损卖出

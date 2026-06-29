@@ -37,10 +37,10 @@ HISTORY_YEARS = 17
 FINANCE_YEARS = HISTORY_YEARS
 
 # 并发进程数
-WORKERS_NUM = 20
+WORKERS_NUM = 1
 
 # 请求间隔（秒）
-REQUEST_INTERVAL = 0.5
+REQUEST_INTERVAL = 0.01
 
 
 # 增量更新配置
@@ -48,7 +48,7 @@ INCREMENTAL_UPDATE = True  # 默认使用增量更新
 CHECK_LAST_N_DAYS = 5      # 检查最近N天的数据完整性
 AUTO_FILL_GAPS = False      # 自动填补历史数据缺口
 
-# 会话最大复用次数 (建议 50-100 之后注销重登，防止连接缓慢)
+# 会话最大复用次数 
 SESSION_MAX_STOCKS = 10000
 
 # 单只股票任务超时阈值（秒）。超过此时间未响应则跳过，防止进度卡死

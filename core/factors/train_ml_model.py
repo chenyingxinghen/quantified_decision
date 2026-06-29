@@ -633,68 +633,24 @@ class MLModelTrainer:
         # ── 2. 波动率调整：ATR 越大爆发力越强 ────────────────────────────
         vol_booster = 1.0 + (rel_atr * 10.0)
 
-
-        if TrainingConfig.SHORT_PREDICTION:
-            # ── 3. 入场日动能乘数 (intraday_intensity × relative_intensity) ──
-            #   intraday_intensity = 当日振幅 / ATR，反映绝对爆发力
-            #   relative_intensity = 当日振幅/ATR 相对近5日均值，反映相对活跃度
-            #   两者乘积 > 1 表示当日动能高于近期均值，给予正向加权
-            #   clip 到 [0.5, 2.0]，避免极端值主导得分
-            momentum_mult = np.clip(
-                getattr(TrainingConfig, 'MOMENTUM_MULT_BASE', 0.5) +
-                getattr(TrainingConfig, 'MOMENTUM_MULT_SCALE', 0.5) *
-                np.clip(intraday_intensity * relative_intensity, 0.0, 4.0),
-                0.5, 2.0
-            )
-
-            # ── 4. 资金参与度乘数 (volume_ratio) ─────────────────────────────
-            #   volume_ratio = 当日量 / 20日均量
-            #   无量行情（< 0.5）折扣；放量行情（> 2.0）适度奖励
-            #   clip 到 [0.5, 1.5]，防止单日天量过度放大
-            volume_mult = np.clip(
-                getattr(TrainingConfig, 'VOLUME_MULT_BASE', 0.5) +
-                getattr(TrainingConfig, 'VOLUME_MULT_SCALE', 0.5) *
-                np.clip(volume_ratio, 0.0, 3.0) / 3.0,
-                0.5, 1.5
-            )
-
-            # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
-            #   f_high_idx：持仓期内最高点出现在第几天（0-based）
-            #   f_low_idx ：持仓期内最低点出现在第几天（0-based）
-            #   先涨后跌（high_idx < low_idx）：路径友好，给予奖励
-            #   先跌后涨（low_idx < high_idx）：路径不友好，给予惩罚
-            #   两者相等或含 NaN 时保持中性（1.0）
-            high_idx = np.asarray(f_high_idx, dtype=np.float64)
-            low_idx  = np.asarray(f_low_idx,  dtype=np.float64)
-            path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)  # 先涨后跌奖励幅度
-            path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10) # 先跌后涨惩罚幅度
-            path_mult = np.where(
-                np.isnan(high_idx) | np.isnan(low_idx),
-                1.0,
-                np.where(high_idx < low_idx, 1.0 + path_bonus,   # 先涨后跌：路径优质
-                np.where(low_idx  < high_idx, 1.0 - path_penalty, # 先跌后涨：路径劣质
-                1.0))                                              # 同天：中性
-            )
-            final_score = base_score * vol_booster * momentum_mult * volume_mult * path_mult
-        else:
-            # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
-            #   f_high_idx：持仓期内最高点出现在第几天（0-based）
-            #   f_low_idx ：持仓期内最低点出现在第几天（0-based）
-            #   先涨后跌（high_idx < low_idx）：路径友好，给予奖励
-            #   先跌后涨（low_idx < high_idx）：路径不友好，给予惩罚
-            #   两者相等或含 NaN 时保持中性（1.0）
-            high_idx = np.asarray(f_high_idx, dtype=np.float64)
-            low_idx  = np.asarray(f_low_idx,  dtype=np.float64)
-            path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)  # 先涨后跌奖励幅度
-            path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10) # 先跌后涨惩罚幅度
-            path_mult = np.where(
-                np.isnan(high_idx) | np.isnan(low_idx),
-                1.0,
-                np.where(high_idx < low_idx, 1.0 + path_bonus,   # 先涨后跌：路径优质
-                np.where(low_idx  < high_idx, 1.0 - path_penalty, # 先跌后涨：路径劣质
-                1.0))                                              # 同天：中性
-            )
-            final_score = base_score * vol_booster*path_mult
+        # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
+        #   f_high_idx：持仓期内最高点出现在第几天（0-based）
+        #   f_low_idx ：持仓期内最低点出现在第几天（0-based）
+        #   先涨后跌（high_idx < low_idx）：路径友好，给予奖励
+        #   先跌后涨（low_idx < high_idx）：路径不友好，给予惩罚
+        #   两者相等或含 NaN 时保持中性（1.0）
+        high_idx = np.asarray(f_high_idx, dtype=np.float64)
+        low_idx  = np.asarray(f_low_idx,  dtype=np.float64)
+        path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)  # 先涨后跌奖励幅度
+        path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10) # 先跌后涨惩罚幅度
+        path_mult = np.where(
+            np.isnan(high_idx) | np.isnan(low_idx),
+            1.0,
+            np.where(high_idx < low_idx, 1.0 + path_bonus,   # 先涨后跌：路径优质
+            np.where(low_idx  < high_idx, 1.0 - path_penalty, # 先跌后涨：路径劣质
+            1.0))                                              # 同天：中性
+        )
+        final_score = base_score * vol_booster*path_mult
         return final_score
 
     def _extract_stock_components(self, code: str, data: pd.DataFrame, 
@@ -1400,6 +1356,10 @@ class MLModelTrainer:
                 if _dc > 1:
                     # 获取当前截面的原始分数
                     scores = _scores_sub[_ds:_de]
+                    # clipped = sub_scores= np.clip(scores, -100, 50)
+                    # min_val = clipped.min()
+                    # max_val = clipped.max()
+                    # sub_scores = (clipped - min_val) / (max_val - min_val)
                     ranks = _fast_rankdata_1d(scores) / (_dc + 1)
                     if TrainingConfig.LABEL_WEIGHTED_FOR_REGRESSION:
                         _y_sub[_ds:_de] = np.power(ranks.astype(np.float32), TrainingConfig.LABEL_WEIGHT_EXPONENT)
@@ -1416,9 +1376,7 @@ class MLModelTrainer:
                         _y_discrete[_ds:_de] = bins.astype(np.int32)
 
                     except ValueError:
-                        # 样本数太少或分数重复过多，回退到基于排名的简单分档
-                        bins = np.clip((ranks * _n_bins).astype(np.int32), 0, _n_bins-1)
-                        _y_discrete[_ds:_de] = bins
+                        raise ValueError(f"  {_dates_sub[_ds:_de]} 样本标签分布不均匀，请检查数据质量。")
                 else:
                     _y_discrete[_ds:_de] = _mid_bin
                     _y_sub[_ds:_de] = 0.5

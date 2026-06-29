@@ -11,6 +11,7 @@
 from typing import Dict, Any
 from config import baostock_config
 
+n_bins = 15
 
 # ============================================================================
 # 1. 模型超参数配置
@@ -21,17 +22,16 @@ class ModelConfig:
 
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
-        'n_estimators': 500,
-        'max_depth': 6,
-        'num_leaves': 36,          
+        'n_estimators': 400,
+        'num_leaves': 16,          
         'learning_rate': 0.01,    
 
-        'min_child_weight': 280,
-        'min_gain_to_split': 5, # 最小分裂增益，剪掉无意义的分裂
-        'reg_alpha': 3.0,          # L1 正则，促进稀疏性
+        'min_child_weight': 100,
+        'min_gain_to_split': 6, # 最小分裂增益，剪掉无意义的分裂
+        'reg_alpha': 1.0,          # L1 正则，促进稀疏性
         'reg_lambda': 3.0,         # L2 正则，平滑权重
 
-        'subsample': 0.5,
+        'subsample': 0.8,
         'colsample_bytree': 0.8,
         'subsample_freq': 1,
 
@@ -40,7 +40,7 @@ class ModelConfig:
         'metric': 'ndcg',
         'eval_at': [5],
         'lambdarank_truncation_level': 20,
-        'label_gain': [i//3*i**1.5 if i>2 else i for i in range(15)],
+        'label_gain': [i//3*i**1.5 if i>2 else i for i in range(n_bins)],
 
         'early_stopping_rounds': 0,
         'n_jobs': -1,  # 使用所有CPU核心
@@ -49,29 +49,28 @@ class ModelConfig:
 
 
     XGBOOST_PARAMS: Dict[str, Any] = {
-        'n_estimators': 400,
+        'n_estimators': 800,
         'max_depth': 8,
-        'learning_rate': 0.02,
-        'max_leaves': 30,
+        'learning_rate': 0.01,
 
-        'subsample': 0.4,
-        'colsample_bytree': 0.5,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
         'subsample_freq': 1,
 
-        'min_child_weight': 50,
+        'min_child_weight': 100,
         'gamma': 2.01,              # 最小分裂损失，剪掉无意义的分裂
-        'reg_alpha': 1.0,          # L1 正则
-        'reg_lambda': 1.0,         # L2 正则
+        'reg_alpha': 5.0,          # L1 正则
+        'reg_lambda': 8.0,         # L2 正则
 
         # Ranking 专属配置
         'objective': 'reg:squarederror',
-        'eval_metric': 'rmse',
+        'eval_metric': 'ndcg',
         'ndcg_exp_gain': False,  
         'lambdarank_num_pair_per_sample': 200,
-        'lambdarank_pair_method':'mean',
+        'lambdarank_pair_method':'topk',
 
         'n_jobs': -1,  # 使用所有CPU核心
-        'early_stopping_rounds': 50,
+        'early_stopping_rounds': 0,
         'verbosity': 0,
     }
 
@@ -100,7 +99,7 @@ class ModelConfig:
         # 根据任务类型设置目标
         if task == 'hybrid':
             if model_type == 'xgboost':
-                params['objective'] = 'reg:logistic'
+                params['objective'] = 'reg:squarederror'
             elif model_type == 'lightgbm':
                 params['objective'] = 'lambdarank'
         elif task == 'ranking':
@@ -138,16 +137,16 @@ class TrainingConfig:
     """训练参数配置"""
 
     # ── 模型 ──────────────────────────────────────────────────────────────
-    MODEL_TYPES          = ['lightgbm', 'xgboost']
-    TASK                 = 'hybrid' 
+    MODEL_TYPES          = ['xgboost']
+    TASK                 = 'ranking' 
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
     YEARS                = baostock_config.HISTORY_YEARS
-    YEARS_FOR_TRAINING   = 16         # 训练数据年数
-    YEARS_FOR_BACKTEST   = 3         # 回测数据年数
+    YEARS_FOR_TRAINING   = 4         # 训练数据年数
+    YEARS_FOR_BACKTEST   = 2         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
-    SHORT_PREDICTION     = False
-    FUTURE_DAYS          = 5 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
+    SHORT_PREDICTION     = True
+    FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
 
 
     # ── 数据集划分 ─────────────────────────────────────────────────────────
@@ -159,21 +158,14 @@ class TrainingConfig:
 
     # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
     LABEL_WEIGHTED_FOR_REGRESSION= True
-    LABEL_WEIGHT_EXPONENT=2
+    LABEL_WEIGHT_EXPONENT=3
     
     UPSIDE_WEIGHT        = 1.0       
-    DOWNSIDE_WEIGHT      = 2.0       
+    DOWNSIDE_WEIGHT      = 3.0       
     FINAL_RETURN_WEIGHT  = 1.0       
 
-    # ── 入场日动能乘数 (intraday_intensity × relative_intensity) ──────────
-    # momentum_mult = clip(BASE + SCALE * clip(intensity * rel_intensity, 0, 4), 0.5, 2.0)
-    MOMENTUM_MULT_BASE   = 0.5       # 动能乘数基础值（无动能时的下限）
-    MOMENTUM_MULT_SCALE  = 0.5       # 动能乘数缩放系数
 
-    # ── 资金参与度乘数 (volume_ratio) ─────────────────────────────────────
-    # volume_mult = clip(BASE + SCALE * clip(vol_ratio, 0, 3) / 3, 0.5, 1.5)
-    VOLUME_MULT_BASE     = 0.5       # 量能乘数基础值（无量时的下限）
-    VOLUME_MULT_SCALE    = 0.5       # 量能乘数缩放系数
+
 
     # ── 路径形态奖惩 (f_high_idx vs f_low_idx) ───────────────────────────
     PATH_BONUS           = 0.15      # 先涨后跌路径奖励幅度（+15%）

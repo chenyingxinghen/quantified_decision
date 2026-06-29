@@ -27,6 +27,7 @@ async def get_kline(code: str, days: int = Query(default=250, ge=10, le=3000)):
         raise HTTPException(status_code=404, detail=f"股票 {code} 无数据")
 
     df = df.sort_values("date").reset_index(drop=True)
+    df = df.fillna(0)
     # 构造 ECharts 友好的数据结构
     columns_map = {
         "date": "date", "open": "open", "high": "high",

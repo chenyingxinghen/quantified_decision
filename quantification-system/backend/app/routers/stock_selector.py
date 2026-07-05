@@ -196,6 +196,7 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
     import threading
     from scripts.select_stocks import select_stocks
     from config.strategy_config import ML_FACTOR_MODEL_PATH
+    import config.strategy_config as _sc
 
     def _run(tk: Optional[str]):
         global _selection_task
@@ -279,7 +280,8 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
                     model_path=p,
                     min_confidence=req.min_confidence,
                     top_n=req.top_n,
-                    apply_filter=user_filters.get("apply_filter", req.apply_filter),
+                    # 优先级：用户配置 > 请求体 > 全局 strategy_config
+                    apply_filter=user_filters.get("apply_filter", req.apply_filter if req.apply_filter else _sc.ENABLE_FUNDAMENTAL_FILTER),
                     workers=4,
                     save_csv=False,
                     min_market_cap=user_filters.get("min_market_cap"),

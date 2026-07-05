@@ -113,15 +113,32 @@ def get_latest_signals() -> List[Dict]:
         strategy.initialize()
 
         from config import automation_config
-        # 设置实盘专用筛选条件
+        import config.strategy_config as sc
+        
+        # 设置实盘专用筛选条件（自动化优先、sc 兜底）
         criteria = {
-            'min_market_cap': getattr(automation_config, 'AUTO_MIN_MARKET_CAP', None),
-            'max_pe': getattr(automation_config, 'AUTO_MAX_PE', None),
-            'max_zcfzl': getattr(automation_config, 'AUTO_MAX_ZCFZL', None),
-            'min_price': getattr(automation_config, 'AUTO_MIN_PRICE', None),
-            'max_price': getattr(automation_config, 'AUTO_MAX_PRICE', None),
-            'include_st': getattr(automation_config, 'AUTO_INCLUDE_ST', True),
-            'markets': getattr(automation_config, 'SELECTOR_MARKETS', ['sh_main', 'sz_main'])
+            'min_market_cap': getattr(automation_config, 'AUTO_MIN_MARKET_CAP', None) 
+                             if getattr(automation_config, 'AUTO_MIN_MARKET_CAP', None) is not None 
+                             else sc.MIN_MARKET_CAP,
+            'max_pe': getattr(automation_config, 'AUTO_MAX_PE', None) 
+                     if getattr(automation_config, 'AUTO_MAX_PE', None) is not None 
+                     else sc.MAX_PE,
+            'max_zcfzl': getattr(automation_config, 'AUTO_MAX_ZCFZL', None) 
+                        if getattr(automation_config, 'AUTO_MAX_ZCFZL', None) is not None 
+                        else sc.MAX_ZCFZL,
+            'min_price': getattr(automation_config, 'AUTO_MIN_PRICE', None) 
+                        if getattr(automation_config, 'AUTO_MIN_PRICE', None) is not None 
+                        else sc.MIN_PRICE,
+            'max_price': getattr(automation_config, 'AUTO_MAX_PRICE', None) 
+                        if getattr(automation_config, 'AUTO_MAX_PRICE', None) is not None 
+                        else sc.MAX_PRICE,
+            'include_st': getattr(automation_config, 'AUTO_INCLUDE_ST', None) 
+                         if getattr(automation_config, 'AUTO_INCLUDE_ST', None) is not None 
+                         else sc.INCLUDE_ST,
+            'markets': getattr(automation_config, 'SELECTOR_MARKETS', None) 
+                      if getattr(automation_config, 'SELECTOR_MARKETS', None) is not None 
+                      else sc.SELECTOR_MARKETS,
+            'apply_filter': getattr(automation_config, 'AUTO_APPLY_FILTER', sc.ENABLE_FUNDAMENTAL_FILTER)
         }
         
         results = strategy.select_for_live(

@@ -154,25 +154,25 @@ def _fast_rankdata_1d(a):
     return ranks
 
 
-def _normalize_chunk_worker(X_sub, group_starts, group_counts):
+def _normalize_chunk_worker(X, rank_cols_idx, chunk_start_row, group_starts, group_counts):
     """
-    进程池/线程池中的子工作任务：
-    contiguously 归一化特征子矩阵中的一组日期。
+    线程池中的子工作任务：原地归一化特征子矩阵中的一组日期。
     """
-    result_sub = np.empty_like(X_sub)
-    F = X_sub.shape[1]
+    F = len(rank_cols_idx)
     
     for start, count in zip(group_starts, group_counts):
+        row_start = chunk_start_row + start
+        row_end = row_start + count
         if count <= 1:
-            result_sub[start:start+count, :] = 0.5
+            X[row_start:row_end, rank_cols_idx] = 0.5
             continue
             
-        day_data = X_sub[start:start+count, :]
         for j in range(F):
-            col_data = day_data[:, j]
-            result_sub[start:start+count, j] = _fast_rankdata_1d(col_data) / (count + 1)
+            col = rank_cols_idx[j]
+            col_data = X[row_start:row_end, col]
+            X[row_start:row_end, col] = _fast_rankdata_1d(col_data) / (count + 1)
             
-    return result_sub
+    return None
 
 
 class MLModelTrainer:
@@ -277,9 +277,8 @@ class MLModelTrainer:
             if df.empty:
                 continue
 
-            # 按股票分组并执行动态复权
-            for code in df['code'].unique():
-                stock_df = df[df['code'] == code].copy()
+            # 按股票分组并执行动态复权。groupby 避免为每只股票重复构造整批布尔掩码。
+            for code, stock_df in df.groupby('code', sort=False):
                 stock_df = stock_df.sort_values('date').reset_index(drop=True)
                 
                 # 动态复权处理
@@ -314,8 +313,18 @@ class MLModelTrainer:
                         stock_df['days_to_delist'] = np.float32(-1)
                 else:
                     stock_df['days_to_delist'] = np.float32(-1)
+
+                float_cols = stock_df.select_dtypes(include=['float64']).columns
+                if len(float_cols) > 0:
+                    stock_df[float_cols] = stock_df[float_cols].astype(np.float32, copy=False)
+                int_cols = [c for c in stock_df.select_dtypes(include=['int64']).columns if c not in ('code', 'date')]
+                for col in int_cols:
+                    stock_df[col] = pd.to_numeric(stock_df[col], downcast='integer')
                 
                 stocks_data[code] = stock_df
+
+            del df
+            gc.collect()
             
             # 进度提示
             pbar.update(len(batch_codes))
@@ -325,6 +334,99 @@ class MLModelTrainer:
         
         delist_count = sum(1 for v in delist_map.values() if v is not None)
         print(f"成功加载并复权 {len(stocks_data)} 只股票的数据 (其中 {delist_count} 只含退市日期)")
+        return stocks_data
+
+    def load_label_data(self, stock_codes: List[str],
+                        start_date: str, end_date: str,
+                        batch_size: int = 500) -> Dict[str, pd.DataFrame]:
+        """
+        仅加载生成训练标签所需的行情列。
+
+        因子从 parquet 缓存读取时使用该路径，避免为已缓存股票加载基本面、估值等训练特征源数据。
+        """
+        print(f"正在加载 {len(stock_codes)} 只股票的标签行情数据...")
+
+        stocks_data = {}
+        conn = sqlite3.connect(self.db_path)
+        db_dir = os.path.dirname(self.db_path)
+        meta_db = os.path.join(db_dir, 'stock_meta.db')
+        if os.path.exists(meta_db):
+            conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+
+        delist_map: Dict[str, Optional[str]] = {}
+        try:
+            placeholders_all = ','.join(['?' for _ in stock_codes])
+            delist_df = pd.read_sql_query(
+                f"SELECT code, outDate FROM meta.stock_basic WHERE code IN ({placeholders_all})",
+                conn, params=stock_codes
+            )
+            for _, row in delist_df.iterrows():
+                out = row['outDate']
+                delist_map[row['code']] = out if (out and str(out).strip() not in ('', 'None', 'nan')) else None
+        except Exception as e:
+            print(f"  ⚠ 读取退市日期失败，退市特征将不可用: {e}")
+
+        pbar = tqdm(total=len(stock_codes), desc="标签行情加载")
+        for i in range(0, len(stock_codes), batch_size):
+            batch_codes = stock_codes[i:i+batch_size]
+            placeholders = ','.join(['?' for _ in batch_codes])
+            query = f'''
+                SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.volume,
+                       k.is_st, a.fore_adjust_factor
+                FROM daily_data k
+                LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
+                WHERE k.code IN ({placeholders}) AND k.date >= ? AND k.date <= ?
+                ORDER BY k.code, k.date ASC
+            '''
+            params = list(batch_codes) + [str(start_date), str(end_date)]
+            df = pd.read_sql_query(query, conn, params=tuple(params))
+            if df.empty:
+                pbar.update(len(batch_codes))
+                continue
+
+            for code, stock_df in df.groupby('code', sort=False):
+                stock_df = stock_df.sort_values('date').reset_index(drop=True)
+
+                if 'fore_adjust_factor' in stock_df.columns:
+                    valid_adj = stock_df['fore_adjust_factor'].dropna()
+                    if not valid_adj.empty:
+                        base_factor = float(valid_adj.iloc[-1])
+                        if base_factor != 0:
+                            ratio = stock_df['fore_adjust_factor'].bfill().ffill().fillna(1.0) / base_factor
+                            for col in ['open', 'high', 'low', 'close']:
+                                stock_df[col] = stock_df[col] * ratio
+                    stock_df = stock_df.drop(columns=['fore_adjust_factor'])
+
+                if len(stock_df) < 100:
+                    continue
+
+                out_date_str = delist_map.get(code)
+                if out_date_str:
+                    try:
+                        out_dt = pd.Timestamp(out_date_str)
+                        dates_ts = pd.to_datetime(stock_df['date'])
+                        stock_df['days_to_delist'] = (out_dt - dates_ts).dt.days.clip(lower=0).astype(np.float32)
+                    except Exception:
+                        stock_df['days_to_delist'] = np.float32(-1)
+                else:
+                    stock_df['days_to_delist'] = np.float32(-1)
+
+                float_cols = stock_df.select_dtypes(include=['float64']).columns
+                if len(float_cols) > 0:
+                    stock_df[float_cols] = stock_df[float_cols].astype(np.float32, copy=False)
+                int_cols = [c for c in stock_df.select_dtypes(include=['int64']).columns if c not in ('code', 'date')]
+                for col in int_cols:
+                    stock_df[col] = pd.to_numeric(stock_df[col], downcast='integer')
+
+                stocks_data[code] = stock_df
+
+            del df
+            gc.collect()
+            pbar.update(len(batch_codes))
+
+        pbar.close()
+        conn.close()
+        print(f"成功加载标签行情 {len(stocks_data)} 只股票")
         return stocks_data
     
     def calculate_and_save_factors(self, code: str, data: pd.DataFrame, 
@@ -706,7 +808,12 @@ class MLModelTrainer:
                     f_high_max = f_low_min = f_high_idx = f_low_idx = np.full(len(data), np.nan)
 
                 # 计算 ATR
-                atr_raw = talib.ATR(high, low, close, timeperiod=FactorConfig.ATR_PERIOD)
+                atr_raw = talib.ATR(
+                    high.astype(np.float64, copy=False),
+                    low.astype(np.float64, copy=False),
+                    close.astype(np.float64, copy=False),
+                    timeperiod=FactorConfig.ATR_PERIOD
+                )
                 atr_rel = atr_raw / (close + 1e-6)
 
                 # 涨跌停阈值计算
@@ -785,6 +892,145 @@ class MLModelTrainer:
             if verbose:
                 import traceback
                 print(f"  Extraction error for {code}: {e}\n{traceback.format_exc()}")
+            return None
+
+    def _extract_stock_components_from_cache(self, code: str, data: pd.DataFrame,
+                                             forward_days: int,
+                                             target_features: Optional[List[str]] = None,
+                                             train_start_date: str = None,
+                                             train_end_date: str = None,
+                                             verbose: bool = False) -> Optional[dict]:
+        """从因子 parquet 缓存读取 X，仅用行情数据生成标签组件。"""
+        try:
+            cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
+            if not os.path.exists(cache_file):
+                return None
+
+            read_cols = None
+            if target_features:
+                try:
+                    import pyarrow.parquet as pq
+                    schema_names = set(pq.read_schema(cache_file).names)
+                    read_cols = ['date'] + [c for c in target_features if c in schema_names]
+                except Exception:
+                    read_cols = None
+
+            factors = pd.read_parquet(cache_file, columns=read_cols)
+            if factors is None or factors.empty or 'date' not in factors.columns:
+                return None
+            if not pd.api.types.is_string_dtype(factors['date']):
+                factors['date'] = factors['date'].astype(str)
+
+            data_dates = data[['date']].copy()
+            if not pd.api.types.is_string_dtype(data_dates['date']):
+                data_dates['date'] = data_dates['date'].astype(str)
+            factors = pd.merge(data_dates, factors, on='date', how='left').reset_index(drop=True)
+
+            factor_value_cols = [c for c in factors.columns if c != 'date']
+            if target_features:
+                missing_features = [c for c in target_features if c not in factors.columns]
+                if missing_features:
+                    missing_df = pd.DataFrame(0.5, index=factors.index, columns=missing_features)
+                    factors = pd.concat([factors, missing_df], axis=1)
+                factor_value_cols = [c for c in target_features if c in factors.columns]
+            if not factor_value_cols:
+                return None
+            factors[factor_value_cols] = factors[factor_value_cols].apply(pd.to_numeric, errors='coerce')
+            valid_factor_idx = ~factors[factor_value_cols].isna().all(axis=1)
+            factors[factor_value_cols] = factors[factor_value_cols].fillna(0.5)
+
+            close = data['close'].values
+            high = data['high'].values
+            low = data['low'].values
+
+            next_open = data['open'].shift(-1).values
+            f_close = data['close'].shift(-forward_days).values
+
+            if len(data) > forward_days:
+                _high_wins = sliding_window_view(high[1:], forward_days)
+                _low_wins  = sliding_window_view(low[1:],  forward_days)
+                f_high_max = np.concatenate([np.max(_high_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                f_low_min  = np.concatenate([np.min(_low_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                f_high_idx = np.concatenate([np.argmax(_high_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+                f_low_idx  = np.concatenate([np.argmin(_low_wins, axis=1), np.full(forward_days, np.nan)])[:len(data)]
+            else:
+                f_high_max = f_low_min = f_high_idx = f_low_idx = np.full(len(data), np.nan)
+
+            atr_raw = talib.ATR(
+                high.astype(np.float64, copy=False),
+                low.astype(np.float64, copy=False),
+                close.astype(np.float64, copy=False),
+                timeperiod=FactorConfig.ATR_PERIOD
+            )
+            atr_rel = atr_raw / (close + 1e-6)
+
+            limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
+            if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
+                limit_thresholds[:] = MARKET_LIMITS['gem_star']
+            elif code.startswith(MARKET_PREFIXES['bj']):
+                limit_thresholds[:] = MARKET_LIMITS['bj']
+
+            if 'is_st' in data.columns:
+                is_main_board = ~(code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']) or code.startswith(MARKET_PREFIXES['bj']))
+                if is_main_board:
+                    limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
+
+            epsilon = 0.002
+            t_plus_1_preclose = data['close'].values
+            t_plus_1_open = data['open'].shift(-1).values
+            t_plus_1_high = data['high'].shift(-1).values
+            t_plus_1_low = data['low'].shift(-1).values
+            t_plus_1_vol = data['volume'].shift(-1).values
+
+            is_one_word_up = (t_plus_1_open == t_plus_1_high) & (t_plus_1_open == t_plus_1_low) & \
+                             (t_plus_1_open >= t_plus_1_preclose * (1 + limit_thresholds) - epsilon)
+            is_suspended = t_plus_1_vol == 0
+            unbuyable = is_one_word_up | is_suspended
+
+            price_range_rel_atr = (data['high'].values - data['low'].values) / (atr_raw + 1e-6)
+            comp_df = pd.DataFrame({
+                'date': data['date'],
+                'code': code,
+                'next_open': next_open,
+                'f_close': f_close,
+                'f_high_max': f_high_max,
+                'f_low_min': f_low_min,
+                'f_high_idx': f_high_idx,
+                'f_low_idx': f_low_idx,
+                'atr_raw': atr_raw,
+                'atr_rel': atr_rel,
+                'intraday_intensity': price_range_rel_atr,
+                'volume_ratio': data['volume'].values / (data['volume'].rolling(20).mean().values + 1e-6),
+                'relative_intensity': price_range_rel_atr / (pd.Series(price_range_rel_atr).rolling(5).mean().values + 1e-6),
+                'limit_thresholds': limit_thresholds,
+                'unbuyable': unbuyable,
+                'is_st': data['is_st'] if 'is_st' in data.columns else 0,
+                'days_to_delist': data['days_to_delist'] if 'days_to_delist' in data.columns else -1
+            })
+
+            label_valid_idx = ~comp_df[['next_open', 'f_close', 'f_high_max', 'f_low_min', 'atr_raw', 'atr_rel']].isna().any(axis=1)
+            final_valid_idx = valid_factor_idx & label_valid_idx
+            if train_start_date:
+                final_valid_idx = final_valid_idx & (data['date'] >= train_start_date)
+            if train_end_date:
+                final_valid_idx = final_valid_idx & (data['date'] <= train_end_date)
+
+            if final_valid_idx.sum() <= 0:
+                return None
+
+            drop_cols = ['date', 'is_st', 'is_suspended', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate']
+            if target_features:
+                X_df = factors.loc[final_valid_idx, factor_value_cols]
+            else:
+                X_df = factors[final_valid_idx].drop(columns=[c for c in drop_cols if c in factors.columns], errors='ignore')
+            return {
+                'X': X_df,
+                'components': comp_df[final_valid_idx]
+            }
+        except Exception as e:
+            if verbose:
+                import traceback
+                print(f"  Cached extraction error for {code}: {e}\n{traceback.format_exc()}")
             return None
 
     def _calculate_vectorized_labels(self, components: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -964,7 +1210,8 @@ class MLModelTrainer:
                        train_start_date: str = None,
                        train_end_date: str = None,
                        include_fundamentals: bool = True,
-                       target_features: Optional[List[str]] = None) -> tuple:
+                       target_features: Optional[List[str]] = None,
+                       use_factor_cache_only: bool = False) -> tuple:
         """
         准备训练数据集
         
@@ -979,6 +1226,7 @@ class MLModelTrainer:
             include_fundamentals: 是否包含基本面因子
             target_features: 外部传入的完整特征列表；若提供则跳过内部特征发现，
                              与 batch_update_factor_cache 共享同一列表以保证缓存命中
+            use_factor_cache_only: 仅从 parquet 因子缓存读取特征，stocks_data 只用于生成标签
         
         返回:
             (X, y, returns, factor_names, dates, unbuyable, limit_groups, y_raw, is_st, w_sig)
@@ -986,10 +1234,11 @@ class MLModelTrainer:
 
         # print("\n正在计算量化因子（技术指标 + K线形态 + 基本面）...")
         
-        # 0. 自动更新市场情绪数据 (全局性指标，只需计算一次)
-        print("\n正在检查并更新全市场情绪指标...")
-        sentiment_calc = MarketSentimentCalculator(self.db_path)
-        sentiment_calc.check_and_update()
+        # 0. 自动更新市场情绪数据。直接使用因子缓存时，情绪因子已在 parquet 中，无需重复检查。
+        if not use_factor_cache_only:
+            print("\n正在检查并更新全市场情绪指标...")
+            sentiment_calc = MarketSentimentCalculator(self.db_path)
+            sentiment_calc.check_and_update()
         
         # 使用配置中的默认值
         if forward_days is None:
@@ -1003,7 +1252,9 @@ class MLModelTrainer:
         cache_info = self.get_cache_info()
         print(f"  缓存状态: {cache_info['cached_stocks']}/{len(stocks_data)} 只股票已缓存")
         
-        if cache_engineered_features:
+        if use_factor_cache_only:
+            print(f"  缓存策略: 直接使用因子 parquet 构建训练集")
+        elif cache_engineered_features:
             print(f"  缓存策略: 保存特征工程后的完整因子")
             
             if target_features is not None:
@@ -1027,9 +1278,16 @@ class MLModelTrainer:
         def process_with_logging(idx, code, data):
             """提取单只股票组件，第一个输出日志"""
             verbose = (idx == 0) and cache_engineered_features
-            return self._extract_stock_components(code, data, forward_days, 
-                                                 cache_engineered_features, target_features, verbose,
-                                                 train_start_date, train_end_date, include_fundamentals)
+            if use_factor_cache_only:
+                return self._extract_stock_components_from_cache(
+                    code, data, forward_days, target_features,
+                    train_start_date, train_end_date, verbose
+                )
+            return self._extract_stock_components(
+                code, data, forward_days, cache_engineered_features,
+                target_features, verbose, train_start_date, train_end_date,
+                include_fundamentals
+            )
         
         results = Parallel(n_jobs=n_jobs, verbose=1)(
             delayed(process_with_logging)(i, code, data)
@@ -1048,23 +1306,39 @@ class MLModelTrainer:
             if res is not None:
                 all_X.append(res['X'])
                 all_comps.append(res['components'])
+        del results
+        gc.collect()
         
         if not all_X:
             raise ValueError("没有生成的有效样本")
             
-        # 2. 批量合并 (Vectorized) 并按日期进行一次性的全局时间排序，消除后续的所有重排与拷贝
+        # 2. 批量合并标签组件，并按日期进行一次性的全局时间排序。
+        # 特征矩阵直接散写到最终 float32 数组，避免同时持有未排序和已排序的巨大 X DataFrame。
         comps_df = pd.concat(all_comps, ignore_index=True)
-        sort_idx = np.argsort(comps_df['date'].values)
+        del all_comps
+        gc.collect()
+
+        sort_idx = np.argsort(comps_df['date'].values, kind='mergesort')
         
-        # 按排序索引原地覆盖或重排 DataFrame (采用 views 或单次排序拷贝)
         comps_df = comps_df.iloc[sort_idx].reset_index(drop=True)
-        X_df = pd.concat(all_X, ignore_index=True).iloc[sort_idx].reset_index(drop=True)
+        inverse_sort = np.empty_like(sort_idx)
+        inverse_sort[sort_idx] = np.arange(len(sort_idx), dtype=sort_idx.dtype)
+        
+        factor_names = all_X[0].columns.tolist()
+        X_arr = np.empty((len(sort_idx), len(factor_names)), dtype=np.float32)
+        offset = 0
+        for part_idx, x_part in enumerate(all_X):
+            n_rows = len(x_part)
+            dest_idx = inverse_sort[offset:offset + n_rows]
+            X_arr[dest_idx, :] = x_part.to_numpy(dtype=np.float32, copy=False)
+            offset += n_rows
+            all_X[part_idx] = None
         
         # 释放中间列表
-        del all_X, all_comps, results, sort_idx
+        del all_X, sort_idx, inverse_sort
         gc.collect()
         
-        print(f"  - 原始样本量: {len(X_df)}, 特征数: {X_df.shape[1]}")
+        print(f"  - 原始样本量: {len(X_arr)}, 特征数: {X_arr.shape[1]}")
         
         # 3. 向量化计算标签 (此时输入已是有序，截面排序速度最快，返回的标签和分数天然有序)
         print("  - 向量化生成标签 (标准化 + 截面排名)...")
@@ -1076,19 +1350,12 @@ class MLModelTrainer:
         limit_groups_arr = comps_df['limit_thresholds'].values
         is_st_arr = (comps_df['is_st'] == 1).values
         
-        factor_names = X_df.columns.tolist()
-
         y_final_arr = y_ranked
         raw_scores_arr = raw_scores
         returns_arr = returns_raw
         w_sig_arr = w_sig
-        
-        # DataFrame -> numpy 仅在最后做一次单次转换，避免多次复制和 values 高级索引复制。
-        # 此处使用 copy=True 确保生成的 numpy 数组是可写 (writeable) 的，以支持原地归一化。
-        X_arr = X_df.to_numpy(dtype=np.float32, copy=True)
-        
-        # 释放 DataFrame
-        del X_df, comps_df
+
+        del comps_df
         gc.collect()
 
         # 5. 不可买入样本处理（涨停/停牌）——在归一化之前剔除，确保排序不含涨停股
@@ -1132,9 +1399,21 @@ class MLModelTrainer:
         sentiment_cols = [c for c in all_cols if c in remaining_all and c in _sentiment_known]
         remaining_all -= set(sentiment_cols)
         
-        # 3. 特征工程 (衍生的复合因子) — 从 FeatureEngineer 实例获取精确列表
+        def _is_engineered_name(col: str) -> bool:
+            """缓存特征只保留列名时，用稳定命名模式识别工程特征。"""
+            return (
+                col.startswith(('rank_', 'log_')) or
+                any(token in col for token in ('_div_', '_mul_', '_sub_', '_x_'))
+            )
+
+        # 3. 特征工程 (衍生的复合因子)
+        # 缓存训练路径不会重建 FeatureEngineer 实例的 generated_features，
+        # 因此除实例列表外，还按列名模式识别交互、比率、rank/log 变换。
         _engineered_set = set(self.feature_engineer.get_generated_features())
-        engineered_cols = [c for c in all_cols if c in remaining_all and c in _engineered_set]
+        engineered_cols = [
+            c for c in all_cols
+            if c in remaining_all and (c in _engineered_set or _is_engineered_name(c))
+        ]
         remaining_all -= set(engineered_cols)
         
         # 4. K线形态 — 精确匹配 CandlestickPatternFactors.get_pattern_names()
@@ -1142,12 +1421,7 @@ class MLModelTrainer:
         candle_cols = [c for c in all_cols if c in remaining_all and c in _candle_set]
         remaining_all -= set(candle_cols)
         
-        # 5. 技术指标 — 精确匹配 QuantitativeFactors.get_factor_names()
-        _tech_set = set(self.tech_calculator.get_factor_names())
-        tech_cols = [c for c in all_cols if c in remaining_all and c in _tech_set]
-        remaining_all -= set(tech_cols)
-        
-        # 6. 基本面因子 — 精确匹配 FundamentalFactors.NUMERIC_COLS + 已知衍生列
+        # 5. 基本面因子 — 精确匹配 FundamentalFactors.NUMERIC_COLS + 已知衍生列
         _fund_known = set(FundamentalFactors.NUMERIC_COLS) | {
             'dynamic_pe', 'dynamic_pb', 'inv_pe', 'inv_pb', 'market_cap',
             'roe_x_np_growth', 'roe_to_pb',
@@ -1156,7 +1430,7 @@ class MLModelTrainer:
         fund_cols = [c for c in all_cols if c in remaining_all and c in _fund_known]
         remaining_all -= set(fund_cols)
         
-        # 7. 高级时序/风险特征 — 精确匹配 advanced_factors.py 中的列名
+        # 6. 高级时序/风险特征 — 精确匹配 advanced_factors.py 中的列名
         _adv_known = {
             # TimeSeriesFactors.calculate_price_series_features
             'hl_range_mean', 'hl_range_std', 'oc_ratio_mean', 'oc_ratio_std',
@@ -1177,6 +1451,24 @@ class MLModelTrainer:
         }
         adv_cols = [c for c in all_cols if c in remaining_all and c in _adv_known]
         remaining_all -= set(adv_cols)
+
+        # 7. 技术指标 — 兼容缓存中的周期后缀命名，如 rsi_12、atr_14、amount_ma_10
+        _tech_set = set(self.tech_calculator.get_factor_names())
+        _tech_prefixes = (
+            'rsi_', 'roc_', 'mtm_', 'cmo_', 'stochrsi_', 'rvi_',
+            'macd', 'adx_', 'dmi_', 'aroon_', 'trix_', 'ma_ratio_',
+            'ma_slope_', 'price_slope_', 'atr_', 'natr_', 'bb_',
+            'cci_', 'price_variance_', 'obv', 'ad', 'adosc', 'mfi_',
+            'vroc_', 'vrsi_', 'vmacd', 'volume_ma_', 'volume_std_',
+            'amount_ma_', 'amount_std_', 'willr_', 'bias_', 'vr_',
+            'psy_', 'ar_', 'br_', 'cr_', 'kdj_', 'vol_ma_', 'vol_std_',
+            'plus_di', 'minus_di', 'ulcer_', 'price_var_', 'sqrt_atr_', 'sqrt_natr_',
+        )
+        tech_cols = [
+            c for c in all_cols
+            if c in remaining_all and (c in _tech_set or c.startswith(_tech_prefixes))
+        ]
+        remaining_all -= set(tech_cols)
         
         # 8. 其它 (未被以上任何类别匹配到的列)
         other_cols = list(remaining_all)
@@ -1367,13 +1659,15 @@ class MLModelTrainer:
                         _y_sub[_ds:_de] = ranks
                     try:
                         # 需要 _n_bins+1 个边界点才能产生 _n_bins 个 bin
-                        bin_0_watershed = 0.1
+                        bin_0_watershed = 1/_n_bins
                         q_skewed = np.concatenate([
                             [0.0, bin_0_watershed],
-                            np.linspace(bin_0_watershed, 1.0, _n_bins - 1)
+                            np.linspace(bin_0_watershed, 1.0, _n_bins)
                         ])
                         bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
                         _y_discrete[_ds:_de] = bins.astype(np.int32)
+                        if TrainingConfig.LABEL_WEIGHTED_FOR_REGRESSION:
+                            _y_discrete[_ds:_de] = (np.power(bins.astype(np.int32), TrainingConfig.LABEL_WEIGHT_EXPONENT)).astype(np.int32)
 
                     except ValueError:
                         raise ValueError(f"  {_dates_sub[_ds:_de]} 样本标签分布不均匀，请检查数据质量。")
@@ -1441,53 +1735,57 @@ class MLModelTrainer:
         
         # 记录原始特征列表，用于同步过滤 X_val
         original_factor_names = list(factor_names)
-        
-        # 尝试从缓存读取特征选择结果
-        loaded_from_cache = False
-        if os.path.exists(selection_cache_file):
-            try:
-                import json
-                with open(selection_cache_file, 'r', encoding='utf-8') as f:
-                    cached_data = json.load(f)
-                    # 只有当原始特征集完全一致时，才复用缓存
-                    if set(cached_data.get('original_features', [])) == set(original_factor_names):
-                        factor_names = cached_data['selected_features']
-                        print(f"\n[特征优化] 从缓存加载特征选择结果 (保留 {len(factor_names)} 个核心特征)")
-                        loaded_from_cache = True
-            except Exception as e:
-                print(f"  读取特征选择缓存失败: {e}")
 
-        if not loaded_from_cache:
-            print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
-            # 使用相关性过滤
-            X_train, factor_names = self._select_features(
-                X_train, factor_names, 0.8
-            )
-            # 保存特征选择结果到缓存
-            try:
-                import json
-                with open(selection_cache_file, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'original_features': original_factor_names,
-                        'selected_features': factor_names,
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                print(f"  保存特征选择结果失败: {e}")
-        
-        # 同步更新数据矩阵 (无论是否来自缓存，都要确保矩阵列数对齐)
-        if len(factor_names) < len(original_factor_names):
-            keep_indices = [original_factor_names.index(f) for f in factor_names]
-            if loaded_from_cache:
-                X_train = X_train[:, keep_indices] if not isinstance(X_train, pd.DataFrame) else X_train[factor_names]
+        apply_feature_selection=True
+        if apply_feature_selection:        
+            # 尝试从缓存读取特征选择结果
+            loaded_from_cache = False
+            if os.path.exists(selection_cache_file):
+                try:
+                    import json
+                    with open(selection_cache_file, 'r', encoding='utf-8') as f:
+                        cached_data = json.load(f)
+                        # 只有当原始特征集完全一致时，才复用缓存
+                        if set(cached_data.get('original_features', [])) == set(original_factor_names):
+                            factor_names = cached_data['selected_features']
+                            print(f"\n[特征优化] 从缓存加载特征选择结果 (保留 {len(factor_names)} 个核心特征)")
+                            loaded_from_cache = True
+                except Exception as e:
+                    print(f"  读取特征选择缓存失败: {e}")
+
+            if not loaded_from_cache:
+                print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
+                # 使用相关性过滤
+                X_train, factor_names = self._select_features(
+                    X_train, factor_names, 0.8
+                )
+                # 保存特征选择结果到缓存
+                try:
+                    import json
+                    with open(selection_cache_file, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            'original_features': original_factor_names,
+                            'selected_features': factor_names,
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }, f, ensure_ascii=False, indent=4)
+                except Exception as e:
+                    print(f"  保存特征选择结果失败: {e}")
             
-            if isinstance(X_val, pd.DataFrame):
-                X_val = X_val[factor_names]
-            else:
-                X_val = X_val[:, keep_indices]
-            
-        if not loaded_from_cache:
-            print(f"  特征优化完成: 保留 {len(factor_names)} 个核心特征")
+            # 同步更新数据矩阵 (无论是否来自缓存，都要确保矩阵列数对齐)
+            if len(factor_names) < len(original_factor_names):
+                keep_indices = [original_factor_names.index(f) for f in factor_names]
+                if loaded_from_cache:
+                    X_train = X_train[:, keep_indices] if not isinstance(X_train, pd.DataFrame) else X_train[factor_names]
+                
+                if isinstance(X_val, pd.DataFrame):
+                    X_val = X_val[factor_names]
+                else:
+                    X_val = X_val[:, keep_indices]
+                
+            if not loaded_from_cache:
+                print(f"  特征优化完成: 保留 {len(factor_names)} 个核心特征")
+        else:
+            feature_names=original_factor_names
 
 
 
@@ -1680,23 +1978,23 @@ class MLModelTrainer:
                 chunk_start_row = group_start[first_date_idx]
                 chunk_end_row = group_start[last_date_idx] + group_counts[last_date_idx]
                 
-                # Contiguous sub-matrix slice (memory views)
-                X_sub = X[chunk_start_row:chunk_end_row, rank_cols_idx]
                 rel_starts = group_start[chunk] - chunk_start_row
                 counts = group_counts[chunk]
                 
-                tasks.append((X_sub, rel_starts, counts, chunk_start_row, chunk_end_row))
+                tasks.append((chunk_start_row, chunk_end_row, rel_starts, counts))
                 
-            # 执行多核并行计算 (Loky/Multiprocessing)
+            # 在每个连续行块内原地赋值，避免 loky 子进程序列化大矩阵切片。
             from joblib import Parallel, delayed
-            results = Parallel(n_jobs=n_jobs)(
-                delayed(_normalize_chunk_worker)(X_sub, rel_starts, counts)
-                for X_sub, rel_starts, counts, _, _ in tasks
+            Parallel(n_jobs=n_jobs,  require="sharedmem")(
+                delayed(_normalize_chunk_worker)(
+                    X,
+                    rank_cols_idx,
+                    chunk_start_row,
+                    rel_starts,
+                    counts,
+                )
+                for chunk_start_row, chunk_end_row, rel_starts, counts in tasks
             )
-            
-            # 原地赋回原矩阵
-            for (_, _, _, chunk_start_row, chunk_end_row), res_sub in zip(tasks, results):
-                X[chunk_start_row:chunk_end_row, rank_cols_idx] = res_sub
         else:
             # 串行备用方案，利用 _fast_rankdata_1d 依然极快
             for start, count in zip(group_start, group_counts):

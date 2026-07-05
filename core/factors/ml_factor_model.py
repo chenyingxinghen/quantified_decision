@@ -283,9 +283,8 @@ class MLFactorModel:
         # ---------------------------------------------------------------------
         # 情况 A: XGBoost 分批训练 (DataIter)
         # ---------------------------------------------------------------------
-        # 优化：通过 DataIter 分批向 GPU 供弹，核心在于 batch_size 需足够大以遮掩 PCIe 延迟
-        batch_size = getattr(TrainingConfig, 'GPU_BATCH_SIZE', 100000)
-        if self.model_type == 'xgboost' and mem_efficient and len(X_train_raw) > batch_size:
+        # QuantileDMatrix 一次性将数据驻留 GPU，避免迭代间反复 PCIe 搬运
+        if self.model_type == 'xgboost' and mem_efficient:
             print(f"  [INFO] XGBoost 启动 QuantileDMatrix 训练模式 (样本数: {len(X_train_raw)})")
             
             # 直接传整个数组给 QuantileDMatrix，避免 DataIter 多次遍历的队列等待瓶颈。
@@ -487,7 +486,23 @@ class MLFactorModel:
                 fit_params['eval_set'] = [(X_val, y_val)]
 
             if self.model_type == 'xgboost':
-                self.model.fit(X_train, y_train, verbose=False, **fit_params)
+                self.model.fit(X_train, y_train, verbose=50, **fit_params)
+                if hasattr(self.model, 'evals_result'):
+                    _raw = self.model.evals_result()
+                    if _raw:
+                        _keys = list(_raw.keys())
+                        if len(_keys) == 1:
+                            self._evals_result = {k: v for k, v in _raw.items()}
+                        else:
+                            renamed = {}
+                            for _i, _k in enumerate(_keys):
+                                if _i == 0:
+                                    renamed['train_monitor'] = _raw[_k]
+                                elif _i == 1:
+                                    renamed['valid'] = _raw[_k]
+                                else:
+                                    renamed[_k] = _raw[_k]
+                            self._evals_result = renamed
             elif self.model_type == 'lightgbm':
                 from lightgbm import early_stopping, log_evaluation, record_evaluation
                 es_rounds = getattr(self, 'early_stopping_rounds', None)
@@ -552,8 +567,6 @@ class MLFactorModel:
         }
 
     def _get_predict_proba(self, X: Any) -> np.ndarray:
-        if not isinstance(X, pd.DataFrame): X = pd.DataFrame(X, columns=self.feature_names)
-        
         # 对于分类器，返回正类概率
         if hasattr(self.model, 'predict_proba'):
             return self.model.predict_proba(X)[:, 1]

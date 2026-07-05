@@ -42,11 +42,15 @@ class MLFactorBacktestStrategy(BaseStrategy):
         
         self.model = None
         self._factors_cache = {}  # 内存缓存，用于存放 parquet 加载全量因子数据
+        self._factor_dates_cache = {}
+        self._factor_matrix_cache = {}
+        self._finance_history = {}
         self._warned_stocks = set()
     
     def initialize(self, **kwargs):
         """初始化策略 - 预定全量缓存以极大提升速度"""
         super().initialize(**kwargs)
+        self._active_stock_codes = set(kwargs.get('stock_codes') or [])
         
         # 0. 预加载所有 PIT 筛选所需的基本面指标 (性能优化核心)
         print(f"正在进行 PIT 数据全量预缓存...")
@@ -86,6 +90,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 self.norm_stats = None
         else:
             self.norm_stats = None
+
+        if self.use_cache:
+            self._preload_factor_cache()
         
         print(f"策略初始化完成: {self.name} (已启用 PIT 预缓存 ✓)")
     
@@ -113,19 +120,17 @@ class MLFactorBacktestStrategy(BaseStrategy):
 
         # 1. 获取所有股票列表
         all_codes = market_data.keys()
-        
-        # 2. 预筛选 (利用内存快照，无 SQL)
-        info_map = self._get_optimized_info_map(current_date, market_data)
-        
+
         # 筛选逻辑：
-        # 1. 如果显式传入了 criteria，则使用它。
-        #    - 若 criteria 中包含 'apply_filter' 键，则以此为准；
-        #    - 否则，以全局配置 sc.ENABLE_FUNDAMENTAL_FILTER 为准。
-        # 2. 如果未传入 criteria (回测场景)，则完全遵循 sc 全局配置。
+        # 1. 回测场景：criteria 为 None，完全使用 sc 配置
+        # 2. 后端场景：criteria 由前端传入，前端必须明确传入所有参数（不传或空值则不限制该条件）
+        # 3. 自动化场景：criteria 由自动化传入，自动化配置优先，未设置的参数使用 sc 兜底
         if criteria is not None:
+            # 后端/自动化场景：criteria 已传入
             filter_criteria = criteria
-            should_apply_filter = criteria.get('apply_filter', sc.ENABLE_FUNDAMENTAL_FILTER)
+            should_apply_filter = criteria.get('apply_filter', False)  # 默认 False，必须显式启用
         else:
+            # 回测场景：使用 sc 配置
             filter_criteria = {
                 'min_market_cap': sc.MIN_MARKET_CAP, 'max_pe': sc.MAX_PE, 'max_zcfzl': sc.MAX_ZCFZL,
                 'min_price': sc.MIN_PRICE, 'max_price': sc.MAX_PRICE, 'include_st': sc.INCLUDE_ST,
@@ -134,6 +139,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
             should_apply_filter = sc.ENABLE_FUNDAMENTAL_FILTER
 
         if should_apply_filter:
+            # 2. 预筛选 (利用内存快照，无 SQL)。仅在启用过滤时构建，避免无谓遍历全市场。
+            info_map = self._get_optimized_info_map(current_date, market_data)
             predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
                                                  apply_filter=True, 
                                                  criteria=filter_criteria)
@@ -145,32 +152,30 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 3. 批量获取当前因子的最新行
         raw_rows = []
         stock_codes_with_data = []
+        feature_names = self._get_model_feature_names()
+        if not feature_names:
+            return signals
         for code in predict_codes:
-            # 此处可能触发磁盘读取，如果内存不足 1万只股票，会有少量淘汰
-            factors = self._get_factors(code, None, current_date)
-            if factors is not None and not factors.empty:
-                latest_row = factors.iloc[-1:]
-                if 'date' in latest_row.columns:
-                    # 严格日期限制，不取未来日期
-                    if str(latest_row['date'].iloc[0])[:10] > current_date: continue
-                    feature_row = latest_row.drop(columns=['date']).values[0]
-                else: continue
-                raw_rows.append(feature_row)
-                stock_codes_with_data.append(code)
+            if code in existing_positions:
+                continue
+            feature_row = self._get_factor_row_array(code, current_date)
+            if feature_row is None:
+                continue
+            raw_rows.append(feature_row)
+            stock_codes_with_data.append(code)
         
         if not raw_rows: return signals
 
-        # 4. 批量预测
-        all_X = pd.DataFrame(raw_rows, columns=self.model.feature_names)
-        
-        # 横截面归一化 (与训练时精确匹配逻辑保持一致)
-        rank_cols = [col for col in all_X.columns if not fc.TrainingConfig.should_skip_rank(col)]
+        # 4. 批量预测。优先保持 numpy 矩阵，避免每日反复构造 DataFrame。
+        X_arr = np.vstack(raw_rows).astype(np.float32, copy=False)
 
-        if rank_cols and len(all_X) > 1:
+        # 横截面归一化 (与训练时精确匹配逻辑保持一致)
+        rank_cols_idx = [i for i, col in enumerate(feature_names) if not fc.TrainingConfig.should_skip_rank(col)]
+
+        if rank_cols_idx and len(X_arr) > 1:
             from scipy.stats import rankdata as _rankdata
-            arr = all_X[rank_cols].values
-            ranked = _rankdata(arr, method='average', axis=0) / (len(all_X) + 1)
-            all_X[rank_cols] = ranked.astype(np.float32)
+            ranked = _rankdata(X_arr[:, rank_cols_idx], method='average', axis=0) / (len(X_arr) + 1)
+            X_arr[:, rank_cols_idx] = ranked.astype(np.float32)
 
         # skip_cols：复用训练集 robust 统计量（仅连续型，二值列保留原值）
         norm_stats = getattr(self, 'norm_stats', None)
@@ -182,7 +187,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 robust_global_idx  = skip_col_stats['robust_global_idx']
                 robust_col_names   = [train_factor_names[i] for i in robust_global_idx
                                       if i < len(train_factor_names)]
-                present_robust = [c for c in robust_col_names if c in all_X.columns]
+                feature_pos = {name: idx for idx, name in enumerate(feature_names)}
+                present_robust = [c for c in robust_col_names if c in feature_pos]
                 if present_robust:
                     col_to_idx = {train_factor_names[i]: j
                                   for j, i in enumerate(robust_global_idx)
@@ -192,12 +198,17 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     valid_iqr = skip_col_stats['valid_iqr']
                     for col in present_robust:
                         j = col_to_idx[col]
+                        arr_idx = feature_pos[col]
                         if valid_iqr[j]:
-                            z = (all_X[col].values.astype(float) - median[j]) / iqr[j]
-                            all_X[col] = (1.0 / (1.0 + _np.exp(-_np.clip(z, -10, 10)))).astype(_np.float32)
+                            z = (X_arr[:, arr_idx].astype(float) - median[j]) / iqr[j]
+                            X_arr[:, arr_idx] = (1.0 / (1.0 + _np.exp(-_np.clip(z, -10, 10)))).astype(_np.float32)
                         else:
-                            all_X[col] = 0.5  # 零方差列，置中性值
-        probs = self.model.predict(all_X.fillna(0.5))
+                            X_arr[:, arr_idx] = 0.5  # 零方差列，置中性值
+        X_arr = np.nan_to_num(X_arr, nan=0.5, posinf=1.0, neginf=0.0)
+        if getattr(self.model, 'models', None):
+            probs = self.model.predict(pd.DataFrame(X_arr, columns=feature_names))
+        else:
+            probs = self.model.predict(X_arr)
         
         # 5. 生成信号
         candidates = []
@@ -247,32 +258,143 @@ class MLFactorBacktestStrategy(BaseStrategy):
             for col in num_cols:
                 self._all_finance_df[col] = pd.to_numeric(self._all_finance_df[col], errors='coerce').astype('float32')
             self._all_finance_df = self._all_finance_df.sort_values('pub_date')
+            self._finance_history = {}
+            for code, group in self._all_finance_df.groupby('code', sort=False):
+                dates = group['pub_date'].astype(str).str[:10].to_numpy()
+                values = group[num_cols].to_numpy(dtype=np.float32, copy=True)
+                self._finance_history[code] = (dates, values)
         finally: conn.close()
 
     def _get_optimized_info_map(self, target_date: str, market_data: Any) -> Dict[str, Dict]:
         """极速信息映射逻辑，复用预缓存信息"""
         info_map = {}
-        # 筛选截止日期前的最新财务数据
-        actual_fin = self._all_finance_df[self._all_finance_df['pub_date'] <= target_date]
-        latest_fin = actual_fin.groupby('code').last()
-        fin_map = latest_fin.to_dict('index')
         
         for code in market_data.keys():
             bar = market_data.get_bar(code)
             if bar is None: continue
-            fin = fin_map.get(code, {})
-            eps, ts = fin.get('EPSJB'), fin.get('totalShare')
+            fin_hist = getattr(self, '_finance_history', {}).get(code)
+            eps = ts = zcfzl = None
+            if fin_hist is not None:
+                fin_dates, fin_values = fin_hist
+                fin_idx = np.searchsorted(fin_dates, target_date, side='right') - 1
+                if fin_idx >= 0:
+                    eps = fin_values[fin_idx, 0]
+                    ts = fin_values[fin_idx, 1]
+                    zcfzl = fin_values[fin_idx, 2]
             # 组装基本面字典供筛选
             info_map[code] = {
                 'name': self._meta_map.get(code, '-'), 'is_st': int(bar.get('is_st', 0)),
                 'pe_ratio': (bar['close']/eps if eps and eps>0 else None),
-                'zcfzl': fin.get('ZCFZL'), 'current_price': bar['close'],
+                'zcfzl': zcfzl, 'current_price': bar['close'],
                 'market_cap': (bar['close']*ts/1e8 if ts else None)
             }
         return info_map
 
+    def _preload_factor_cache(self):
+        """预加载回测所需因子列，并建立按日期二分查找的缓存。"""
+        feature_names = self._get_model_feature_names()
+        if not feature_names:
+            return
+        if not os.path.isdir(self.cache_dir):
+            return
+
+        active_codes = getattr(self, '_active_stock_codes', set())
+        if active_codes:
+            files = [
+                f'{code}_factors.parquet'
+                for code in active_codes
+                if os.path.exists(os.path.join(self.cache_dir, f'{code}_factors.parquet'))
+            ]
+        else:
+            files = [f for f in os.listdir(self.cache_dir) if f.endswith('_factors.parquet')]
+        if not files:
+            return
+
+        scope = "当前回测股票池" if active_codes else "全部缓存"
+        print(f"正在预加载因子缓存({scope}): {len(files)} 个 parquet...")
+
+        def _load_one(filename):
+            code = filename[:-len('_factors.parquet')]
+            path = os.path.join(self.cache_dir, filename)
+            try:
+                import pyarrow.parquet as pq
+                pf = pq.ParquetFile(path)
+                schema_names = set(pf.schema.names)
+                if 'date' not in schema_names:
+                    return None
+                read_cols = ['date'] + [c for c in feature_names if c in schema_names]
+                df = pd.read_parquet(path, columns=read_cols)
+                if df.empty or 'date' not in df.columns:
+                    return None
+
+                dates = df['date'].astype(str).str[:10].to_numpy()
+                order = np.argsort(dates, kind='mergesort')
+                if not np.all(order == np.arange(len(order))):
+                    df = df.iloc[order].reset_index(drop=True)
+                    dates = dates[order]
+
+                matrix = np.full((len(df), len(feature_names)), 0.5, dtype=np.float32)
+                for col_idx, col in enumerate(feature_names):
+                    if col in df.columns:
+                        matrix[:, col_idx] = pd.to_numeric(df[col], errors='coerce').fillna(0.5).to_numpy(dtype=np.float32)
+                return code, dates, matrix
+            except Exception:
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(8, max(1, len(files)))
+        loaded = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for item in executor.map(_load_one, files):
+                if item is None:
+                    continue
+                code, dates, matrix = item
+                self._factor_dates_cache[code] = dates
+                self._factor_matrix_cache[code] = matrix
+                loaded += 1
+        print(f"  因子缓存预加载完成: {loaded}/{len(files)}")
+
+    def _get_factor_row_array(self, stock_code: str, current_date: str) -> Optional[np.ndarray]:
+        """按股票和日期快速取得 PIT 特征行。"""
+        dates = self._factor_dates_cache.get(stock_code)
+        matrix = self._factor_matrix_cache.get(stock_code)
+        if dates is not None and matrix is not None:
+            idx = np.searchsorted(dates, current_date, side='right') - 1
+            if idx >= 0:
+                return matrix[idx]
+
+        factors = self._get_factors(stock_code, None, current_date)
+        if factors is None or factors.empty:
+            return None
+        row = factors.drop(columns=['date'], errors='ignore').iloc[-1]
+        return row.reindex(self._get_model_feature_names()).fillna(0.5).to_numpy(dtype=np.float32)
+
+    def _get_model_feature_names(self) -> List[str]:
+        """获取模型需要的特征列，兼容单模型与集成模型。"""
+        names = getattr(self.model, 'feature_names', None)
+        if names:
+            return list(names)
+        models = getattr(self.model, 'models', None)
+        if models:
+            ordered = []
+            seen = set()
+            for model in models:
+                for name in getattr(model, 'feature_names', []) or []:
+                    if name not in seen:
+                        ordered.append(name)
+                        seen.add(name)
+            return ordered
+        return []
+
     def _pre_filter_stocks(self, all_codes: List[str], info_map: Dict[str, Dict], apply_filter: bool, criteria: Dict) -> Tuple[List[str], Dict]:
-        """股票池预筛选，保持逻辑完全一致"""
+        """
+        股票池预筛选逻辑
+        
+        参数优先级说明：
+        - 后端场景：criteria 中的参数由前端传入，None 表示不限制该条件
+        - 回测场景：criteria 使用 sc 配置的默认值
+        - 自动化场景：criteria 使用 automation_config 优先，未设置则使用 sc 兜底
+        """
         if not apply_filter: return all_codes, {}
         passed = []
         
@@ -304,16 +426,17 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 continue
 
             # 2. ST股及退市搜索
-            if not _get_val('include_st', True) and (info['is_st'] == 1 or '退' in info['name']): continue
+            if not _get_val('include_st', sc.INCLUDE_ST) and (info['is_st'] == 1 or '退' in info['name']): continue
             
             # 3. PE 筛选
             pe = info.get('pe_ratio')
-            max_pe = _get_val('max_pe', float('inf'))
+            max_pe = _get_val('max_pe', sc.MAX_PE if sc.MAX_PE is not None else float('inf'))
             if pe is not None and (pe <= 0 or pe > max_pe): continue
             
             # 4. 价格筛选
             price = info['current_price']
-            if price < _get_val('min_price', 0) or price > _get_val('max_price', float('inf')): continue
+            if price < _get_val('min_price', sc.MIN_PRICE if sc.MIN_PRICE is not None else 0) or \
+               price > _get_val('max_price', sc.MAX_PRICE if sc.MAX_PRICE is not None else float('inf')): continue
             
             # 5. 市值筛选
             mkt_cap = info.get('market_cap')
@@ -350,13 +473,14 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if factors.empty: return None
         factors = factors.iloc[[-1]]
         
-        if self.model and self.model.feature_names:
+        feature_names = self._get_model_feature_names()
+        if self.model and feature_names:
             # 填充缺失列为0，保持特征列顺序与模型一致
-            missing = [f for f in self.model.feature_names if f not in factors.columns]
+            missing = [f for f in feature_names if f not in factors.columns]
             if missing:
                 missing_df = pd.DataFrame(0.5, index=factors.index, columns=missing)
                 factors = pd.concat([factors, missing_df], axis=1)
-            f_cols = self.model.feature_names + (['date'] if 'date' not in self.model.feature_names else [])
+            f_cols = feature_names + (['date'] if 'date' not in feature_names else [])
             factors = factors[[c for c in f_cols if c in factors.columns]]
         return factors
 

@@ -154,21 +154,31 @@ def main():
         except Exception:
             pass
         
-        print(f"  正在扫描 {len(trainer_stocks)} 只股票的缓存状态...")
-        for code in trainer_stocks:
+        def _scan_one_cache(code):
             cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
             if os.path.exists(cache_file):
                 try:
-                    # 快速读取日期列的最后一行
-                    last_row = pq.read_table(cache_file, columns=['date']).to_pandas().tail(1)
-                    if not last_row.empty:
-                        cache_last_date = str(last_row['date'].iloc[0])
-                        if cache_last_date >= _actual_latest_date:
-                            skipped_count += 1
-                            continue
+                    pf = pq.ParquetFile(cache_file)
+                    if pf.num_row_groups > 0:
+                        table = pf.read_row_group(pf.num_row_groups - 1, columns=['date'])
+                    else:
+                        table = pq.read_table(cache_file, columns=['date'])
+                    if table.num_rows > 0:
+                        cache_last_date = str(table.column('date')[-1].as_py())[:10]
+                        return code, cache_last_date < _actual_latest_date
                 except Exception:
                     pass
-            stocks_to_update.append(code)
+            return code, True
+
+        print(f"  正在并行扫描 {len(trainer_stocks)} 只股票的缓存状态...")
+        from concurrent.futures import ThreadPoolExecutor
+        scan_workers = max(1, min(32, args.workers if args.workers and args.workers > 0 else 32, len(trainer_stocks)))
+        with ThreadPoolExecutor(max_workers=scan_workers) as executor:
+            for code, needs_update in executor.map(_scan_one_cache, trainer_stocks):
+                if needs_update:
+                    stocks_to_update.append(code)
+                else:
+                    skipped_count += 1
             
         print(f"  扫描完成: {skipped_count} 只已同步，{len(stocks_to_update)} 只待更新")
         
@@ -201,8 +211,8 @@ def main():
         return
 
     # ── 5. 加载训练数据 ──────────────────────────────────────────────────
-    print(f"\n[Step 1] 正在读取训练历史行情数据...")
-    stocks_data = trainer.load_training_data(trainer_stocks, train_start_date, train_end_date)
+    print(f"\n[Step 1] 正在读取训练标签行情数据...")
+    stocks_data = trainer.load_label_data(trainer_stocks, train_start_date, train_end_date)
 
     # ── 6. 准备数据集 ────────────────────────────────────────────────────
     print(f"\n[Step 2] 准备特征数据集与标签...")
@@ -212,8 +222,11 @@ def main():
         train_end_date=train_end_date,
         include_fundamentals=True,
         n_jobs=args.workers,
-        target_features=target_features  # 复用 Step 0 发现的特征集，跳过重复发现
+        target_features=target_features,  # 复用 Step 0 发现的特征集，跳过重复发现
+        use_factor_cache_only=True
     )
+    del stocks_data
+    import gc; gc.collect()
 
     # ── 7. 训练模型 ──────────────────────────────────────────────────────
     print(f"\n[Step 3] 训练机器学习模型...")

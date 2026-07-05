@@ -42,15 +42,18 @@ def _load_stock_batch_baostock(args):
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
     
-    # 按股票分组
+    # 按股票分组，避免为每只股票重复构造整批布尔掩码
     result = {}
-    for code in df['code'].unique():
-        stock_df = df[df['code'] == code].copy()
+    for code, stock_df in df.groupby('code', sort=False):
         stock_df = stock_df.sort_values('date').reset_index(drop=True)
         
         # 填充缺失的复权因子
         stock_df['fore_adjust_factor'] = stock_df['fore_adjust_factor'].ffill().fillna(1.0)
         stock_df['back_adjust_factor'] = stock_df['back_adjust_factor'].ffill().fillna(1.0)
+        numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
+        numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
+        if numeric_cols:
+            stock_df[numeric_cols] = stock_df[numeric_cols].astype('float32', copy=False)
         
         if len(stock_df) >= 30:
             result[code] = stock_df
@@ -83,7 +86,8 @@ class BaostockDataHandler:
         
         self._data_cache: Dict[str, pd.DataFrame] = {}
         self._date_index: Dict[str, Dict[str, int]] = {}
-        self._daily_bars: Dict[str, Dict[str, pd.Series]] = {}
+        self._daily_bars: Dict[str, set] = {}
+        self._bar_cache: Dict[tuple, dict] = {}
         self._all_trading_dates: List[str] = []
         
         # 动态复权缓存
@@ -118,7 +122,7 @@ class BaostockDataHandler:
         else:
             data = self._load_sequential(stock_codes, start_date, end_date, min_days)
         
-        self._data_cache = data
+        self._data_cache = self._downcast_to_float32(data)
         self._build_indexes()
         self._all_trading_dates = sorted(self._daily_bars.keys())
         
@@ -157,18 +161,30 @@ class BaostockDataHandler:
         df = pd.read_sql_query(query, self.conn, params=params)
         
         result = {}
-        for code in df['code'].unique():
-            stock_df = df[df['code'] == code].copy()
+        for code, stock_df in df.groupby('code', sort=False):
             stock_df = stock_df.sort_values('date').reset_index(drop=True)
             
             # 填充缺失的复权因子
             stock_df['fore_adjust_factor'] = stock_df['fore_adjust_factor'].ffill().fillna(1.0)
             stock_df['back_adjust_factor'] = stock_df['back_adjust_factor'].ffill().fillna(1.0)
+            numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
+            numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
+            if numeric_cols:
+                stock_df[numeric_cols] = stock_df[numeric_cols].astype('float32', copy=False)
             
             if len(stock_df) >= min_days:
                 result[code] = stock_df
         
         return result
+
+    def _downcast_to_float32(self, data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """压缩数值列，降低回测常驻内存。"""
+        for _, df in data.items():
+            numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
+            numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
+            if numeric_cols:
+                df[numeric_cols] = df[numeric_cols].astype('float32', copy=False)
+        return data
     
     def _load_parallel(self,
                       stock_codes: List[str],
@@ -196,21 +212,19 @@ class BaostockDataHandler:
         return result
     
     def _build_indexes(self):
-        """构建日期索引和每日行情哈希表"""
+        """构建日期索引和每日活跃股票集合，不再缓存每行 Series。"""
         self._date_index = {}
         self._daily_bars = {}
+        self._bar_cache = {}
         
         for code, df in self._data_cache.items():
-            date_to_idx = {}
-            for idx, row in df.iterrows():
-                date = row['date']
-                date_to_idx[date] = idx
-                
+            date_list = df['date'].tolist()
+            self._date_index[code] = {d: i for i, d in enumerate(date_list)}
+
+            for date in date_list:
                 if date not in self._daily_bars:
-                    self._daily_bars[date] = {}
-                self._daily_bars[date][code] = row
-            
-            self._date_index[code] = date_to_idx
+                    self._daily_bars[date] = set()
+                self._daily_bars[date].add(code)
     
     def get_trading_dates(self, start_date: str, end_date: str) -> List[str]:
         """获取交易日列表"""
@@ -251,11 +265,11 @@ class BaostockDataHandler:
             
             if lookback_days:
                 start_idx = max(0, end_idx - lookback_days + 1)
-                result = df.iloc[start_idx:end_idx+1].copy()
+                result = df.iloc[start_idx:end_idx+1]
             else:
-                result = df.iloc[:end_idx+1].copy()
+                result = df.iloc[:end_idx+1]
         else:
-            result = df[df['date'] <= end_date].copy()
+            result = df[df['date'] <= end_date]
             if lookback_days and len(result) > lookback_days:
                 result = result.tail(lookback_days)
         
@@ -302,7 +316,7 @@ class BaostockDataHandler:
         
         return df
     
-    def get_bar_data(self, stock_code: str, date: str, adjusted: bool = True) -> Optional[pd.Series]:
+    def get_bar_data(self, stock_code: str, date: str, adjusted: bool = True) -> Optional[dict]:
         """
         获取单日行情
         
@@ -312,23 +326,44 @@ class BaostockDataHandler:
             adjusted: 是否返回复权数据（以当日为基准）
         
         返回:
-            Series或None
+            dict或None
         """
-        if date in self._daily_bars and stock_code in self._daily_bars[date]:
-            bar = self._daily_bars[date][stock_code].copy()
-            
-            if adjusted:
-                # 已经是当日基准，价格无需变动但添加 adj_ 前缀以对齐接口
-                for col in ['open', 'high', 'low', 'close', 'preclose']:
-                    bar[f'adj_{col}'] = bar[col]
-            
-            return bar
+        cache_key = (stock_code, date, adjusted)
+        cached = self._bar_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if stock_code in self._date_index:
+            idx = self._date_index[stock_code].get(date)
+            if idx is not None:
+                bar = self._data_cache[stock_code].iloc[idx].to_dict()
+                if adjusted:
+                    # 已经是当日基准，价格无需变动但添加 adj_ 前缀以对齐接口
+                    for col in ['open', 'high', 'low', 'close', 'preclose']:
+                        bar[f'adj_{col}'] = bar[col]
+                self._bar_cache[cache_key] = bar
+                return bar
         
         return None
     
     def get_market_snapshot(self, date: str) -> 'LazyMarketSnapshotBaostock':
         """获取市场快照（支持动态复权）"""
         return LazyMarketSnapshotBaostock(self, date)
+
+    def prune_bar_cache(self, keep_dates: Optional[set] = None, max_items: int = None):
+        """按日期裁剪延迟 bar 缓存，避免长回测中无限增长。"""
+        if not getattr(self, '_bar_cache', None):
+            return
+        if keep_dates is not None:
+            self._bar_cache = {
+                key: value
+                for key, value in self._bar_cache.items()
+                if key[1] in keep_dates
+            }
+        if max_items is not None and len(self._bar_cache) > max_items:
+            overflow = len(self._bar_cache) - max_items
+            for key in list(self._bar_cache.keys())[:overflow]:
+                self._bar_cache.pop(key, None)
     
     def close(self):
         """关闭数据库连接"""
@@ -343,7 +378,7 @@ class LazyMarketSnapshotBaostock:
         self.data_handler = data_handler
         self.date = date
         self._cache = {}
-        self.stock_codes = list(data_handler._daily_bars.get(date, {}).keys())
+        self.stock_codes = list(data_handler._daily_bars.get(date, set()))
     
     def get_bar(self, stock_code: str, adjusted: bool = True):
         """获取指定股票当日的单行行情数据"""
@@ -369,4 +404,4 @@ class LazyMarketSnapshotBaostock:
         return len(self.stock_codes)
     
     def __contains__(self, stock_code):
-        return stock_code in self.stock_codes
+        return stock_code in self.data_handler._daily_bars.get(self.date, set())

@@ -38,16 +38,14 @@ def _load_stock_batch(args):
     
     # 按股票分组 并进行 float32 转换 (节省内存)
     result = {}
-    for code in df['code'].unique():
-        stock_df = df[df['code'] == code].copy()
+    for code, stock_df in df.groupby('code', sort=False):
         stock_df = stock_df.sort_values('date').reset_index(drop=True)
-        
+
         # 强制转换为 float32 (除了 date 和 code)
         numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
-        # 排除 code (即便它是数字，通常也是类别)
         numeric_cols = [c for c in numeric_cols if c not in ['code', 'date']]
         stock_df[numeric_cols] = stock_df[numeric_cols].astype('float32', copy=False)
-        
+
         if len(stock_df) >= 30:
             result[code] = stock_df
     
@@ -69,7 +67,7 @@ class DataHandler:
         # SQLite 连接不能跨线程，FastAPI 多线程环境下会引发 ProgrammingError
         self._data_cache: Dict[str, pd.DataFrame] = {}
         self._date_index: Dict[str, Dict[str, int]] = {}
-        self._daily_bars: Dict[str, Dict[str, pd.Series]] = {} # 每日行情快照: date -> {code -> Series}
+        self._daily_bars: Dict[str, set] = {} # 每日活跃股票代码: date -> set(code, ...)
         self._all_trading_dates: List[str] = []
     
     def _get_connection(self):
@@ -176,15 +174,14 @@ class DataHandler:
         conn.close()
         
         result = {}
-        for code in df['code'].unique():
-            stock_df = df[df['code'] == code].copy()
+        for code, stock_df in df.groupby('code', sort=False):
             stock_df = stock_df.sort_values('date').reset_index(drop=True)
-            
+
             # 立即进行 float32 转换，减少单线程加载时的内存堆积
             target_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
             target_cols = [c for c in target_cols if c not in ['code', 'date']]
             stock_df[target_cols] = stock_df[target_cols].astype('float32', copy=False)
-            
+
             if len(stock_df) >= min_days:
                 result[code] = stock_df
         
@@ -220,46 +217,27 @@ class DataHandler:
     
     def _build_indexes(self):
         """
-        同时构建日期索引和每日行情哈希表（高性能优化版本）
-        
-        优化点：
-        1. 使用 to_dict('index') 代替 iterrows 循环，性能提升几十倍。
-        2. _date_index 用于快速定位股票在 DataFrame 中的行索引。
-        3. _daily_bars 用于快速获取某日全市场的行情快照。
+        构建日期索引和每日活跃股票集合。
+
+        _date_index: {code: {date: row_idx}} 用于 O(1) 行定位
+        _daily_bars: {date: set(code, ...)} 仅记录当日活跃股票代码，
+                     不再存储 row dict，由 get_bar_data 从 DataFrame 按需读取
+        _bar_cache:  延迟填充的 {(code, date): dict} 缓存
         """
         self._date_index = {}
         self._daily_bars = {}
-        
-        # 预先收集所有交易日，一次性初始化字典，避免循环中判断成员
-        all_dates = set()
-        for df in self._data_cache.values():
-            all_dates.update(df['date'].values)
-        
-        for date in all_dates:
-            self._daily_bars[date] = {}
-            
-        print(f"  - 正在构建索引，涉及 {len(self._data_cache)} 只股票，共约 {len(all_dates)} 个交易日...")
-        
+        self._bar_cache = {}
+
+        print(f"  - 正在构建索引，涉及 {len(self._data_cache)} 只股票...")
+
         for code, df in self._data_cache.items():
-            # 1. 构建日期到索引的快速映射 (T+1 定位用)
-            # 使用 zip 比 set_index().to_dict() 更快
             date_list = df['date'].tolist()
             self._date_index[code] = {d: i for i, d in enumerate(date_list)}
-            
-            # 2. 构建每日行情映射 (快照用)
-            # 技巧：将 DataFrame 按日期设为索引，然后转为字典。
-            # 这样一行的所有字段（open, high, low, close 等）都会变成 dict，
-            #虽然不是 Series，但 LazyMarketSnapshot.get_bar 可以根据需要转 Series。
-            df_temp = df.set_index('date')
-            # 核心优化：to_dict('index') 会返回 {date: {col: val, ...}}
-            # 这种形式非常契合 _daily_bars[date][code] = row_dict
-            code_daily_dict = df_temp.to_dict('index')
-            
-            for date, row_data in code_daily_dict.items():
-                # 为了保持向后兼容性（返回 pd.Series），我们在这里只存 dict。
-                # 只有在 get_bar_data 被调用时，才按需转换为 Series。
-                # 或者在 LazyMarketSnapshot 中进行转换。
-                self._daily_bars[date][code] = row_data
+
+            for d in date_list:
+                if d not in self._daily_bars:
+                    self._daily_bars[d] = set()
+                self._daily_bars[d].add(code)
     
     def get_trading_dates(self, start_date: str, end_date: str) -> List[str]:
         """
@@ -316,34 +294,23 @@ class DataHandler:
         
         return result if not result.empty else None
     
-    def get_bar_data(self, stock_code: str, date: str) -> Optional[pd.Series]:
+    def get_bar_data(self, stock_code: str, date: str):
         """
-        获取单日行情
-        
-        参数:
-            stock_code: 股票代码
-            date: 日期
-        
-        返回:
-            Series或None
+        获取单日行情 (返回 dict，所有调用方均使用 bar["key"] 访问)
+        延迟计算并缓存，避免启动时一次性生成 1500 万个 dict
         """
-        # 1. 优先使用预构建的每日行情映射 (O(1))
-        if date in self._daily_bars and stock_code in self._daily_bars[date]:
-            bar = self._daily_bars[date][stock_code]
-            if isinstance(bar, dict):
-                # 兼容性转换：按需将 dict 转为 pd.Series 并写回缓存
-                bar = pd.Series(bar)
-                bar.name = date
-                self._daily_bars[date][stock_code] = bar
-            return bar
-            
-        # 2. 如果缓存未生效（非预加载范围），使用索引定位
-        if stock_code in self._data_cache:
-            df = self._data_cache[stock_code]
-            if stock_code in self._date_index and date in self._date_index[stock_code]:
-                idx = self._date_index[stock_code][date]
-                return df.iloc[idx]
-        
+        cache_key = (stock_code, date)
+        cached = self._bar_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if stock_code in self._date_index:
+            idx = self._date_index[stock_code].get(date)
+            if idx is not None:
+                bar = self._data_cache[stock_code].iloc[idx].to_dict()
+                self._bar_cache[cache_key] = bar
+                return bar
+
         return None
     
     def get_market_snapshot(self, date: str) -> 'LazyMarketSnapshot':
@@ -351,6 +318,21 @@ class DataHandler:
         获取优化的市场快照代理对象
         """
         return LazyMarketSnapshot(self, date)
+
+    def prune_bar_cache(self, keep_dates: Optional[set] = None, max_items: int = None):
+        """按日期裁剪延迟 bar 缓存，避免长回测中无限增长。"""
+        if not getattr(self, '_bar_cache', None):
+            return
+        if keep_dates is not None:
+            self._bar_cache = {
+                key: value
+                for key, value in self._bar_cache.items()
+                if key[1] in keep_dates
+            }
+        if max_items is not None and len(self._bar_cache) > max_items:
+            overflow = len(self._bar_cache) - max_items
+            for key in list(self._bar_cache.keys())[:overflow]:
+                self._bar_cache.pop(key, None)
 
     def close(self):
         """关闭数据库连接（已废弃，保留以兼容旧代码）"""
@@ -366,7 +348,7 @@ class LazyMarketSnapshot:
         self.date = date
         self._cache = {}
         # 快速定位当日活跃的所有股票
-        self.stock_codes = [code for code, bars in data_handler._daily_bars.get(date, {}).items()]
+        self.stock_codes = list(data_handler._daily_bars.get(date, set()))
 
     def get_bar(self, stock_code):
         """获取指定股票当日的单行行情数据 Series (不触发全量拷贝)"""
@@ -390,4 +372,4 @@ class LazyMarketSnapshot:
         return len(self.stock_codes)
         
     def __contains__(self, stock_code):
-        return stock_code in self.stock_codes
+        return stock_code in self.data_handler._daily_bars.get(self.date, set())

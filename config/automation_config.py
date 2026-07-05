@@ -74,28 +74,29 @@ AUTO_TOP_N = MAX_POSITIONS_AUTO
 # ==============================================================================
 # 5. 自动化专属选股筛选条件
 #    独立于 strategy_config.py，专门用于实盘自动交易，可单独调整。
-#    设置为 None 则不启用该筛选条件（等价于关闭）。
+#    设置为 None 则回退使用 strategy_config.py 中的 sc 配置（自动化优先、sc 兜底）。
 # ==============================================================================
 
 # 是否启用自动化选股的基础条件筛选（市值/PE/股价/ST）
 AUTO_APPLY_FILTER = True
 
-# 最小流通市值（亿元），过滤微盘股。None = 不限制
+# 最小流通市值（亿元），过滤微盘股。None = 使用 sc.MIN_MARKET_CAP 兜底
 AUTO_MIN_MARKET_CAP = None       # 至少 20 亿市值
 
-# 最大市盈率（倍），过滤估值过高的股票。None = 不限制
+# 最大市盈率（倍），过滤估值过高的股票。None = 使用 sc.MAX_PE 兜底
 AUTO_MAX_PE = None              # PE 不高于 150 倍
 
-# 最大资产负债率（%）。None = 不限制
+# 最大资产负债率（%）。None = 使用 sc.MAX_ZCFZL 兜底
 AUTO_MAX_ZCFZL = None
 
-# 股价区间（元），过滤极低价或高价股。None = 不限制
+# 股价区间（元），过滤极低价或高价股。None = 使用 sc.MIN_PRICE/MAX_PRICE 兜底
 AUTO_MIN_PRICE = 0.0             # 最低 0 元
 AUTO_MAX_PRICE = 20.0           # 最高 20 元
 
-# 是否包含 ST / *ST 股票。实盘建议设为 False 规避退市风险
-AUTO_INCLUDE_ST = True
+# 是否包含 ST / *ST 股票。None = 使用 sc.INCLUDE_ST 兜底。实盘建议设为 False 规避退市风险
+AUTO_INCLUDE_ST = False
 
+# 市场类型列表。None = 使用 sc.SELECTOR_MARKETS 兜底
 SELECTOR_MARKETS=['sh_main','sz_main']
 
 

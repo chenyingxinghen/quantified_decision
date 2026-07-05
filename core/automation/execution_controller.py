@@ -357,32 +357,37 @@ class ExecutionController:
             for s in self.signals_cache
         )
         if all_done:
+            logger.info("所有信号今日已处理完毕，跳过买入。")
             return
 
+        logger.info("步骤1: 获取账户资金...")
         balance = self.trader.get_balance()
         if not balance:
             if not self.trader.is_connected:
-                logger.warning("桌面不可用，等待恢复后继续买入...")
+                logger.warning("  → 桌面不可用，等待恢复后继续买入...")
                 if not self.trader.wait_for_desktop(timeout_seconds=300):
-                    logger.error("桌面恢复超时，取消本次买入。")
+                    logger.error("  → 桌面恢复超时，取消本次买入。")
                     return
+                logger.info("  → 桌面已恢复，重新获取资金...")
                 balance = self.trader.get_balance()
             if not balance:
-                logger.warning("资金数据获取失败（GUI 异常或验证码），取消买入。")
+                logger.warning("  → 资金数据获取失败（GUI 异常或验证码），取消买入。")
                 return
+        logger.info("  → 资金获取成功")
 
         available_cash = float(balance.get('可用', balance.get('可用余额', balance.get('可用金额', 0))))
-        logger.info(f"当前可用资金: {available_cash:.2f}")
+        logger.info(f"  当前可用资金: {available_cash:.2f}")
 
         if available_cash < 200:
-            logger.warning(f"可用资金 ({available_cash:.2f}) 不足 200 元，取消买入。")
+            logger.warning(f"  → 可用资金 ({available_cash:.2f}) 不足 200 元，取消买入。")
             return
 
-        # 开始时同步一次持仓，后续不再重复查询
+        logger.info("步骤2: 同步持仓...")
         positions = self.sync_positions(cleanup=False)
         if positions is None:
-            logger.error("  获取持仓失败，为安全起见，取消本次买入。")
+            logger.error("  → 获取持仓失败，为安全起见，取消本次买入。")
             return
+        logger.info("  → 持仓同步完成")
         
         holding_codes = [p.get('证券代码', p.get('stock_code', ''))[:6] for p in positions]
 
@@ -393,7 +398,7 @@ class ExecutionController:
         # 跟踪当前可用资金（本地跟踪，减少对不稳定性 GUI 的依赖）
         running_avail = available_cash
 
-        # 1. 预过滤信号
+        logger.info(f"步骤3: 预过滤信号 (共 {len(self.signals_cache)} 个)...")
         targets = []
         for s in self.signals_cache:
             code = s['stock_code']
@@ -427,10 +432,10 @@ class ExecutionController:
             targets.append(s)
 
         if not targets:
-            logger.info("所有信号已处理完毕。")
+            logger.info(f"  → 所有 {len(self.signals_cache)} 个信号均已处理完毕，无待买入。")
             return
 
-        # 3. 循环执行买入
+        logger.info(f"步骤4: 开始执行买入 (共 {len(targets)} 个目标)...")
         for signal in targets:
             code = signal['stock_code']
             base_code = code[:6]

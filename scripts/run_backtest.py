@@ -19,7 +19,8 @@ from config.strategy_config import (
     INITIAL_CAPITAL,
     COMMISSION_RATE,
     MAX_POSITIONS,
-    SELECTOR_MARKETS, ENABLE_FUNDAMENTAL_FILTER
+    SELECTOR_MARKETS, ENABLE_FUNDAMENTAL_FILTER,
+    MIN_PRICE, MAX_PRICE, INCLUDE_ST,
 )
 import pandas as pd
 import sqlite3
@@ -93,6 +94,38 @@ def main():
         df_stocks = bdm.get_stock_list_from_db(SELECTOR_MARKETS if ENABLE_FUNDAMENTAL_FILTER else None)
         stock_codes = df_stocks['code'].tolist()
         bdm.close()
+
+        if ENABLE_FUNDAMENTAL_FILTER and stock_codes:
+            conn = sqlite3.connect(DATABASE_PATH)
+            placeholders = ','.join(['?' for _ in stock_codes])
+            latest_df = pd.read_sql_query(
+                f"""SELECT code, close, is_st
+                    FROM daily_data
+                    WHERE code IN ({placeholders})
+                      AND date = (SELECT MAX(date) FROM daily_data)""",
+                conn,
+                params=stock_codes
+            )
+            conn.close()
+            latest_map = latest_df.set_index('code').to_dict('index')
+            before_load_count = len(stock_codes)
+            filtered_codes = []
+            for code in stock_codes:
+                row = latest_map.get(code)
+                if not row:
+                    filtered_codes.append(code)
+                    continue
+                price = row.get('close')
+                if price is not None:
+                    if MIN_PRICE is not None and price < MIN_PRICE:
+                        continue
+                    if MAX_PRICE is not None and price > MAX_PRICE:
+                        continue
+                if not INCLUDE_ST and row.get('is_st', 0) == 1:
+                    continue
+                filtered_codes.append(code)
+            stock_codes = filtered_codes
+            print(f"  回测加载股票池裁剪: {before_load_count} → {len(stock_codes)}")
 
 
     # 为了让第1个交易日就有足够的历史数据（例如250日均线需要，这里预留365个自然日），

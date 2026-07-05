@@ -11,7 +11,7 @@
 from typing import Dict, Any
 from config import baostock_config
 
-n_bins = 15
+n_bins = 10
 
 # ============================================================================
 # 1. 模型超参数配置
@@ -49,29 +49,25 @@ class ModelConfig:
 
 
     XGBOOST_PARAMS: Dict[str, Any] = {
-        'n_estimators': 800,
-        'max_depth': 8,
-        'learning_rate': 0.01,
+        'n_estimators': 2000,
+        'max_depth': 3,
+        'learning_rate': 0.02,
 
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'subsample_freq': 1,
+        'subsample': 0.2,
+        'colsample_bytree': 0.5,
 
-        'min_child_weight': 100,
-        'gamma': 2.01,              # 最小分裂损失，剪掉无意义的分裂
-        'reg_alpha': 5.0,          # L1 正则
-        'reg_lambda': 8.0,         # L2 正则
+        'min_child_weight': 1,
+        'gamma': 0.01,              # 最小分裂损失，剪掉无意义的分裂
+        'reg_alpha': 6.0,          # L1 正则
+        'reg_lambda': 6.0,         # L2 正则
 
         # Ranking 专属配置
-        'objective': 'reg:squarederror',
         'eval_metric': 'ndcg',
         'ndcg_exp_gain': False,  
-        'lambdarank_num_pair_per_sample': 200,
-        'lambdarank_pair_method':'topk',
 
         'n_jobs': -1,  # 使用所有CPU核心
-        'early_stopping_rounds': 0,
-        'verbosity': 0,
+        'early_stopping_rounds': 200,
+        'verbosity': 1,
     }
 
 
@@ -80,7 +76,7 @@ class ModelConfig:
     GPU_PARAMS_XGB: Dict[str, Any] = {
         'tree_method': 'hist',   # XGBoost 2.0+ 推荐 hist + device=cuda
         'device': 'cuda',
-        'n_jobs': 1,             # GPU 模式下 CPU 线程数设为 1，避免与 GPU 争资源
+        'n_jobs': 1,             # CPU 核心数：设为物理核数一半，保证 CPU 预处理不拖 GPU 后腿
     }
 
     # ── 统一接口 ──────────────────────────────────────────────────────────
@@ -142,7 +138,7 @@ class TrainingConfig:
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
     YEARS                = baostock_config.HISTORY_YEARS
-    YEARS_FOR_TRAINING   = 4         # 训练数据年数
+    YEARS_FOR_TRAINING   = 16         # 训练数据年数
     YEARS_FOR_BACKTEST   = 2         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
     SHORT_PREDICTION     = True
@@ -158,10 +154,10 @@ class TrainingConfig:
 
     # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
     LABEL_WEIGHTED_FOR_REGRESSION= True
-    LABEL_WEIGHT_EXPONENT=3
+    LABEL_WEIGHT_EXPONENT=1.5
     
     UPSIDE_WEIGHT        = 1.0       
-    DOWNSIDE_WEIGHT      = 3.0       
+    DOWNSIDE_WEIGHT      = 1.0       
     FINAL_RETURN_WEIGHT  = 1.0       
 
 
@@ -189,7 +185,8 @@ class TrainingConfig:
     # ── 基础设施与计算性能 (Infrastructure) ────────────────────────────────
     USE_GPU              = True          # 是否启用 GPU 加速（XGBoost/LightGBM）
     MEMORY_EFFICIENT     = True          # 是否启用分批训练/流式加载
-    GPU_BATCH_SIZE       = 2_000_000     # GPU 批次大小
+    GPU_BATCH_SIZE       = 1_000_000     # GPU 批次大小
+    N_JOBS_FACTOR_CALC   = 2             # 横截面归一化线程数；过高会增加峰值内存与调度开销
 
     # ── 因子归一化 (Feature Normalization) ────────────────────────────────
     # 在进行横截面排名时，跳过这些特定类型的因子

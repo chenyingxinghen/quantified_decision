@@ -299,23 +299,25 @@ def select_stocks(
     执行完整的选股流程。直接复用 MLFactorBacktestStrategy.select_for_live()，
     保证与回测逻辑完全一致。
 
+    参数优先级：后端场景 - 前端传入的参数生效，未传入或为 None 则不限制该条件
+
     参数:
         model_path:      训练好的模型文件路径
         min_confidence:  最小置信度阈值（百分制）
         top_n:           输出前 N 只股票
-        apply_filter:    是否使用基础条件预筛选
+        apply_filter:    是否使用基础条件预筛选（后端必须显式传入）
         workers:         并行线程数（用于缓存更新）
         cache_dir:       因子缓存目录
         only_cache:      保留参数，暂不使用（缓存由策略内部管理）
         save_csv:        是否将结果保存为 CSV
         skip_cache_update: 跳过增量缓存更新
-        min_market_cap:  (动态) 最小市值（亿）
-        max_pe:          (动态) 最大市盈率
-        max_zcfzl:       (动态) 最大资产负债率 (%)
-        min_price:       (动态) 最小价格
-        max_price:       (动态) 最大价格
-        include_st:      (动态) 是否包含 ST
-        markets:         (动态) 市场类型列表
+        min_market_cap:  (动态) 最小市值（亿）- None 表示不限制
+        max_pe:          (动态) 最大市盈率 - None 表示不限制
+        max_zcfzl:       (动态) 最大资产负债率 (%) - None 表示不限制
+        min_price:       (动态) 最小价格 - None 表示不限制
+        max_price:       (动态) 最大价格 - None 表示不限制
+        include_st:      (动态) 是否包含 ST - None 表示不限制
+        markets:         (动态) 市场类型列表 - None 表示不限制
     返回:
         按置信度降序的候选股票列表
     """
@@ -363,19 +365,18 @@ def select_stocks(
     print("\n" + "-" * 60)
     print("⚖️  通过回测策略生成信号 ...")
 
-    # 组装过滤条件（仅在 apply_filter=True 时传入，否则传 None 让策略跳过筛选）
-    criteria = None
-    if apply_filter:
-        criteria = {
-            'min_market_cap': min_market_cap,
-            'max_pe':         max_pe,
-            'max_zcfzl':      max_zcfzl,
-            'min_price':      min_price,
-            'max_price':      max_price,
-            'include_st':     include_st,
-            'markets':        markets,
-            'apply_filter':   apply_filter,
-        }
+    # 始终组装 criteria 并携带 apply_filter 标志
+    # 后端场景：前端传入的参数优先，不传或为 None 则不限制该条件
+    criteria = {
+        'min_market_cap': min_market_cap,
+        'max_pe':         max_pe,
+        'max_zcfzl':      max_zcfzl,
+        'min_price':      min_price,
+        'max_price':      max_price,
+        'include_st':     include_st,
+        'markets':        markets,
+        'apply_filter':   apply_filter,  # 后端场景：必须显式传入，不传则为 False
+    }
 
     strategy = MLFactorBacktestStrategy(
         model_path=model_path,

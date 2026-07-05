@@ -70,6 +70,7 @@ class BacktestEngine:
         # 回测状态
         self._current_date = None
         self._trading_dates = []
+        self._trading_date_index = {}  # {date: idx} O(1) 查找
         self._trend_break_cache = {}  # (stock_code, date) -> result
         self._delist_map = self._load_delist_map()  # {stock_code: outDate}
 
@@ -103,8 +104,8 @@ class BacktestEngine:
             print(f"最大持仓: {self.max_positions}")
             print("=" * 80)
 
-        # 初始化策略
-        self.strategy.initialize()
+        # 初始化策略。传入回测股票池，便于策略预加载缓存时按股票池裁剪。
+        self.strategy.initialize(stock_codes=stock_codes)
 
         # 加载数据 (如果尚未加载)
         if not self.data_handler._data_cache:
@@ -127,6 +128,7 @@ class BacktestEngine:
 
         # 获取交易日
         self._trading_dates = self.data_handler.get_trading_dates(start_date, end_date)
+        self._trading_date_index = {d: i for i, d in enumerate(self._trading_dates)}
         if verbose:
             print(f"交易日数量: {len(self._trading_dates)}")
 
@@ -137,6 +139,11 @@ class BacktestEngine:
 
         for i, date in enumerate(self._trading_dates):
             self._current_date = date
+            if hasattr(self.data_handler, "prune_bar_cache"):
+                keep_dates = {date}
+                if i + 1 < len(self._trading_dates):
+                    keep_dates.add(self._trading_dates[i + 1])
+                self.data_handler.prune_bar_cache(keep_dates=keep_dates)
 
             # 清理昨天的趋势分析缓存，节省内存
             self._trend_break_cache = {}
@@ -311,7 +318,7 @@ class BacktestEngine:
                 self.strategy.on_trade(trade)
 
     def _check_exit_conditions(
-        self, position, date: str, bar: pd.Series, market_data: Dict
+        self, position, date: str, bar: dict, market_data: Dict
     ) -> tuple:
         """
         检查退出条件
@@ -433,14 +440,11 @@ class BacktestEngine:
             (next_date, entry_price)
         """
         # 找到下一交易日
-        try:
-            current_idx = self._trading_dates.index(current_date)
-            if current_idx + 1 >= len(self._trading_dates):
-                return None, None
-
-            next_date = self._trading_dates[current_idx + 1]
-        except ValueError:
+        current_idx = self._trading_date_index.get(current_date)
+        if current_idx is None or current_idx + 1 >= len(self._trading_dates):
             return None, None
+
+        next_date = self._trading_dates[current_idx + 1]
 
         # 获取下一交易日行情
         bar = self.data_handler.get_bar_data(stock_code, next_date)

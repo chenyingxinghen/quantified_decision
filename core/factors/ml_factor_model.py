@@ -566,6 +566,56 @@ class MLFactorModel:
             'val_metrics': {},
         }
 
+    @staticmethod
+    def _slice_rows(data: Any, mask: np.ndarray) -> Any:
+        if data is None:
+            return None
+        if isinstance(data, (pd.DataFrame, pd.Series)):
+            return data.iloc[np.flatnonzero(mask)]
+        try:
+            return data[mask]
+        except TypeError:
+            return np.asarray(data)[mask]
+
+    @staticmethod
+    def _get_xgb_best_iteration(booster: Any) -> Optional[int]:
+        best_iteration = None
+        try:
+            best_iteration = getattr(booster, 'best_iteration')
+        except Exception:
+            best_iteration = None
+
+        if best_iteration is None and hasattr(booster, 'attr'):
+            try:
+                best_iteration = booster.attr('best_iteration')
+            except Exception:
+                best_iteration = None
+
+        try:
+            best_iteration = int(best_iteration)
+        except (TypeError, ValueError):
+            return None
+
+        return best_iteration if best_iteration >= 0 else None
+
+    def _predict_xgb_booster(self, booster: Any, dmat: Any) -> np.ndarray:
+        best_iteration = self._get_xgb_best_iteration(booster)
+        if best_iteration is None:
+            return booster.predict(dmat)
+
+        try:
+            return booster.predict(dmat, iteration_range=(0, best_iteration + 1))
+        except TypeError:
+            best_ntree_limit = best_iteration + 1
+            try:
+                best_ntree_limit = int(getattr(booster, 'best_ntree_limit'))
+            except Exception:
+                pass
+            try:
+                return booster.predict(dmat, ntree_limit=best_ntree_limit)
+            except TypeError:
+                return booster.predict(dmat)
+
     def _get_predict_proba(self, X: Any) -> np.ndarray:
         # 对于分类器，返回正类概率
         if hasattr(self.model, 'predict_proba'):
@@ -584,7 +634,7 @@ class MLFactorModel:
                     dmat = xgb.DMatrix(X)
                 else:
                     dmat = xgb.DMatrix(X, feature_names=self.feature_names)
-                preds = self.model.predict(dmat)
+                preds = self._predict_xgb_booster(self.model, dmat)
             else:
                 # scikit-learn 包装类
                 device = self.model.get_params().get('device', 'cpu')
@@ -593,10 +643,14 @@ class MLFactorModel:
                 if is_gpu:
                     # GPU 模式下的预测加速与防止显存碎片
                     dmat = xgb.DMatrix(X, feature_names=self.feature_names) if not isinstance(X, pd.DataFrame) else xgb.DMatrix(X)
-                    preds = self.model.get_booster().predict(dmat)
+                    preds = self._predict_xgb_booster(self.model.get_booster(), dmat)
                 else:
+                    if not isinstance(X, pd.DataFrame) and self.feature_names:
+                        X = pd.DataFrame(X, columns=self.feature_names)
                     preds = self.model.predict(X)
         else:
+            if not isinstance(X, pd.DataFrame) and self.feature_names:
+                X = pd.DataFrame(X, columns=self.feature_names)
             preds = self.model.predict(X)
             
         # 自动纠正任务类型：如果模型是 LGBMRanker 但任务标记不是 ranking，强制按 ranking 处理
@@ -722,7 +776,29 @@ class MLFactorModel:
 
     def _evaluate(self, X: Any, y: np.ndarray, dataset_name: str, returns: np.ndarray = None, 
                  dates: np.ndarray = None, sample_ratio: float = 0.2) -> Dict:
+        eval_type = "全量"
+        eval_dates = None
+        dates_eval = None
+
+        if dates is not None:
+            dates = np.asarray(dates)
+            all_dates = np.unique(dates)
+            eval_dates = all_dates
+
+            if sample_ratio < 1.0:
+                n_sample = max(1, int(len(all_dates) * sample_ratio))
+                rng = np.random.default_rng(42)
+                eval_dates = rng.choice(all_dates, size=n_sample, replace=False)
+                eval_type = f"随机抽样 {sample_ratio:.0%}"
+
+            sample_mask = np.isin(dates, eval_dates)
+            X = self._slice_rows(X, sample_mask)
+            y = self._slice_rows(y, sample_mask)
+            returns = self._slice_rows(returns, sample_mask)
+            dates_eval = dates[sample_mask]
+
         y_prob = self._get_predict_proba(X)
+        y = np.asarray(y)
         # 1. 基础指标计算 (针对类别/回归)
         # y 可能包含软标签，因此先进行二元化处理
         y_true_bin = (y >= 0.5).astype(int)
@@ -749,24 +825,13 @@ class MLFactorModel:
         if isinstance(reference, np.ndarray) and reference.dtype != np.float32:
             reference = reference.astype(np.float32)
         
-        if dates is not None:
-            # 获取日期分组
-            unique_dates = np.unique(dates)
-            
-            # 抽样逻辑：减少非验证集的计算开销
-            if sample_ratio < 1.0:
-                n_sample = max(1, int(len(unique_dates) * sample_ratio))
-                unique_dates = np.random.choice(unique_dates, size=n_sample, replace=False)
-                eval_type = f"随机抽样 {sample_ratio:.0%}"
-            else:
-                eval_type = "全量"
-
+        if dates_eval is not None:
             rank_ics = []
             top1_hits = []
             top5_hits = []
             
-            for d in unique_dates:
-                mask = dates == d
+            for d in eval_dates:
+                mask = dates_eval == d
                 if mask.sum() < 10:  # 样本太少的日期跳过
                     continue
                 
@@ -807,7 +872,7 @@ class MLFactorModel:
             prob_std = np.std(y_prob)
             unique_probs = len(np.unique(np.round(y_prob, 6)))
             
-            print(f"  [{dataset_name}] {eval_type}评估 ({len(unique_dates)} 个交易日):")
+            print(f"  [{dataset_name}] {eval_type}评估 ({len(eval_dates)} 个交易日):")
             print(f"    预测区分度: Std={prob_std:.4f}, Unique={unique_probs}")
             print(f"    Rank IC: {metrics['rank_ic']:.4f} ± {metrics['rank_ic_std']:.4f}")
             print(f"    Top-1 胜率 (收益>0): {metrics['win_rate']:.2%}")
@@ -875,16 +940,18 @@ class MLFactorModel:
         """
         if not self.is_trained: raise ValueError("未训练")
         
-        # 1. 提取特征，对齐训练时的特征顺序
+        # 1. 提取特征，对齐训练时的特征顺序，处理缺失值与边界
         if isinstance(factors, pd.DataFrame):
-            X_df = factors[self.feature_names].copy()
-            X = X_df.values
+            X_arr = factors[self.feature_names].values.astype(np.float32)
+        elif isinstance(factors, np.ndarray):
+            X_arr = factors.astype(np.float32)
         else:
-            X = factors
-            
-        # 2. 处理缺失值与边界
-        X = np.nan_to_num(X.astype(np.float32), nan=0.5, posinf=1.0, neginf=0.0)
-        
+            X_arr = np.asarray(factors, dtype=np.float32)
+        X_arr = np.nan_to_num(X_arr, nan=0.5, posinf=1.0, neginf=0.0)
+
+        # 保留列名包装为 DataFrame，避免 sklearn 警告 "X does not have valid feature names"
+        X = pd.DataFrame(X_arr, columns=self.feature_names) if self.feature_names else X_arr
+
         return self._get_predict_proba(X)
 
     def predict_signal(self, factors: pd.DataFrame, threshold: float = 0.5) -> Dict:

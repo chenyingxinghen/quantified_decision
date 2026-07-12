@@ -1629,8 +1629,10 @@ class MLModelTrainer:
             _label_source = np.nan_to_num(_label_source, nan=0.5)
         y_train = np.empty(len(dates_train), dtype=np.float32)
         y_val   = np.empty(len(dates_val),   dtype=np.float32)
+        _label_weighted = getattr(TrainingConfig, 'LABEL_WEIGHTED_FOR_XGB', False)
+        _label_exponent = getattr(TrainingConfig, 'LABEL_WEIGHT_EXPONENT', 1.0)
         
-        # 离散档位标签：XGBoost 和 LightGBM 共用同一档位数（N_BINS）。
+        # LightGBM ranking 固定使用原始离散档位；XGBoost ranking 直接复用连续标签变换。
         # N_BINS 由 ModelConfig.get_n_bins() 统一获取（以 LIGHTGBM_PARAMS.label_gain 长度为准）。
         # 设计原则：档位数 × truncation_level ≈ 股票池大小，确保 lambdarank 有效 pair 密度。
         _n_bins = ModelConfig.get_n_bins()
@@ -1638,7 +1640,7 @@ class MLModelTrainer:
         y_train_discrete = np.empty(len(dates_train), dtype=np.int32)
         y_val_discrete = np.empty(len(dates_val), dtype=np.int32)
         
-        for _dates_sub, _scores_sub, _y_sub, _y_discrete in [
+        for _dates_sub, _scores_sub, _y_sub, _y_discrete_lgb in [
             (dates_train, _label_source[:split_idx], y_train, y_train_discrete), 
             (dates_val, _label_source[val_start_idx:], y_val, y_val_discrete)
         ]:
@@ -1653,8 +1655,8 @@ class MLModelTrainer:
                     # max_val = clipped.max()
                     # sub_scores = (clipped - min_val) / (max_val - min_val)
                     ranks = _fast_rankdata_1d(scores) / (_dc + 1)
-                    if TrainingConfig.LABEL_WEIGHTED_FOR_REGRESSION:
-                        _y_sub[_ds:_de] = np.power(ranks.astype(np.float32), TrainingConfig.LABEL_WEIGHT_EXPONENT)
+                    if _label_weighted:
+                        _y_sub[_ds:_de] = np.power(ranks.astype(np.float32), _label_exponent)
                     else:
                         _y_sub[_ds:_de] = ranks
                     try:
@@ -1665,22 +1667,22 @@ class MLModelTrainer:
                             np.linspace(bin_0_watershed, 1.0, _n_bins)
                         ])
                         bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
-                        _y_discrete[_ds:_de] = bins.astype(np.int32)
-                        if TrainingConfig.LABEL_WEIGHTED_FOR_REGRESSION:
-                            _y_discrete[_ds:_de] = (np.power(bins.astype(np.int32), TrainingConfig.LABEL_WEIGHT_EXPONENT)).astype(np.int32)
+                        _y_discrete_lgb[_ds:_de] = bins.astype(np.int32)
 
                     except ValueError:
                         raise ValueError(f"  {_dates_sub[_ds:_de]} 样本标签分布不均匀，请检查数据质量。")
                 else:
-                    _y_discrete[_ds:_de] = _mid_bin
+                    _y_discrete_lgb[_ds:_de] = _mid_bin
                     _y_sub[_ds:_de] = 0.5
         
         # 诊断输出：检查标签分布
         print(f"\n[标签分布诊断]")
-        print(f"  训练集离散标签分布:")
+        print(f"  训练集离散标签分布 (LightGBM 原始档位):")
         unique_train, counts_train = np.unique(y_train_discrete, return_counts=True)
         for bin_id, count in zip(unique_train, counts_train):
             print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_train_discrete)*100:>5.2f}%)")
+        if _label_weighted:
+            print(f"  XGBoost/回归连续标签变换: exponent={_label_exponent}")
         print(f"  原始分数统计 (训练集): min={_label_source[:split_idx].min():.4f}, max={_label_source[:split_idx].max():.4f}, std={_label_source[:split_idx].std():.4f}")
         
 
@@ -1801,8 +1803,14 @@ class MLModelTrainer:
                 # 外部验证集时间更靠后，与真实推理场景一致，early stopping 更可靠。
                 _, es_val_group = np.unique(dates_val, return_counts=True)
                 if model.task == 'ranking':
+                    if model_type == 'xgboost':
+                        y_train_rank = y_train
+                        y_val_rank = y_val
+                    else:
+                        y_train_rank = y_train_discrete
+                        y_val_rank = y_val_discrete
                     train_result = model.train(
-                        X_train, y_train_discrete,
+                        X_train, y_train_rank,
                         validation_split=0.2,
                         use_time_series_split=True,
                         feature_names=factor_names,
@@ -1810,7 +1818,7 @@ class MLModelTrainer:
                         returns=returns_train,
                         split_idx=len(X_train),
                         X_val_external=X_val,
-                        y_val_external=y_val_discrete,
+                        y_val_external=y_val_rank,
                         dates_val_external=dates_val,
                         dates=dates_train,
                         group=train_group,
@@ -1831,11 +1839,11 @@ class MLModelTrainer:
                         dates=dates_train,
                     )
                 # 训练集评估（采样，用于与验证集对比学习效果）
-                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.05)
+                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.03)
                 train_result['train_metrics'] = train_eval
 
                 # 在验证集（阻隔期后）上做最终评估
-                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.3)
+                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.5)
                 train_result['val_metrics'] = val_eval
                 
                 self.models[model_type] = model

@@ -16,6 +16,11 @@ from typing import Dict, Optional
 from config.factor_config import FactorConfig
 
 
+def _td(arr):
+    """Convert array to float64 for TA-Lib compatibility"""
+    return np.asarray(arr, dtype=np.float64)
+
+
 class QuantitativeFactors:
     """量化因子计算器"""
     
@@ -55,11 +60,11 @@ class QuantitativeFactors:
     
     def calculate_rsi(self, data: pd.DataFrame, period: int = 6) -> np.ndarray:
         """RSI - 相对强弱指标"""
-        return talib.RSI(data['close'].values, timeperiod=period)
+        return talib.RSI(_td(data['close'].values), timeperiod=period)
     
     def calculate_roc(self, data: pd.DataFrame, period: int = 12) -> np.ndarray:
         """ROC - 变动速率"""
-        return talib.ROC(data['close'].values, timeperiod=period)
+        return talib.ROC(_td(data['close'].values), timeperiod=period)
     
     def calculate_mtm(self, data: pd.DataFrame, period: int = 12) -> np.ndarray:
         """MTM - 动量指标"""
@@ -70,11 +75,11 @@ class QuantitativeFactors:
     
     def calculate_cmo(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """CMO - 钱德动量摆动指标"""
-        return talib.CMO(data['close'].values, timeperiod=period)
+        return talib.CMO(_td(data['close'].values), timeperiod=period)
     
     def calculate_stochrsi(self, data: pd.DataFrame, period: int = 14) -> tuple:
         """StochRSI - 随机强弱指数"""
-        fastk, fastd = talib.STOCHRSI(data['close'].values, timeperiod=period)
+        fastk, fastd = talib.STOCHRSI(_td(data['close'].values), timeperiod=period)
         return fastk, fastd
     
     def calculate_rvi(self, data: pd.DataFrame, period: int = 10) -> np.ndarray:
@@ -141,7 +146,7 @@ class QuantitativeFactors:
     def calculate_macd(self, data: pd.DataFrame) -> tuple:
         """MACD - 指数平滑异同平均线 (相对变化版)"""
         macd, signal, hist = talib.MACD(
-            data['close'].values,
+            _td(data['close'].values),
             fastperiod=self.config.MACD_FAST,
             slowperiod=self.config.MACD_SLOW,
             signalperiod=self.config.MACD_SIGNAL
@@ -156,24 +161,24 @@ class QuantitativeFactors:
     def calculate_adx(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """ADX - 平均趋向指标"""
         return talib.ADX(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
     
     def calculate_dmi(self, data: pd.DataFrame, period: int = 14) -> tuple:
         """DMI - 动向指标"""
         plus_di = talib.PLUS_DI(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
         minus_di = talib.MINUS_DI(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
         return plus_di, minus_di
@@ -181,34 +186,34 @@ class QuantitativeFactors:
     def calculate_aroon(self, data: pd.DataFrame, period: int = 25) -> tuple:
         """Aroon - 阿隆指标"""
         aroon_up, aroon_down = talib.AROON(
-            data['high'].values,
-            data['low'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
             timeperiod=period
         )
         return aroon_up, aroon_down
     
     def calculate_trix(self, data: pd.DataFrame, period: int = 30) -> np.ndarray:
         """TRIX - 三重指数平滑平均线"""
-        return talib.TRIX(data['close'].values, timeperiod=period)
+        return talib.TRIX(_td(data['close'].values), timeperiod=period)
     
     def calculate_ma_ratio(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """MA/CLOSE - 均线价格比"""
         close = data['close'].values
-        ma = talib.SMA(close, timeperiod=period)
+        ma = talib.SMA(_td(close), timeperiod=period)
         # 避免除以零，并填充NaN
         ratio = np.where(close != 0, ma / close, 1.0)
         return ratio
     
     def calculate_ma_slope(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """MA线性回归系数 (向量化版)"""
-        ma = talib.SMA(data['close'].values, timeperiod=period)
-        slopes = talib.LINEARREG_SLOPE(ma, timeperiod=period)
+        ma = talib.SMA(_td(data['close'].values), timeperiod=period)
+        slopes = talib.LINEARREG_SLOPE(_td(ma), timeperiod=period)
         return np.nan_to_num(slopes, nan=0.0)
     
     def calculate_price_slope(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """价格线性回归系数 (向量化版)"""
         close = data['close'].values
-        slopes = talib.LINEARREG_SLOPE(close, timeperiod=period)
+        slopes = talib.LINEARREG_SLOPE(_td(close), timeperiod=period)
         return np.nan_to_num(slopes, nan=0.0)
 
     # ==================== 波动率因子 ====================
@@ -216,9 +221,9 @@ class QuantitativeFactors:
     def calculate_atr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """ATR - 平均真实波幅 (相对变化版)"""
         atr = talib.ATR(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
         close = data['close'].values
@@ -228,16 +233,16 @@ class QuantitativeFactors:
     def calculate_natr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """NATR - 归一化平均真实波幅"""
         return talib.NATR(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
 
     def calculate_bollinger_bands(self, data: pd.DataFrame, period: int = 20) -> tuple:
         """布林带"""
         upper, middle, lower = talib.BBANDS(
-            data['close'].values,
+            _td(data['close'].values),
             timeperiod=period,
             nbdevup=self.config.BB_STD,
             nbdevdn=self.config.BB_STD
@@ -254,9 +259,9 @@ class QuantitativeFactors:
     def calculate_cci(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """CCI - 顺势指标"""
         return talib.CCI(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
 
@@ -269,8 +274,8 @@ class QuantitativeFactors:
     
     def calculate_obv(self, data: pd.DataFrame) -> np.ndarray:
         """OBV - 能量潮 (相对变化版：去除趋势)"""
-        obv = talib.OBV(data['close'].values, data['volume'].values)
-        vol_ma = talib.SMA(data['volume'].values, timeperiod=20)
+        obv = talib.OBV(_td(data['close'].values), _td(data['volume'].values))
+        vol_ma = talib.SMA(_td(data['volume'].values), timeperiod=20)
         with np.errstate(divide='ignore', invalid='ignore'):
             obv_rel = np.where(vol_ma!=0, (obv - pd.Series(obv).rolling(20).mean().values) / vol_ma, 0)
         return np.nan_to_num(obv_rel)
@@ -278,12 +283,12 @@ class QuantitativeFactors:
     def calculate_ad(self, data: pd.DataFrame) -> np.ndarray:
         """AD - 累积/派发指标 (相对变化版)"""
         ad = talib.AD(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
-            data['volume'].values
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
+            _td(data['volume'].values)
         )
-        vol_ma = talib.SMA(data['volume'].values, timeperiod=20)
+        vol_ma = talib.SMA(_td(data['volume'].values), timeperiod=20)
         with np.errstate(divide='ignore', invalid='ignore'):
             ad_rel = np.where(vol_ma!=0, (ad - pd.Series(ad).rolling(20).mean().values) / vol_ma, 0)
         return np.nan_to_num(ad_rel)
@@ -291,39 +296,39 @@ class QuantitativeFactors:
     def calculate_adosc(self, data: pd.DataFrame) -> np.ndarray:
         """Chaikin Oscillator - 佳庆指标 (相对变化版)"""
         adosc = talib.ADOSC(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
-            data['volume'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
+            _td(data['volume'].values),
             fastperiod=self.config.ADOSC_FAST,
             slowperiod=self.config.ADOSC_SLOW
         )
-        vol_ma = talib.SMA(data['volume'].values, timeperiod=20)
+        vol_ma = talib.SMA(_td(data['volume'].values), timeperiod=20)
         with np.errstate(divide='ignore', invalid='ignore'):
             return np.nan_to_num(np.where(vol_ma!=0, adosc / vol_ma, 0))
     
     def calculate_mfi(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """MFI - 资金流量指标"""
         return talib.MFI(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
-            data['volume'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
+            _td(data['volume'].values),
             timeperiod=period
         )
 
     def calculate_vroc(self, data: pd.DataFrame, period: int = 12) -> np.ndarray:
         """VROC - 量变动速率"""
-        return talib.ROC(data['volume'].values, timeperiod=period)
+        return talib.ROC(_td(data['volume'].values), timeperiod=period)
     
     def calculate_vrsi(self, data: pd.DataFrame, period: int = 6) -> np.ndarray:
         """VRSI - 量相对强弱"""
-        return talib.RSI(data['volume'].values, timeperiod=period)
+        return talib.RSI(_td(data['volume'].values), timeperiod=period)
     
     def calculate_vmacd(self, data: pd.DataFrame) -> tuple:
         """VMACD - 量指数平滑异同平均线"""
         macd, signal, hist = talib.MACD(
-            data['volume'].values,
+            _td(data['volume'].values),
             fastperiod=self.config.VMACD_FAST,
             slowperiod=self.config.VMACD_SLOW,
             signalperiod=self.config.VMACD_SIGNAL
@@ -332,8 +337,8 @@ class QuantitativeFactors:
 
     def calculate_volume_ma(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """换手率(或相对成交量)移动平均 (相对变化版)"""
-        vol_ma = talib.SMA(data['volume'].values, timeperiod=period)
-        vol_base = talib.SMA(data['volume'].values, timeperiod=period*5)
+        vol_ma = talib.SMA(_td(data['volume'].values), timeperiod=period)
+        vol_base = talib.SMA(_td(data['volume'].values), timeperiod=period*5)
         with np.errstate(divide='ignore', invalid='ignore'):
             return np.nan_to_num(np.where(vol_base!=0, vol_ma / vol_base, 1.0))
     
@@ -341,15 +346,15 @@ class QuantitativeFactors:
         """成交量波动率 (相对变化版)"""
         volume = pd.to_numeric(data['volume'], errors='coerce').replace([np.inf, -np.inf], np.nan)
         vol_std = volume.rolling(period).std().fillna(0).values
-        vol_ma = talib.SMA(data['volume'].values, timeperiod=period)
+        vol_ma = talib.SMA(_td(data['volume'].values), timeperiod=period)
         with np.errstate(divide='ignore', invalid='ignore'):
             return np.nan_to_num(np.where(vol_ma!=0, vol_std / vol_ma, 0.0))
     
     def calculate_amount_ma(self, data: pd.DataFrame, period: int = 20) -> np.ndarray:
         """相对成交金额移动平均 (相对变化版)"""
         if 'amount' in data.columns:
-            amt_ma = talib.SMA(data['amount'].values, timeperiod=period)
-            amt_base = talib.SMA(data['amount'].values, timeperiod=period*5)
+            amt_ma = talib.SMA(_td(data['amount'].values), timeperiod=period)
+            amt_base = talib.SMA(_td(data['amount'].values), timeperiod=period*5)
             with np.errstate(divide='ignore', invalid='ignore'):
                 return np.nan_to_num(np.where(amt_base!=0, amt_ma / amt_base, 1.0))
         return np.zeros(len(data))
@@ -359,7 +364,7 @@ class QuantitativeFactors:
         if 'amount' in data.columns:
             amount = pd.to_numeric(data['amount'], errors='coerce').replace([np.inf, -np.inf], np.nan)
             amt_std = amount.rolling(period).std().fillna(0).values
-            amt_ma = talib.SMA(data['amount'].values, timeperiod=period)
+            amt_ma = talib.SMA(_td(data['amount'].values), timeperiod=period)
             with np.errstate(divide='ignore', invalid='ignore'):
                 return np.nan_to_num(np.where(amt_ma!=0, amt_std / amt_ma, 0.0))
         return np.zeros(len(data))
@@ -369,15 +374,15 @@ class QuantitativeFactors:
     def calculate_willr(self, data: pd.DataFrame, period: int = 14) -> np.ndarray:
         """W%R - 威廉指标"""
         return talib.WILLR(
-            data['high'].values,
-            data['low'].values,
-            data['close'].values,
+            _td(data['high'].values),
+            _td(data['low'].values),
+            _td(data['close'].values),
             timeperiod=period
         )
     
     def calculate_bias(self, data: pd.DataFrame, period: int = 6) -> np.ndarray:
         """BIAS - 乖离率"""
-        ma = talib.SMA(data['close'].values, timeperiod=period)
+        ma = talib.SMA(_td(data['close'].values), timeperiod=period)
         with np.errstate(divide='ignore', invalid='ignore'):
             bias = np.divide(data['close'].values - ma, ma, where=ma!=0, out=np.zeros_like(ma)) * 100
         bias = np.nan_to_num(bias, nan=0.0, posinf=0.0, neginf=0.0)

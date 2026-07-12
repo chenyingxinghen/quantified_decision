@@ -32,7 +32,7 @@ from config.automation_config import (
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
     DRY_RUN
 )
-from config.config import SYSTEM_DATA_DIR
+from config.baostock_config import SYSTEM_DATA_DIR
 
 # 信号存档目录
 SIGNALS_DIR = os.path.join(SYSTEM_DATA_DIR, "automation", "signals")
@@ -49,17 +49,71 @@ logging.basicConfig(
 logger = logging.getLogger("AutoTraderApp")
 
 def save_signals_to_file(signals: List[Dict]):
-    """将每日信号持久化到 JSON 文件以供重启恢复"""
+    """将每日信号持久化到 JSON 文件以供重启恢复，并同步更新统一信号库"""
     if not os.path.exists(SIGNALS_DIR):
         os.makedirs(SIGNALS_DIR, exist_ok=True)
     
     today_str = datetime.now().strftime("%Y%m%d")
-    file_path = os.path.join(SIGNALS_DIR, f"signals_{today_str}.json")
+    today_date_str = datetime.now().strftime("%Y-%m-%d")
+    daily_file_path = os.path.join(SIGNALS_DIR, f"signals_{today_str}.json")
+    unified_file_path = os.path.join(SIGNALS_DIR, "signals.json")
     
     try:
-        with open(file_path, 'w', encoding='utf-8') as f:
+        # 1. 保存到日文件
+        with open(daily_file_path, 'w', encoding='utf-8') as f:
             json.dump(signals, f, ensure_ascii=False, indent=4)
-        logger.info(f"今日信号已存档至: {file_path}")
+        logger.info(f"今日信号已存档至: {daily_file_path}")
+        
+        # 2. 更新统一信号库
+        if os.path.exists(unified_file_path):
+            try:
+                with open(unified_file_path, 'r', encoding='utf-8') as f:
+                    unified_data = json.load(f)
+            except Exception as e:
+                logger.warning(f"读取统一信号库失败，创建新的: {e}")
+                unified_data = {"signals": [], "by_stock_code": {}}
+        else:
+            unified_data = {"signals": [], "by_stock_code": {}}
+        
+        # 添加新信号
+        for signal in signals:
+            stock_code = signal["stock_code"]
+            # 添加到signals数组
+            unified_signal = {
+                "stock_code": stock_code,
+                "signal_date": today_date_str,
+                "confidence": signal["confidence"],
+                "current_price": signal["current_price"],
+                "stop_loss": signal["stop_loss"],
+                "take_profit": signal["take_profit"]
+            }
+            unified_data["signals"].append(unified_signal)
+            
+            # 更新by_stock_code索引
+            if stock_code not in unified_data["by_stock_code"]:
+                unified_data["by_stock_code"][stock_code] = {
+                    "latest_signal_date": today_date_str,
+                    "signals": []
+                }
+            else:
+                # 更新最新信号日期
+                if today_date_str > unified_data["by_stock_code"][stock_code]["latest_signal_date"]:
+                    unified_data["by_stock_code"][stock_code]["latest_signal_date"] = today_date_str
+            
+            # 添加信号记录
+            unified_data["by_stock_code"][stock_code]["signals"].append({
+                "signal_date": today_date_str,
+                "confidence": signal["confidence"],
+                "current_price": signal["current_price"],
+                "stop_loss": signal["stop_loss"],
+                "take_profit": signal["take_profit"]
+            })
+        
+        # 保存更新后的统一信号库
+        with open(unified_file_path, 'w', encoding='utf-8') as f:
+            json.dump(unified_data, f, ensure_ascii=False, indent=4)
+        logger.info(f"统一信号库已更新: {unified_file_path}")
+        
     except Exception as e:
         logger.error(f"存档信号失败: {e}")
 
@@ -85,7 +139,7 @@ def get_latest_signals() -> List[Dict]:
     from config.automation_config import AUTO_MODEL_PATH, AUTO_TOP_N
     from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
     from config.factor_config import TrainingConfig
-    from config import DATABASE_PATH
+    from config.baostock_config import DATABASE_PATH
 
     logger.info("正在获取今日信号")
     logger.info(f"  配置: top_n={AUTO_TOP_N}, min_confidence={AUTO_MIN_CONFIDENCE}")

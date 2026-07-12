@@ -12,7 +12,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from config.config import DATABASE_PATH
+from config.baostock_config import DATABASE_PATH
 
 class MarketSentimentCalculator:
     """

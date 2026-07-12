@@ -11,7 +11,7 @@
 from typing import Dict, Any
 from config import baostock_config
 
-n_bins = 10
+n_bins = 15
 
 # ============================================================================
 # 1. 模型超参数配置
@@ -22,14 +22,14 @@ class ModelConfig:
 
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
-        'n_estimators': 400,
-        'num_leaves': 16,          
-        'learning_rate': 0.01,    
+        'n_estimators': 2000,
+        'num_leaves': 10,          
+        'learning_rate': 0.02,    
 
-        'min_child_weight': 100,
-        'min_gain_to_split': 6, # 最小分裂增益，剪掉无意义的分裂
-        'reg_alpha': 1.0,          # L1 正则，促进稀疏性
-        'reg_lambda': 3.0,         # L2 正则，平滑权重
+        'min_child_weight': 1,
+        'min_gain_to_split': 0.01, # 最小分裂增益，剪掉无意义的分裂
+        'reg_alpha': 0.01,          # L1 正则，促进稀疏性
+        'reg_lambda': 0.01,         # L2 正则，平滑权重
 
         'subsample': 0.8,
         'colsample_bytree': 0.8,
@@ -39,10 +39,10 @@ class ModelConfig:
         'objective': 'lambdarank',
         'metric': 'ndcg',
         'eval_at': [5],
-        'lambdarank_truncation_level': 20,
+        'lambdarank_truncation_level': 50,
         'label_gain': [i//3*i**1.5 if i>2 else i for i in range(n_bins)],
 
-        'early_stopping_rounds': 0,
+        'early_stopping_rounds': 200,
         'n_jobs': -1,  # 使用所有CPU核心
         'verbosity': -1,
     }
@@ -53,13 +53,13 @@ class ModelConfig:
         'max_depth': 3,
         'learning_rate': 0.02,
 
-        'subsample': 0.2,
+        'subsample': 0.8,
         'colsample_bytree': 0.5,
 
-        'min_child_weight': 1,
+        'min_child_weight': 2.0,
         'gamma': 0.01,              # 最小分裂损失，剪掉无意义的分裂
-        'reg_alpha': 6.0,          # L1 正则
-        'reg_lambda': 6.0,         # L2 正则
+        'reg_alpha': 0.2,          # L1 正则
+        'reg_lambda': 0.2,         # L2 正则
 
         # Ranking 专属配置
         'eval_metric': 'ndcg',
@@ -133,12 +133,12 @@ class TrainingConfig:
     """训练参数配置"""
 
     # ── 模型 ──────────────────────────────────────────────────────────────
-    MODEL_TYPES          = ['xgboost']
+    MODEL_TYPES          = ['lightgbm','xgboost']
     TASK                 = 'ranking' 
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
     YEARS                = baostock_config.HISTORY_YEARS
-    YEARS_FOR_TRAINING   = 16         # 训练数据年数
+    YEARS_FOR_TRAINING   = 17         # 训练数据年数
     YEARS_FOR_BACKTEST   = 2         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
     SHORT_PREDICTION     = True
@@ -152,9 +152,9 @@ class TrainingConfig:
     INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
     INCLUDE_CANDLE_PATTERN = False
 
-    # 核心逻辑：raw_score = upside * W1 + final_return * W2 - break * W3 - retracement * W4
-    LABEL_WEIGHTED_FOR_REGRESSION= True
-    LABEL_WEIGHT_EXPONENT=1.5
+    # 标签变换：回归与 XGBoost ranking 共用连续标签变换；LightGBM ranking 由 label_gain 控制
+    LABEL_WEIGHTED_FOR_XGB= True
+    LABEL_WEIGHT_EXPONENT=1.2
     
     UPSIDE_WEIGHT        = 1.0       
     DOWNSIDE_WEIGHT      = 1.0       

@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional
 import sqlite3
-from config.config import DATABASE_PATH
+from config.baostock_config import DATABASE_PATH
 
 
 class TimeSeriesFactors:

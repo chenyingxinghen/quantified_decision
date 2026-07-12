@@ -25,7 +25,7 @@ import pandas as pd
 from typing import Optional, Dict, List, Tuple
 from functools import lru_cache
 
-from config.config import DATABASE_PATH
+from config.baostock_config import DATABASE_PATH
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ from core.backtest.strategy import BaseStrategy, StrategySignal
 from core.factors.ml_factor_model import MLFactorModel
 import config.strategy_config as sc
 import config.factor_config as fc
-from config import DATABASE_PATH, SUPPORTED_MARKETS
+from config import DATABASE_PATH, PROJECT_ROOT, SUPPORTED_MARKETS
 
 class MLFactorBacktestStrategy(BaseStrategy):
     """ML因子回测策略
@@ -29,10 +29,18 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  min_confidence: float = sc.ML_FACTOR_MIN_CONFIDENCE,
                  use_cache: bool = True,
                  cache_dir: str = None,
+                 norm_stats_path: str = None,
                  name: str = "ML因子策略"):
         """初始化策略"""
         super().__init__(name)
-        self.model_path = model_path
+        self.model_path = (
+            model_path if os.path.isabs(model_path)
+            else os.path.join(PROJECT_ROOT, model_path)
+        )
+        self.norm_stats_path = (
+            norm_stats_path if not norm_stats_path or os.path.isabs(norm_stats_path)
+            else os.path.join(PROJECT_ROOT, norm_stats_path)
+        )
         self.min_confidence = min_confidence
         self.use_cache = use_cache
         
@@ -60,7 +68,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
         from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
         def _load_smart_model(target_path):
             if os.path.isdir(target_path):
-                pkls = [os.path.join(target_path, f) for f in os.listdir(target_path) if f.endswith('.pkl')]
+                pkls = [
+                    os.path.join(target_path, f)
+                    for f in os.listdir(target_path)
+                    if f.endswith('_factor_model.pkl') or f == 'ensemble_factor_model.pkl'
+                ]
                 if pkls:
                     latest_pkl = sorted(pkls, key=os.path.getmtime)[-1]
                     return _load_smart_model(latest_pkl)
@@ -79,16 +91,23 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 加载归一化统计量（与模型同目录的 norm_stats.pkl）
         import pickle as _pickle
         _model_dir = os.path.dirname(os.path.abspath(self.model_path)) if os.path.isfile(self.model_path) else os.path.abspath(self.model_path)
-        _norm_path = os.path.join(_model_dir, 'norm_stats.pkl')
+        _norm_path = (
+            os.path.abspath(self.norm_stats_path)
+            if self.norm_stats_path
+            else os.path.join(_model_dir, 'norm_stats.pkl')
+        )
         if os.path.exists(_norm_path):
             try:
                 with open(_norm_path, 'rb') as _f:
                     self.norm_stats = _pickle.load(_f)
-                print(f"  已加载归一化统计量: norm_stats.pkl")
+                print(f"  已加载归一化统计量: {_norm_path}")
             except Exception as _e:
                 print(f"  警告: 加载归一化统计量失败: {_e}")
                 self.norm_stats = None
         else:
+            if self.norm_stats_path:
+                raise FileNotFoundError(f"指定的归一化统计量不存在: {_norm_path}")
+            print(f"  警告: 模型目录缺少 norm_stats.pkl，跳过全局列归一化: {_model_dir}")
             self.norm_stats = None
 
         if self.use_cache:
@@ -203,7 +222,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
                             z = (X_arr[:, arr_idx].astype(float) - median[j]) / iqr[j]
                             X_arr[:, arr_idx] = (1.0 / (1.0 + _np.exp(-_np.clip(z, -10, 10)))).astype(_np.float32)
                         else:
-                            X_arr[:, arr_idx] = 0.5  # 零方差列，置中性值
+                            # 必须与训练端保持一致；训练端零 IQR 列固定为 0.0。
+                            X_arr[:, arr_idx] = 0.0
         X_arr = np.nan_to_num(X_arr, nan=0.5, posinf=1.0, neginf=0.0)
         if getattr(self.model, 'models', None):
             probs = self.model.predict(pd.DataFrame(X_arr, columns=feature_names))
@@ -282,11 +302,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     ts = fin_values[fin_idx, 1]
                     zcfzl = fin_values[fin_idx, 2]
             # 组装基本面字典供筛选
+            raw_close = float(bar.get('raw_close', bar['close']))
             info_map[code] = {
                 'name': self._meta_map.get(code, '-'), 'is_st': int(bar.get('is_st', 0)),
-                'pe_ratio': (bar['close']/eps if eps and eps>0 else None),
-                'zcfzl': zcfzl, 'current_price': bar['close'],
-                'market_cap': (bar['close']*ts/1e8 if ts else None)
+                'pe_ratio': (raw_close/eps if eps and eps>0 else None),
+                'zcfzl': zcfzl, 'current_price': raw_close,
+                'market_cap': (raw_close*ts/1e8 if ts else None)
             }
         return info_map
 
@@ -426,7 +447,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 continue
 
             # 2. ST股及退市搜索
-            if not _get_val('include_st', sc.INCLUDE_ST) and (info['is_st'] == 1 or '退' in info['name']): continue
+            # 股票名称来自当前元数据，不具备 PIT 语义，回测中不能用“退”字样
+            # 反向污染历史。风险过滤只依赖当日行情中的 is_st。
+            if not _get_val('include_st', sc.INCLUDE_ST) and info['is_st'] == 1: continue
             
             # 3. PE 筛选
             pe = info.get('pe_ratio')

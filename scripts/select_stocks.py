@@ -31,13 +31,14 @@ sys.path.insert(0, PROJECT_ROOT)
 from config import DATABASE_PATH
 from config.factor_config import TrainingConfig
 from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST, SELECTOR_MARKETS
+from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.train_ml_model import MLModelTrainer
 warnings.filterwarnings('ignore')
 # ============================================================================
 # 常量 & 默认配置
 # ============================================================================
-DEFAULT_MODEL_PATH = 'models/mark/automation/lightgbm_factor_model.pkl' # 默认搜寻 mark 目录
+DEFAULT_MODEL_PATH = AUTO_MODEL_PATH
 DEFAULT_MIN_CONFIDENCE = 0
 DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
@@ -252,7 +253,7 @@ def _update_factor_cache_incremental(db_path: str, codes: List[str], cache_dir: 
     
     trainer = MLModelTrainer(db_path=db_path)
     # 使用传入的 cache_dir，若未指定则回退到默认目录
-    effective_cache_dir = DEFAULT_CACHE_DIR
+    effective_cache_dir = os.path.abspath(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
     trainer.factors_cache_dir = effective_cache_dir
     os.makedirs(effective_cache_dir, exist_ok=True)
     
@@ -278,6 +279,7 @@ def _update_factor_cache_incremental(db_path: str, codes: List[str], cache_dir: 
 # ============================================================================
 def select_stocks(
     model_path: str = DEFAULT_MODEL_PATH,
+    norm_stats_path: Optional[str] = None,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     top_n: int = DEFAULT_TOP_N,
     apply_filter: bool = False,
@@ -332,6 +334,13 @@ def select_stocks(
         print(f"❌ 模型文件不存在: {model_path}")
         return []
 
+    if norm_stats_path is None:
+        auto_model_abs = os.path.abspath(os.path.join(PROJECT_ROOT, AUTO_MODEL_PATH))
+        if os.path.abspath(model_path) == auto_model_abs:
+            norm_stats_path = AUTO_NORM_STATS_PATH
+    if norm_stats_path and not os.path.isabs(norm_stats_path):
+        norm_stats_path = os.path.join(PROJECT_ROOT, norm_stats_path)
+
     print("=" * 80)
     print("📊 量化因子选股系统")
     print("=" * 80)
@@ -382,6 +391,7 @@ def select_stocks(
         model_path=model_path,
         min_confidence=min_confidence,
         cache_dir=cache_dir,
+        norm_stats_path=norm_stats_path,
     )
     try:
         strategy.initialize()
@@ -479,6 +489,10 @@ def parse_args():
         help=f'模型文件路径 (默认: {DEFAULT_MODEL_PATH})',
     )
     parser.add_argument(
+        '--norm-stats', type=str, default=None,
+        help='归一化统计量路径；默认从模型目录读取，自动化默认模型使用绑定的训练归档',
+    )
+    parser.add_argument(
         '--min-confidence', type=float, default=DEFAULT_MIN_CONFIDENCE,
         help=f'最小置信度阈值 (默认: {DEFAULT_MIN_CONFIDENCE}%%)',
     )
@@ -541,6 +555,7 @@ def main():
     markets = [m.strip() for m in args.markets.split(',')] if args.markets else None
     select_stocks(
         model_path=args.model,
+        norm_stats_path=args.norm_stats,
         min_confidence=args.min_confidence,
         top_n=args.top,
         apply_filter=args.filter,

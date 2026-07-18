@@ -10,6 +10,7 @@ from .strategy import BaseStrategy, StrategySignal
 from .portfolio import Portfolio, Trade
 from .data_handler import DataHandler
 from .performance import PerformanceAnalyzer
+from core.exit_rules import evaluate_exit
 import sqlite3
 import os
 from config import DATABASE_PATH, TrainingConfig, MARKET_LIMITS, MARKET_PREFIXES
@@ -330,9 +331,6 @@ class BacktestEngine:
         if date == position.entry_date:
             return False, None, None
 
-        open_price = bar["open"]
-        high = bar["high"]
-        low = bar["low"]
         close = bar["close"]
 
         # 计算价格变化率
@@ -340,25 +338,20 @@ class BacktestEngine:
         if buy_price_abs == 0:
             return False, None, None
 
-        # 止损检查
-        if position.stop_loss and ENABLE_STOP_LOSS_EXIT:
-            if low <= position.stop_loss:
-                # 日内触及止损价
-                return True, close, "stop_loss"
-
-        # 止盈检查
-        if ENABLE_TAKE_PROFIT_EXIT and position.take_profit:
-            if high >= position.take_profit:
-                # 日内触及止盈价
-                return True, close, "take_profit"
-
-        # 时间止损（持仓超过阙值且亏损超过阙值）
-        if (
-            ENABLE_TIME_STOP_EXIT
-            and position.holding_days >= TIME_STOP_DAYS
-            and position.unrealized_pnl_pct <= TIME_STOP_MIN_LOSS_PCT
-        ):
-            return True, close, f"time_stoploss"
+        decision = evaluate_exit(
+            current_price=close,
+            entry_price=position.entry_price,
+            holding_days=position.holding_days,
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
+            enable_stop_loss=ENABLE_STOP_LOSS_EXIT,
+            enable_take_profit=ENABLE_TAKE_PROFIT_EXIT,
+            enable_time_stop=ENABLE_TIME_STOP_EXIT,
+            time_stop_days=TIME_STOP_DAYS,
+            time_stop_max_return_pct=TIME_STOP_MIN_LOSS_PCT,
+        )
+        if decision.should_exit:
+            return True, close, decision.reason
 
         # 趋势破位检查
         if ENABLE_SUPPORT_BREAK_EXIT and self._check_trend_break(

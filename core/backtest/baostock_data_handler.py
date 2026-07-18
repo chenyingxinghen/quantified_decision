@@ -2,8 +2,8 @@
 Baostock 数据处理器 - 支持动态前复权
 
 核心特性：
-1. 在回测过程中，始终以当前日为基准进行前复权
-2. 消除未来函数问题
+1. 使用连续前复权价格计算持仓收益，正确吸收分红送转影响
+2. 同时保留 raw_* 原始价格，供历史时点的价格/市值筛选
 3. 高效的数据加载和缓存
 """
 import os
@@ -12,6 +12,43 @@ import pandas as pd
 from typing import Dict, List, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+
+
+_PRICE_COLUMNS = ('open', 'high', 'low', 'close', 'preclose')
+
+
+def _prepare_adjusted_stock_data(
+    stock_df: pd.DataFrame,
+    prior_fore_factor: float = None,
+    prior_back_factor: float = None,
+) -> pd.DataFrame:
+    """Build one continuous, corporate-action-adjusted price series.
+
+    Baostock stores adjustment factors only on corporate-action dates. The
+    effective factor is therefore carried forward after an event and the first
+    known factor is carried backward to earlier rows. Raw prices are retained
+    for point-in-time price/market-cap filters; the standard OHLC columns are
+    replaced with ``raw_price * fore_adjust_factor`` so entry and exit prices
+    remain comparable across dividends and share distributions.
+    """
+    stock_df = stock_df.sort_values('date').reset_index(drop=True).copy()
+    fore = pd.to_numeric(stock_df.get('fore_adjust_factor'), errors='coerce')
+    back = pd.to_numeric(stock_df.get('back_adjust_factor'), errors='coerce')
+    if prior_fore_factor is not None and len(fore) > 0 and pd.isna(fore.iloc[0]):
+        fore.iloc[0] = prior_fore_factor
+    if prior_back_factor is not None and len(back) > 0 and pd.isna(back.iloc[0]):
+        back.iloc[0] = prior_back_factor
+    stock_df['fore_adjust_factor'] = fore.ffill().bfill().fillna(1.0)
+    stock_df['back_adjust_factor'] = back.ffill().bfill().fillna(1.0)
+
+    for col in _PRICE_COLUMNS:
+        raw = pd.to_numeric(stock_df[col], errors='coerce')
+        stock_df[f'raw_{col}'] = raw
+        adjusted = raw * stock_df['fore_adjust_factor']
+        stock_df[col] = adjusted
+        stock_df[f'adj_{col}'] = adjusted
+
+    return stock_df
 
 
 def _load_stock_batch_baostock(args):
@@ -40,16 +77,29 @@ def _load_stock_batch_baostock(args):
     
     params = stock_codes + [start_date, end_date]
     df = pd.read_sql_query(query, conn, params=params)
+    prior_query = f'''
+        SELECT af.code, af.fore_adjust_factor, af.back_adjust_factor
+        FROM adjust_factor af
+        INNER JOIN (
+            SELECT code, MAX(date) AS max_date
+            FROM adjust_factor
+            WHERE code IN ({placeholders}) AND date < ?
+            GROUP BY code
+        ) latest ON latest.code = af.code AND latest.max_date = af.date
+    '''
+    prior_df = pd.read_sql_query(prior_query, conn, params=stock_codes + [start_date])
     conn.close()
+    prior_map = prior_df.set_index('code').to_dict('index') if not prior_df.empty else {}
     
     # 按股票分组，避免为每只股票重复构造整批布尔掩码
     result = {}
     for code, stock_df in df.groupby('code', sort=False):
-        stock_df = stock_df.sort_values('date').reset_index(drop=True)
-        
-        # 填充缺失的复权因子
-        stock_df['fore_adjust_factor'] = stock_df['fore_adjust_factor'].ffill().fillna(1.0)
-        stock_df['back_adjust_factor'] = stock_df['back_adjust_factor'].ffill().fillna(1.0)
+        prior = prior_map.get(code, {})
+        stock_df = _prepare_adjusted_stock_data(
+            stock_df,
+            prior.get('fore_adjust_factor'),
+            prior.get('back_adjust_factor'),
+        )
         numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
         numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
         if numeric_cols:
@@ -62,7 +112,7 @@ def _load_stock_batch_baostock(args):
 
 
 class BaostockDataHandler:
-    """Baostock 数据处理器 - 支持动态前复权"""
+    """Baostock 数据处理器 - 支持连续复权与原始价格双轨数据。"""
     
     def __init__(self, db_path: str):
         """
@@ -159,14 +209,31 @@ class BaostockDataHandler:
         
         params = stock_codes + [start_date, end_date]
         df = pd.read_sql_query(query, self.conn, params=params)
+        prior_query = f'''
+            SELECT af.code, af.fore_adjust_factor, af.back_adjust_factor
+            FROM adjust_factor af
+            INNER JOIN (
+                SELECT code, MAX(date) AS max_date
+                FROM adjust_factor
+                WHERE code IN ({placeholders}) AND date < ?
+                GROUP BY code
+            ) latest ON latest.code = af.code AND latest.max_date = af.date
+        '''
+        prior_df = pd.read_sql_query(
+            prior_query,
+            self.conn,
+            params=stock_codes + [start_date],
+        )
+        prior_map = prior_df.set_index('code').to_dict('index') if not prior_df.empty else {}
         
         result = {}
         for code, stock_df in df.groupby('code', sort=False):
-            stock_df = stock_df.sort_values('date').reset_index(drop=True)
-            
-            # 填充缺失的复权因子
-            stock_df['fore_adjust_factor'] = stock_df['fore_adjust_factor'].ffill().fillna(1.0)
-            stock_df['back_adjust_factor'] = stock_df['back_adjust_factor'].ffill().fillna(1.0)
+            prior = prior_map.get(code, {})
+            stock_df = _prepare_adjusted_stock_data(
+                stock_df,
+                prior.get('fore_adjust_factor'),
+                prior.get('back_adjust_factor'),
+            )
             numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
             numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
             if numeric_cols:
@@ -276,7 +343,8 @@ class BaostockDataHandler:
         if result.empty:
             return None
         
-        # 动态前复权
+        # 可选：重新缩放到 end_date 的原始价格量纲。回测主路径使用
+        # 全局连续复权序列（adjust_to_date=False），避免持仓期间量纲变化。
         if adjust_to_date:
             result = self._apply_dynamic_adjustment(result, end_date)
         
@@ -305,14 +373,15 @@ class BaostockDataHandler:
         if pd.isna(base_factor) or base_factor == 0:
             base_factor = 1.0
         
-        # 计算复权比例
+        # 计算复权比例，并始终从保留的原始价格重新生成，避免重复复权。
         df = df.copy()
         df['adj_factor_ratio'] = df['fore_adjust_factor'] / base_factor
         
-        # 应用复权计算并覆盖原始价格列以兼容回测引擎
-        for col in ['open', 'high', 'low', 'close', 'preclose']:
-            df[col] = df[col] * df['adj_factor_ratio']
-            df[f'adj_{col}'] = df[col]  # 冗余保存一个 adj_ 前缀以备不时之需
+        for col in _PRICE_COLUMNS:
+            raw_col = f'raw_{col}'
+            raw = df[raw_col] if raw_col in df.columns else df[col]
+            df[col] = raw * df['adj_factor_ratio']
+            df[f'adj_{col}'] = df[col]
         
         return df
     
@@ -337,10 +406,11 @@ class BaostockDataHandler:
             idx = self._date_index[stock_code].get(date)
             if idx is not None:
                 bar = self._data_cache[stock_code].iloc[idx].to_dict()
-                if adjusted:
-                    # 已经是当日基准，价格无需变动但添加 adj_ 前缀以对齐接口
-                    for col in ['open', 'high', 'low', 'close', 'preclose']:
-                        bar[f'adj_{col}'] = bar[col]
+                if not adjusted:
+                    for col in _PRICE_COLUMNS:
+                        raw_col = f'raw_{col}'
+                        if raw_col in bar:
+                            bar[col] = bar[raw_col]
                 self._bar_cache[cache_key] = bar
                 return bar
         
@@ -386,9 +456,9 @@ class LazyMarketSnapshotBaostock:
     
     def __getitem__(self, stock_code):
         if stock_code not in self._cache:
-            # 获取截止到当日的历史数据，并以当日为基准复权
+            # 使用同一量纲的连续复权序列，保证跨公司行为的持仓收益可比。
             data = self.data_handler.get_historical_data(
-                stock_code, self.date, adjust_to_date=True
+                stock_code, self.date, adjust_to_date=False
             )
             self._cache[stock_code] = data
         return self._cache[stock_code]

@@ -68,7 +68,6 @@ new_data/*
 
 database/*
 .*
-tests/
 diagnose_output/*
 diagnose_output/factor_ic_report.csv
 diagnose_output/factor_quality.png

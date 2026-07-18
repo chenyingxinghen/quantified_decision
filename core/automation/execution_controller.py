@@ -34,6 +34,7 @@ from config.automation_config import (
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
 )
 from config.strategy_config import TIME_STOP_DAYS, TIME_STOP_MIN_LOSS_PCT
+from core.exit_rules import evaluate_exit
 
 from enum import Enum
 
@@ -581,27 +582,23 @@ class ExecutionController:
             # 条件检查
             holding_days = _get_trading_days_count(entry_date_str, today_str, self._db_path)
             unrealized_pnl_pct = (current_price - entry_price) / entry_price
-            
-            should_exit = False
-            reason = ""
-
             sl = meta.get('stop_loss')
-            if ENABLE_STOP_LOSS_EXIT and sl and current_price <= float(sl):
-                should_exit = True
-                reason = "stop_loss"
-
             tp = meta.get('take_profit')
-            if ENABLE_TAKE_PROFIT_EXIT and tp and current_price >= float(tp):
-                should_exit = True
-                reason = "take_profit"
+            decision = evaluate_exit(
+                current_price=current_price,
+                entry_price=entry_price,
+                holding_days=holding_days,
+                stop_loss=float(sl) if sl is not None else None,
+                take_profit=float(tp) if tp is not None else None,
+                enable_stop_loss=ENABLE_STOP_LOSS_EXIT,
+                enable_take_profit=ENABLE_TAKE_PROFIT_EXIT,
+                enable_time_stop=ENABLE_TIME_STOP_EXIT,
+                time_stop_days=TIME_STOP_DAYS,
+                time_stop_max_return_pct=TIME_STOP_MIN_LOSS_PCT,
+            )
 
-            if (ENABLE_TIME_STOP_EXIT
-                    and holding_days >= TIME_STOP_DAYS
-                    and unrealized_pnl_pct <= TIME_STOP_MIN_LOSS_PCT):
-                should_exit = True
-                reason = "time_stop"
-
-            if should_exit:
+            if decision.should_exit:
+                reason = decision.reason
                 logger.info(f"  {code} 触发卖出: {reason} | 持有 {holding_days}D | 浮盈 {unrealized_pnl_pct*100:.2f}%")
                 success, op_status = self._do_sell_robust(code, ref_price=current_price, is_st=is_st, avail_amount=avail_amount)
                 if op_status in [OperationStatus.SUCCESS, OperationStatus.SKIPPED]:

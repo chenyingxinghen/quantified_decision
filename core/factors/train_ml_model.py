@@ -1107,6 +1107,59 @@ class MLModelTrainer:
         w_sig = f_returns_norm.astype(np.float32)
         
         return y_final, raw_scores, f_returns_raw, w_sig
+
+    @staticmethod
+    def _apply_unbuyable_penalty(
+        raw_scores: np.ndarray,
+        returns_raw: np.ndarray,
+        dates: np.ndarray,
+        unbuyable_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Force next-day untradeable samples to the bottom of each date group.
+
+        The model predicts after the close and enters at the next open. A sample
+        that is suspended or locked at a one-price limit-up on that next day is
+        not a realizable opportunity. ``punish`` therefore changes the target
+        itself; it must not depend on optional sample weighting.
+        """
+        penalized_scores = np.asarray(raw_scores, dtype=np.float64).copy()
+        penalized_returns = np.asarray(returns_raw, dtype=np.float32).copy()
+        dates = np.asarray(dates)
+        mask = np.asarray(unbuyable_mask, dtype=bool)
+        ranked = np.empty(len(penalized_scores), dtype=np.float32)
+        configured_floor = float(
+            getattr(TrainingConfig, 'UNBUYABLE_PENALTY_SCORE', -100.0)
+        )
+
+        _, starts, counts = np.unique(dates, return_index=True, return_counts=True)
+        for start, count in zip(starts, counts):
+            end = start + count
+            group_mask = mask[start:end]
+            group_scores = penalized_scores[start:end]
+            group_returns = penalized_returns[start:end]
+
+            if group_mask.any():
+                buyable = ~group_mask
+                if buyable.any():
+                    score_floor = min(
+                        configured_floor,
+                        float(np.nanmin(group_scores[buyable])) - 1.0,
+                    )
+                    min_return = float(np.nanmin(group_returns[buyable]))
+                    return_margin = max(1e-4, abs(min_return) * 0.01)
+                    return_floor = min_return - return_margin
+                else:
+                    score_floor = configured_floor
+                    return_floor = -1.0
+                group_scores[group_mask] = score_floor
+                group_returns[group_mask] = return_floor
+
+            if count > 1:
+                ranked[start:end] = _fast_rankdata_1d(group_scores) / (count + 1)
+            else:
+                ranked[start:end] = 0.5
+
+        return ranked, penalized_scores, penalized_returns
                     
 
 
@@ -1358,7 +1411,7 @@ class MLModelTrainer:
         del comps_df
         gc.collect()
 
-        # 5. 不可买入样本处理（涨停/停牌）——在归一化之前剔除，确保排序不含涨停股
+        # 5. 不可买入样本处理（次日一字涨停/停牌）
         penalty_count = np.sum(unbuyable_arr)
         if penalty_count > 0:
             handling = getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'remove')
@@ -1374,6 +1427,18 @@ class MLModelTrainer:
                 w_sig_arr        = w_sig_arr[keep_mask]
                 raw_scores_arr   = raw_scores_arr[keep_mask]
                 unbuyable_arr    = unbuyable_arr[keep_mask]
+            elif handling == 'punish':
+                print(f"  - 惩罚不可买入样本: {penalty_count} 个样本强制进入当日最低标签档")
+                y_final_arr, raw_scores_arr, returns_arr = self._apply_unbuyable_penalty(
+                    raw_scores_arr,
+                    returns_arr,
+                    dates_arr,
+                    unbuyable_arr,
+                )
+            else:
+                raise ValueError(
+                    f"不支持的 UNBUYABLE_HANDLING={handling!r}，仅支持 'remove' 或 'punish'"
+                )
 
 
         # 日期分组信息（仅计算一次，供后续归一化和 group 划分共用）

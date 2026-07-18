@@ -178,7 +178,8 @@ class TrainingConfig:
     # 退市预警处理
     DELIST_PENALTY_DAYS  = 60      
     DELIST_PENALTY_SCORE = -100      # 退市样本直接给最低分
-    UNBUYABLE_HANDLING   = 'punish'  
+    UNBUYABLE_HANDLING   = 'remove'  
+    UNBUYABLE_PENALTY_SCORE = 0.0  # 次日无法成交的样本强制进入当日最低标签档
     
         
 

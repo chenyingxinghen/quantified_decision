@@ -136,7 +136,7 @@ def get_latest_signals() -> List[Dict]:
     """
     获取今日信号。直接复用 MLFactorBacktestStrategy，保证与回测逻辑完全一致。
     """
-    from config.automation_config import AUTO_MODEL_PATH, AUTO_TOP_N
+    from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH, AUTO_TOP_N
     from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
     from config.factor_config import TrainingConfig
     from config.baostock_config import DATABASE_PATH
@@ -163,6 +163,7 @@ def get_latest_signals() -> List[Dict]:
             model_path=AUTO_MODEL_PATH,
             min_confidence=AUTO_MIN_CONFIDENCE,
             cache_dir=TrainingConfig.CACHE_DIR,
+            norm_stats_path=AUTO_NORM_STATS_PATH,
         )
         strategy.initialize()
 

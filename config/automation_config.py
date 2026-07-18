@@ -59,8 +59,11 @@ CASH_BUFFER = 100
 # 4. 模型 & 信号相关
 # ==============================================================================
 
-# 自动化交易使用的模型路径
-AUTO_MODEL_PATH = 'models/mark/automation'  # 或者具体的 pkl 文件路径
+# 自动化交易使用的模型与其训练期归一化统计量。
+# automation/lightgbm_factor_model.pkl 与下方归档模型 SHA256 完全一致；
+# 显式绑定 norm_stats，避免模型被单独复制后推理分布漂移。
+AUTO_MODEL_PATH = 'models/mark/automation/lightgbm_factor_model.pkl'
+AUTO_NORM_STATS_PATH = 'models/mark/automation/norm_stats.pkl'
 
 # 信号生成时使用的最低置信度阈值（百分制，0.0 表示不过滤）
 AUTO_MIN_CONFIDENCE = 0.0

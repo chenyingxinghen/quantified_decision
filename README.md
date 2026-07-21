@@ -82,6 +82,25 @@ python scripts/update_daily_data.py
 python scripts/update_daily_data.py --full
 ```
 
+#### 聚源结构化特征数据
+
+聚源数据采用两阶段接入：先从 SQL Server 抽取并清洗到本地
+`database/jydb_features.db`，再由训练、选股和回测共同按公告可用日读取。
+远端数据库凭据只通过环境变量配置：
+
+```powershell
+$env:JYDB_ENABLED='1'
+$env:JYDB_SERVER='your-server'
+$env:JYDB_DATABASE='JYDB'
+$env:JYDB_USERNAME='your-user'
+$env:JYDB_PASSWORD='your-password'
+python scripts/update_jydb_data.py --start 2015-01-01 --end 2026-07-21
+```
+
+当前首批覆盖日估值、主要财务指标、业绩预告、自由流通股本、股东户数、
+股权质押统计、交易资金流、分红和回购。财务与事件数据按首次公告日生效，
+不会按报告期末回填；本地特征库不存在时自动保持原 Baostock 流程。
+
 ### 2. 训练模型
 
 ```bash

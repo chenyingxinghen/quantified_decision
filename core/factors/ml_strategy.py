@@ -162,8 +162,8 @@ class MLFactorStrategy:
                 return None
             
             # 检查是否有NaN值
-            if factors.isna().all().any():
-                # 所有行都是NaN，跳过
+            if factors.isna().all().all():
+                # 整个因子矩阵都不可用才跳过；稀疏外部列允许全列 NaN。
                 return None
             
             # 使用最新的因子数据进行预测
@@ -269,7 +269,9 @@ class MLFactorStrategy:
                 if factors is not None and not factors.empty:
                     # 取最新一行
                     latest = factors.iloc[[-1]].copy()
-                    if not latest.isna().all().any():
+                    # 稀疏 PIT 特征允许部分缺失；只有整行都没有任何可用特征时
+                    # 才跳过该股票，剩余缺失将在横截面排名后置为 0.5。
+                    if not latest.isna().all(axis=1).iloc[0]:
                         all_latest_factors.append(latest)
                         valid_codes.append(code)
                         stock_prices[code] = data['close'].iloc[-1]
@@ -293,7 +295,11 @@ class MLFactorStrategy:
             # rank_cols：横截面百分位排名
             rank_cols = [col for col in all_X.columns if not TrainingConfig.should_skip_rank(col)]
             if rank_cols and len(all_X) > 1:
-                all_X[rank_cols] = all_X[rank_cols].rank(pct=True).fillna(0.5)
+                rank_frame = all_X[rank_cols]
+                ranked = rank_frame.rank(method='average')
+                all_X[rank_cols] = ranked.divide(
+                    rank_frame.notna().sum(axis=0) + 1, axis=1
+                ).fillna(0.5)
 
             # skip_cols：复用训练集 robust 统计量（仅连续型，二值列保留原值）
             norm_stats = getattr(self, 'norm_stats', None)
@@ -314,13 +320,15 @@ class MLFactorStrategy:
                         valid_iqr = skip_col_stats['valid_iqr']
                         for col in present_robust:
                             j = col_to_idx[col]
+                            missing = ~np.isfinite(all_X[col].values)
                             if valid_iqr[j]:
                                 z = (all_X[col].values - median[j]) / iqr[j]
                                 all_X[col] = (1.0 / (1.0 + np.exp(-np.clip(z, -10, 10)))).astype(np.float32)
                             else:
-                                all_X[col] = 0.5  # 零方差列，置中性值
+                                all_X[col] = 0.0
+                            if missing.any():
+                                all_X.loc[missing, col] = 0.5
 
-        all_X = all_X.fillna(0.5)
         all_X = all_X.fillna(0.5)
 
         # 3. 批量预测

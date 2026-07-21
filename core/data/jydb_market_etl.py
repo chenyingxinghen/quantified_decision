@@ -1,0 +1,364 @@
+"""将聚源行情转换为项目既有的 stock_daily.db schema。"""
+from __future__ import annotations
+
+import os
+import sqlite3
+import warnings
+from contextlib import closing
+from typing import Callable, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from core.data.jydb_feature_store import A_SHARE_FILTER, JYDBETL, iter_date_batches
+
+
+DAILY_QUOTE_SQL = f"""
+    SELECT * FROM (
+        SELECT s.SecuCode AS code, q.TradingDay AS date,
+               q.OpenPrice AS [open], q.HighPrice AS high, q.LowPrice AS low,
+               q.ClosePrice AS [close], q.PrevClosePrice AS preclose,
+               q.TurnoverVolume AS volume, q.TurnoverValue AS amount,
+               q.TurnoverDeals AS turnover_deals,
+               CAST(1 AS int) AS tradestatus,
+               CASE WHEN q.PrevClosePrice IS NULL OR q.PrevClosePrice = 0 THEN NULL
+                    ELSE (q.ClosePrice / q.PrevClosePrice - 1) * 100 END AS pctChg,
+               v.PE AS peTTM, v.PB AS pbMRQ, v.PSTTM AS psTTM,
+               v.PCFTTM AS pcfNcfTTM
+        FROM QT_DailyQuote q
+        JOIN SecuMain s ON q.InnerCode = s.InnerCode
+        LEFT JOIN LC_DIndicesForValuation v
+          ON q.InnerCode = v.InnerCode AND q.TradingDay = v.TradingDay
+        WHERE q.TradingDay >= ? AND q.TradingDay <= ?
+          AND s.SecuCategory = 1
+          {A_SHARE_FILTER}
+        UNION ALL
+        SELECT s.SecuCode AS code, q.TradingDay AS date,
+               q.OpenPrice AS [open], q.HighPrice AS high, q.LowPrice AS low,
+               q.ClosePrice AS [close], q.PrevClosePrice AS preclose,
+               q.TurnoverVolume AS volume, q.TurnoverValue AS amount,
+               q.TurnoverDeals AS turnover_deals,
+               CAST(1 AS int) AS tradestatus,
+               CASE WHEN q.PrevClosePrice IS NULL OR q.PrevClosePrice = 0 THEN NULL
+                    ELSE (q.ClosePrice / q.PrevClosePrice - 1) * 100 END AS pctChg,
+               v.PE AS peTTM, v.PB AS pbMRQ, v.PSTTM AS psTTM,
+               v.PCFTTM AS pcfNcfTTM
+        FROM LC_STIBDailyQuote q
+        JOIN SecuMain s ON q.InnerCode = s.InnerCode
+        LEFT JOIN LC_DIndicesForValuation v
+          ON q.InnerCode = v.InnerCode AND q.TradingDay = v.TradingDay
+        WHERE q.TradingDay >= ? AND q.TradingDay <= ?
+          AND s.SecuCategory = 1
+          {A_SHARE_FILTER}
+    ) d
+    WHERE 1=1
+"""
+
+ADJUST_FACTOR_SQL = f"""
+    SELECT s.SecuCode AS code, a.ExDiviDate AS effective_date,
+           a.RatioAdjustingFactor AS factor
+    FROM QT_AdjustingFactor a
+    JOIN SecuMain s ON a.InnerCode = s.InnerCode
+    WHERE a.ExDiviDate <= ?
+      AND s.SecuCategory = 1
+      {A_SHARE_FILTER}
+    ORDER BY s.SecuCode, a.ExDiviDate
+"""
+
+SPECIAL_TRADE_SQL = f"""
+    SELECT s.SecuCode AS code, t.SpecialTradeTime AS effective_date,
+           t.SecurityAbbr, t.SpecialTradeType
+    FROM LC_SpecialTrade t
+    JOIN SecuMain s ON t.InnerCode = s.InnerCode
+    WHERE t.SpecialTradeTime <= ?
+      AND s.SecuCategory = 1
+      {A_SHARE_FILTER}
+    ORDER BY s.SecuCode, t.SpecialTradeTime, t.InfoPublDate
+"""
+
+
+class JYDBMarketETL:
+    """聚源行情 ETL；输出可直接被 DataHandler/MLModelTrainer 使用。"""
+
+    def __init__(self, db_path: str, connection_factory=None):
+        self.db_path = os.path.abspath(db_path)
+        self.source = JYDBETL(store=None, connection_factory=connection_factory)
+
+    def initialize(self):
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS daily_data (
+                    code TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    open REAL, high REAL, low REAL, close REAL, preclose REAL,
+                    volume REAL, amount REAL, turnover_deals REAL,
+                    turnover_rate REAL, tradestatus INTEGER NOT NULL DEFAULT 1,
+                    pctChg REAL, is_st INTEGER NOT NULL DEFAULT 0,
+                    peTTM REAL, pbMRQ REAL, psTTM REAL, pcfNcfTTM REAL,
+                    PRIMARY KEY(code, date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_data_date ON daily_data(date);
+                CREATE TABLE IF NOT EXISTS adjust_factor (
+                    code TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    fore_adjust_factor REAL,
+                    back_adjust_factor REAL,
+                    PRIMARY KEY(code, date)
+                );
+                """
+            )
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(daily_data)")}
+            migrations = {
+                "tradestatus": "INTEGER NOT NULL DEFAULT 1",
+                "pctChg": "REAL", "psTTM": "REAL", "pcfNcfTTM": "REAL",
+            }
+            for column, definition in migrations.items():
+                if column not in existing:
+                    conn.execute(f'ALTER TABLE daily_data ADD COLUMN "{column}" {definition}')
+
+    @staticmethod
+    def _read_chunks(conn, sql, params, chunksize):
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="pandas only supports SQLAlchemy connectable.*",
+                category=UserWarning,
+            )
+            return pd.read_sql_query(sql, conn, params=params, chunksize=chunksize)
+
+    def extract_daily_quotes(
+        self, start_date: str, end_date: str, chunksize: int = 100_000,
+        stock_codes: Optional[Sequence[str]] = None,
+    ) -> int:
+        self.initialize()
+        source_conn = self.source._connect()
+        total = 0
+        try:
+            sql = DAILY_QUOTE_SQL
+            params = [start_date, end_date, start_date, end_date]
+            if stock_codes:
+                placeholders = ",".join("?" for _ in stock_codes)
+                sql += f" AND d.code IN ({placeholders})"
+                params.extend(str(code) for code in stock_codes)
+            chunks = self._read_chunks(source_conn, sql, tuple(params), chunksize)
+            with closing(sqlite3.connect(self.db_path, timeout=60)) as target, target:
+                target.execute("PRAGMA journal_mode=WAL")
+                sql = """
+                    INSERT INTO daily_data (
+                        code,date,open,high,low,close,preclose,volume,amount,
+                        turnover_deals,turnover_rate,tradestatus,pctChg,is_st,
+                        peTTM,pbMRQ,psTTM,pcfNcfTTM
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,0,?,?,?,?)
+                    ON CONFLICT(code,date) DO UPDATE SET
+                        open=excluded.open, high=excluded.high, low=excluded.low,
+                        close=excluded.close, preclose=excluded.preclose,
+                        volume=excluded.volume, amount=excluded.amount,
+                        turnover_deals=excluded.turnover_deals,
+                        tradestatus=excluded.tradestatus, pctChg=excluded.pctChg,
+                        peTTM=excluded.peTTM, pbMRQ=excluded.pbMRQ,
+                        psTTM=excluded.psTTM, pcfNcfTTM=excluded.pcfNcfTTM
+                """
+                for chunk in chunks:
+                    chunk["code"] = chunk["code"].astype(str).str.extract(r"(\d{6})", expand=False)
+                    chunk["date"] = pd.to_datetime(chunk["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    chunk = chunk.dropna(subset=["code", "date"])
+                    numeric = [
+                        "open", "high", "low", "close", "preclose", "volume",
+                        "amount", "turnover_deals", "tradestatus", "pctChg",
+                        "peTTM", "pbMRQ", "psTTM", "pcfNcfTTM",
+                    ]
+                    for col in numeric:
+                        chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
+                    rows = list(chunk[["code", "date", *numeric]].itertuples(index=False, name=None))
+                    target.executemany(sql, rows)
+                    total += len(rows)
+        finally:
+            source_conn.close()
+        return total
+
+    def rebuild_adjust_factors(
+        self, start_date: str, end_date: str,
+        stock_codes: Optional[Sequence[str]] = None,
+    ) -> int:
+        """把除权事件累计因子扩展为逐交易日因子。"""
+        self.initialize()
+        source_conn = self.source._connect()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="pandas only supports SQLAlchemy connectable.*",
+                    category=UserWarning,
+                )
+                source_sql = ADJUST_FACTOR_SQL
+                source_params = [end_date]
+                if stock_codes:
+                    placeholders = ",".join("?" for _ in stock_codes)
+                    order_pos = source_sql.upper().find("ORDER BY")
+                    predicate = f" AND s.SecuCode IN ({placeholders}) "
+                    source_sql = source_sql[:order_pos] + predicate + source_sql[order_pos:]
+                    source_params.extend(str(code) for code in stock_codes)
+                events = pd.read_sql_query(
+                    source_sql, source_conn, params=tuple(source_params)
+                )
+        finally:
+            source_conn.close()
+        if not events.empty:
+            events["effective_date"] = pd.to_datetime(events["effective_date"], errors="coerce")
+            events["factor"] = pd.to_numeric(events["factor"], errors="coerce")
+            events = events.dropna(subset=["code", "effective_date", "factor"])
+
+        with closing(sqlite3.connect(self.db_path, timeout=60)) as conn, conn:
+            daily_sql = "SELECT code,date FROM daily_data WHERE date>=? AND date<=?"
+            daily_params = [start_date, end_date]
+            if stock_codes:
+                placeholders = ",".join("?" for _ in stock_codes)
+                daily_sql += f" AND code IN ({placeholders})"
+                daily_params.extend(str(code) for code in stock_codes)
+            daily_sql += " ORDER BY code,date"
+            daily = pd.read_sql_query(daily_sql, conn, params=tuple(daily_params))
+            if daily.empty:
+                return 0
+            daily["date_dt"] = pd.to_datetime(daily["date"])
+            outputs = []
+            event_groups = {
+                str(code): group.sort_values("effective_date")
+                for code, group in events.groupby("code", sort=False)
+            } if not events.empty else {}
+            for code, group in daily.groupby("code", sort=False):
+                group = group.sort_values("date_dt")
+                code_events = event_groups.get(str(code))
+                if code_events is None or code_events.empty:
+                    factors = np.ones(len(group), dtype=float)
+                else:
+                    merged = pd.merge_asof(
+                        group[["date_dt"]],
+                        code_events[["effective_date", "factor"]],
+                        left_on="date_dt", right_on="effective_date",
+                        direction="backward",
+                    )
+                    factors = merged["factor"].fillna(1.0).to_numpy(dtype=float)
+                part = pd.DataFrame({
+                    "code": str(code), "date": group["date"].values,
+                    "fore_adjust_factor": factors,
+                    # 后复权在现有代码中仅用于兼容；累计比例因子可直接作为同口径值。
+                    "back_adjust_factor": factors,
+                })
+                outputs.append(part)
+            result = pd.concat(outputs, ignore_index=True)
+            conn.executemany(
+                """
+                INSERT INTO adjust_factor(code,date,fore_adjust_factor,back_adjust_factor)
+                VALUES (?,?,?,?)
+                ON CONFLICT(code,date) DO UPDATE SET
+                    fore_adjust_factor=excluded.fore_adjust_factor,
+                    back_adjust_factor=excluded.back_adjust_factor
+                """,
+                result.itertuples(index=False, name=None),
+            )
+        return len(result)
+
+    def rebuild_st_status(
+        self, start_date: str, end_date: str,
+        stock_codes: Optional[Sequence[str]] = None,
+    ) -> int:
+        """根据历史特别处理实施日生成逐日 ST 状态。"""
+        source_conn = self.source._connect()
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="pandas only supports SQLAlchemy connectable.*",
+                    category=UserWarning,
+                )
+                source_sql = SPECIAL_TRADE_SQL
+                source_params = [end_date]
+                if stock_codes:
+                    placeholders = ",".join("?" for _ in stock_codes)
+                    order_pos = source_sql.upper().find("ORDER BY")
+                    predicate = f" AND s.SecuCode IN ({placeholders}) "
+                    source_sql = source_sql[:order_pos] + predicate + source_sql[order_pos:]
+                    source_params.extend(str(code) for code in stock_codes)
+                events = pd.read_sql_query(
+                    source_sql, source_conn, params=tuple(source_params)
+                )
+        finally:
+            source_conn.close()
+        if not events.empty:
+            events["effective_date"] = pd.to_datetime(events["effective_date"], errors="coerce")
+            events["is_st"] = events["SecurityAbbr"].fillna("").astype(str).str.upper().str.contains("ST").astype(int)
+            events = events.dropna(subset=["code", "effective_date"])
+
+        updates = []
+        with closing(sqlite3.connect(self.db_path, timeout=60)) as conn, conn:
+            daily_sql = "SELECT code,date FROM daily_data WHERE date>=? AND date<=?"
+            daily_params = [start_date, end_date]
+            if stock_codes:
+                placeholders = ",".join("?" for _ in stock_codes)
+                daily_sql += f" AND code IN ({placeholders})"
+                daily_params.extend(str(code) for code in stock_codes)
+            daily_sql += " ORDER BY code,date"
+            daily = pd.read_sql_query(daily_sql, conn, params=tuple(daily_params))
+            daily["date_dt"] = pd.to_datetime(daily["date"])
+            event_groups = {
+                str(code): group.sort_values("effective_date")
+                for code, group in events.groupby("code", sort=False)
+            } if not events.empty else {}
+            for code, group in daily.groupby("code", sort=False):
+                code_events = event_groups.get(str(code))
+                if code_events is None or code_events.empty:
+                    states = np.zeros(len(group), dtype=int)
+                else:
+                    merged = pd.merge_asof(
+                        group.sort_values("date_dt")[["date", "date_dt"]],
+                        code_events[["effective_date", "is_st"]],
+                        left_on="date_dt", right_on="effective_date",
+                        direction="backward",
+                    )
+                    states = merged["is_st"].fillna(0).astype(int).to_numpy()
+                    group = group.sort_values("date_dt")
+                updates.extend(
+                    (int(state), str(code), date)
+                    for state, date in zip(states, group["date"].values)
+                )
+            conn.executemany(
+                "UPDATE daily_data SET is_st=? WHERE code=? AND date=?", updates
+            )
+        return len(updates)
+
+    def run(
+        self, start_date: str, end_date: str,
+        stock_codes: Optional[Sequence[str]] = None,
+    ) -> dict:
+        quotes = self.extract_daily_quotes(
+            start_date, end_date, stock_codes=stock_codes
+        )
+        factors = self.rebuild_adjust_factors(start_date, end_date, stock_codes=stock_codes)
+        st_rows = self.rebuild_st_status(start_date, end_date, stock_codes=stock_codes)
+        return {"daily_data": quotes, "adjust_factor": factors, "st_status": st_rows}
+
+    def run_batched(
+        self,
+        start_date: str,
+        end_date: str,
+        stock_codes: Optional[Sequence[str]] = None,
+        batch_months: int = 12,
+        progress: Optional[Callable[[str, str, str, int], None]] = None,
+    ) -> dict:
+        """按日期分批提交行情、复权和 ST 状态，避免首次全量长事务不可见。"""
+        totals = {"daily_data": 0, "adjust_factor": 0, "st_status": 0}
+        for batch_start, batch_end in iter_date_batches(
+            start_date, end_date, batch_months
+        ):
+            steps = (
+                ("daily_data", self.extract_daily_quotes),
+                ("adjust_factor", self.rebuild_adjust_factors),
+                ("st_status", self.rebuild_st_status),
+            )
+            for name, operation in steps:
+                count = operation(
+                    batch_start, batch_end, stock_codes=stock_codes
+                )
+                totals[name] += count
+                if progress is not None:
+                    progress(name, batch_start, batch_end, count)
+        return totals

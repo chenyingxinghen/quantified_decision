@@ -30,6 +30,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  use_cache: bool = True,
                  cache_dir: str = None,
                  norm_stats_path: str = None,
+                 db_path: str = None,
                  name: str = "ML因子策略"):
         """初始化策略"""
         super().__init__(name)
@@ -43,6 +44,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         )
         self.min_confidence = min_confidence
         self.use_cache = use_cache
+        self.db_path = os.path.abspath(db_path or DATABASE_PATH)
         
         if cache_dir is None:
             cache_dir = fc.TrainingConfig.CACHE_DIR
@@ -65,7 +67,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         self._precompute_pit_data()
         
         # 智能加载模型
-        from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
+        from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel, MultiObjectiveFactorModel
         def _load_smart_model(target_path):
             if os.path.isdir(target_path):
                 pkls = [
@@ -78,6 +80,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     return _load_smart_model(latest_pkl)
                 return None
             if not os.path.exists(target_path): return None
+            try:
+                return MultiObjectiveFactorModel.load_model(target_path)
+            except:
+                pass
             try:
                 return EnsembleFactorModel.load_model(target_path)
             except:
@@ -113,7 +119,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if self.use_cache:
             self._preload_factor_cache()
         
-        print(f"策略初始化完成: {self.name} (已启用 PIT 预缓存 ✓)")
+        print(f"策略初始化完成: {self.name} (已启用 PIT 预缓存 [OK])")
     
     def generate_signals(self,
                         current_date: str,
@@ -192,9 +198,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
         rank_cols_idx = [i for i, col in enumerate(feature_names) if not fc.TrainingConfig.should_skip_rank(col)]
 
         if rank_cols_idx and len(X_arr) > 1:
-            from scipy.stats import rankdata as _rankdata
-            ranked = _rankdata(X_arr[:, rank_cols_idx], method='average', axis=0) / (len(X_arr) + 1)
-            X_arr[:, rank_cols_idx] = ranked.astype(np.float32)
+            # NaN 不得在排名前伪装成 0.5；只对当天真实存在的股票值排名，
+            # 排名结束后再将缺失项置为中性值。
+            rank_frame = pd.DataFrame(X_arr[:, rank_cols_idx])
+            ranked = rank_frame.rank(method='average')
+            ranked = ranked.divide(rank_frame.notna().sum(axis=0) + 1, axis=1)
+            X_arr[:, rank_cols_idx] = ranked.fillna(0.5).to_numpy(dtype=np.float32)
 
         # skip_cols：复用训练集 robust 统计量（仅连续型，二值列保留原值）
         norm_stats = getattr(self, 'norm_stats', None)
@@ -218,15 +227,21 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     for col in present_robust:
                         j = col_to_idx[col]
                         arr_idx = feature_pos[col]
+                        missing = ~_np.isfinite(X_arr[:, arr_idx])
                         if valid_iqr[j]:
                             z = (X_arr[:, arr_idx].astype(float) - median[j]) / iqr[j]
                             X_arr[:, arr_idx] = (1.0 / (1.0 + _np.exp(-_np.clip(z, -10, 10)))).astype(_np.float32)
                         else:
                             # 必须与训练端保持一致；训练端零 IQR 列固定为 0.0。
                             X_arr[:, arr_idx] = 0.0
+                        X_arr[missing, arr_idx] = 0.5
         X_arr = np.nan_to_num(X_arr, nan=0.5, posinf=1.0, neginf=0.0)
+        objective_components = None
         if getattr(self.model, 'models', None):
-            probs = self.model.predict(pd.DataFrame(X_arr, columns=feature_names))
+            model_frame = pd.DataFrame(X_arr, columns=feature_names)
+            probs = self.model.predict(model_frame)
+            if hasattr(self.model, 'predict_components'):
+                objective_components = self.model.predict_components(model_frame)
         else:
             probs = self.model.predict(X_arr)
         
@@ -238,7 +253,16 @@ class MLFactorBacktestStrategy(BaseStrategy):
             
             # 使用 md5 哈希在概率相同时保持排序稳定
             tie_breaker = int(hashlib.md5(code.encode()).hexdigest(), 16) % 1000 / 100000.0
-            candidates.append({'code': code, 'score': confidence + tie_breaker, 'prob': probs[i]})
+            component_scores = None
+            if objective_components is not None:
+                component_scores = {
+                    name: float(values[i])
+                    for name, values in objective_components.items()
+                }
+            candidates.append({
+                'code': code, 'score': confidence + tie_breaker,
+                'prob': probs[i], 'objective_scores': component_scores,
+            })
             
         candidates.sort(key=lambda x: x['score'], reverse=True)
         
@@ -255,19 +279,49 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 price=bar['close'], confidence=cand['score'], 
                 stop_loss=bar['close'] - sc.ATR_STOP_MULTIPLIER * atr, 
                 take_profit=bar['close'] + sc.ATR_TARGET_MULTIPLIER * atr,
-                metadata={'strategy': 'ml_factor_integrated', 'prediction': cand['prob']}
+                metadata={
+                    'strategy': 'ml_factor_integrated',
+                    'prediction': cand['prob'],
+                    'objective_scores': cand.get('objective_scores'),
+                }
             ))
         return signals
 
     def _precompute_pit_data(self):
         """预加载元数据，消除循环内的 SQL 压力"""
-        db_dir = os.path.dirname(DATABASE_PATH)
-        conn = sqlite3.connect(DATABASE_PATH)
+        db_dir = os.path.dirname(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        attached = set()
         for db in ['stock_meta.db', 'stock_finance.db']:
             path = os.path.join(db_dir, db)
-            if os.path.exists(path): conn.execute(f"ATTACH DATABASE '{path}' AS {db.split('_')[1].split('.')[0]}")
+            if os.path.exists(path):
+                alias = db.split('_')[1].split('.')[0]
+                conn.execute(f"ATTACH DATABASE ? AS {alias}", (path,))
+                attached.add(alias)
         try:
-            self._meta_map = pd.read_sql_query("SELECT code, code_name AS name FROM meta.stock_basic", conn).set_index('code')['name'].to_dict()
+            self._meta_map = {}
+            self._finance_history = {}
+            meta_table = (
+                'meta' in attached and conn.execute(
+                    "SELECT 1 FROM meta.sqlite_master WHERE type='table' AND name='stock_basic'"
+                ).fetchone() is not None
+            )
+            if meta_table:
+                self._meta_map = pd.read_sql_query(
+                    "SELECT code, code_name AS name FROM meta.stock_basic", conn
+                ).set_index('code')['name'].to_dict()
+
+            finance_tables = set()
+            if 'finance' in attached:
+                finance_tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM finance.sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            if not {'profit_ability', 'balance_ability'}.issubset(finance_tables):
+                self._all_finance_df = pd.DataFrame()
+                return
+
             self._all_finance_df = pd.read_sql_query("""
                 SELECT p.code, p.pub_date, p.stat_date, p.epsTTM AS EPSJB, p.totalShare, b.liabilityToAsset AS ZCFZL
                 FROM finance.profit_ability p
@@ -278,7 +332,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
             for col in num_cols:
                 self._all_finance_df[col] = pd.to_numeric(self._all_finance_df[col], errors='coerce').astype('float32')
             self._all_finance_df = self._all_finance_df.sort_values('pub_date')
-            self._finance_history = {}
             for code, group in self._all_finance_df.groupby('code', sort=False):
                 dates = group['pub_date'].astype(str).str[:10].to_numpy()
                 values = group[num_cols].to_numpy(dtype=np.float32, copy=True)
@@ -354,10 +407,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     df = df.iloc[order].reset_index(drop=True)
                     dates = dates[order]
 
-                matrix = np.full((len(df), len(feature_names)), 0.5, dtype=np.float32)
+                # 保留缓存中的真实缺失状态，等当日横截面排名完成后再置中性值。
+                matrix = np.full((len(df), len(feature_names)), np.nan, dtype=np.float32)
                 for col_idx, col in enumerate(feature_names):
                     if col in df.columns:
-                        matrix[:, col_idx] = pd.to_numeric(df[col], errors='coerce').fillna(0.5).to_numpy(dtype=np.float32)
+                        matrix[:, col_idx] = pd.to_numeric(
+                            df[col], errors='coerce'
+                        ).to_numpy(dtype=np.float32)
                 return code, dates, matrix
             except Exception:
                 return None
@@ -388,7 +444,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if factors is None or factors.empty:
             return None
         row = factors.drop(columns=['date'], errors='ignore').iloc[-1]
-        return row.reindex(self._get_model_feature_names()).fillna(0.5).to_numpy(dtype=np.float32)
+        return row.reindex(self._get_model_feature_names()).to_numpy(dtype=np.float32)
 
     def _get_model_feature_names(self) -> List[str]:
         """获取模型需要的特征列，兼容单模型与集成模型。"""
@@ -399,7 +455,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if models:
             ordered = []
             seen = set()
-            for model in models:
+            model_iter = models.values() if isinstance(models, dict) else models
+            for model in model_iter:
                 for name in getattr(model, 'feature_names', []) or []:
                     if name not in seen:
                         ordered.append(name)

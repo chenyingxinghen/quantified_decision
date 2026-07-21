@@ -83,7 +83,7 @@ def load_smart_model(model_path: str):
     1. 如果是目录，优先尝试加载集成模型（双 pkl），否则加载最新 pkl
     2. 如果是 pkl 文件，优先尝试 EnsembleFactorModel，再回退到 MLFactorModel
     """
-    from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
+    from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel, MultiObjectiveFactorModel
 
     # 情况 1: 目录
     if os.path.isdir(model_path):
@@ -91,7 +91,7 @@ def load_smart_model(model_path: str):
         lgb_path = os.path.join(model_path, 'lightgbm_factor_model.pkl')
 
         if os.path.exists(xgb_path) and os.path.exists(lgb_path):
-            print(f"📦 检测到双模型目录，正在构建集成模型...")
+            print(f"[MODEL] 检测到双模型目录，正在构建集成模型...")
             m1 = MLFactorModel(model_type='xgboost')
             m1.load_model(xgb_path)
             m2 = MLFactorModel(model_type='lightgbm')
@@ -104,10 +104,14 @@ def load_smart_model(model_path: str):
             return load_smart_model(latest)
         return None
 
-    # 情况 2: pkl 文件 —— 优先尝试 EnsembleFactorModel，再回退到 MLFactorModel
+    # 情况 2: pkl 文件 —— 多目标、集成、单模型依次尝试
     if not os.path.exists(model_path):
         return None
 
+    try:
+        return MultiObjectiveFactorModel.load_model(model_path)
+    except Exception:
+        pass
     try:
         return EnsembleFactorModel.load_model(model_path)
     except Exception:
@@ -264,7 +268,7 @@ def _update_factor_cache_incremental(db_path: str, codes: List[str], cache_dir: 
     stocks_data = trainer.load_training_data(codes, start_date, end_date)
     
     if not stocks_data:
-        print("   ✗ 未获取到有效行情数据，同步跳过")
+        print("   [SKIP] 未获取到有效行情数据，同步跳过")
         return
 
     # 直接调用统一的批量更新方法
@@ -454,7 +458,7 @@ def select_stocks(
         os.makedirs(output_dir, exist_ok=True)
         csv_path = os.path.join(output_dir, f"selected_stocks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         pd.DataFrame(results).to_csv(csv_path, index=False, encoding='utf-8-sig')
-        print(f"\n💾 结果 CSV 已保存: {csv_path}")
+        print(f"\n[SAVED] 结果 CSV 已保存: {csv_path}")
 
     # 显示因子重要性（从策略模型中读取）
     try:

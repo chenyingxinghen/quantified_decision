@@ -9,7 +9,11 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from core.factors.train_ml_model import MLModelTrainer
+from core.factors.train_ml_model import (
+    FACTOR_CACHE_PREPROCESSING_VERSION,
+    MLModelTrainer,
+    _read_factor_cache_version,
+)
 from config.baostock_config import DATABASE_PATH
 from config.factor_config import TrainingConfig
 import pandas as pd
@@ -23,6 +27,8 @@ def main():
                         help=f'训练选取的股票数量 (默认{TrainingConfig.STOCK_NUM})')
     parser.add_argument('--force',  action='store_true', help='强制重新计算所有因子')
     parser.add_argument('--workers', type=int, default=15, help='并行线程数')
+    parser.add_argument('--multi-objective', action='store_true',
+                        help='训练多周期收益、风险、流动性与可交易性组合模型')
 
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
@@ -158,6 +164,11 @@ def main():
             cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
             if os.path.exists(cache_file):
                 try:
+                    if (
+                        _read_factor_cache_version(cache_file)
+                        != FACTOR_CACHE_PREPROCESSING_VERSION
+                    ):
+                        return code, True
                     pf = pq.ParquetFile(cache_file)
                     if pf.num_row_groups > 0:
                         table = pf.read_row_group(pf.num_row_groups - 1, columns=['date'])
@@ -216,6 +227,13 @@ def main():
 
     # ── 6. 准备数据集 ────────────────────────────────────────────────────
     print(f"\n[Step 2] 准备特征数据集与标签...")
+    multi_labels = None
+    if args.multi_objective:
+        print("  正在构造多目标标签...")
+        multi_labels = trainer.build_multiobjective_labels(
+            stocks_data, train_start_date, train_end_date
+        )
+
     full_dataset = trainer.prepare_dataset(
         stocks_data,
         train_start_date=train_start_date,
@@ -223,7 +241,8 @@ def main():
         include_fundamentals=True,
         n_jobs=args.workers,
         target_features=target_features,  # 复用 Step 0 发现的特征集，跳过重复发现
-        use_factor_cache_only=True
+        use_factor_cache_only=True,
+        return_codes=args.multi_objective,
     )
     del stocks_data
     import gc; gc.collect()
@@ -232,6 +251,52 @@ def main():
     print(f"\n[Step 3] 训练机器学习模型...")
     
     # 解析数据集
+    if args.multi_objective:
+        X, y, returns, factor_names, dates, unbuyable_mask, limit_groups, path_scores, is_st_arr, w_sig_arr, codes = full_dataset
+        keys = pd.DataFrame({
+            'date': pd.Series(dates).astype(str).str[:10],
+            'code': pd.Series(codes).astype(str),
+            '__row_order': range(len(dates)),
+        })
+        label_frame = multi_labels.copy()
+        label_frame['date'] = label_frame['date'].astype(str).str[:10]
+        label_frame['code'] = label_frame['code'].astype(str)
+        aligned = keys.merge(label_frame, on=['date', 'code'], how='left', sort=False)
+        aligned = aligned.sort_values('__row_order').reset_index(drop=True)
+
+        multi_model, results, selected_names = trainer.train_multiobjective_models(
+            X, aligned, factor_names, dates,
+            objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
+            model_type='lightgbm',
+        )
+        import json, pickle, shutil
+        archive_dir = os.path.join(
+            TrainingConfig.SAVE_DIR,
+            'multi_objective_' + datetime.now().strftime('%Y%m%d_%H%M%S'),
+        )
+        latest_dir = os.path.join(TrainingConfig.SAVE_DIR, 'latest')
+        os.makedirs(archive_dir, exist_ok=True)
+        os.makedirs(latest_dir, exist_ok=True)
+        archive_model = os.path.join(archive_dir, 'multi_objective_factor_model.pkl')
+        latest_model = os.path.join(latest_dir, 'multi_objective_factor_model.pkl')
+        multi_model.save_model(archive_model)
+        shutil.copy2(archive_model, latest_model)
+        with open(os.path.join(archive_dir, 'multi_objective_config.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                'objectives': list(multi_model.models),
+                'weights': multi_model.weights,
+                'selected_features': selected_names,
+                'train_start_date': train_start_date,
+                'train_end_date': train_end_date,
+            }, f, ensure_ascii=False, indent=2)
+        if getattr(trainer, 'norm_stats', None) is not None:
+            for target_dir in (archive_dir, latest_dir):
+                with open(os.path.join(target_dir, 'norm_stats.pkl'), 'wb') as f:
+                    pickle.dump(trainer.norm_stats, f)
+        trainer.save_factor_summary(selected_names, save_dir=archive_dir)
+        print(f"\n=== 多目标模型训练完成: {archive_model} ===")
+        return
+
     X, y, returns, factor_names, dates, unbuyable_mask, limit_groups, path_scores, is_st_arr, w_sig_arr = full_dataset
     
     results = trainer.train_models(

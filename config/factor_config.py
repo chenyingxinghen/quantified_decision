@@ -10,6 +10,8 @@
 
 from typing import Dict, Any
 from config import baostock_config
+from config.jydb_config import JYDB_ENABLED, JYDB_FEATURE_DB_PATH
+import os
 
 n_bins = 15
 
@@ -143,6 +145,18 @@ class TrainingConfig:
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
     SHORT_PREDICTION     = True
     FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
+    MULTI_OBJECTIVE_ENABLED = False
+    MULTI_OBJECTIVE_RETURN_HORIZONS = (5, 20, 60)
+    MULTI_OBJECTIVE_RISK_HORIZON = 20
+    MULTI_OBJECTIVE_WEIGHTS = {
+        'y_ret_5d': 0.20,
+        'y_ret_20d': 0.25,
+        'y_ret_60d': 0.20,
+        'y_mdd_20d': 0.15,
+        'y_downvol_20d': 0.08,
+        'y_illiq_20d': 0.07,
+        'y_tradable_20d': 0.05,
+    }
 
 
     # ── 数据集划分 ─────────────────────────────────────────────────────────
@@ -150,6 +164,8 @@ class TrainingConfig:
 
     # ── 因子与基本面 ───────────────────────────────────────────────────────
     INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
+    # 聚源清洗后的 PIT 特征。数据库不存在时自动降级为空特征，保持旧流程兼容。
+    INCLUDE_JYDB_FEATURES = JYDB_ENABLED or os.path.exists(JYDB_FEATURE_DB_PATH)
     INCLUDE_CANDLE_PATTERN = False
 
     # 标签变换：回归与 XGBoost ranking 共用连续标签变换；LightGBM ranking 由 label_gain 控制
@@ -236,8 +252,12 @@ class TrainingConfig:
         if col in TrainingConfig.FEATURE_TRANSFORM_EXCLUDE_LIST:
             return True
         col_l = col.lower()
+        # 外部结构化特征在训练前统一做横截面 Rank；对其再做 log/sqrt 等
+        # 单调变换不会增加排序信息，只会扩大稀疏事件列和类别列的候选空间。
+        if col_l.startswith('jy_'):
+            return True
         # 排除所有状态位、K线形态、宏观指标
-        if col_l.startswith(('industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
+        if col_l.startswith(('industry_', 'jy_industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
             return True
         # 排除 FEATURE_TRANSFORM_EXCLUDE_LIST 中以前缀方式匹配的条目（如 'aroon' 匹配 'aroon_up'）
         for excl in TrainingConfig.FEATURE_TRANSFORM_EXCLUDE_LIST:
@@ -252,7 +272,7 @@ class TrainingConfig:
             return True
         col_l = col.lower()
         # 行业、板块分类、退市天数、二元标记、市场/指标前缀
-        if col_l.startswith(('industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
+        if col_l.startswith(('industry_', 'jy_industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
             # 如果是已经 label encoding 过的行业因子，可以参与排名（保持分布一致）
             if col_l.endswith('_encoded'):
                 return False
@@ -382,7 +402,7 @@ class OptimizationConfig:
 
     # 特征选择方法
     FEATURE_SELECTION_METHOD = 'hybrid'  # 'importance', 'correlation', 'mutual_info', 'rfe', 'hybrid'
-    N_FEATURES_TO_SELECT = 80  # 进一步增加特征数，给模型更多信息
+    N_FEATURES_TO_SELECT = 200  # 候选上限；最终数量仍受覆盖率、常量和相关性过滤约束
 
     # 特征选择阈值
     FEATURE_IMPORTANCE_THRESHOLD = 0.001

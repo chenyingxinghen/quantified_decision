@@ -5,5 +5,7 @@
 """
 from .data_fetcher import DataFetcher
 from .baostock_main import BaostockDataManager
+from .jydb_feature_store import JYDBETL, JYDBFeatureStore
+from .jydb_market_etl import JYDBMarketETL
 
-__all__ = ['DataFetcher', 'BaostockDataManager']
+__all__ = ['DataFetcher', 'BaostockDataManager', 'JYDBETL', 'JYDBFeatureStore', 'JYDBMarketETL']

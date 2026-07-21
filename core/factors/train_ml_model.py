@@ -58,6 +58,30 @@ from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, M
 # 顶层 worker 函数（进程池要求 picklable，必须定义在模块顶层）
 # ============================================================================
 
+FACTOR_CACHE_PREPROCESSING_VERSION = "2"
+
+
+def _read_factor_cache_version(cache_file: str) -> Optional[str]:
+    try:
+        import pyarrow.parquet as pq
+        metadata = pq.read_metadata(cache_file).metadata or {}
+        value = metadata.get(b'factor_preprocessing_version')
+        return value.decode('utf-8') if value else None
+    except Exception:
+        return None
+
+
+def _write_factor_cache(frame: pd.DataFrame, cache_file: str) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.Table.from_pandas(frame, preserve_index=False)
+    metadata = dict(table.schema.metadata or {})
+    metadata[b'factor_preprocessing_version'] = (
+        FACTOR_CACHE_PREPROCESSING_VERSION.encode('utf-8')
+    )
+    pq.write_table(table.replace_schema_metadata(metadata), cache_file)
+
 def _cache_worker(args):
     """
     进程池 worker：在独立子进程中计算并保存单只股票的因子缓存。
@@ -100,6 +124,8 @@ def _scan_cache_file(args):
     try:
         import pyarrow.parquet as pq
         if not os.path.exists(cache_file):
+            return code, True
+        if _read_factor_cache_version(cache_file) != FACTOR_CACHE_PREPROCESSING_VERSION:
             return code, True
         pf = pq.read_table(cache_file, columns=['date'])
         last_row = pf.to_pandas().tail(1)
@@ -154,6 +180,25 @@ def _fast_rankdata_1d(a):
     return ranks
 
 
+def _rank_finite_to_unit_interval(a, missing_value: float = 0.5):
+    """仅对有限值排名，缺失值在排名完成后置为中性值。
+
+    不能在横截面排名前把 NaN 替换成 0.5：原始因子的量纲并不一定在
+    [0, 1]，提前填充会让“缺失”获得一个虚假的可排序数值，并泄露数据覆盖。
+    """
+    values = np.asarray(a)
+    result = np.full(len(values), missing_value, dtype=np.float32)
+    valid = np.isfinite(values)
+    valid_count = int(valid.sum())
+    if valid_count == 0:
+        return result
+    if valid_count == 1:
+        result[valid] = 0.5
+        return result
+    result[valid] = _fast_rankdata_1d(values[valid]) / (valid_count + 1)
+    return result
+
+
 def _normalize_chunk_worker(X, rank_cols_idx, chunk_start_row, group_starts, group_counts):
     """
     线程池中的子工作任务：原地归一化特征子矩阵中的一组日期。
@@ -170,7 +215,7 @@ def _normalize_chunk_worker(X, rank_cols_idx, chunk_start_row, group_starts, gro
         for j in range(F):
             col = rank_cols_idx[j]
             col_data = X[row_start:row_end, col]
-            X[row_start:row_end, col] = _fast_rankdata_1d(col_data) / (count + 1)
+            X[row_start:row_end, col] = _rank_finite_to_unit_interval(col_data)
             
     return None
 
@@ -236,24 +281,31 @@ class MLModelTrainer:
         # 挂载元数据库以支持 is_st 查询 & 退市日期
         db_dir = os.path.dirname(self.db_path)
         meta_db = os.path.join(db_dir, 'stock_meta.db')
+        has_meta_stock_basic = False
         if os.path.exists(meta_db):
             conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+            has_meta_stock_basic = conn.execute(
+                "SELECT 1 FROM meta.sqlite_master WHERE type='table' AND name='stock_basic'"
+            ).fetchone() is not None
         
         conn.row_factory = sqlite3.Row
         
         # 预加载退市日期映射 {code: outDate_str or None}
         delist_map: Dict[str, Optional[str]] = {}
         try:
-            placeholders_all = ','.join(['?' for _ in stock_codes])
-            delist_df = pd.read_sql_query(
-                f"SELECT code, outDate FROM meta.stock_basic WHERE code IN ({placeholders_all})",
-                conn, params=stock_codes
-            )
-            for _, row in delist_df.iterrows():
-                out = row['outDate']
-                delist_map[row['code']] = out if (out and str(out).strip() not in ('', 'None', 'nan')) else None
+            if not has_meta_stock_basic:
+                print("  [INFO] 未配置 stock_basic 元数据，退市日期特征使用默认值")
+            else:
+                placeholders_all = ','.join(['?' for _ in stock_codes])
+                delist_df = pd.read_sql_query(
+                    f"SELECT code, outDate FROM meta.stock_basic WHERE code IN ({placeholders_all})",
+                    conn, params=stock_codes
+                )
+                for _, row in delist_df.iterrows():
+                    out = row['outDate']
+                    delist_map[row['code']] = out if (out and str(out).strip() not in ('', 'None', 'nan')) else None
         except Exception as e:
-            print(f"  ⚠ 读取退市日期失败，退市特征将不可用: {e}")
+            print(f"  [WARN] 读取退市日期失败，退市特征将不可用: {e}")
         
         # 分批加载，避免 IN 子句过长
         pbar = tqdm(total=len(stock_codes), desc="加载进度")
@@ -350,28 +402,35 @@ class MLModelTrainer:
         conn = sqlite3.connect(self.db_path)
         db_dir = os.path.dirname(self.db_path)
         meta_db = os.path.join(db_dir, 'stock_meta.db')
+        has_meta_stock_basic = False
         if os.path.exists(meta_db):
             conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+            has_meta_stock_basic = conn.execute(
+                "SELECT 1 FROM meta.sqlite_master WHERE type='table' AND name='stock_basic'"
+            ).fetchone() is not None
 
         delist_map: Dict[str, Optional[str]] = {}
         try:
-            placeholders_all = ','.join(['?' for _ in stock_codes])
-            delist_df = pd.read_sql_query(
-                f"SELECT code, outDate FROM meta.stock_basic WHERE code IN ({placeholders_all})",
-                conn, params=stock_codes
-            )
-            for _, row in delist_df.iterrows():
-                out = row['outDate']
-                delist_map[row['code']] = out if (out and str(out).strip() not in ('', 'None', 'nan')) else None
+            if not has_meta_stock_basic:
+                print("  [INFO] 未配置 stock_basic 元数据，退市日期特征使用默认值")
+            else:
+                placeholders_all = ','.join(['?' for _ in stock_codes])
+                delist_df = pd.read_sql_query(
+                    f"SELECT code, outDate FROM meta.stock_basic WHERE code IN ({placeholders_all})",
+                    conn, params=stock_codes
+                )
+                for _, row in delist_df.iterrows():
+                    out = row['outDate']
+                    delist_map[row['code']] = out if (out and str(out).strip() not in ('', 'None', 'nan')) else None
         except Exception as e:
-            print(f"  ⚠ 读取退市日期失败，退市特征将不可用: {e}")
+            print(f"  [WARN] 读取退市日期失败，退市特征将不可用: {e}")
 
         pbar = tqdm(total=len(stock_codes), desc="标签行情加载")
         for i in range(0, len(stock_codes), batch_size):
             batch_codes = stock_codes[i:i+batch_size]
             placeholders = ','.join(['?' for _ in batch_codes])
             query = f'''
-                SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.volume,
+                SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.volume, k.amount,
                        k.is_st, a.fore_adjust_factor
                 FROM daily_data k
                 LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
@@ -428,6 +487,34 @@ class MLModelTrainer:
         conn.close()
         print(f"成功加载标签行情 {len(stocks_data)} 只股票")
         return stocks_data
+
+    def build_multiobjective_labels(
+        self,
+        stocks_data: Dict[str, pd.DataFrame],
+        start_date: str = None,
+        end_date: str = None,
+    ) -> pd.DataFrame:
+        """构造多目标标签宽表，不改变现有单目标训练 API。"""
+        from core.factors.multi_objective_labels import (
+            MultiObjectiveLabelBuilder,
+            cross_sectional_rank_targets,
+        )
+        builder = MultiObjectiveLabelBuilder(
+            return_horizons=getattr(
+                TrainingConfig, 'MULTI_OBJECTIVE_RETURN_HORIZONS', (5, 20, 60)
+            ),
+            risk_horizon=getattr(TrainingConfig, 'MULTI_OBJECTIVE_RISK_HORIZON', 20),
+        )
+        labels = builder.build_universe(stocks_data, start_date, end_date)
+        if labels.empty:
+            return labels
+        target_cols = list(getattr(TrainingConfig, 'MULTI_OBJECTIVE_WEIGHTS', {}).keys())
+        target_cols = [col for col in target_cols if col in labels.columns]
+        return cross_sectional_rank_targets(
+            labels,
+            target_cols,
+            risk_cols={'y_downvol_20d', 'y_illiq_20d'},
+        )
     
     def calculate_and_save_factors(self, code: str, data: pd.DataFrame, 
                                   apply_feature_engineering: bool = True,
@@ -451,6 +538,7 @@ class MLModelTrainer:
         返回:
             合并后的因子DataFrame
         """
+        os.makedirs(self.factors_cache_dir, exist_ok=True)
         cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
         
         # 确保 data 中的 date 列为字符串（方便比较）
@@ -462,9 +550,17 @@ class MLModelTrainer:
         cached_factors = None
         if os.path.exists(cache_file):
             try:
-                cached_factors = pd.read_parquet(cache_file)
-                if 'date' in cached_factors.columns and not pd.api.types.is_string_dtype(cached_factors['date']):
-                    cached_factors['date'] = cached_factors['date'].astype(str)
+                cache_version = _read_factor_cache_version(cache_file)
+                if cache_version != FACTOR_CACHE_PREPROCESSING_VERSION:
+                    if verbose:
+                        print(
+                            f"  {code}: 缓存预处理版本 {cache_version or 'legacy'} "
+                            f"!= {FACTOR_CACHE_PREPROCESSING_VERSION}，触发全量重算"
+                        )
+                else:
+                    cached_factors = pd.read_parquet(cache_file)
+                    if 'date' in cached_factors.columns and not pd.api.types.is_string_dtype(cached_factors['date']):
+                        cached_factors['date'] = cached_factors['date'].astype(str)
             except Exception:
                 print(f"  {code}: 缓存文件损坏，触发全量重算")
                 cached_factors = None
@@ -600,7 +696,7 @@ class MLModelTrainer:
 
         # ── 6. 保存到缓存 ──────────────────────────────────────────────────
         try:
-            all_factors.to_parquet(cache_file, index=False)
+            _write_factor_cache(all_factors, cache_file)
             if verbose:
                 mode = '增量' if (not need_full_recompute and cached_factors is not None) else '全量'
                 print(f"  {code} 因子{mode}缓存 ({len(all_factors)} 行, {len(all_factors.columns)} 列)")
@@ -691,11 +787,11 @@ class MLModelTrainer:
                         if ok:
                             success += 1
                         else:
-                            tqdm.write(f"  ✗ {code} 缓存更新失败: {err}")
+                            tqdm.write(f"  [FAIL] {code} 缓存更新失败: {err}")
                             failed += 1
                     except Exception as e:
                         code = futures[future]
-                        tqdm.write(f"  ✗ {code} 进程异常: {e}")
+                        tqdm.write(f"  [FAIL] {code} 进程异常: {e}")
                         failed += 1
                     pbar.set_postfix({"成功": success, "失败": failed})
                     pbar.update(1)
@@ -714,7 +810,7 @@ class MLModelTrainer:
                 pass
                     
         elapsed = time() - start_time
-        print(f"✓ 缓存同步完成: 成功 {success}, 失败 {failed} | 已跳过 {skipped} | 耗时 {elapsed:.1f}s")
+        print(f"[OK] 缓存同步完成: 成功 {success}, 失败 {failed} | 已跳过 {skipped} | 耗时 {elapsed:.1f}s")
     
 
 
@@ -930,14 +1026,18 @@ class MLModelTrainer:
             if target_features:
                 missing_features = [c for c in target_features if c not in factors.columns]
                 if missing_features:
-                    missing_df = pd.DataFrame(0.5, index=factors.index, columns=missing_features)
+                    # 保留“整只股票没有该字段”的真实缺失状态，供训练段覆盖率
+                    # 筛选使用；中性值只能在横截面归一化完成之后填充。
+                    missing_df = pd.DataFrame(
+                        np.nan, index=factors.index, columns=missing_features,
+                        dtype=np.float32,
+                    )
                     factors = pd.concat([factors, missing_df], axis=1)
                 factor_value_cols = [c for c in target_features if c in factors.columns]
             if not factor_value_cols:
                 return None
             factors[factor_value_cols] = factors[factor_value_cols].apply(pd.to_numeric, errors='coerce')
             valid_factor_idx = ~factors[factor_value_cols].isna().all(axis=1)
-            factors[factor_value_cols] = factors[factor_value_cols].fillna(0.5)
 
             close = data['close'].values
             high = data['high'].values
@@ -1264,7 +1364,8 @@ class MLModelTrainer:
                        train_end_date: str = None,
                        include_fundamentals: bool = True,
                        target_features: Optional[List[str]] = None,
-                       use_factor_cache_only: bool = False) -> tuple:
+                       use_factor_cache_only: bool = False,
+                       return_codes: bool = False) -> tuple:
         """
         准备训练数据集
         
@@ -1377,13 +1478,23 @@ class MLModelTrainer:
         inverse_sort = np.empty_like(sort_idx)
         inverse_sort[sort_idx] = np.arange(len(sort_idx), dtype=sort_idx.dtype)
         
-        factor_names = all_X[0].columns.tolist()
+        # 事件类别、指数成份等稀疏外部特征并不会在每只股票上都出现，
+        # 因此缓存列集合允许不同。按首次出现顺序构造全股票特征并集，再将
+        # 各股票重索引到统一 schema；不存在的列保留 NaN 供覆盖率筛选处理。
+        factor_names = []
+        seen_factor_names = set()
+        for x_part in all_X:
+            for name in x_part.columns:
+                if name not in seen_factor_names:
+                    factor_names.append(name)
+                    seen_factor_names.add(name)
         X_arr = np.empty((len(sort_idx), len(factor_names)), dtype=np.float32)
         offset = 0
         for part_idx, x_part in enumerate(all_X):
             n_rows = len(x_part)
             dest_idx = inverse_sort[offset:offset + n_rows]
-            X_arr[dest_idx, :] = x_part.to_numpy(dtype=np.float32, copy=False)
+            aligned_part = x_part.reindex(columns=factor_names)
+            X_arr[dest_idx, :] = aligned_part.to_numpy(dtype=np.float32, copy=False)
             offset += n_rows
             all_X[part_idx] = None
         
@@ -1399,6 +1510,7 @@ class MLModelTrainer:
         
         # 全局时间已是有序状态，直接提取和转换 numpy，完全避免了多次复制和多重排序！
         dates_arr = comps_df['date'].values
+        codes_arr = comps_df['code'].astype(str).values
         unbuyable_arr = comps_df['unbuyable'].values
         limit_groups_arr = comps_df['limit_thresholds'].values
         is_st_arr = (comps_df['is_st'] == 1).values
@@ -1422,6 +1534,7 @@ class MLModelTrainer:
                 y_final_arr      = y_final_arr[keep_mask]
                 returns_arr      = returns_arr[keep_mask]
                 dates_arr        = dates_arr[keep_mask]
+                codes_arr        = codes_arr[keep_mask]
                 limit_groups_arr = limit_groups_arr[keep_mask]
                 is_st_arr        = is_st_arr[keep_mask]
                 w_sig_arr        = w_sig_arr[keep_mask]
@@ -1494,8 +1607,12 @@ class MLModelTrainer:
         }
         fund_cols = [c for c in all_cols if c in remaining_all and c in _fund_known]
         remaining_all -= set(fund_cols)
+
+        # 6. 聚源外部 PIT 特征
+        external_cols = [c for c in all_cols if c in remaining_all and c.startswith('jy_')]
+        remaining_all -= set(external_cols)
         
-        # 6. 高级时序/风险特征 — 精确匹配 advanced_factors.py 中的列名
+        # 7. 高级时序/风险特征 — 精确匹配 advanced_factors.py 中的列名
         _adv_known = {
             # TimeSeriesFactors.calculate_price_series_features
             'hl_range_mean', 'hl_range_std', 'oc_ratio_mean', 'oc_ratio_std',
@@ -1535,7 +1652,7 @@ class MLModelTrainer:
         ]
         remaining_all -= set(tech_cols)
         
-        # 8. 其它 (未被以上任何类别匹配到的列)
+        # 9. 其它 (未被以上任何类别匹配到的列)
         other_cols = list(remaining_all)
 
         print("\n" + "="*50)
@@ -1545,15 +1662,20 @@ class MLModelTrainer:
         print(f"2. K线形态 (Candlestick):   {len(candle_cols):>4} 个")
         print(f"3. 基础基本面 (Fundamental): {len(fund_cols):>4} 个")
         print(f"4. 市场情绪 (Sentiment):   {len(sentiment_cols):>4} 个")
-        print(f"5. 高级时序 (Advanced):     {len(adv_cols):>4} 个")
-        print(f"6. 特征工程 (Engineered):   {len(engineered_cols):>4} 个")
-        print(f"7. 其它状态 (Others):       {len(status_cols) + len(other_cols):>4} 个")
+        print(f"5. 聚源 PIT (JYDB):         {len(external_cols):>4} 个")
+        print(f"6. 高级时序 (Advanced):     {len(adv_cols):>4} 个")
+        print(f"7. 特征工程 (Engineered):   {len(engineered_cols):>4} 个")
+        print(f"8. 其它状态 (Others):       {len(status_cols) + len(other_cols):>4} 个")
         if other_cols:
             print(f"   未分类列: {other_cols[:20]}{'...' if len(other_cols) > 20 else ''}")
         print("="*50 + "\n")
         
         # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
-        return X_arr, y_final_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, raw_scores_arr, is_st_arr, w_sig_arr
+        output = (
+            X_arr, y_final_arr, returns_arr, all_cols, dates_arr,
+            unbuyable_arr, limit_groups_arr, raw_scores_arr, is_st_arr, w_sig_arr
+        )
+        return output + (codes_arr,) if return_codes else output
 
     def _apply_cross_sectional_normalization(self, X_df: pd.DataFrame, dates: np.ndarray) -> pd.DataFrame:
         """
@@ -1592,7 +1714,8 @@ class MLModelTrainer:
                     path_scores: np.ndarray = None,
                     is_st_arr: np.ndarray = None,
                     w_sig_arr: np.ndarray = None,
-                    task: str = None) -> Dict:
+                    task: str = None,
+                    apply_feature_selection: bool = True) -> Dict:
         """
         训练多个模型
         """
@@ -1605,23 +1728,43 @@ class MLModelTrainer:
         # 确保数据类型正确 (copy=False 避免不必要的内存复制)
         X = X.astype(np.float32, copy=False)
         y = y.astype(np.float32, copy=False)
+
+        # 这两个输入在公共 API 中是可选的。多目标训练不依赖 ST/信号权重时，
+        # 使用中性的默认值，避免后续时间切分直接对 None 进行切片。
+        if is_st_arr is None:
+            is_st_arr = np.zeros(len(y), dtype=bool)
+        else:
+            is_st_arr = np.asarray(is_st_arr, dtype=bool)
+        if w_sig_arr is None:
+            w_sig_arr = np.ones(len(y), dtype=np.float32)
+        else:
+            w_sig_arr = np.asarray(w_sig_arr, dtype=np.float32)
+
+        if len(is_st_arr) != len(y):
+            raise ValueError(
+                f"is_st_arr 长度 {len(is_st_arr)} 与标签长度 {len(y)} 不一致"
+            )
+        if len(w_sig_arr) != len(y):
+            raise ValueError(
+                f"w_sig_arr 长度 {len(w_sig_arr)} 与标签长度 {len(y)} 不一致"
+            )
         
-        # 最后一次NaN/inf检查和替换
-        # 对于排名后的特征(0-1)，0.5是中性值。确保 X 为 float32。
-        # 注意：inf 检查必须独立于 NaN 检查，否则当 nan_count==0 但存在 inf 时
-        # nan_to_num 不会被调用，导致 float32 溢出产生天文数字。
+        # 记录原始缺失状态，但不要在覆盖率筛选和横截面排名之前填充。
+        # Inf 同样视为无效观测；归一化结束后才统一填为中性值 0.5。
         nan_count = np.isnan(X).sum()
         inf_count = np.isinf(X).sum()
         if nan_count > 0 or inf_count > 0:
             if nan_count > 0:
-                print(f"  警告: 发现 {nan_count} 个 NaN 值，已替换为 0.5")
+                print(f"  提示: 发现 {nan_count} 个缺失值，将先用于覆盖率筛选")
             if inf_count > 0:
-                print(f"  警告: 发现 {inf_count} 个 Inf 值，已替换为边界值 (posinf→1.0, neginf→0.0)")
-            X = np.nan_to_num(X, copy=False, nan=0.5, posinf=1.0, neginf=0.0)
+                print(f"  警告: 发现 {inf_count} 个 Inf 值，按缺失值处理")
+                X[np.isinf(X)] = np.nan
         
         # 特征质量诊断：检查是否所有特征都是常数（无区分度）
-        feature_stds = np.std(X, axis=0)
-        zero_std_count = np.sum(feature_stds < 1e-6)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=RuntimeWarning)
+            feature_stds = np.nanstd(X, axis=0)
+        zero_std_count = np.sum(np.isfinite(feature_stds) & (feature_stds < 1e-6))
         if zero_std_count > 0:
             print(f"  警告: 发现 {zero_std_count} 个零方差特征（无区分度），建议检查特征工程")
             if zero_std_count > len(factor_names) * 0.5:
@@ -1629,7 +1772,13 @@ class MLModelTrainer:
         
         print(f"  数据验证完成: {X.shape[0]} 行, {X.shape[1]} 列")
         # 注意：此处统计为归一化前的原始特征值，仅用于诊断异常值是否已被清理
-        print(f"  特征统计(归一化前): mean={X.mean():.4f}, std={X.std():.4f}, min={X.min():.4f}, max={X.max():.4f}")
+        finite_values = X[np.isfinite(X)]
+        if finite_values.size:
+            print(
+                f"  特征统计(归一化前): mean={finite_values.mean():.4f}, "
+                f"std={finite_values.std():.4f}, min={finite_values.min():.4f}, "
+                f"max={finite_values.max():.4f}"
+            )
         
         # 先进行时间序列划分 (增加 Embargo 阻隔期，防止数据泄漏)
         forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
@@ -1659,6 +1808,9 @@ class MLModelTrainer:
         returns_train, returns_val = returns[:split_idx], returns[val_start_idx:]
         is_st_train, is_st_val = is_st_arr[:split_idx], is_st_arr[val_start_idx:]
         w_sig_train, w_sig_val = w_sig_arr[:split_idx], w_sig_arr[val_start_idx:]
+
+        # 覆盖率必须在任何填充/归一化之前、且只用训练段计算。
+        feature_coverage_train = np.isfinite(X_train).mean(axis=0)
         
         # 训练集：正常横截面排名归一化
         print("\n  对训练样本进行横截面归一化...")
@@ -1732,7 +1884,14 @@ class MLModelTrainer:
                             np.linspace(bin_0_watershed, 1.0, _n_bins)
                         ])
                         bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
-                        _y_discrete_lgb[_ds:_de] = bins.astype(np.int32)
+                        # 常量截面或有效分位点不足时 qcut 会返回全 NaN；直接转 int32
+                        # 会变成 -2147483648，随后被 LightGBM 判为非法负标签。
+                        if pd.isna(bins).all():
+                            _y_discrete_lgb[_ds:_de] = _mid_bin
+                        else:
+                            _y_discrete_lgb[_ds:_de] = (
+                                pd.Series(bins).fillna(_mid_bin).to_numpy(dtype=np.int32)
+                            )
 
                     except ValueError:
                         raise ValueError(f"  {_dates_sub[_ds:_de]} 样本标签分布不均匀，请检查数据质量。")
@@ -1797,13 +1956,13 @@ class MLModelTrainer:
         sample_weight_train /= (sample_weight_train.mean() + 1e-8)
         
         # 5. 特征选择：减少冗余和高度相关的特征 (New)
+        from config.factor_config import OptimizationConfig
         selection_cache_file = os.path.join(TrainingConfig.SAVE_DIR, "selected_features.json")
         os.makedirs(TrainingConfig.SAVE_DIR, exist_ok=True)
         
         # 记录原始特征列表，用于同步过滤 X_val
         original_factor_names = list(factor_names)
 
-        apply_feature_selection=True
         if apply_feature_selection:        
             # 尝试从缓存读取特征选择结果
             loaded_from_cache = False
@@ -1813,7 +1972,14 @@ class MLModelTrainer:
                     with open(selection_cache_file, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
                         # 只有当原始特征集完全一致时，才复用缓存
-                        if set(cached_data.get('original_features', [])) == set(original_factor_names):
+                        current_max_features = getattr(
+                            OptimizationConfig, 'N_FEATURES_TO_SELECT', 200
+                        )
+                        if (
+                            set(cached_data.get('original_features', [])) == set(original_factor_names)
+                            and cached_data.get('max_features') == current_max_features
+                            and cached_data.get('preprocessing_version') == 2
+                        ):
                             factor_names = cached_data['selected_features']
                             print(f"\n[特征优化] 从缓存加载特征选择结果 (保留 {len(factor_names)} 个核心特征)")
                             loaded_from_cache = True
@@ -1824,7 +1990,8 @@ class MLModelTrainer:
                 print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
                 # 使用相关性过滤
                 X_train, factor_names = self._select_features(
-                    X_train, factor_names, 0.8
+                    X_train, factor_names, y=y_train, corr_threshold=0.95,
+                    feature_coverage=feature_coverage_train,
                 )
                 # 保存特征选择结果到缓存
                 try:
@@ -1833,6 +2000,10 @@ class MLModelTrainer:
                         json.dump({
                             'original_features': original_factor_names,
                             'selected_features': factor_names,
+                            'max_features': getattr(
+                                OptimizationConfig, 'N_FEATURES_TO_SELECT', 200
+                            ),
+                            'preprocessing_version': 2,
                             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         }, f, ensure_ascii=False, indent=4)
                 except Exception as e:
@@ -1921,6 +2092,140 @@ class MLModelTrainer:
         
         return results
 
+    def train_multiobjective_models(
+        self,
+        X: np.ndarray,
+        targets: pd.DataFrame,
+        factor_names: List[str],
+        dates: np.ndarray,
+        objective_weights: Dict[str, float] = None,
+        model_type: str = 'lightgbm',
+    ):
+        """训练多个方向统一的目标模型并返回组合模型及训练结果。
+
+        ``targets`` 应包含 ``rank_y_*`` 列，所有列均遵循越大越好的语义。
+        特征仅在训练数据上进行一次多目标联合筛选，随后每个目标复用相同列。
+        """
+        from core.factors.feature_selector import CrossSectionalFeatureSelector
+        from core.factors.ml_factor_model import MultiObjectiveFactorModel
+        from config.factor_config import OptimizationConfig
+
+        weights = dict(objective_weights or getattr(TrainingConfig, 'MULTI_OBJECTIVE_WEIGHTS', {}))
+        objective_cols = []
+        normalized_weights = {}
+        for raw_name, weight in weights.items():
+            rank_name = raw_name if raw_name.startswith('rank_') else f'rank_{raw_name}'
+            if rank_name in targets.columns and weight > 0:
+                objective_cols.append(rank_name)
+                normalized_weights[rank_name] = float(weight)
+        if not objective_cols:
+            raise ValueError("targets 中没有与 MULTI_OBJECTIVE_WEIGHTS 匹配的 rank 目标")
+
+        target_matrix = targets[objective_cols].to_numpy(dtype=np.float32)
+        complete = np.isfinite(target_matrix).all(axis=1)
+        if complete.sum() < 100:
+            raise ValueError(f"多目标完整样本不足: {int(complete.sum())}")
+        X_fit = np.asarray(X, dtype=np.float32)[complete]
+        y_fit = target_matrix[complete]
+        dates_fit = np.asarray(dates)[complete]
+
+        # 与 train_models 使用相同的时间切分口径。目标可学习性判断和特征选择
+        # 都只能看到训练段，验证段标签不得参与选列。
+        raw_selection_split = int(len(dates_fit) * TrainingConfig.TRAIN_TEST_SPLIT)
+        if raw_selection_split <= 0 or raw_selection_split >= len(dates_fit):
+            raise ValueError("多目标训练时间切分后没有足够的训练/验证样本")
+        selection_split_date = dates_fit[raw_selection_split]
+        selection_train_mask = dates_fit < selection_split_date
+        if selection_train_mask.sum() < 100:
+            raise ValueError(f"多目标特征筛选训练样本不足: {int(selection_train_mask.sum())}")
+
+        # 某些目标在特定训练股票池中可能没有正负样本，例如全体股票未来窗口
+        # 都可交易。此时不存在可学习的横截面关系，应明确跳过并对剩余权重
+        # 重新归一化，而不是训练伪模型或让离散化产生非法标签。
+        # 判断的是“同一交易日内”是否存在排序差异，不能只看全样本标准差；
+        # 当每日标签全相同但当日股票数不同，pct-rank 的日均值会轻微变化，
+        # 全局标准差会误判为可学习信号。
+        variable_mask = np.zeros(y_fit.shape[1], dtype=bool)
+        selection_dates = dates_fit[selection_train_mask]
+        selection_targets = y_fit[selection_train_mask]
+        for date in np.unique(selection_dates):
+            day_values = selection_targets[selection_dates == date]
+            if len(day_values) > 1:
+                variable_mask |= np.nanmax(day_values, axis=0) - np.nanmin(day_values, axis=0) > 1e-8
+        if not variable_mask.all():
+            skipped = [name for name, keep in zip(objective_cols, variable_mask) if not keep]
+            print(f"  [多目标训练] 跳过无横截面变化目标: {skipped}")
+            objective_cols = [name for name, keep in zip(objective_cols, variable_mask) if keep]
+            y_fit = y_fit[:, variable_mask]
+            normalized_weights = {
+                name: weight for name, weight in normalized_weights.items()
+                if name in objective_cols
+            }
+        if not objective_cols:
+            raise ValueError("所有多目标标签在训练样本中均无横截面变化")
+
+        selector = CrossSectionalFeatureSelector(
+            max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 200),
+            min_coverage=0.20,
+            corr_threshold=getattr(OptimizationConfig, 'CORRELATION_THRESHOLD', 0.95),
+        )
+        ordered_weights = [normalized_weights[name] for name in objective_cols]
+
+        # 筛选必须使用与最终模型一致的训练段横截面预处理；覆盖率则来自
+        # 预处理前的原始缺失状态，避免中性值 0.5 被误算为有效观测。
+        raw_selection_X = X_fit[selection_train_mask]
+        feature_coverage = np.isfinite(raw_selection_X).mean(axis=0)
+        selection_X = raw_selection_X.copy()
+        self._apply_cross_sectional_normalization_inplace(
+            selection_X, dates_fit[selection_train_mask], factor_names,
+        )
+        selector.fit(
+            selection_X, factor_names,
+            y_fit[selection_train_mask], target_weights=ordered_weights,
+            feature_coverage=feature_coverage,
+        )
+        selected_names = list(selector.report_.selected_features)
+        selected_indices = [factor_names.index(name) for name in selected_names]
+        X_selected = X_fit[:, selected_indices]
+
+        trained_models = {}
+        objective_results = {}
+        previous_models = self.models
+        try:
+            for idx, objective in enumerate(objective_cols):
+                print(f"\n[多目标训练] {objective} ({idx + 1}/{len(objective_cols)})")
+                objective_y = y_fit[:, idx]
+                result = self.train_models(
+                    X_selected.copy(), objective_y.copy(), objective_y.copy(),
+                    selected_names, dates_fit,
+                    model_types=[model_type], task='ranking',
+                    apply_feature_selection=False,
+                )
+                if model_type not in self.models or model_type not in result:
+                    raise RuntimeError(f"目标 {objective} 训练失败")
+                objective_result = result[model_type]
+                train_metrics = objective_result.get('train_metrics', {})
+                val_metrics = objective_result.get('val_metrics', {})
+                if (
+                    objective.endswith('tradable_20d')
+                    and abs(float(train_metrics.get('rank_ic', 0.0))) < 1e-12
+                    and abs(float(val_metrics.get('rank_ic', 0.0))) < 1e-12
+                    and abs(float(val_metrics.get('auc', 0.5)) - 0.5) < 1e-12
+                ):
+                    print(f"  [多目标训练] 跳过无预测区分度目标: {objective}")
+                    self.models = {}
+                    continue
+                trained_models[objective] = self.models[model_type]
+                objective_results[objective] = objective_result
+                self.models = {}
+        finally:
+            self.models = previous_models
+
+        wrapper = MultiObjectiveFactorModel(trained_models, {
+            name: normalized_weights[name] for name in trained_models
+        })
+        return wrapper, objective_results, selected_names
+
 
     def _apply_cross_sectional_normalization_inplace(self, X: np.ndarray, dates: np.ndarray, 
                                                    factor_names: List[str],
@@ -1928,34 +2233,11 @@ class MLModelTrainer:
         """
         使用并行化处理和内存视图，原位对特征矩阵进行横截面归一化，降低内存占用并大幅提升性能。
         """
-        # 跳过横截面排名归一化的特征集合
-        _skip_normalization = {
-            'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio', 
-            'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio', 
-            'breadth_ma20', 'market_type',
-            'is_limit_up', 'is_suspended',
-            'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
-            'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
-            'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
-            'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
-            'three_white_soldiers', 'three_black_crows',
-        }
-        
-        def _should_skip(col: str) -> bool:
-            if col in _skip_normalization: return True
-            if col.startswith(('industry_', 'sector_', 'is_', 'days_to_')):
-                if col.endswith('_encoded'): return False
-                return True
-            if col.startswith(('mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
-                return True
-            return False
-
-        rank_cols_mask = np.array([not _should_skip(col) for col in factor_names])
+        rank_cols_mask = np.array([
+            not TrainingConfig.should_skip_rank(col) for col in factor_names
+        ])
         rank_cols_idx = np.where(rank_cols_mask)[0]
         skip_cols_idx = np.where(~rank_cols_mask)[0]
-
-        if len(rank_cols_idx) == 0:
-            return None
 
         # ── B/C 类：连续型跳过列，robust scaler + sigmoid → [0,1] ──
         # 优化：采用单列内存视图处理，完全避免生成大面积临时 2D 矩阵的复制
@@ -2015,7 +2297,9 @@ class MLModelTrainer:
                         scaled_01 = 1.0 / (1.0 + np.exp(-scaled))
                         X[:, col] = scaled_01
                     else:
+                        missing = ~np.isfinite(col_view)
                         X[:, col] = 0.0
+                        X[missing, col] = 0.5
             elif skip_col_stats is None:
                 skip_col_stats = {
                     'median': np.array([]), 'iqr': np.array([]),
@@ -2078,35 +2362,44 @@ class MLModelTrainer:
                 day_data = X[start:start+count, rank_cols_idx]
                 for j in range(len(rank_cols_idx)):
                     col_data = day_data[:, j]
-                    X[start:start+count, rank_cols_idx[j]] = _fast_rankdata_1d(col_data) / (count + 1)
+                    X[start:start+count, rank_cols_idx[j]] = _rank_finite_to_unit_interval(col_data)
 
+        # 模型最终只消费有限的 [0, 1] 数值。缺失值在完成覆盖率统计和
+        # 有效值排名后才置为中性 0.5，避免参与排序。
+        np.nan_to_num(X, copy=False, nan=0.5, posinf=1.0, neginf=0.0)
         gc.collect()
         return skip_col_stats
 
-    def _select_features(self, X: np.ndarray, feature_names: List[str], 
-                       corr_threshold: float = 0.85,
-                       method: str = 'correlation') -> Tuple[np.ndarray, List[str]]:
+    def _select_features(self, X: np.ndarray, feature_names: List[str],
+                       y: np.ndarray = None,
+                       corr_threshold: float = 0.95,
+                       method: str = 'target_aware',
+                       feature_coverage: Optional[np.ndarray] = None) -> Tuple[np.ndarray, List[str]]:
         """
         特征选择：过滤高度相关的特征
         """
         if method == 'none' or len(feature_names) <= 50:
             return X, feature_names
-            
-        df_temp = pd.DataFrame(X, columns=feature_names)
-        
-        # 1. 简单相关性过滤
-        corr_matrix = df_temp.corr().abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-        
-        to_drop = [column for column in upper.columns if any(upper[column] > corr_threshold)]
-        
-        if to_drop:
-            print(f"  - 发现 {len(to_drop)} 个高度相关特征 (corr > {corr_threshold})，已剔除")
-            df_temp = df_temp.drop(columns=to_drop)
-            new_feature_names = df_temp.columns.tolist()
-            return df_temp.values, new_feature_names
-            
-        return X, feature_names
+        if y is None:
+            raise ValueError("目标感知特征筛选需要训练标签 y")
+        from core.factors.feature_selector import CrossSectionalFeatureSelector
+        from config.factor_config import OptimizationConfig
+
+        selector = CrossSectionalFeatureSelector(
+            max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 200),
+            min_coverage=0.20,
+            corr_threshold=corr_threshold,
+        )
+        X_selected, selected = selector.fit_transform(
+            X, feature_names, y, feature_coverage=feature_coverage,
+        )
+        report = selector.report_
+        print(
+            f"  - 目标感知筛选: {len(feature_names)} -> {len(selected)}；"
+            f"低覆盖 {len(report.dropped_low_coverage)}，常量 {len(report.dropped_constant)}，"
+            f"冗余 {len(report.dropped_redundant)}"
+        )
+        return X_selected, selected
     
     def compare_models(self, results: Dict):
         """对比模型性能"""
@@ -2339,7 +2632,8 @@ class MLModelTrainer:
         adv_names = sorted(all_set & _adv_known)
         engineered_names = sorted(all_set & _engineered_set)
         status_names = sorted(all_set & _status_known)
-        classified = _tech_set | _candle_set | _fund_known | _sentiment_known | _adv_known | _engineered_set | _status_known
+        external_names = sorted(name for name in all_set if name.startswith('jy_'))
+        classified = _tech_set | _candle_set | _fund_known | _sentiment_known | _adv_known | _engineered_set | _status_known | set(external_names)
         other_names = sorted(all_set - classified)
         
         summary = {
@@ -2351,6 +2645,7 @@ class MLModelTrainer:
             'advanced_factors': len(adv_names),
             'engineered_factors': len(engineered_names),
             'status_factors': len(status_names),
+            'external_source_factors': len(external_names),
             'other_factors': len(other_names),
             'factor_names': factor_names,
             'technical_factor_names': tech_names,
@@ -2360,6 +2655,7 @@ class MLModelTrainer:
             'advanced_factor_names': adv_names,
             'engineered_factor_names': engineered_names,
             'status_factor_names': status_names,
+            'external_source_factor_names': external_names,
             'other_factor_names': other_names,
             'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }

@@ -18,6 +18,7 @@ from core.factors.ml_factor_model import MLFactorModel
 from core.factors.feature_engineering import FeatureEngineer
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller
+from core.factors.external_source_factors import ExternalSourceFactors
 from config import DATABASE_PATH, FactorConfig, TrainingConfig
 
 class ComprehensiveFactorCalculator:
@@ -30,6 +31,7 @@ class ComprehensiveFactorCalculator:
         self.factor_calculator = QuantitativeFactors(config=self.factor_config)
         self.candlestick_calculator = CandlestickPatternFactors()
         self.fundamental_calculator = FundamentalFactors(db_path)
+        self.external_source_calculator = ExternalSourceFactors()
         self.feature_engineer = FeatureEngineer()
         self.filler = FactorFiller(fill_value=0.0, fill_method='zero')
         
@@ -64,11 +66,9 @@ class ComprehensiveFactorCalculator:
         else:
             all_factors = base_factors
             
-        # 3. 填充缺失因子并对齐目标特征
-        # 即使计算失败或由于数据不足无法计算，也要确保列存在，且没有 NaN/Inf
+        # 3. 对齐已生成特征。聚源事件/PIT 特征必须保留 NaN，训练侧需要在
+        # 填充之前据此计算真实覆盖率；内部技术特征仍沿用零填充兼容旧流程。
         all_factors = self.filler.fill_missing_factors(all_factors, target_factors=target_features, keep_all_generated=True)
-        all_factors = self.filler.fill_nan_values(all_factors, fill_method='zero')
-        all_factors = self.filler.fill_inf_values(all_factors, fill_value=0.0)
         
         # 4. 统一数据清理 (向量化优化)
         # 识别不应转换的列 (日期、代码等)
@@ -79,8 +79,18 @@ class ComprehensiveFactorCalculator:
         # 使用 pd.to_numeric 兼容空字符串 '' 等异常情况
         for col in numeric_cols:
             all_factors[col] = pd.to_numeric(all_factors[col], errors='coerce').astype(np.float32)
-        all_factors[numeric_cols] = all_factors[numeric_cols].fillna(0)
-        all_factors[numeric_cols] = all_factors[numeric_cols].replace([np.inf, -np.inf], 0)
+        external_cols = [c for c in numeric_cols if c.startswith('jy_')]
+        internal_cols = [c for c in numeric_cols if c not in external_cols]
+        if internal_cols:
+            all_factors[internal_cols] = (
+                all_factors[internal_cols]
+                .replace([np.inf, -np.inf], 0)
+                .fillna(0)
+            )
+        if external_cols:
+            all_factors[external_cols] = all_factors[external_cols].replace(
+                [np.inf, -np.inf], np.nan
+            )
             
         # 5. 如果指定了目标特征且不仅是用来填充，则按目标特征排序/筛选
         if target_features:
@@ -89,8 +99,16 @@ class ComprehensiveFactorCalculator:
             if missing:
                 if verbose:
                     print(f"  警告: 仍有 {len(missing)} 个特征无法生成，已进行批量填充")
-                # 预定义一个全零矩阵并扩充
-                all_factors = all_factors.reindex(columns=all_factors.columns.tolist() + missing, fill_value=0)
+                # 外部特征缺列表示未知/未覆盖，不能伪装成数值 0；内部计算型
+                # 特征继续使用 0 作为兼容性占位。
+                missing_data = {
+                    name: (np.nan if name.startswith('jy_') else 0.0)
+                    for name in missing
+                }
+                all_factors = pd.concat([
+                    all_factors,
+                    pd.DataFrame(missing_data, index=all_factors.index, dtype=np.float32),
+                ], axis=1)
                 
             # 重排与筛选，使用固定的特征集和顺序
             all_factors = all_factors[target_features]
@@ -143,8 +161,20 @@ class ComprehensiveFactorCalculator:
                     print(f"  [ERROR] 计算基本面因子失败 ({code}): {e}")
                     traceback.print_exc()
                     fundamental_factors = pd.DataFrame(index=data.index)
+
+            # E. 聚源外部结构化特征。数据已在 ETL 阶段标准化为 available_date，
+            # 此处只做严格的 PIT 对齐；本地库不存在时返回空表，兼容旧数据源。
+            external_factors = pd.DataFrame(index=data.index)
+            if getattr(TrainingConfig, 'INCLUDE_JYDB_FEATURES', False) and 'date' in data.columns:
+                try:
+                    external_factors = self.external_source_calculator.calculate_series(code, data)
+                except Exception as e:
+                    import traceback
+                    print(f"  [ERROR] 计算聚源 PIT 因子失败 ({code}): {e}")
+                    traceback.print_exc()
+                    external_factors = pd.DataFrame(index=data.index)
                 
-            # E. 高级特征 (时间序列、风险) - 现在返回的是 Rolling DataFrames
+            # F. 高级特征 (时间序列、风险) - 现在返回的是 Rolling DataFrames
             try:
                 ts_price = TimeSeriesFactors.calculate_price_series_features(data)
                 ts_vol = TimeSeriesFactors.calculate_volume_series_features(data)
@@ -159,7 +189,7 @@ class ComprehensiveFactorCalculator:
                 traceback.print_exc()
                 adv_factors = pd.DataFrame(index=data.index)
                 
-            # F. 交易状态因子 (涨停/停牌 + 市场分类)
+            # G. 交易状态因子 (涨停/停牌 + 市场分类)
             status_factors = pd.DataFrame(index=data.index)
             
             # 兼容多市场的涨跌停阈值判断
@@ -211,7 +241,7 @@ class ComprehensiveFactorCalculator:
 
             # 合并所有（基本面因子现在始终包含占位列，不再条件跳过）
             factors_list = [tech_factors, candlestick_factors, sentiment_factors, status_factors,
-                            fundamental_factors, adv_factors]
+                            fundamental_factors, external_factors, adv_factors]
             factors_list = [f for f in factors_list if not f.empty]
                 
             # 确保索引对齐

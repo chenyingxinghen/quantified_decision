@@ -1034,3 +1034,76 @@ class EnsembleFactorModel:
             models.append(reconstructed_model)
             
         return cls(models, ensemble_state['weights'])
+
+
+class MultiObjectiveFactorModel:
+    """将多个目标模型组合为统一选股分数。
+
+    每个子模型都预测已经方向统一的 desirability rank（越大越好），因此
+    回测和实盘只需消费加权总分，同时可以审计各目标分量。
+    """
+
+    FORMAT_VERSION = 1
+
+    def __init__(self, models: Dict[str, MLFactorModel], weights: Dict[str, float]):
+        if not models:
+            raise ValueError("models 不能为空")
+        if set(models) != set(weights):
+            raise ValueError("models 与 weights 的目标名称必须一致")
+        if any(weight < 0 for weight in weights.values()) or sum(weights.values()) <= 0:
+            raise ValueError("多目标权重必须非负且总和大于 0")
+        total = float(sum(weights.values()))
+        self.models = dict(models)
+        self.weights = {name: float(weights[name]) / total for name in models}
+        self.is_trained = all(getattr(model, 'is_trained', False) for model in models.values())
+        ordered = []
+        seen = set()
+        for model in models.values():
+            for name in getattr(model, 'feature_names', []) or []:
+                if name not in seen:
+                    ordered.append(name)
+                    seen.add(name)
+        self.feature_names = ordered
+
+    def predict_components(self, factors: pd.DataFrame) -> Dict[str, np.ndarray]:
+        if not self.is_trained:
+            raise ValueError("多目标子模型尚未全部训练")
+        result = {}
+        for objective, model in self.models.items():
+            model_input = factors.reindex(columns=model.feature_names, fill_value=0.5)
+            result[objective] = np.asarray(model.predict(model_input), dtype=np.float32)
+        return result
+
+    def predict(self, factors: pd.DataFrame) -> np.ndarray:
+        components = self.predict_components(factors)
+        output = np.zeros(len(factors), dtype=np.float32)
+        for objective, values in components.items():
+            output += values * self.weights[objective]
+        return output
+
+    def save_model(self, filepath: str):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        state = {
+            'format': 'multi_objective_factor_model',
+            'version': self.FORMAT_VERSION,
+            'weights': self.weights,
+            'model_states': {name: model.__dict__ for name, model in self.models.items()},
+        }
+        with open(filepath, 'wb') as f:
+            pickle.dump(state, f)
+
+    @classmethod
+    def load_model(cls, filepath: str):
+        with open(filepath, 'rb') as f:
+            state = pickle.load(f)
+        if state.get('format') != 'multi_objective_factor_model':
+            raise ValueError("不是多目标模型文件")
+        models = {}
+        for objective, model_state in state['model_states'].items():
+            model = MLFactorModel(
+                model_type=model_state.get('model_type', 'xgboost'),
+                task=model_state.get('task', 'ranking'),
+            )
+            model.__dict__.update(model_state)
+            models[objective] = model
+        return cls(models, state['weights'])

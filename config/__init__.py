@@ -6,6 +6,7 @@ from .strategy_config import *
 from .factor_config import (
     ModelConfig, TrainingConfig, FactorConfig, OptimizationConfig,
 )
+from .jydb_config import JYDB_ENABLED, JYDB_FEATURE_DB_PATH
 
 __all__ = [
     # 从 baostock_config 导出
@@ -19,4 +20,5 @@ __all__ = [
     
     # 从 factor_config.py 导出
     'ModelConfig', 'TrainingConfig', 'FactorConfig', 'OptimizationConfig',
+    'JYDB_ENABLED', 'JYDB_FEATURE_DB_PATH',
 ]

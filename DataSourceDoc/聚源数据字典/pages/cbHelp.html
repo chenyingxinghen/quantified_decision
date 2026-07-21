@@ -1,0 +1,264 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<title>用户帮助</title>
+<style type="text/css">
+body {
+	background-color: #FFFFFF;
+	font-family: 'San Francisco', 微软雅黑, 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+}
+
+.datalist {
+	width: 80%;
+	margin-top: 2%;
+	background-color: #FFFFFF; /* 表格背景色 */
+	border: 1px solid #000000; /* 表格边框 */
+	border-collapse: collapse;
+}
+
+.datalist caption {
+	font-size: 18px;
+	font-weight: bold;
+	text-align: center;
+	padding-bottom: 10px;
+}
+
+.datalist th {
+	background-color: rgb(81,81,81); /* 行名称背景色 */
+	border: 1px solid #000000; /* 行名称边框 */
+	color: #FFFFFF; /* 行名称颜色 */
+	font-size: 12px;
+	font-weight: bold;
+	text-align: center;
+	word-wrap: break-word;
+	word-break: break-all;
+	padding-top: 5px;
+	padding-bottom: 5px;
+}
+
+.datalist td {
+	border: 1px solid #000000; /* 单元格边框 */
+	font-size: 14px;
+	text-align: left;
+	word-wrap: break-word;
+	word-break: break-all;
+	line-height: 1.25em;
+	padding-top: 5px;
+	padding-bottom: 5px;
+}
+
+.data {
+	width: 80%;
+	margin-top: 2%;
+	text-align: left;
+	font-size: 14px;
+	line-height: 1.25em;
+	word-wrap: break-word;
+	word-break: break-all;
+}
+</style>
+</head>
+<body>
+	<center>
+		<!--Top-->
+		<table class="datalist">
+			<img style="margin-top: 1%; margin-left: 1%; float: left;" src="logo.png"></img>
+			<caption id="test">数据表样例</caption>
+			<tr>
+				<th width="10%">表名</th>
+				<td width="30%">基金前10名持有人持股信息</td>
+				<td width="30%">MF_TopTenHolder</td>
+				<th width="10%">版本</th>
+				<td width="20%">1.00</td>
+			</tr>
+			<tr>
+				<th>说明</th>
+				<td colspan="4">基金前10名持有人持有基金份额情况</td>
+			</tr>
+			<tr>
+				<td colspan="5">业务主键：(InnerCode,EndDate,HolderName)
+<br>最后修改日期：
+				</td>
+			</tr>
+		</table>
+		<!--Center-->
+		<table class="datalist">
+			<tr>
+				<th>序号</th>
+				<th>列名</th>
+				<th>中文名称</th>
+				<th>类型</th>
+				<th>空否</th>
+				<th>备注</th>
+			</tr>
+			<tr>
+				<td>1</td>
+				<td>ID</td>
+				<td>ID</td>
+				<td>bigint</td>
+				<td>否</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>2</td>
+				<td>InnerCode</td>
+				<td>基金内部编码</td>
+				<td>int</td>
+				<td>否</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>3</td>
+				<td>InfoPublDate</td>
+				<td>信息发布日期</td>
+				<td>datetime</td>
+				<td>是</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>4</td>
+				<td>InfoSource</td>
+				<td>信息来源</td>
+				<td>varchar(100)</td>
+				<td>是</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>5</td>
+				<td>EndDate</td>
+				<td>截止日期</td>
+				<td>datetime</td>
+				<td>否</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>6</td>
+				<td>SerialNumber</td>
+				<td>序号</td>
+				<td>int</td>
+				<td>是</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>7</td>
+				<td>HolderName</td>
+				<td>持有人名称</td>
+				<td>varchar(100)</td>
+				<td>否</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>8</td>
+				<td>HolderCode</td>
+				<td>机构代码</td>
+				<td>varchar(20)</td>
+				<td>是</td>
+				<td>注1</td>
+			</tr>
+			<tr>
+				<td>9</td>
+				<td>HoldingVolume</td>
+				<td>持有份额(份)</td>
+				<td>decimal(18,0)</td>
+				<td>是</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>10</td>
+				<td>HoldingRatio</td>
+				<td>持有比例</td>
+				<td>decimal(18,6)</td>
+				<td>是</td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>11</td>
+				<td>HolderNature</td>
+				<td>持有人性质</td>
+				<td>varchar(50)</td>
+				<td>是</td>
+				<td>从表</td>
+			</tr>
+			<tr>
+				<td>12</td>
+				<td>XGRQ</td>
+				<td>更新日期</td>
+				<td>datetime</td>
+				<td>否</td>
+				<td></td>
+			</tr>
+		</table>
+		<table class="datalist">
+			<tr>
+				<th width="20%">从表名</th>
+				<td width="80%" colspan="3">MF_TopTenHolder_SE</td>
+			</tr>
+			<tr>
+				<th>序号</th>
+				<th>列名</th>
+				<th>中文名</th>
+				<th>类别</th>
+			</tr>
+			<tr>
+				<td>14</td>
+				<td>HolderNature</td>
+				<td>持有人性质</td>
+				<td>varchar</td>
+			</tr>
+		</table>
+		<!--Buttom-->
+		<table class="datalist">
+			<tr>
+				<th>备注说明</th>
+			</tr>
+			<tr>
+				<td>【注1】机构代码(HolderCode)：与机构基本资料表（LC_InstiArchive）中的公司代码（CompanyCode）字段关联。</td>
+			</tr>
+		</table>
+		
+		<table class="datalist">
+			<tr>
+				<th width="20%">从表</th>
+				<td width="80%" colspan="3">MF_TopTenHolder_SE</td>
+			</tr>
+			<tr>
+				<th>序号</th>
+				<th>列名</th>
+				<th>中文名</th>
+				<th>类别</th>
+			</tr>
+			<tr>
+				<td>1</td>
+				<td>ID</td>
+				<td>对应主表中记录中ID</td>
+				<td>decimal(18,0)</td>
+			</tr>
+			<tr>
+				<td>2</td>
+				<td>TypeCode</td>
+				<td>对应从表描述中的字段序号</td>
+				<td>int</td>
+			</tr>
+			<tr>
+				<td>3</td>
+				<td>Code</td>
+				<td>对应系统常量表或其他表中的代码</td>
+				<td>int</td>
+			</tr>
+		</table>
+		
+		<div class="data">
+        ●每个表列出序号、列名、中文名称、类型、字段空否、备注，对于某个字段进一步说明通过备注项解释。
+		假如不清楚某个数据项在那个表中，可通过搜索功能，输入中文关键词检索；<br>
+        ●从表对应的表名为:主表名称+“_SE”，例如：基金前10名持有人持股信息（MF_TopTenHolder）表中有一个从表MF_TopTenHolder_SE, 持有人性质（HolderNature）对应的序号是1，则TypeCode = 1；
+        在从表描述中如没有特别注明什么类别，则都是对应系统常量表中的类别：<br>
+          select A.InnerCode, A.HolderName,A. HoldingVolume, C.MS <br>
+          from MF_TopTenHolder A <br>
+          left join MF_TopTenHolder_SE B on A.ID = B.ID and TypeCode = 1 <br>
+          left join CT_SystemConst C on C.DM = B.Code and C.LB = 1026 <br>
+        通过以上语句就得到了持有人持有份额对应的性质。
+		</div>
+	</center>
+</body>
+</html>

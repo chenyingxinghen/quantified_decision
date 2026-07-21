@@ -1,0 +1,681 @@
+{
+  "analysis_date": "2026-07-21 13:32:08",
+  "database_config": [
+    "聚源数据库",
+    "天相数据库"
+  ],
+  "category_analysis": {
+    "上市公司基本资料": {
+      "summary": {
+        "category_name": "上市公司基本资料",
+        "table_count": 7,
+        "total_rows": 6117898,
+        "total_size_mb": -7,
+        "total_size_gb": -0.01,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_InstiArchive",
+          "row_count": 1904402,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_SecuChange",
+          "row_count": 623254,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CodeRelationship",
+          "row_count": 1355,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_ListStatus",
+          "row_count": 2867640,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CodeChange",
+          "row_count": 685291,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_NameChange",
+          "row_count": 12822,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_OrganizationInfo",
+          "row_count": 23134,
+          "size_mb": -1
+        }
+      ]
+    },
+    "上市公司行业板块": {
+      "summary": {
+        "category_name": "上市公司行业板块",
+        "table_count": 7,
+        "total_rows": 77754785,
+        "total_size_mb": -7,
+        "total_size_gb": -0.01,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_CSIIndustry",
+          "row_count": 12520164,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_ExgIndustry",
+          "row_count": 128860,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CorrIndexIndustry",
+          "row_count": 21151,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CSIIndusPE",
+          "row_count": 59361580,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_SSIIndusPE",
+          "row_count": 3920015,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_COConcept",
+          "row_count": 1801871,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_ConceptList",
+          "row_count": 1144,
+          "size_mb": -1
+        }
+      ]
+    },
+    "上市公司股票行情": {
+      "summary": {
+        "category_name": "上市公司股票行情",
+        "table_count": 4,
+        "total_rows": 83938300,
+        "total_size_mb": -4,
+        "total_size_gb": -0.0,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_STIBDailyQuote",
+          "row_count": 705591,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_STIBAfterDailyQuote",
+          "row_count": 628680,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_STIBAdjustingFactor",
+          "row_count": 2474,
+          "size_mb": -1
+        },
+        {
+          "table_name": "QT_DailyQuote",
+          "row_count": 82601555,
+          "size_mb": -1
+        }
+      ]
+    },
+    "上市公司财务报表": {
+      "summary": {
+        "category_name": "上市公司财务报表",
+        "table_count": 19,
+        "total_rows": 20723537,
+        "total_size_mb": -19,
+        "total_size_gb": -0.02,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_BalanceSheet",
+          "row_count": 1177610,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_BalanceSheetAll",
+          "row_count": 2079523,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_BalanceSheetNew",
+          "row_count": 1874797,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FBalanceSheet",
+          "row_count": 45733,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FBalanceSheetNew",
+          "row_count": 101284,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_IncomeStatement",
+          "row_count": 1350166,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_IncomeStatementAll",
+          "row_count": 2241210,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_IncomeStatementNew",
+          "row_count": 2093780,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FIncomeStatement",
+          "row_count": 47131,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FIncomeStatementNew",
+          "row_count": 106646,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CashFlowStatement",
+          "row_count": 1107978,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CashFlowStatementAll",
+          "row_count": 1958041,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_CashFlowStatementNew",
+          "row_count": 1876885,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FCashFlowStatement",
+          "row_count": 33080,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FCashFlowStatementNew",
+          "row_count": 76066,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_QIncomeStatement",
+          "row_count": 910876,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_QIncomeStatementNew",
+          "row_count": 1363106,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_QCashFlowStatement",
+          "row_count": 856918,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_QCashFlowStatementNew",
+          "row_count": 1422707,
+          "size_mb": -1
+        }
+      ]
+    },
+    "上市公司财务报表附注": {
+      "summary": {
+        "category_name": "上市公司财务报表附注",
+        "table_count": 4,
+        "total_rows": 38519873,
+        "total_size_mb": -4,
+        "total_size_gb": -0.0,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_BalanceSheetPS",
+          "row_count": 13023843,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_BalanceSheetPSCN",
+          "row_count": 8973780,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_IncomeStatementPS",
+          "row_count": 9407714,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_IncomeStatementPSCN",
+          "row_count": 7114536,
+          "size_mb": -1
+        }
+      ]
+    },
+    "上市公司财务指标": {
+      "summary": {
+        "category_name": "上市公司财务指标",
+        "table_count": 8,
+        "total_rows": 6778074,
+        "total_size_mb": -8,
+        "total_size_gb": -0.01,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_MainIndexNew",
+          "row_count": 610669,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_MainDataNew",
+          "row_count": 1808104,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_NewestFinaIndex",
+          "row_count": 413578,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_MainQuarterData",
+          "row_count": 53898,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_PerformanceForecast",
+          "row_count": 239703,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_PerformanceLetters",
+          "row_count": 25913,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_AuditOpinion",
+          "row_count": 803083,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_NonRecurringEvent",
+          "row_count": 2823126,
+          "size_mb": -1
+        }
+      ]
+    },
+    "上市公司财务衍生指标": {
+      "summary": {
+        "category_name": "上市公司财务衍生指标",
+        "table_count": 7,
+        "total_rows": 32889215,
+        "total_size_mb": -7,
+        "total_size_gb": -0.01,
+        "missing_tables": []
+      },
+      "details": [
+        {
+          "table_name": "LC_DerivativeData",
+          "row_count": 635721,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FSDerivedData",
+          "row_count": 1655210,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FinanceIndex",
+          "row_count": 11082,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_FSpecialIndicators",
+          "row_count": 2237185,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_ModelIndex",
+          "row_count": 44490,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_DIndicesForValuation",
+          "row_count": 28011391,
+          "size_mb": -1
+        },
+        {
+          "table_name": "LC_IndicesForValuation",
+          "row_count": 294136,
+          "size_mb": -1
+        }
+      ]
+    }
+  },
+  "factor_analysis": {
+    "基本面因子": {
+      "估值因子": [
+        {
+          "name": "PE",
+          "description": "市盈率",
+          "source_table": "FS_ValuationAnalysis",
+          "calculation": "总市值/净利润"
+        },
+        {
+          "name": "PB",
+          "description": "市净率",
+          "source_table": "FS_ValuationAnalysis",
+          "calculation": "总市值/净资产"
+        },
+        {
+          "name": "PS",
+          "description": "市销率",
+          "source_table": "FS_ValuationAnalysis",
+          "calculation": "总市值/营业收入"
+        },
+        {
+          "name": "PCF",
+          "description": "市现率",
+          "source_table": "FS_ValuationAnalysis",
+          "calculation": "总市值/经营现金流"
+        },
+        {
+          "name": "EV_EBITDA",
+          "description": "企业价值倍数",
+          "source_table": "FS_ValuationAnalysis",
+          "calculation": "EV/EBITDA"
+        }
+      ],
+      "盈利因子": [
+        {
+          "name": "ROE",
+          "description": "净资产收益率",
+          "source_table": "FS_LatestFinancialIndicators",
+          "calculation": "净利润/平均净资产"
+        },
+        {
+          "name": "ROA",
+          "description": "总资产收益率",
+          "source_table": "FS_LatestFinancialIndicators",
+          "calculation": "净利润/平均总资产"
+        },
+        {
+          "name": "ROIC",
+          "description": "投入资本回报率",
+          "source_table": "FS_MainFinancialAnalysis",
+          "calculation": "税后净营业利润/投入资本"
+        },
+        {
+          "name": "GrossMargin",
+          "description": "毛利率",
+          "source_table": "FS_MainFinancialAnalysis",
+          "calculation": "毛利/营业收入"
+        },
+        {
+          "name": "NetMargin",
+          "description": "净利率",
+          "source_table": "FS_MainFinancialAnalysis",
+          "calculation": "净利润/营业收入"
+        },
+        {
+          "name": "OperatingMargin",
+          "description": "营业利润率",
+          "source_table": "FS_MainFinancialAnalysis",
+          "calculation": "营业利润/营业收入"
+        }
+      ],
+      "成长因子": [
+        {
+          "name": "RevenueGrowth",
+          "description": "营收增长率",
+          "source_table": "FS_MainAccountingData",
+          "calculation": "(本期营收-上期营收)/上期营收"
+        },
+        {
+          "name": "ProfitGrowth",
+          "description": "净利润增长率",
+          "source_table": "FS_MainAccountingData",
+          "calculation": "(本期净利润-上期净利润)/上期净利润"
+        },
+        {
+          "name": "EPSGrowth",
+          "description": "每股收益增长率",
+          "source_table": "FS_LatestFinancialIndicators",
+          "calculation": "(本期EPS-上期EPS)/上期EPS"
+        },
+        {
+          "name": "AssetGrowth",
+          "description": "资产增长率",
+          "source_table": "FS_MainAccountingData",
+          "calculation": "(本期资产-上期资产)/上期资产"
+        },
+        {
+          "name": "OperatingCashFlowGrowth",
+          "description": "经营现金流增长率",
+          "source_table": "FS_MainAccountingData",
+          "calculation": "(本期经营现金流-上期经营现金流)/上期经营现金流"
+        }
+      ],
+      "质量因子": [
+        {
+          "name": "AssetTurnover",
+          "description": "资产周转率",
+          "source_table": "FS_MainFinancialAnalysis",
+          "calculation": "营业收入/平均总资产"
+        },
+        {
+          "name": "CurrentRatio",
+          "description": "流动比率",
+          "source_table": "FS_BalanceSheet",
+          "calculation": "流动资产/流动负债"
+        },
+        {
+          "name": "QuickRatio",
+          "description": "速动比率",
+          "source_table": "FS_BalanceSheet",
+          "calculation": "(流动资产-存货)/流动负债"
+        },
+        {
+          "name": "DebtToEquity",
+          "description": "资产负债率",
+          "source_table": "FS_BalanceSheet",
+          "calculation": "总负债/总资产"
+        },
+        {
+          "name": "CashConversionCycle",
+          "description": "现金转换周期",
+          "source_table": "FS_BalanceSheetNotes",
+          "calculation": "应收账款周转天数+存货周转天数-应付账款周转天数"
+        },
+        {
+          "name": "OperatingCashFlowToRevenue",
+          "description": "经营现金流/营收",
+          "source_table": "FS_CashFlowStatement",
+          "calculation": "经营现金流/营业收入"
+        }
+      ]
+    },
+    "市场因子": {
+      "规模因子": [
+        {
+          "name": "MarketCap",
+          "description": "总市值",
+          "source_table": "QT_DailyQuote",
+          "calculation": "收盘价*总股本"
+        },
+        {
+          "name": "CirculatingCap",
+          "description": "流通市值",
+          "source_table": "QT_DailyQuote",
+          "calculation": "收盘价*流通股本"
+        }
+      ],
+      "动量因子": [
+        {
+          "name": "Momentum1M",
+          "description": "1月动量",
+          "source_table": "QT_DailyQuote",
+          "calculation": "过去20日收益率"
+        },
+        {
+          "name": "Momentum3M",
+          "description": "3月动量",
+          "source_table": "QT_DailyQuote",
+          "calculation": "过去60日收益率"
+        },
+        {
+          "name": "Momentum6M",
+          "description": "6月动量",
+          "source_table": "QT_DailyQuote",
+          "calculation": "过去120日收益率"
+        },
+        {
+          "name": "Momentum12M",
+          "description": "12月动量",
+          "source_table": "QT_DailyQuote",
+          "calculation": "过去240日收益率"
+        },
+        {
+          "name": "RSI",
+          "description": "相对强弱指数",
+          "source_table": "QT_DailyQuote",
+          "calculation": "14日RSI"
+        }
+      ],
+      "波动因子": [
+        {
+          "name": "Volatility1M",
+          "description": "1月波动率",
+          "source_table": "QT_DailyQuote",
+          "calculation": "过去20日收益率标准差"
+        },
+        {
+          "name": "Volatility3M",
+          "description": "3月波动率",
+          "source_table": "QT_DailyQuote",
+          "calculation": "过去60日收益率标准差"
+        },
+        {
+          "name": "Beta",
+          "description": "贝塔系数",
+          "source_table": "FS_ModelIndicators",
+          "calculation": "股票与市场的相关性"
+        }
+      ],
+      "流动性因子": [
+        {
+          "name": "Volume",
+          "description": "成交量",
+          "source_table": "QT_DailyQuote",
+          "calculation": "当日成交量"
+        },
+        {
+          "name": "Turnover",
+          "description": "换手率",
+          "source_table": "QT_DailyQuote",
+          "calculation": "成交量/流通股本"
+        },
+        {
+          "name": "AmihudIlliquidity",
+          "description": "非流动性指标",
+          "source_table": "QT_DailyQuote",
+          "calculation": "|收益率|/成交额"
+        },
+        {
+          "name": "FundFlow",
+          "description": "资金流向",
+          "source_table": "QT_FundFlow",
+          "calculation": "净流入金额"
+        }
+      ]
+    },
+    "行业因子": {
+      "行业分类": [
+        {
+          "name": "IndustryCode",
+          "description": "行业代码",
+          "source_table": "LC_CompanyIndustry",
+          "calculation": "中证行业分类代码"
+        },
+        {
+          "name": "IndustryName",
+          "description": "行业名称",
+          "source_table": "LC_CompanyIndustry",
+          "calculation": "行业名称"
+        },
+        {
+          "name": "IndustryPE",
+          "description": "行业市盈率",
+          "source_table": "LC_IndustryPE_CSRC",
+          "calculation": "行业平均市盈率"
+        },
+        {
+          "name": "ConceptPlate",
+          "description": "概念板块",
+          "source_table": "LC_CompanyConcept",
+          "calculation": "所属概念板块"
+        }
+      ]
+    },
+    "质量因子": {
+      "盈利质量": [
+        {
+          "name": "Accruals",
+          "description": "应计项目",
+          "source_table": "FS_CashFlowStatement",
+          "calculation": "(净利润-经营现金流)/总资产"
+        },
+        {
+          "name": "OperatingAccruals",
+          "description": "经营应计",
+          "source_table": "FS_BalanceSheet",
+          "calculation": "Δ应收账款+Δ存货-Δ应付账款"
+        },
+        {
+          "name": "EarningsQuality",
+          "description": "盈利质量",
+          "source_table": "FS_AuditOpinion",
+          "calculation": "审计意见类型"
+        }
+      ],
+      "治理因子": [
+        {
+          "name": "Top1HolderRatio",
+          "description": "第一大股东持股比例",
+          "source_table": "LC_ShareholderStatistics",
+          "calculation": "第一大股东持股数/总股本"
+        },
+        {
+          "name": "InstitutionalHoldings",
+          "description": "机构持股比例",
+          "source_table": "LC_ShareholderStatistics",
+          "calculation": "机构持股数/总股本"
+        },
+        {
+          "name": "ManagementOwnership",
+          "description": "管理层持股比例",
+          "source_table": "LC_ManagementShareholding",
+          "calculation": "管理层持股数/总股本"
+        }
+      ]
+    }
+  }
+}

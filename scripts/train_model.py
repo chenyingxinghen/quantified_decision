@@ -64,8 +64,8 @@ def main():
 
     # ── 3. 获取股票列表（纯聚源：从 daily_data 取 DISTINCT code）───────
     from core.data.jydb_market_etl import JYDBMarketETL
-    stock_codes_all = JYDBMarketETL(DATABASE_PATH).get_stock_list(
-        as_of_date=cache_end_date, limit=args.stocks
+    stock_codes_all = JYDBMarketETL.get_stock_list(
+        DATABASE_PATH, as_of_date=cache_end_date, limit=args.stocks
     )
     trainer_stocks = stock_codes_all[:args.stocks]
 

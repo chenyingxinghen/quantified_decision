@@ -279,8 +279,12 @@ class TrainingConfig:
         return False
 
     # ── 路径 ───────────────────────────────────────────────────────────────
-    CACHE_DIR            = 'database/system_data/factors_cache'  # 因子缓存目录
-    SAVE_DIR             = 'models'                              # 模型保存目录
+    # 云端适配：
+    #  - 因子缓存需在可写目录生成（平台挂载的数据为只读），云端用 GEMINI_CACHE_DIR 指向 $GEMINI_DATAOUT 下目录；
+    #  - 模型产物需落盘到 $GEMINI_DATAOUT 才能持久化，云端用 GEMINI_SAVE_DIR 覆盖。
+    # 本地运行不设置这些变量时回退到项目内默认相对路径（相对 cwd=项目根）。
+    CACHE_DIR = os.getenv("GEMINI_CACHE_DIR", "database/system_data/factors_cache")
+    SAVE_DIR  = os.getenv("GEMINI_SAVE_DIR", "models")
 
     # ── 训练股票池过滤（与 strategy_config 中的选股条件对齐）──────────────
     # 开启后，训练数据只包含满足策略选股条件的股票，使训练分布与推理分布一致。

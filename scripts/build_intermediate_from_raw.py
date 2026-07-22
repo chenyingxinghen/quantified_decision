@@ -176,31 +176,36 @@ def _read_raw_slice(
 def _feature_worker(
     table: str, start: str, end: str,
     raw_db: str, feature_db: str, chunksize: int,
-) -> Tuple[str, str, str, int]:
-    """读 raw 切片 → 透视 → 写特征库；一个 (表 × 日期批次) 工作单元。
+) -> Tuple[str, str, str, list]:
+    """读 raw 切片 → 本地清洗透视（纯 CPU）→ 返回已准备好的写库载荷。
 
-    特征写入为 upsert，幂等可安全重跑。
+    不在子进程写库：数据库写入集中到主进程单一写者，规避 SQLite 并发写锁。
+    返回 (table, start, end, prepared)，prepared 为按块的元素列表：
+      - 日频(daily): ("daily", rows, feature_names)
+      - 长表(pit):    ("pit", rows)
     """
     from core.data.jydb_feature_store import JYDBFeatureStore
 
     spec = DEFAULT_TABLE_SPECS[table]
-    store = JYDBFeatureStore(feature_db)
-    total = 0
+    store = JYDBFeatureStore(feature_db)  # 仅用其纯 CPU 的准备方法，不持有写连接
+    prepared = []
     for chunk in _read_raw_slice(
         raw_db, table, spec.available_date_col, start, end, chunksize
     ):
         if chunk.empty:
             continue
         if spec.storage == "daily":
-            total += store.upsert_daily_wide_frame(
+            rows, feature_names, _vc = store.prepare_daily_rows(
                 chunk,
                 date_col=spec.available_date_col,
                 feature_cols=spec.feature_cols,
                 dimension_cols=spec.dimension_cols,
                 prefix=spec.prefix,
             )
+            if rows:
+                prepared.append(("daily", rows, feature_names))
         else:
-            total += store.upsert_wide_frame(
+            rows = store.prepare_wide_rows(
                 chunk,
                 source_table=spec.name,
                 available_date_col=spec.available_date_col,
@@ -209,22 +214,21 @@ def _feature_worker(
                 dimension_cols=spec.dimension_cols,
                 prefix=spec.prefix,
             )
-    return table, start, end, total
+            if rows:
+                prepared.append(("pit", rows))
+    return table, start, end, prepared
 
 
 def _market_worker(
-    start: str, end: str, raw_db: str, market_db: str, chunksize: int,
-) -> Tuple[str, str, int]:
-    """读 raw 日线切片 → 组装标准列 → 写 daily_data；一个日期批次。
+    start: str, end: str, raw_db: str, chunksize: int,
+) -> Tuple[str, str, list]:
+    """读 raw 日线切片 → 组装标准列（只读，不在子进程写库）。
 
-    日线写入为 upsert，幂等可安全重跑。
+    返回标准列 DataFrame 列表；真正的写库由主进程串行完成，
+    以规避 SQLite 单写者并发锁竞争（多进程并发写同一库会 "database is locked"）。
     """
-    from core.data.jydb_market_etl import JYDBMarketETL
-
-    etl = JYDBMarketETL(market_db)
-    chunks = _read_daily_quote_slices(raw_db, start, end, chunksize)
-    count = etl.write_daily_chunks(chunks)
-    return start, end, count
+    chunks = list(_read_daily_quote_slices(raw_db, start, end, chunksize))
+    return start, end, chunks
 
 
 # ─── 行情：从 raw 库组装标准 daily_data 列 ─────────────────────────────────────────
@@ -417,7 +421,16 @@ def run_features(
                     f.cancel()
                 break
             try:
-                tbl, b_start, b_end, count = fut.result()
+                tbl, b_start, b_end, prepared = fut.result()
+                # 串行写入：主进程作为单一写者，杜绝并发写锁
+                count = 0
+                for item in prepared:
+                    if item[0] == "daily":
+                        _, rows, feature_names = item
+                        count += store.write_daily_rows(rows, feature_names)
+                    else:
+                        _, rows = item
+                        count += store.write_pit_rows(rows)
                 completed += 1
                 prev = table_max_end.get(tbl)
                 if prev is None or b_end > prev:
@@ -506,7 +519,7 @@ def run_market(
         for (bs, be) in batches:
             if _stop_requested:
                 break
-            fut = executor.submit(_market_worker, bs, be, raw_db, market_db, chunksize)
+            fut = executor.submit(_market_worker, bs, be, raw_db, chunksize)
             future_map[fut] = (bs, be)
 
         for fut in as_completed(future_map):
@@ -516,7 +529,9 @@ def run_market(
                     f.cancel()
                 break
             try:
-                b_start, b_end, count = fut.result()
+                b_start, b_end, chunks = fut.result()
+                # 串行写入：主进程作为单一写者，杜绝并发写锁
+                count = market_etl.write_daily_chunks(iter(chunks))
                 completed += 1
                 total_rows += count
                 elapsed = time.time() - t0

@@ -92,6 +92,16 @@ class MultiObjectiveLabelBuilder:
         result[f"y_downvol_{h}d"] = downvol
         result[f"y_illiq_{h}d"] = illiq
         result[f"y_tradable_{h}d"] = tradable
+
+        # 风险调整收益（前瞻 Sharpe 类）：未来收益 / |最大回撤|，越大越好。
+        # 直接把"收益"与"回撤"绑成单一目标，使模型学习"每单位风险的收益"，
+        # 而非单纯预测谁收益高。分母用同一风险窗口的最大回撤。
+        for horizon in self.return_horizons:
+            ret_vals = result[f"y_ret_{horizon}d"].to_numpy(dtype=float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                s = ret_vals / (np.abs(mdd) + 1e-3)
+            s[~np.isfinite(s)] = np.nan
+            result[f"y_sharpe_{horizon}d"] = np.clip(s, -10.0, 10.0).astype(np.float32)
         return result
 
     def build_universe(

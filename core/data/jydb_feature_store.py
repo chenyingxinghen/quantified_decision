@@ -110,7 +110,7 @@ class JYDBFeatureStore:
     def _date_string(values: pd.Series) -> pd.Series:
         return pd.to_datetime(values, errors="coerce").dt.strftime("%Y-%m-%d")
 
-    def upsert_wide_frame(
+    def prepare_wide_rows(
         self,
         frame: pd.DataFrame,
         *,
@@ -122,10 +122,14 @@ class JYDBFeatureStore:
         dimension_cols: Sequence[str] = (),
         prefix: str = "jy_",
         revision: int = 0,
-    ) -> int:
-        """清洗宽表并写入长表，返回写入的非空特征值数量。"""
+    ) -> List[tuple]:
+        """清洗+透视宽表为长表行（纯 CPU，不碰数据库）。
+
+        拆出此步骤是为了让并行 worker 只做「读 raw + 变换」，把数据库写入
+        集中到主进程单一写者，彻底规避 SQLite 单写者并发锁竞争。
+        """
         if frame.empty:
-            return 0
+            return []
         required = {code_col, available_date_col}
         missing = required.difference(frame.columns)
         if missing:
@@ -150,7 +154,7 @@ class JYDBFeatureStore:
             ]
         feature_cols = [col for col in feature_cols if col in data.columns]
         if not feature_cols:
-            return 0
+            return []
 
         for col in feature_cols:
             data[col] = pd.to_numeric(data[col], errors="coerce")
@@ -161,7 +165,7 @@ class JYDBFeatureStore:
             value_name="feature_value",
         ).dropna(subset=["feature_value"])
         if long_df.empty:
-            return 0
+            return []
         long_df["feature_name"] = prefix + long_df["feature_name"].str.strip()
         if dimension_cols:
             def _dimension_suffix(row):
@@ -180,29 +184,59 @@ class JYDBFeatureStore:
             long_df["feature_name"] += long_df.apply(_dimension_suffix, axis=1)
         long_df["source_table"] = source_table
         long_df["revision"] = int(revision)
-        rows = list(long_df[[
+        return list(long_df[[
             code_col, available_date_col, end_date_col, "source_table",
             "feature_name", "feature_value", "revision",
         ]].itertuples(index=False, name=None))
 
+    _PIT_UPSERT_SQL = """
+        INSERT INTO pit_features (
+            code, available_date, end_date, source_table,
+            feature_name, feature_value, revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (
+            code, available_date, end_date,
+            source_table, feature_name, revision
+        ) DO UPDATE SET
+            feature_value=excluded.feature_value,
+            loaded_at=CURRENT_TIMESTAMP
+    """
+
+    def write_pit_rows(self, rows: List[tuple]) -> int:
+        """把已准备的长表行写入 pit_features（单连接、幂等 upsert）。"""
+        if not rows:
+            return 0
         self.initialize()
         with self.session() as conn:
-            conn.executemany(
-                """
-                INSERT INTO pit_features (
-                    code, available_date, end_date, source_table,
-                    feature_name, feature_value, revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (
-                    code, available_date, end_date,
-                    source_table, feature_name, revision
-                ) DO UPDATE SET
-                    feature_value=excluded.feature_value,
-                    loaded_at=CURRENT_TIMESTAMP
-                """,
-                rows,
-            )
+            conn.executemany(self._PIT_UPSERT_SQL, rows)
         return len(rows)
+
+    def upsert_wide_frame(
+        self,
+        frame: pd.DataFrame,
+        *,
+        source_table: str,
+        code_col: str = "code",
+        available_date_col: str = "available_date",
+        end_date_col: Optional[str] = "end_date",
+        feature_cols: Optional[Sequence[str]] = None,
+        dimension_cols: Sequence[str] = (),
+        prefix: str = "jy_",
+        revision: int = 0,
+    ) -> int:
+        """清洗宽表并写入长表，返回写入的非空特征值数量（单进程直连路径用）。"""
+        rows = self.prepare_wide_rows(
+            frame,
+            source_table=source_table,
+            code_col=code_col,
+            available_date_col=available_date_col,
+            end_date_col=end_date_col,
+            feature_cols=feature_cols,
+            dimension_cols=dimension_cols,
+            prefix=prefix,
+            revision=revision,
+        )
+        return self.write_pit_rows(rows)
 
     @staticmethod
     def _safe_column_name(name: str) -> str:
@@ -211,7 +245,7 @@ class JYDBFeatureStore:
             cleaned = "f_" + cleaned
         return cleaned
 
-    def upsert_daily_wide_frame(
+    def prepare_daily_rows(
         self,
         frame: pd.DataFrame,
         *,
@@ -220,10 +254,14 @@ class JYDBFeatureStore:
         feature_cols: Sequence[str],
         dimension_cols: Sequence[str] = (),
         prefix: str = "jy_",
-    ) -> int:
-        """把高频数据按证券—交易日保存为宽表，返回有效单元格数。"""
+    ):
+        """清洗宽表并透视成日频宽表行（纯 CPU，不写库）。
+
+        返回 (rows, feature_names, value_count)；rows 为待 INSERT 的元组列表。
+        拆出此步骤让并行 worker 只做变换，数据库写入集中到主进程单一写者。
+        """
         if frame.empty:
-            return 0
+            return [], [], 0
         data = frame.copy()
         data[code_col] = data[code_col].astype(str).str.extract(r"(\d{6})", expand=False)
         data[date_col] = self._date_string(data[date_col])
@@ -239,7 +277,7 @@ class JYDBFeatureStore:
             value_name="feature_value",
         ).dropna(subset=["feature_value"])
         if long_df.empty:
-            return 0
+            return [], [], 0
         long_df["feature_name"] = prefix + long_df["feature_name"].astype(str)
         for dim in dimension_cols:
             values = long_df[dim]
@@ -256,8 +294,16 @@ class JYDBFeatureStore:
         ).reset_index()
         feature_names = [col for col in wide.columns if col not in (code_col, date_col)]
         if not feature_names:
-            return 0
+            return [], [], 0
+        rows = []
+        for row in wide[[code_col, date_col, *feature_names]].itertuples(index=False, name=None):
+            rows.append(tuple(None if pd.isna(value) else value for value in row))
+        return rows, feature_names, int(long_df["feature_value"].notna().sum())
 
+    def write_daily_rows(self, rows: List[tuple], feature_names: Sequence[str]) -> int:
+        """把已准备的日频宽表行写入 daily_features（含按需加列，单连接幂等）。"""
+        if not rows or not feature_names:
+            return 0
         self.initialize()
         with self.session() as conn:
             existing = {row[1] for row in conn.execute("PRAGMA table_info(daily_features)")}
@@ -275,11 +321,30 @@ class JYDBFeatureStore:
                 f"INSERT INTO daily_features ({quoted}) VALUES ({placeholders}) "
                 f"ON CONFLICT(code,date) DO UPDATE SET {updates}"
             )
-            rows = []
-            for row in wide[[code_col, date_col, *feature_names]].itertuples(index=False, name=None):
-                rows.append(tuple(None if pd.isna(value) else value for value in row))
             conn.executemany(sql, rows)
-        return int(long_df["feature_value"].notna().sum())
+        return len(rows)
+
+    def upsert_daily_wide_frame(
+        self,
+        frame: pd.DataFrame,
+        *,
+        code_col: str = "code",
+        date_col: str = "available_date",
+        feature_cols: Sequence[str],
+        dimension_cols: Sequence[str] = (),
+        prefix: str = "jy_",
+    ) -> int:
+        """把高频数据按证券—交易日保存为宽表，返回有效单元格数。"""
+        rows, feature_names, value_count = self.prepare_daily_rows(
+            frame,
+            code_col=code_col,
+            date_col=date_col,
+            feature_cols=feature_cols,
+            dimension_cols=dimension_cols,
+            prefix=prefix,
+        )
+        self.write_daily_rows(rows, feature_names)
+        return value_count
 
     def get_feature_names(self) -> List[str]:
         if not os.path.exists(self.db_path):

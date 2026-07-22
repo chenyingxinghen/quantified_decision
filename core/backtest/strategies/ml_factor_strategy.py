@@ -31,7 +31,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  cache_dir: str = None,
                  norm_stats_path: str = None,
                  db_path: str = None,
-                 name: str = "ML因子策略"):
+                 name: str = "ML因子策略",
+                 use_portfolio_optimizer: bool = False,
+                 portfolio_config: dict = None):
         """初始化策略"""
         super().__init__(name)
         self.model_path = (
@@ -45,6 +47,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
         self.min_confidence = min_confidence
         self.use_cache = use_cache
         self.db_path = os.path.abspath(db_path or DATABASE_PATH)
+        # 组合优化开关：开启后用 PortfolioOptimizer 直接产出带权组合，
+        # 而非贪心 top-N 等权（向后兼容：默认关闭）。
+        self.use_portfolio_optimizer = bool(use_portfolio_optimizer)
+        self.portfolio_config = dict(portfolio_config or {})
         
         if cache_dir is None:
             cache_dir = fc.TrainingConfig.CACHE_DIR
@@ -70,26 +76,46 @@ class MLFactorBacktestStrategy(BaseStrategy):
         from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel, MultiObjectiveFactorModel
         def _load_smart_model(target_path):
             if os.path.isdir(target_path):
+                _skip = {'norm_stats.pkl'}
                 pkls = [
                     os.path.join(target_path, f)
                     for f in os.listdir(target_path)
-                    if f.endswith('_factor_model.pkl') or f == 'ensemble_factor_model.pkl'
+                    if f.endswith('.pkl') and f not in _skip
                 ]
                 if pkls:
-                    latest_pkl = sorted(pkls, key=os.path.getmtime)[-1]
-                    return _load_smart_model(latest_pkl)
+                    # 优先尝试神经网络/多目标模型，其次按扩展名，最后按修改时间取最新
+                    def _rank(p):
+                        name = os.path.basename(p)
+                        if name == 'neural_multi_objective_model.pkl' or name.endswith('_neural_model.pkl'):
+                            return 0
+                        if (name.endswith('_multi_objective_model.pkl')
+                                or name.endswith('_factor_model.pkl')
+                                or name == 'ensemble_factor_model.pkl'):
+                            return 1
+                        return 2
+                    pkls.sort(key=lambda p: (_rank(p), os.path.getmtime(p)))
+                    for p in pkls:
+                        m = _load_smart_model(p)
+                        if m is not None:
+                            return m
                 return None
             if not os.path.exists(target_path): return None
+            # 神经网络模型优先（load_model 会因 format 不匹配而抛错，安全降级）
+            try:
+                from core.neural.nn_models import MultiObjectiveNeuralModel
+                return MultiObjectiveNeuralModel.load_model(target_path)
+            except Exception:
+                pass
             try:
                 return MultiObjectiveFactorModel.load_model(target_path)
-            except:
+            except Exception:
                 pass
             try:
                 return EnsembleFactorModel.load_model(target_path)
-            except:
+            except Exception:
                 try:
                     m = MLFactorModel(); m.load_model(target_path); return m
-                except: return None
+                except Exception: return None
 
         self.model = _load_smart_model(self.model_path)
         if self.model is None: raise ValueError(f"无法加载模型: {self.model_path}")
@@ -265,7 +291,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
             })
             
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        
+
+        # ── 组合优化分支：直接产出带权组合，平衡收益/回撤/波动 ──
+        if self.use_portfolio_optimizer and candidates:
+            return self._generate_portfolio_signals(
+                candidates, available_slots, current_date, market_data, sc
+            )
+
         for cand in candidates[:available_slots]:
             code = cand['code']
             bar = market_data.get_bar(code)
@@ -286,6 +318,99 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 }
             ))
         return signals
+
+    def _generate_portfolio_signals(self, candidates, available_slots, current_date,
+                                    market_data, sc):
+        """用 PortfolioOptimizer 把候选分数转成带权组合信号。"""
+        from core.neural.portfolio import select_portfolio
+
+        pcfg = self.portfolio_config or {}
+        pool_size = max(int(pcfg.get('candidate_pool', 30)), available_slots)
+        pool = candidates[:pool_size]
+        scores = {c['code']: float(c['prob']) for c in pool}
+
+        # 预测回撤（mdd 目标 rank 越大=回撤越小=越好），用作优化器惩罚项
+        predicted_mdd = None
+        if any('rank_y_mdd_20d' in (c.get('objective_scores') or {}) for c in pool):
+            predicted_mdd = {
+                c['code']: float(c['objective_scores'].get('rank_y_mdd_20d', 0.5))
+                for c in pool
+            }
+
+        lookback = int(pcfg.get('lookback_days', 120))
+        returns_df = self._load_trailing_returns(list(scores.keys()), current_date, lookback)
+
+        result = select_portfolio(
+            scores, returns_df,
+            method=pcfg.get('method', 'max_sharpe'),
+            max_weight=float(pcfg.get('max_weight', 0.2)),
+            min_weight=float(pcfg.get('min_weight', 0.0)),
+            risk_aversion=float(pcfg.get('risk_aversion', 1.0)),
+            drawdown_penalty=float(pcfg.get('drawdown_penalty', 0.0)),
+            predicted_mdd=predicted_mdd,
+            score_to_return_scale=float(pcfg.get('score_to_return_scale', 0.8)),
+            shrinkage=float(pcfg.get('shrinkage', 0.1)),
+        )
+        weights = {h['code']: h['weight'] for h in result['holdings']}
+
+        print(f"  [组合优化] 候选 {len(pool)} -> 持仓 {len(weights)}，"
+              f"组合预期收益≈{result['portfolio']['expected_return']:.3f}，"
+              f"组合波动≈{result['portfolio']['expected_risk']:.3f}")
+
+        signals = []
+        for code, w in weights.items():
+            cand = next((c for c in pool if c['code'] == code), None)
+            if cand is None:
+                continue
+            bar = market_data.get_bar(code)
+            if bar is None:
+                continue
+            hist_df = market_data[code]
+            atr = self._calculate_atr(hist_df)
+            signals.append(StrategySignal(
+                stock_code=code, signal_type='buy', timestamp=current_date,
+                price=bar['close'], confidence=float(cand['prob'] * 100),
+                stop_loss=bar['close'] - sc.ATR_STOP_MULTIPLIER * atr,
+                take_profit=bar['close'] + sc.ATR_TARGET_MULTIPLIER * atr,
+                weight=w,
+                metadata={
+                    'strategy': 'ml_factor_neural_portfolio',
+                    'prediction': cand['prob'],
+                    'portfolio_weight': w,
+                    'objective_scores': cand.get('objective_scores'),
+                }
+            ))
+        return signals
+
+    def _load_trailing_returns(self, codes, current_date, lookback_days=120):
+        """读取候选股近 lookback_days 的日收益，构造协方差所需的收益矩阵。"""
+        import sqlite3
+        from datetime import datetime, timedelta
+        if not codes:
+            return pd.DataFrame()
+        end = str(current_date)
+        try:
+            start = (datetime.strptime(current_date, '%Y-%m-%d') -
+                     timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+        except Exception:
+            start = '2000-01-01'
+        try:
+            conn = sqlite3.connect(self.db_path)
+            placeholders = ','.join(['?'] * len(codes))
+            df = pd.read_sql_query(
+                f"SELECT code, date, close FROM daily_data "
+                f"WHERE code IN ({placeholders}) AND date>=? AND date<=? ORDER BY date",
+                conn, params=list(codes) + [start, end],
+            )
+            conn.close()
+        except Exception as _e:
+            print(f"  [组合优化] 读取历史收益失败: {_e}")
+            return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
+        df['ret'] = df.groupby('code')['close'].pct_change()
+        wide = df.pivot(index='date', columns='code', values='ret')
+        return wide
 
     def _precompute_pit_data(self):
         """预加载元数据，消除循环内的 SQL 压力"""
@@ -584,24 +709,39 @@ class MLFactorBacktestStrategy(BaseStrategy):
                         db_path: str,
                         top_n: int = 10,
                         lookback_days: int = 500,
-                        criteria: Optional[Dict] = None) -> List[Dict]:
+                        criteria: Optional[Dict] = None,
+                        as_of: Optional[str] = None) -> List[Dict]:
         """
         实盘选股入口，完全复用 generate_signals 逻辑，保证与回测一致。
 
+        参数:
+            as_of: 选股基准日（YYYY-MM-DD）。不传则自动取数据库 daily_data 的
+                   最新交易日（适配静态/快照库，避免用系统当前时间导致无数据）。
         返回列表，每项包含：
             stock_code, confidence, current_price, stop_loss, take_profit
         """
         import sqlite3
         from datetime import datetime, timedelta
 
-        today = datetime.now().strftime('%Y-%m-%d')
+        # 基准日：优先用入参，否则取库内最新交易日
+        if as_of:
+            today = str(as_of)
+        else:
+            try:
+                conn = sqlite3.connect(db_path)
+                r = conn.execute("SELECT MAX(date) FROM daily_data").fetchone()
+                conn.close()
+                today = str(r[0]) if r and r[0] else datetime.now().strftime('%Y-%m-%d')
+            except Exception:
+                today = datetime.now().strftime('%Y-%m-%d')
 
         # --- 构造轻量 LiveMarketData 适配器 ---
         class LiveMarketData:
             """从数据库读取最新行情，提供与回测 MarketSnapshot 相同的接口"""
-            def __init__(self, db_path: str, lookback_days: int):
+            def __init__(self, db_path: str, lookback_days: int, as_of: str):
                 self._db_path = db_path
                 self._lookback_days = lookback_days
+                self._as_of = as_of
                 self._cache: Dict[str, pd.DataFrame] = {}
                 self._bar_cache: Dict[str, Optional[Dict]] = {}
                 self._codes: Optional[List[str]] = None
@@ -609,8 +749,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
             def _load(self, code: str) -> Optional[pd.DataFrame]:
                 if code in self._cache:
                     return self._cache[code]
-                end_date = datetime.now().strftime('%Y-%m-%d')
-                start_date = (datetime.now() - timedelta(days=self._lookback_days)).strftime('%Y-%m-%d')
+                end_date = self._as_of
+                start_date = (datetime.strptime(self._as_of, '%Y-%m-%d') -
+                              timedelta(days=self._lookback_days)).strftime('%Y-%m-%d')
                 try:
                     conn = sqlite3.connect(self._db_path)
                     df = pd.read_sql_query(
@@ -652,8 +793,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 try:
                     conn = sqlite3.connect(self._db_path)
                     rows = pd.read_sql_query(
-                        "SELECT DISTINCT code FROM daily_data WHERE date >= date('now', '-30 days')",
-                        conn
+                        "SELECT DISTINCT code FROM daily_data "
+                        "WHERE date >= date(?, '-30 days')",
+                        conn, params=(self._as_of,)
                     )
                     conn.close()
                     self._codes = rows['code'].tolist()
@@ -661,7 +803,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     self._codes = []
                 return self._codes
 
-        market_data = LiveMarketData(db_path, lookback_days)
+        market_data = LiveMarketData(db_path, lookback_days, today)
 
         # 复用 generate_signals，portfolio_state 传空持仓、足够的 slots
         portfolio_state = {'positions': {}, 'available_slots': top_n}
@@ -678,6 +820,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
             results.append({
                 'stock_code': sig.stock_code,
                 'confidence': sig.confidence,
+                'weight': sig.weight,
                 'current_price': sig.price,
                 'stop_loss': sig.stop_loss,
                 'take_profit': sig.take_profit,

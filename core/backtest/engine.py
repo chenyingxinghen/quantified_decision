@@ -218,9 +218,9 @@ class BacktestEngine:
         if not signals:
             return
 
-        # 优化 4: 计算每只股票应分配的资金 (等权分配)
-        # 使用总资产除以最大持仓数，确保即使当前有现金也能按预定比例买入
-        capital_per_position = self.portfolio.total_value / self.max_positions
+        # 优化 4: 计算每只股票应分配的资金
+        # 若信号携带 weight（组合优化产出），按权重分配；否则沿用等权分配。
+        base_capital = self.portfolio.total_value / self.max_positions
 
         # 处理买入信号
         for signal in signals:
@@ -257,12 +257,18 @@ class BacktestEngine:
             if "confidence" not in metadata:
                 metadata["confidence"] = signal.confidence
 
+            # 权重感知的资金分配：signal.weight 非空时按其比例，否则等权
+            if signal.weight is not None and signal.weight > 0:
+                capital_allocation = self.portfolio.total_value * float(signal.weight)
+            else:
+                capital_allocation = base_capital
+
             # 开仓 (传入计算好的分配资金)
             position = self.portfolio.open_position(
                 stock_code=signal.stock_code,
                 date=next_date,
                 price=entry_price,
-                capital_allocation=capital_per_position,
+                capital_allocation=capital_allocation,
                 stop_loss=actual_stop_loss,
                 take_profit=actual_take_profit,
                 metadata=metadata,

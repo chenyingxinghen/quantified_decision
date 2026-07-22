@@ -20,6 +20,7 @@ class StrategySignal:
     confidence: float = 0.0
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
+    weight: Optional[float] = None  # 组合目标权重（组合优化时设置；None=按引擎默认等权）
     metadata: Optional[Dict[str, Any]] = None
     
     def __post_init__(self):

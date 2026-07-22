@@ -10,7 +10,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ==================== 数据库配置 ====================
 
 # 数据库目录
-DATABASE_DIR = os.path.join(PROJECT_ROOT, "database")
+# 云端（Gemini 等平台）适配：当设置 GEMINI_DATA_IN1 时，所有数据库路径自动指向
+# 平台的只读数据挂载目录；本地运行不设置该变量时回退到项目内 database/。
+DATABASE_DIR = os.getenv("GEMINI_DATA_IN1", os.path.join(PROJECT_ROOT, "database"))
 
 # 主数据库路径
 DATABASE_PATH = os.path.join(DATABASE_DIR, "stock_daily.db")

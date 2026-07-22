@@ -1,8 +1,9 @@
 """
 基本面因子模块 (v3 - 纯聚源 / JYDB 环境)
 
-数据来源: jydb_features.db -> daily_features 表中的 jy_fin_* 列
-（由 core.data.jydb_feature_store 从聚源 LC_MainIndexNew 预处理产出，PIT 对齐）
+数据来源: jydb_features.db -> pit_features 长表 (source_table='LC_MainIndexNew'),
+          feature_name 形如 'jy_fin_*'，按 available_date 做 PIT 对齐
+（由 core.data.jydb_feature_store 从聚源 LC_MainIndexNew 预处理产出）
 核心字段说明:
   jy_fin_ROE / ROECut / ROEWeighted - 盈利核心 (ROE)
   jy_fin_NetProfitRatio / GrossIncomeRatio - 利润率
@@ -12,7 +13,7 @@
   jy_fin_TotalAssetTRate / ARTRate / InventoryTRate - 周转与效率
 
 PIT 原则:
-  - daily_features 已按 available_date (公告日) 存储，对应交易日 T 只读取
+  - pit_features 长表按 available_date (公告日) 存储，对应交易日 T 只读取
     available_date <= T 的最近一期报告，彻底消除前视偏差 (Data Leakage)。
   - 训练时按公告日期对齐, 选股/实时预测时以最新已公布报告为准。
   - 本模块不再依赖 Baostock / stock_finance.db，所有特征由聚源一次性预处理完成，
@@ -113,8 +114,12 @@ class FinanceReportFetcher:
     def _load_reports_for_code(self, code: str) -> pd.DataFrame:
         """加载某只股票的聚源主要财务指标序列 (按 available_date 升序)。
 
-        返回带 announced_date 的 DataFrame，列为聚源原始字段名
-        （ROE / NetProfitRatio / ...），供 PIT 对齐后翻译为下游契约列。
+        数据来源: jydb_features.db.pit_features 长表，source_table='LC_MainIndexNew'。
+        feature_name 形如 'jy_fin_ROE'，透视后去掉 'jy_fin_' 前缀得到列名
+        (ROE / NetProfitRatio / ...)，与 _JY_FIN_COLUMNS 对齐；以 available_date
+        作为 PIT 公告日，供训练/选股时按 'available_date <= T' 对齐最新已公布报告。
+
+        返回带 announced_date 的宽表 DataFrame，缺失的契约列补 NaN。
         """
         if code in self._cache:
             return self._cache[code]
@@ -123,32 +128,50 @@ class FinanceReportFetcher:
             self._cache[code] = pd.DataFrame()
             return self._cache[code]
 
-        cols = ", ".join(f'"{c}"' for c in _JY_FIN_COLUMNS)
         query = (
-            f'SELECT date, {cols} FROM daily_features '
-            f'WHERE code = ? ORDER BY date ASC'
+            "SELECT available_date, revision, feature_name, feature_value "
+            "FROM pit_features "
+            "WHERE code = ? AND source_table = 'LC_MainIndexNew' "
+            "ORDER BY available_date ASC, revision ASC"
         )
         try:
-            with closing(sqlite3.connect(self.feature_db, timeout=30)) as conn:
-                df = pd.read_sql_query(query, conn, params=(code,))
+            with closing(sqlite3.connect(self.feature_db, timeout=60)) as conn:
+                raw = pd.read_sql_query(query, conn, params=(code,))
         except Exception as e:
             import traceback
             print(f"  [ERROR] 加载股票 {code} 聚源财务数据失败: {e}")
             traceback.print_exc()
-            df = pd.DataFrame()
+            raw = pd.DataFrame()
 
-        if not df.empty:
-            df['announced_date'] = pd.to_datetime(df['date'], errors='coerce')
-            df = df.drop(columns=['date'], errors='ignore')
-            df = df.dropna(subset=['announced_date']).sort_values(
-                'announced_date'
-            ).reset_index(drop=True)
-            for c in _JY_FIN_COLUMNS:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
+        if raw.empty:
+            self._cache[code] = pd.DataFrame()
+            return self._cache[code]
 
-        self._cache[code] = df
-        return df
+        # 长表 -> 宽表: 去掉 'jy_fin_' 前缀后透视 (aggfunc='last' 取最高修订版本)
+        raw['feature_name'] = (
+            raw['feature_name'].astype(str).str.replace(r'^jy_fin_', '', regex=True)
+        )
+        wide = raw.pivot_table(
+            index='available_date', columns='feature_name',
+            values='feature_value', aggfunc='last',
+        ).reset_index()
+
+        # 补齐契约列 (缺失列置 NaN)，确保下游按 _JY_FIN_COLUMNS 访问不缺失
+        for c in _JY_FIN_COLUMNS:
+            if c not in wide.columns:
+                wide[c] = np.nan
+        for c in _JY_FIN_COLUMNS:
+            wide[c] = pd.to_numeric(wide[c], errors='coerce')
+
+        wide['announced_date'] = pd.to_datetime(wide['available_date'], errors='coerce')
+        wide = (
+            wide.dropna(subset=['announced_date'])
+            .sort_values('announced_date')
+            .reset_index(drop=True)
+        )
+
+        self._cache[code] = wide
+        return wide
 
     @staticmethod
     def _translate_to_contract(raw_row: Dict) -> Dict:

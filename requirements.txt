@@ -99,3 +99,8 @@ Werkzeug==3.1.8
 
 xgboost==3.3.0
 
+
+# ── 神经网络模块依赖（core/neural）──────────────────────────────────────
+# CPU 版可大幅减小体积；如用默认 PyPI 会拉取带 CUDA 的大体积包。
+# 推荐安装：pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0

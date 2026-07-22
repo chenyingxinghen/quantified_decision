@@ -1,51 +1,57 @@
 import sys
 import os
-import pandas as pd
-from datetime import datetime
 
 # 将项目根目录添加到路径中
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.data.baostock_fetcher import BaostockFetcher
-from core.data.baostock_fetcher_methods import fetch_stock_industry
+from config.jydb_config import JYDB_RAW_DB_PATH, JYDB_FEATURE_DB_PATH
+from core.data.jydb_feature_store import DEFAULT_TABLE_SPECS, JYDBFeatureStore
 
 
 def update_industry_to_db():
     """
-    从 Baostock 抓取全市场股票行业信息，并保存到本地数据库
+    从本地聚源 raw 库 (jydb_raw.db) 重建行业特征到特征库 (jydb_features.db)。
+
+    行业数据来自聚源 LC_CSIIndustry 表，经 build_intermediate_from_raw 预处理为
+    jy_industry_* 列（已按公告日做 PIT 对齐）。本脚本等价于：
+
+        python scripts/build_intermediate_from_raw.py --mode feature --tables LC_CSIIndustry
+
+    不依赖 Baostock。
     """
-    print("开始更新股票行业分类信息...")
-    
-    fetcher = BaostockFetcher()
+    if "LC_CSIIndustry" not in DEFAULT_TABLE_SPECS:
+        print("✗ 当前聚源规格未包含 LC_CSIIndustry，无法更新行业特征")
+        return
+
+    if not os.path.exists(JYDB_RAW_DB_PATH):
+        print(f"✗ raw 库不存在: {JYDB_RAW_DB_PATH}，请先运行 pull_jydb_parallel.py")
+        return
+
+    print(f"开始重建行业特征 (源: {JYDB_RAW_DB_PATH})")
+    store = JYDBFeatureStore(JYDB_FEATURE_DB_PATH)
+    store.initialize()
+    spec = DEFAULT_TABLE_SPECS["LC_CSIIndustry"]
+    total = store.upsert_wide_frame(
+        _read_raw_industry(JYDB_RAW_DB_PATH, spec),
+        source_table=spec.name,
+        available_date_col=spec.available_date_col,
+        end_date_col=spec.end_date_col,
+        feature_cols=spec.feature_cols,
+        dimension_cols=spec.dimension_cols,
+        prefix=spec.prefix,
+    )
+    print(f"✅ 行业特征重建完成，写入 {total:,} 个值 -> {JYDB_FEATURE_DB_PATH}")
+
+
+def _read_raw_industry(raw_db: str, spec):
+    import sqlite3
+    import pandas as pd
+    conn = sqlite3.connect(f"file:{raw_db}?mode=ro", uri=True, timeout=120)
     try:
-        # 登录 Baostock
-        if not fetcher._bs_login():
-            print("Baostock 登录失败，请检查网络和登录凭据")
-            return
-            
-        # 获取行业信息
-        # 如果不传 code 和 date，将获取全市场在该日期（通常是今日或最近工作日）的最新分类
-        # 默认使用 query_stock_industry(code=None, date=None)
-        print("🌐 正在从 Baostock 抓取全市场行业列表...")
-        df_industry = fetch_stock_industry()
-        
-        if df_industry.empty:
-            print("⚠ 抓取失败，行业信息为空")
-            return
-            
-        # 保存到数据库
-        print(f"成功获取 {len(df_industry)} 条行业记录。正在保存到数据库...")
-        fetcher._save_stock_industry_to_db(df_industry)
-        
-        # 统计行业情况
-        industry_counts = df_industry['industry'].value_counts()
-        print(f"\n✅ 行业信息同步完成！共有 {len(industry_counts)} 个细分行业")
-        print(f"前 5 大行业及涵盖股票数:\n{industry_counts.head(5)}")
-        
-    except Exception as e:
-        print(f"✗ 更新行业数据异常: {e}")
+        df = pd.read_sql_query(f'SELECT * FROM "{spec.name}"', conn)
     finally:
-        fetcher.close()
+        conn.close()
+    return df
 
 
 if __name__ == "__main__":

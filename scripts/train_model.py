@@ -14,21 +14,22 @@ from core.factors.train_ml_model import (
     MLModelTrainer,
     _read_factor_cache_version,
 )
-from config.baostock_config import DATABASE_PATH
+from config.jydb_config import DATABASE_PATH
 from config.factor_config import TrainingConfig
 import pandas as pd
+import sqlite3 as _sqlite3
 
 
 def main():
+    default_workers = getattr(TrainingConfig, 'N_JOBS_FACTOR_CALC', 15)
+
     parser = argparse.ArgumentParser(description='Quantified Decision - 机器学习模型训练入口')
     parser.add_argument('--start',  type=str, default=None, help='训练开始日期 (YYYY-MM-DD)')
     parser.add_argument('--end',    type=str, default=None, help='训练结束日期 (YYYY-MM-DD)')
     parser.add_argument('--stocks', type=int, default=TrainingConfig.STOCK_NUM,
                         help=f'训练选取的股票数量 (默认{TrainingConfig.STOCK_NUM})')
     parser.add_argument('--force',  action='store_true', help='强制重新计算所有因子')
-    parser.add_argument('--workers', type=int, default=15, help='并行线程数')
-    parser.add_argument('--multi-objective', action='store_true',
-                        help='训练多周期收益、风险、流动性与可交易性组合模型')
+    parser.add_argument('--workers', type=int, default=default_workers, help=f'并行线程数 (默认{default_workers})')
 
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
@@ -59,15 +60,14 @@ def main():
     print(f"股票样本: 前 {args.stocks} 只")
     print(f"不可买入样本处理: {TrainingConfig.UNBUYABLE_HANDLING}")
 
-    # ── 2. 初始化训练器 ──────────────────────────────────────────────────
     trainer = MLModelTrainer(db_path=DATABASE_PATH)
 
-    # ── 3. 获取股票列表 ──────────────────────────────────────────────────
-    from core.data.baostock_main import BaostockDataManager
-    manager = BaostockDataManager()
-    stock_list = manager.get_stock_list_from_db()
-    trainer_stocks = stock_list['code'].tolist()[:args.stocks]
-    manager.close()
+    # ── 3. 获取股票列表（纯聚源：从 daily_data 取 DISTINCT code）───────
+    from core.data.jydb_market_etl import JYDBMarketETL
+    stock_codes_all = JYDBMarketETL(DATABASE_PATH).get_stock_list(
+        as_of_date=cache_end_date, limit=args.stocks
+    )
+    trainer_stocks = stock_codes_all[:args.stocks]
 
     # ── 3b. 按策略条件过滤训练股票池（可选）────────────────────────────
     if TrainingConfig.FILTER_BY_STRATEGY:
@@ -227,12 +227,10 @@ def main():
 
     # ── 6. 准备数据集 ────────────────────────────────────────────────────
     print(f"\n[Step 2] 准备特征数据集与标签...")
-    multi_labels = None
-    if args.multi_objective:
-        print("  正在构造多目标标签...")
-        multi_labels = trainer.build_multiobjective_labels(
-            stocks_data, train_start_date, train_end_date
-        )
+    print("  正在构造多目标标签...")
+    multi_labels = trainer.build_multiobjective_labels(
+        stocks_data, train_start_date, train_end_date
+    )
 
     full_dataset = trainer.prepare_dataset(
         stocks_data,
@@ -242,89 +240,57 @@ def main():
         n_jobs=args.workers,
         target_features=target_features,  # 复用 Step 0 发现的特征集，跳过重复发现
         use_factor_cache_only=True,
-        return_codes=args.multi_objective,
+        return_codes=True,
     )
     del stocks_data
     import gc; gc.collect()
 
     # ── 7. 训练模型 ──────────────────────────────────────────────────────
-    print(f"\n[Step 3] 训练机器学习模型...")
-    
-    # 解析数据集
-    if args.multi_objective:
-        X, y, returns, factor_names, dates, unbuyable_mask, limit_groups, path_scores, is_st_arr, w_sig_arr, codes = full_dataset
-        keys = pd.DataFrame({
-            'date': pd.Series(dates).astype(str).str[:10],
-            'code': pd.Series(codes).astype(str),
-            '__row_order': range(len(dates)),
-        })
-        label_frame = multi_labels.copy()
-        label_frame['date'] = label_frame['date'].astype(str).str[:10]
-        label_frame['code'] = label_frame['code'].astype(str)
-        aligned = keys.merge(label_frame, on=['date', 'code'], how='left', sort=False)
-        aligned = aligned.sort_values('__row_order').reset_index(drop=True)
+    print(f"\n[Step 3] 训练多目标机器学习模型...")
 
-        multi_model, results, selected_names = trainer.train_multiobjective_models(
-            X, aligned, factor_names, dates,
-            objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
-            model_type='lightgbm',
-        )
-        import json, pickle, shutil
-        archive_dir = os.path.join(
-            TrainingConfig.SAVE_DIR,
-            'multi_objective_' + datetime.now().strftime('%Y%m%d_%H%M%S'),
-        )
-        latest_dir = os.path.join(TrainingConfig.SAVE_DIR, 'latest')
-        os.makedirs(archive_dir, exist_ok=True)
-        os.makedirs(latest_dir, exist_ok=True)
-        archive_model = os.path.join(archive_dir, 'multi_objective_factor_model.pkl')
-        latest_model = os.path.join(latest_dir, 'multi_objective_factor_model.pkl')
-        multi_model.save_model(archive_model)
-        shutil.copy2(archive_model, latest_model)
-        with open(os.path.join(archive_dir, 'multi_objective_config.json'), 'w', encoding='utf-8') as f:
-            json.dump({
-                'objectives': list(multi_model.models),
-                'weights': multi_model.weights,
-                'selected_features': selected_names,
-                'train_start_date': train_start_date,
-                'train_end_date': train_end_date,
-            }, f, ensure_ascii=False, indent=2)
-        if getattr(trainer, 'norm_stats', None) is not None:
-            for target_dir in (archive_dir, latest_dir):
-                with open(os.path.join(target_dir, 'norm_stats.pkl'), 'wb') as f:
-                    pickle.dump(trainer.norm_stats, f)
-        trainer.save_factor_summary(selected_names, save_dir=archive_dir)
-        print(f"\n=== 多目标模型训练完成: {archive_model} ===")
-        return
+    X, y, returns, factor_names, dates, unbuyable_mask, limit_groups, path_scores, is_st_arr, w_sig_arr, codes = full_dataset
+    keys = pd.DataFrame({
+        'date': pd.Series(dates).astype(str).str[:10],
+        'code': pd.Series(codes).astype(str),
+        '__row_order': range(len(dates)),
+    })
+    label_frame = multi_labels.copy()
+    label_frame['date'] = label_frame['date'].astype(str).str[:10]
+    label_frame['code'] = label_frame['code'].astype(str)
+    aligned = keys.merge(label_frame, on=['date', 'code'], how='left', sort=False)
+    aligned = aligned.sort_values('__row_order').reset_index(drop=True)
 
-    X, y, returns, factor_names, dates, unbuyable_mask, limit_groups, path_scores, is_st_arr, w_sig_arr = full_dataset
-    
-    results = trainer.train_models(
-        X, y, returns, factor_names, dates,
-        unbuyable_mask=unbuyable_mask,
-        limit_groups=limit_groups,
-        path_scores=path_scores,
-        is_st_arr=is_st_arr,
-        w_sig_arr=w_sig_arr
+    multi_model, results, selected_names = trainer.train_multiobjective_models(
+        X, aligned, factor_names, dates,
+        objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
+        model_type='lightgbm',
     )
-
-    # ── 8. 对比与保存 ────────────────────────────────────────────────────
-    best_model_type = trainer.compare_models(results)
-
-    if best_model_type is None:
-        print("\n[错误] 模型训练全部失败，请检查数据或参数设置。")
-        return
-
-    print("\n保存最新模型...")
-    archive_dir = trainer.save_models(
-        save_dir=TrainingConfig.SAVE_DIR,
-        years=TrainingConfig.YEARS_FOR_TRAINING,
-        stocks=len(trainer_stocks)
+    import json, pickle, shutil
+    archive_dir = os.path.join(
+        TrainingConfig.SAVE_DIR,
+        'multi_objective_' + datetime.now().strftime('%Y%m%d_%H%M%S'),
     )
-
-    trainer.save_factor_summary(factor_names, save_dir=archive_dir)
-
-    print(f"\n=== 流程结束: 模型已就绪 ===")
+    latest_dir = os.path.join(TrainingConfig.SAVE_DIR, 'latest')
+    os.makedirs(archive_dir, exist_ok=True)
+    os.makedirs(latest_dir, exist_ok=True)
+    archive_model = os.path.join(archive_dir, 'multi_objective_factor_model.pkl')
+    latest_model = os.path.join(latest_dir, 'multi_objective_factor_model.pkl')
+    multi_model.save_model(archive_model)
+    shutil.copy2(archive_model, latest_model)
+    with open(os.path.join(archive_dir, 'multi_objective_config.json'), 'w', encoding='utf-8') as f:
+        json.dump({
+            'objectives': list(multi_model.models),
+            'weights': multi_model.weights,
+            'selected_features': selected_names,
+            'train_start_date': train_start_date,
+            'train_end_date': train_end_date,
+        }, f, ensure_ascii=False, indent=2)
+    if getattr(trainer, 'norm_stats', None) is not None:
+        for target_dir in (archive_dir, latest_dir):
+            with open(os.path.join(target_dir, 'norm_stats.pkl'), 'wb') as f:
+                pickle.dump(trainer.norm_stats, f)
+    trainer.save_factor_summary(selected_names, save_dir=archive_dir)
+    print(f"\n=== 多目标模型训练完成: {archive_model} ===")
 
 
 if __name__ == "__main__":

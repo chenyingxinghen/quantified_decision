@@ -71,14 +71,14 @@ def load_model(model_path: str):
             try:
                 m = EnsembleFactorModel.load_model(str(pkl))
                 models[name] = m
-                print(f"  ✓ 加载集成模型: {pkl.name}  ({len(m.models)} 个子模型)")
+                print(f"  [OK] 加载集成模型: {pkl.name}  ({len(m.models)} 个子模型)")
             except Exception:
                 m = MLFactorModel()
                 m.load_model(str(pkl))
                 models[name] = m
-                print(f"  ✓ 加载模型: {pkl.name}  (type={m.model_type}, features={len(m.feature_names)})")
+                print(f"  [OK] 加载模型: {pkl.name}  (type={m.model_type}, features={len(m.feature_names)})")
         except Exception as e:
-            print(f"  ✗ 加载失败: {pkl.name} — {e}")
+            print(f"  [X] 加载失败: {pkl.name} — {e}")
 
     return models
 
@@ -339,6 +339,9 @@ def plot_importance(imp: pd.Series, top_n: int, model_name: str,
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
 
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans', 'sans-serif']
+        plt.rcParams['axes.unicode_minus'] = False
+
         # 类别颜色映射
         color_map = {
             '技术指标': '#4C72B0',
@@ -390,9 +393,9 @@ def plot_importance(imp: pd.Series, top_n: int, model_name: str,
         plt.close()
         print(f"  图表已保存: {out_path}")
     except ImportError:
-        print("  ⚠ matplotlib 未安装，跳过图表生成")
+        print("  [!] matplotlib 未安装，跳过图表生成")
     except Exception as e:
-        print(f"  ⚠ 图表生成失败: {e}")
+        print(f"  [!] 图表生成失败: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,7 +431,7 @@ def main():
                 imp = extract_importance(model, args.type)
 
             if imp.empty or imp.sum() == 0:
-                print(f"  ⚠ {model_name} 重要性全为 0，可能模型未训练或格式不支持")
+                print(f"  [!] {model_name} 重要性全为 0，可能模型未训练或格式不支持")
                 continue
 
             all_results[model_name] = imp
@@ -454,7 +457,7 @@ def main():
 
         except Exception as e:
             import traceback
-            print(f"  ✗ 处理 {model_name} 失败: {e}")
+            print(f"  [X] 处理 {model_name} 失败: {e}")
             traceback.print_exc()
 
     # 5. 多模型对比（如果有多个模型）

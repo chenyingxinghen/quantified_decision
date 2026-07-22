@@ -357,20 +357,27 @@ class FeatureEngineer:
         """
         new_features = {}
         
-        # 1. 尝试从数据库补充分类信息 (如 industry)
+        # 1. 尝试从聚源特征库补充分类信息 (行业，jy_industry_* 列)
         if 'industry' not in df.columns and 'code' in df.columns:
             try:
-                from core.data.baostock_fetcher import BaostockFetcher
-                fetcher = BaostockFetcher()
-                db_industry = fetcher._get_stock_industry_from_db()
-                fetcher.close()
-                
-                if not db_industry.empty:
-                    # 仅保留 code 和 industry
-                    db_industry = db_industry[['code', 'industry']].drop_duplicates('code')
-                    # 合并到主 DataFrame (基于 code)
-                    df = df.merge(db_industry, on='code', how='left')
-            except Exception as e:
+                from config.jydb_config import JYDB_FEATURE_DB_PATH
+                import sqlite3 as _sqlite3
+                _conn = _sqlite3.connect(JYDB_FEATURE_DB_PATH, timeout=30)
+                ind_cols = [r[1] for r in _conn.execute(
+                    "PRAGMA table_info(daily_features)"
+                ) if r[1].startswith("jy_industry_")]
+                if ind_cols:
+                    # 取每只股票最新日期的行业编码作为映射
+                    q = (
+                        "SELECT code, "
+                        + ", ".join(f'MAX("{c}") AS "{c}"' for c in ind_cols)
+                        + " FROM daily_features GROUP BY code"
+                    )
+                    db_industry = pd.read_sql_query(q, _conn)
+                    _conn.close()
+                    if not db_industry.empty:
+                        df = df.merge(db_industry, on='code', how='left')
+            except Exception:
                 # 记录但不中断，可能因为没有 code 列或数据库连接失败
                 pass
         

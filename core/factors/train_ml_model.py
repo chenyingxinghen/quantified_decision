@@ -815,40 +815,29 @@ class MLModelTrainer:
 
 
 
-    def _compute_path_quality_score(self, f_returns_norm, f_low_min_norm, f_high_idx, f_low_idx, atr_raw, next_open, rel_atr, f_high_max_norm, intraday_intensity, volume_ratio, relative_intensity, limits=0.1,):
+    def _compute_path_quality_score(self, f_returns_norm, f_low_min_norm, f_high_idx, f_low_idx, f_high_max_norm, limits=0.1):
 
         upside  = np.where(f_high_max_norm > 0, f_high_max_norm, 0)
         downside = np.where(f_low_min_norm  < 0, f_low_min_norm,  0)
 
-        # 从配置中读取权重
         w_upside   = getattr(TrainingConfig, 'UPSIDE_WEIGHT',        2.0)
         w_downside = getattr(TrainingConfig, 'DOWNSIDE_WEIGHT',       1.0)
         w_final    = getattr(TrainingConfig, 'FINAL_RETURN_WEIGHT',   3.0)
 
-        # ── 1. 基础得分：落袋收益 + 上行空间 - 下行伤害 ──────────────────
         base_score = (f_returns_norm * w_final) + (upside * w_upside) + (downside * w_downside)
 
-        # ── 2. 波动率调整：ATR 越大爆发力越强 ────────────────────────────
-        vol_booster = 1.0 + (rel_atr * 10.0)
-
-        # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
-        #   f_high_idx：持仓期内最高点出现在第几天（0-based）
-        #   f_low_idx ：持仓期内最低点出现在第几天（0-based）
-        #   先涨后跌（high_idx < low_idx）：路径友好，给予奖励
-        #   先跌后涨（low_idx < high_idx）：路径不友好，给予惩罚
-        #   两者相等或含 NaN 时保持中性（1.0）
         high_idx = np.asarray(f_high_idx, dtype=np.float64)
         low_idx  = np.asarray(f_low_idx,  dtype=np.float64)
-        path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)  # 先涨后跌奖励幅度
-        path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10) # 先跌后涨惩罚幅度
+        path_bonus = getattr(TrainingConfig, 'PATH_BONUS',   0.15)
+        path_penalty = getattr(TrainingConfig, 'PATH_PENALTY', 0.10)
         path_mult = np.where(
             np.isnan(high_idx) | np.isnan(low_idx),
             1.0,
-            np.where(high_idx < low_idx, 1.0 + path_bonus,   # 先涨后跌：路径优质
-            np.where(low_idx  < high_idx, 1.0 - path_penalty, # 先跌后涨：路径劣质
-            1.0))                                              # 同天：中性
+            np.where(high_idx < low_idx, 1.0 + path_bonus,
+            np.where(low_idx  < high_idx, 1.0 - path_penalty,
+            1.0))
         )
-        final_score = base_score * vol_booster*path_mult
+        final_score = base_score * path_mult
         return final_score
 
     def _extract_stock_components(self, code: str, data: pd.DataFrame, 
@@ -1152,16 +1141,10 @@ class MLModelTrainer:
         f_high_max_norm = f_high_max_raw / limits
         f_low_min_norm = f_low_min_raw / limits
         
-        # 2. 计算路径质量原始分
-        # 注意：使用关键字参数传递 limits，避免与 intraday_intensity 的位置混淆
         raw_scores = self._compute_path_quality_score(
-            f_returns_norm, f_low_min_norm, 
+            f_returns_norm, f_low_min_norm,
             components['f_high_idx'].values, components['f_low_idx'].values,
-            components['atr_raw'].values, next_open, components['atr_rel'].values,
             f_high_max_norm,
-            components['intraday_intensity'].values,
-            components['volume_ratio'].values,
-            components['relative_intensity'].values,
             limits=limits,
         )
         
@@ -1503,6 +1486,21 @@ class MLModelTrainer:
         gc.collect()
         
         print(f"  - 原始样本量: {len(X_arr)}, 特征数: {X_arr.shape[1]}")
+        
+        # 特征极端值截断：对每列按 1%/99% 分位数 ± 5×IQR 截断。
+        # JYDB 等外部特征使用原始元单位（如 EnterpriseValue 达 5e13），
+        # 内部 market_cap 等单位使用 亿，量纲不统一。截断不影响截面排名
+        # （极端值在排名中本就在首尾），但避免聚合统计被污染。
+        for col_idx in range(X_arr.shape[1]):
+            col_data = X_arr[:, col_idx]
+            finite = col_data[np.isfinite(col_data)]
+            if len(finite) > 10:
+                lo, hi = np.percentile(finite, [1, 99])
+                rng = hi - lo
+                if rng > 0:
+                    lower = lo - 5 * rng
+                    upper = hi + 5 * rng
+                    X_arr[:, col_idx] = np.clip(col_data, lower, upper)
         
         # 3. 向量化计算标签 (此时输入已是有序，截面排序速度最快，返回的标签和分数天然有序)
         print("  - 向量化生成标签 (标准化 + 截面排名)...")
@@ -1899,15 +1897,15 @@ class MLModelTrainer:
                     _y_discrete_lgb[_ds:_de] = _mid_bin
                     _y_sub[_ds:_de] = 0.5
         
-        # 诊断输出：检查标签分布
-        print(f"\n[标签分布诊断]")
-        print(f"  训练集离散标签分布 (LightGBM 原始档位):")
-        unique_train, counts_train = np.unique(y_train_discrete, return_counts=True)
-        for bin_id, count in zip(unique_train, counts_train):
-            print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_train_discrete)*100:>5.2f}%)")
-        if _label_weighted:
-            print(f"  XGBoost/回归连续标签变换: exponent={_label_exponent}")
-        print(f"  原始分数统计 (训练集): min={_label_source[:split_idx].min():.4f}, max={_label_source[:split_idx].max():.4f}, std={_label_source[:split_idx].std():.4f}")
+        # # 诊断输出：检查标签分布
+        # print(f"\n[标签分布诊断]")
+        # print(f"  训练集离散标签分布 (LightGBM 原始档位):")
+        # unique_train, counts_train = np.unique(y_train_discrete, return_counts=True)
+        # for bin_id, count in zip(unique_train, counts_train):
+        #     print(f"    档位 {bin_id}: {count:>7} 样本 ({count/len(y_train_discrete)*100:>5.2f}%)")
+        # if _label_weighted:
+        #     print(f"  XGBoost/回归连续标签变换: exponent={_label_exponent}")
+        # print(f"  原始分数统计 (训练集): min={_label_source[:split_idx].min():.4f}, max={_label_source[:split_idx].max():.4f}, std={_label_source[:split_idx].std():.4f}")
         
 
         # 1. 初始化基础权重
@@ -2075,11 +2073,11 @@ class MLModelTrainer:
                         dates=dates_train,
                     )
                 # 训练集评估（采样，用于与验证集对比学习效果）
-                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.03)
+                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=1)
                 train_result['train_metrics'] = train_eval
 
                 # 在验证集（阻隔期后）上做最终评估
-                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.5)
+                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=1)
                 train_result['val_metrics'] = val_eval
                 
                 self.models[model_type] = model

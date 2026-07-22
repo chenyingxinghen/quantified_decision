@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 # 添加项目根目录
-from config.baostock_config import PROJECT_ROOT, DATABASE_PATH, SYSTEM_DATA_DIR
+from config.data_config import PROJECT_ROOT, DATABASE_PATH, SYSTEM_DATA_DIR
 
 from core.automation.trader_interface import AutoTrader
 from config.automation_config import (

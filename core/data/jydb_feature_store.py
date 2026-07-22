@@ -51,6 +51,9 @@ class JYDBFeatureStore:
         conn = sqlite3.connect(self.db_path, timeout=60)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=120000")
+        conn.execute("PRAGMA cache_size=-80000")       # 80 MB page cache
+        conn.execute("PRAGMA wal_autocheckpoint=0")    # 禁用自动 checkpoint；由主进程手动 TRUNCATE
         return conn
 
     @contextmanager
@@ -420,6 +423,7 @@ class JYDBTableSpec:
     dimension_cols: Sequence[str] = ()
     storage: str = "pit"
     parameter_multiplier: int = 1
+    earliest_date: Optional[str] = None
 
 
 VALUATION_FIELDS = (
@@ -599,6 +603,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         end_date_col="end_date",
         feature_cols=FINANCIAL_INDEX_FIELDS,
         prefix="jy_fin_",
+        earliest_date="1991-03-01",
     ),
     "LC_PerformanceForecast": JYDBTableSpec(
         name="LC_PerformanceForecast",
@@ -610,6 +615,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=FORECAST_FIELDS, prefix="jy_forecast_",
         dimension_cols=("ForcastType", "ForecastObject"),
+        earliest_date="1999-01-01",
     ),
     "LC_FreeFloat": JYDBTableSpec(
         name="LC_FreeFloat",
@@ -619,6 +625,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=FREE_FLOAT_FIELDS, prefix="jy_float_",
+        earliest_date="1992-05-01",
     ),
     "LC_SHNumber": JYDBTableSpec(
         name="LC_SHNumber",
@@ -628,6 +635,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=SHAREHOLDER_NUMBER_FIELDS, prefix="jy_holder_",
+        earliest_date="1991-10-01",
     ),
     # 该统计表没有独立公告日，EndDate 只能作为保守可用日。生产接入时若能从
     # 公告关联表取得发布时间，应在源查询中替换 available_date。
@@ -648,6 +656,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=PLEDGE_FIELDS, prefix="jy_pledge_",
         dimension_cols=("Category",),
+        earliest_date="2002-10-01",
     ),
     "QT_TradingCapitalFlow": JYDBTableSpec(
         name="QT_TradingCapitalFlow",
@@ -675,6 +684,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=DIVIDEND_FIELDS, prefix="jy_dividend_",
+        earliest_date="1991-01-01",
     ),
     "LC_Buyback": JYDBTableSpec(
         name="LC_Buyback",
@@ -684,6 +694,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col=None,
         feature_cols=BUYBACK_FIELDS, prefix="jy_buyback_",
+        earliest_date="1994-06-01",
     ),
     "LC_PerformanceLetters": JYDBTableSpec(
         name="LC_PerformanceLetters",
@@ -693,6 +704,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=PERFORMANCE_LETTER_FIELDS, prefix="jy_letter_",
+        earliest_date="2004-02-01",
     ),
     "LC_AuditOpinion": JYDBTableSpec(
         name="LC_AuditOpinion",
@@ -709,6 +721,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=("AuditEvent",), prefix="jy_audit_",
         dimension_cols=("OpinionType", "AuditReportsType"),
+        earliest_date="1991-03-01",
     ),
     "LC_ShareStru": JYDBTableSpec(
         name="LC_ShareStru",
@@ -718,6 +731,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=SHARE_STRUCTURE_FIELDS, prefix="jy_share_",
+        earliest_date="1989-03-01",
     ),
     "LC_SharesFloatingSchedule": JYDBTableSpec(
         name="LC_SharesFloatingSchedule",
@@ -738,6 +752,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=FLOATING_SCHEDULE_FIELDS, prefix="jy_unlock_",
         dimension_cols=("SourceType",),
+        earliest_date="2005-11-01",
     ),
     "LC_ActualController": JYDBTableSpec(
         name="LC_ActualController",
@@ -753,7 +768,8 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         """,
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=("ControllerEvent",), prefix="jy_controller_",
-        dimension_cols=("ControllerNature", "EconomicNature", "NationalityCode"),
+        dimension_cols=(),
+        earliest_date="1998-03-01",
     ),
     "LC_SHSZHSCHoldings": JYDBTableSpec(
         name="LC_SHSZHSCHoldings",
@@ -770,12 +786,14 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col=None,
         feature_cols=NORTHBOUND_HOLDING_FIELDS, prefix="jy_north_",
         dimension_cols=("TradingType",), storage="daily",
+        earliest_date="2016-12-01",
     ),
     "MT_TradingDetail": JYDBTableSpec(
         name="MT_TradingDetail",
         sql=_select_sql("MT_TradingDetail", "TradingDay", MARGIN_TRADING_FIELDS, False),
         available_date_col="available_date", end_date_col=None,
         feature_cols=MARGIN_TRADING_FIELDS, prefix="jy_margin_", storage="daily",
+        earliest_date="2010-03-31",
     ),
     "LC_CSIIndustry": JYDBTableSpec(
         name="LC_CSIIndustry",
@@ -785,6 +803,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         ),
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=INDUSTRY_CODE_FIELDS, prefix="jy_industry_",
+        earliest_date="2012-11-01",
     ),
     "LC_ReserveReportDate": JYDBTableSpec(
         name="LC_ReserveReportDate",
@@ -804,6 +823,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=("CorrectNum", "DaysToNoticeStart", "DaysToNoticeEnd", "IfEffected"),
         prefix="jy_disclosure_", dimension_cols=("BulletinType", "NoticeType"),
+        earliest_date="1990-12-01",
     ),
     "LC_AShareSeasonedNewIssue": JYDBTableSpec(
         name="LC_AShareSeasonedNewIssue",
@@ -822,7 +842,8 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         """,
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=SEASONED_ISSUE_FIELDS, prefix="jy_seasoned_",
-        dimension_cols=("IssueType", "EventProcedureCode"),
+        dimension_cols=("IssueType",),
+        earliest_date="1991-07-01",
     ),
     "LC_ASharePlacement": JYDBTableSpec(
         name="LC_ASharePlacement",
@@ -841,7 +862,8 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         """,
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=PLACEMENT_FIELDS, prefix="jy_placement_",
-        dimension_cols=("IssueMethod", "EventProcedureCode"),
+        dimension_cols=(),
+        earliest_date="1991-03-01",
     ),
     "LC_IndexComponentsWeight": JYDBTableSpec(
         name="LC_IndexComponentsWeight",
@@ -860,6 +882,7 @@ DEFAULT_TABLE_SPECS: Dict[str, JYDBTableSpec] = {
         available_date_col="available_date", end_date_col="end_date",
         feature_cols=("Weight",), prefix="jy_index_",
         dimension_cols=("IndexCode",),
+        earliest_date="1997-01-01",
     ),
 }
 

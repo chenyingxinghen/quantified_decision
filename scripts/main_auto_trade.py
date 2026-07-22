@@ -32,7 +32,7 @@ from config.automation_config import (
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
     DRY_RUN
 )
-from config.baostock_config import SYSTEM_DATA_DIR
+from config import SYSTEM_DATA_DIR
 
 # 信号存档目录
 SIGNALS_DIR = os.path.join(SYSTEM_DATA_DIR, "automation", "signals")
@@ -139,7 +139,7 @@ def get_latest_signals() -> List[Dict]:
     from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH, AUTO_TOP_N
     from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
     from config.factor_config import TrainingConfig
-    from config.baostock_config import DATABASE_PATH
+    from config import DATABASE_PATH
 
     logger.info("正在获取今日信号")
     logger.info(f"  配置: top_n={AUTO_TOP_N}, min_confidence={AUTO_MIN_CONFIDENCE}")

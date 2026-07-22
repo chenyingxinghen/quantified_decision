@@ -15,7 +15,6 @@ from typing import Dict, Optional
 
 from core.factors.comprehensive_factor_calculator import ComprehensiveFactorCalculator
 from core.factors.ml_factor_model import MLFactorModel
-from core.data.data_fetcher import DataFetcher
 from config.factor_config import FactorConfig, TrainingConfig
 
 
@@ -30,7 +29,6 @@ class MLFactorStrategy:
             model_path: 模型文件路径
         """
         self.factor_calculator = ComprehensiveFactorCalculator()
-        self.data_fetcher = DataFetcher()
         self.model = None
         
         # 如果没有提供模型路径，使用默认路径
@@ -340,7 +338,7 @@ class MLFactorStrategy:
         top_factor_names = self.model.get_top_factors(n=10)
 
         # 准备涨跌停判定参数
-        from config.baostock_config import MARKET_LIMITS, MARKET_PREFIXES
+        from config import MARKET_LIMITS, MARKET_PREFIXES
         
         for i, code in enumerate(valid_codes):
             prob = float(probs[i])

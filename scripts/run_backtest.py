@@ -6,11 +6,14 @@
 
 import os
 import sys
+import argparse
+
+import pandas as pd
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.backtest import BacktestEngine, DataHandler, PerformanceAnalyzer
-from core.data.baostock_main import BaostockDataManager
+from core.data.jydb_market_etl import JYDBMarketETL
 from core.backtest.strategies import MLFactorBacktestStrategy
 from config import DATABASE_PATH,TrainingConfig
 from config.strategy_config import (
@@ -26,18 +29,25 @@ from datetime import datetime, timedelta
 
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description='Quantified Decision - 回测入口')
+    parser.add_argument('--model', type=str, default=None, help='模型文件路径 (默认使用 strategy_config 中的路径)')
+    parser.add_argument('--start', type=str, default=None, help='回测开始日期 (YYYY-MM-DD)')
+    parser.add_argument('--end',   type=str, default=None, help='回测结束日期 (YYYY-MM-DD)')
+    parser.add_argument('--output', type=str, default=None, help='结果输出目录 (默认自动生成)')
+    args = parser.parse_args()
+
     print("=" * 80)
     print("回测系统")
     print("=" * 80)
     
     # 配置参数
-    start_date = (datetime.now() - timedelta(days=365*TrainingConfig.YEARS_FOR_BACKTEST)).strftime('%Y-%m-%d')
-    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = args.start if args.start else (datetime.now() - timedelta(days=365*TrainingConfig.YEARS_FOR_BACKTEST)).strftime('%Y-%m-%d')
+    end_date   = args.end   if args.end   else datetime.now().strftime('%Y-%m-%d')
     initial_capital = INITIAL_CAPITAL
     commission_rate = COMMISSION_RATE
     
     # 模型路径
-    model_path = ML_FACTOR_MODEL_PATH
+    model_path = args.model if args.model else ML_FACTOR_MODEL_PATH
     if not os.path.isabs(model_path):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         model_path = os.path.join(project_root, model_path)
@@ -87,13 +97,17 @@ def main():
     # 提前获取股票代码
     stock_codes = None # 这里可以指定，不指定则从DB获取
     if stock_codes is None:
-        bdm = BaostockDataManager()
-        df_stocks = bdm.get_stock_list_from_db(SELECTOR_MARKETS if ENABLE_FUNDAMENTAL_FILTER else None)
-        stock_codes = df_stocks['code'].tolist()
-        bdm.close()
-
-        # 不能使用数据库最新日期的价格/ST 状态预裁剪历史股票池。
-        # 市场、价格、ST、基本面条件由策略在每个回测日基于当日快照动态判断。
+        # 纯聚源：从 daily_data 取 DISTINCT code。
+        # 市场/价格/ST/基本面条件由策略在每个回测日基于当日快照动态判断，不在此预裁剪。
+        prefixes = None
+        if ENABLE_FUNDAMENTAL_FILTER and SELECTOR_MARKETS:
+            from config import SUPPORTED_MARKETS
+            prefixes = []
+            for m in SELECTOR_MARKETS:
+                prefixes.extend(SUPPORTED_MARKETS.get(m, {}).get("prefixes", []))
+        stock_codes = JYDBMarketETL.get_stock_list(
+            DATABASE_PATH, as_of_date=end_date, market_prefixes=prefixes
+        )
 
 
     # 为了让第1个交易日就有足够的历史数据（例如250日均线需要，这里预留365个自然日），
@@ -140,7 +154,7 @@ def main():
     backtest_tag = f"conf{int(ML_FACTOR_MIN_CONFIDENCE)}_{start_date}_to_{end_date}"
     
     # 创建归档路径: backtest_result/{archive_tag}/{model_category}/{backtest_tag}/
-    result_dir = os.path.join('backtest_result', archive_tag, model_category, backtest_tag)
+    result_dir = args.output if args.output else os.path.join('backtest_result', archive_tag, model_category, backtest_tag)
     if not os.path.exists(result_dir):
         os.makedirs(result_dir)
         
@@ -149,19 +163,59 @@ def main():
         results['trades'],
         os.path.join(result_dir, 'backtest_trades.csv')
     )
-    
+
+    # 保存资金曲线 CSV（供后续自定义分析/绘图复用）
+    PerformanceAnalyzer.save_equity_curve(
+        results['equity_curve'],
+        os.path.join(result_dir, 'backtest_equity.csv')
+    )
+
+    # 保存绩效指标 JSON（总收益、胜率、盈亏比、最大回撤、夏普、退出原因等）
+    # calculate_metrics 已在 engine.run() 中算出，此前仅打印到控制台，未落盘。
+    import json
+    import numpy as np
+
+    def _json_default(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (pd.Timestamp,)):
+            return obj.strftime('%Y-%m-%d')
+        return str(obj)
+
+    metrics = results.get('metrics', {})
+    metrics_out = dict(metrics)
+    metrics_out['_meta'] = {
+        'strategy': strategy.name,
+        'start_date': start_date,
+        'end_date': end_date,
+        'initial_capital': initial_capital,
+        'model_path': model_path,
+        'min_confidence': ML_FACTOR_MIN_CONFIDENCE,
+    }
+    with open(os.path.join(result_dir, 'backtest_metrics.json'), 'w', encoding='utf-8') as f:
+        json.dump(metrics_out, f, ensure_ascii=False, indent=2, default=_json_default)
+
     # 绘制资金曲线
     PerformanceAnalyzer.plot_equity_curve(
         results['equity_curve'],
         title=f"Backtest Equity Curve ({strategy.name})",
         save_path=os.path.join(result_dir, 'backtest_equity.png')
     )
-    
+
     # 绘制置信度与收益率的关系
     PerformanceAnalyzer.plot_confidence_performance(
         results['trades'],
         title=f"Confidence vs. Return ({strategy.name})",
         save_path=os.path.join(result_dir, 'backtest_confidence_analysis.png')
+    )
+
+    # 控制台打印绩效摘要
+    PerformanceAnalyzer.print_summary(
+        metrics, start_date, end_date, strategy.name
     )
     
     print("\n回测完成！")

@@ -28,6 +28,7 @@ class RawQuerySpec:
     date_col: Optional[str]
     parameter_multiplier: int = 1
     history_kind: str = "pit"
+    earliest_date: Optional[str] = None
 
 
 SECU_MAIN_SQL = f"""
@@ -88,11 +89,11 @@ BASE_RAW_SPECS: Dict[str, RawQuerySpec] = {
     ),
     "QT_AdjustingFactor": RawQuerySpec(
         "QT_AdjustingFactor", ADJUSTING_FACTOR_RAW_SQL,
-        "ExDiviDate", 1, "bootstrap",
+        "ExDiviDate", 1, "bootstrap", earliest_date="1991-01-01",
     ),
     "LC_SpecialTrade": RawQuerySpec(
         "LC_SpecialTrade", SPECIAL_TRADE_RAW_SQL,
-        "SpecialTradeTime", 1, "bootstrap",
+        "SpecialTradeTime", 1, "bootstrap", earliest_date="1998-04-01",
     ),
 }
 
@@ -107,6 +108,7 @@ def training_raw_specs() -> Dict[str, RawQuerySpec]:
             date_col=spec.available_date_col,
             parameter_multiplier=spec.parameter_multiplier,
             history_kind="daily" if spec.storage == "daily" else "pit",
+            earliest_date=spec.earliest_date,
         )
     return result
 
@@ -300,6 +302,8 @@ class JYDBRawETL:
                 if spec.history_kind in {"pit", "bootstrap"}
                 else start_date
             )
+            if spec.earliest_date and spec.earliest_date > table_start:
+                table_start = spec.earliest_date
             total = 0
             for batch_start, batch_end in iter_date_batches(
                 table_start, end_date, batch_months

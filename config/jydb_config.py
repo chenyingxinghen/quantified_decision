@@ -4,11 +4,11 @@
 """
 import os
 
-from .baostock_config import DATABASE_DIR
+from .data_config import DATABASE_DIR, DATABASE_PATH, META_DB_PATH
 
 
 JYDB_ENABLED = os.getenv("JYDB_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-JYDB_DRIVER = os.getenv("JYDB_DRIVER", "ODBC Driver 17 for SQL Server")
+JYDB_DRIVER = os.getenv("JYDB_DRIVER", "SQL Server")
 JYDB_SERVER = os.getenv("JYDB_SERVER", "")
 JYDB_DATABASE = os.getenv("JYDB_DATABASE", "JYDB")
 JYDB_USERNAME = os.getenv("JYDB_USERNAME", "")

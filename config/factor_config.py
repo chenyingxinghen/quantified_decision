@@ -9,7 +9,7 @@
 """
 
 from typing import Dict, Any
-from config import baostock_config
+from config import data_config
 from config.jydb_config import JYDB_ENABLED, JYDB_FEATURE_DB_PATH
 import os
 
@@ -139,13 +139,12 @@ class TrainingConfig:
     TASK                 = 'ranking' 
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
-    YEARS                = baostock_config.HISTORY_YEARS
-    YEARS_FOR_TRAINING   = 17         # 训练数据年数
-    YEARS_FOR_BACKTEST   = 2         # 回测数据年数
+    YEARS                = data_config.HISTORY_YEARS
+    YEARS_FOR_TRAINING   = 6         # 训练数据年数
+    YEARS_FOR_BACKTEST   = 0.5         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
     SHORT_PREDICTION     = True
     FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
-    MULTI_OBJECTIVE_ENABLED = False
     MULTI_OBJECTIVE_RETURN_HORIZONS = (5, 20, 60)
     MULTI_OBJECTIVE_RISK_HORIZON = 20
     MULTI_OBJECTIVE_WEIGHTS = {
@@ -203,7 +202,7 @@ class TrainingConfig:
     USE_GPU              = True          # 是否启用 GPU 加速（XGBoost/LightGBM）
     MEMORY_EFFICIENT     = True          # 是否启用分批训练/流式加载
     GPU_BATCH_SIZE       = 1_000_000     # GPU 批次大小
-    N_JOBS_FACTOR_CALC   = 2             # 横截面归一化线程数；过高会增加峰值内存与调度开销
+    N_JOBS_FACTOR_CALC   = 12             # 横截面归一化线程数；过高会增加峰值内存与调度开销
 
     # ── 因子归一化 (Feature Normalization) ────────────────────────────────
     # 在进行横截面排名时，跳过这些特定类型的因子
@@ -257,7 +256,7 @@ class TrainingConfig:
         if col_l.startswith('jy_'):
             return True
         # 排除所有状态位、K线形态、宏观指标
-        if col_l.startswith(('industry_', 'jy_industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
+        if col_l.startswith(('industry_', 'jy_industry_', 'sector_', 'is_', 'days_to_', 'market_')):
             return True
         # 排除 FEATURE_TRANSFORM_EXCLUDE_LIST 中以前缀方式匹配的条目（如 'aroon' 匹配 'aroon_up'）
         for excl in TrainingConfig.FEATURE_TRANSFORM_EXCLUDE_LIST:
@@ -272,7 +271,7 @@ class TrainingConfig:
             return True
         col_l = col.lower()
         # 行业、板块分类、退市天数、二元标记、市场/指标前缀
-        if col_l.startswith(('industry_', 'jy_industry_', 'sector_', 'is_', 'days_to_', 'mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
+        if col_l.startswith(('industry_', 'jy_industry_', 'sector_', 'is_', 'days_to_', 'market_')):
             # 如果是已经 label encoding 过的行业因子，可以参与排名（保持分布一致）
             if col_l.endswith('_encoded'):
                 return False

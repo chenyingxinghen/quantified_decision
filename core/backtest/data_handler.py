@@ -11,6 +11,41 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
 
+_PRICE_COLUMNS = ('open', 'high', 'low', 'close', 'preclose')
+
+
+def _prepare_adjusted_stock_data(
+    stock_df: pd.DataFrame,
+    prior_fore_factor: float = None,
+    prior_back_factor: float = None,
+) -> pd.DataFrame:
+    """Build one continuous, corporate-action-adjusted price series.
+
+    聚源 adjust_factor 只在公司行为日有值，有效因子需在事件后前向填充、
+    且在首个已知因子前向后填充。保留 raw_* 原始价格供历史时点的价格/市值筛选，
+    标准 OHLC 列替换为 ``raw_price * fore_adjust_factor``，使买卖价格在分红送转
+    后可比。该函数与数据源无关（JYDB 版复用）。
+    """
+    stock_df = stock_df.sort_values('date').reset_index(drop=True).copy()
+    fore = pd.to_numeric(stock_df.get('fore_adjust_factor'), errors='coerce')
+    back = pd.to_numeric(stock_df.get('back_adjust_factor'), errors='coerce')
+    if prior_fore_factor is not None and len(fore) > 0 and pd.isna(fore.iloc[0]):
+        fore.iloc[0] = prior_fore_factor
+    if prior_back_factor is not None and len(back) > 0 and pd.isna(back.iloc[0]):
+        back.iloc[0] = prior_back_factor
+    stock_df['fore_adjust_factor'] = fore.ffill().bfill().fillna(1.0)
+    stock_df['back_adjust_factor'] = back.ffill().bfill().fillna(1.0)
+
+    for col in _PRICE_COLUMNS:
+        raw = pd.to_numeric(stock_df[col], errors='coerce')
+        stock_df[f'raw_{col}'] = raw
+        adjusted = raw * stock_df['fore_adjust_factor']
+        stock_df[col] = adjusted
+        stock_df[f'adj_{col}'] = adjusted
+
+    return stock_df
+
+
 def _load_stock_batch(args):
     """多进程加载股票数据"""
     db_path, stock_codes, start_date, end_date = args

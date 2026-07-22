@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH
-from core.backtest.baostock_data_handler import _prepare_adjusted_stock_data
+from core.backtest.data_handler import _prepare_adjusted_stock_data
 from core.exit_rules import evaluate_exit
 from core.factors.train_ml_model import MLModelTrainer
 from scripts.select_stocks import _update_factor_cache_incremental

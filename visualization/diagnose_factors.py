@@ -28,7 +28,7 @@ from scipy.stats import spearmanr, rankdata
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
-from config.baostock_config import DATABASE_PATH, MARKET_LIMITS, MARKET_PREFIXES
+from config.data_config import DATABASE_PATH, MARKET_LIMITS, MARKET_PREFIXES
 from config.factor_config import TrainingConfig, FactorConfig, ModelConfig
 from core.factors.train_ml_model import MLModelTrainer
 

@@ -1,31 +1,78 @@
 """
-基本面因子模块 (v2 - 基于 finance_reports PIT 数据重构)
+基本面因子模块 (v3 - 纯聚源 / JYDB 环境)
 
-数据来源: stock_finance.db -> finance_reports 表
+数据来源: jydb_features.db -> daily_features 表中的 jy_fin_* 列
+（由 core.data.jydb_feature_store 从聚源 LC_MainIndexNew 预处理产出，PIT 对齐）
 核心字段说明:
-  roeAvg / dupontROE - 盈利核心 (ROE)
-  npMargin / gpMargin / dupontPnitoni - 利润率
-  YOYNI / YOYPNI / YOYEquity - 成长因子
-  currentRatio / quickRatio / liabilityToAsset - 偿债及杠杆
-  dupontAssetTurn / dupontNitogr - 周转与效率
-  epsTTM / totalShare / liqaShare - 每股指标
-  dupontTaxBurden / dupontIntburden - 税利负担
+  jy_fin_ROE / ROECut / ROEWeighted - 盈利核心 (ROE)
+  jy_fin_NetProfitRatio / GrossIncomeRatio - 利润率
+  jy_fin_NetProfitGrowRate / OperatingRevenueGrowRate / NetAssetGrowRate - 成长因子
+  jy_fin_CurrentRatio / QuickRatio / DebtAssetsRatio / DebtEquityRatio - 偿债及杠杆
+  jy_fin_EPS / BasicEPS / NetAssetPS - 每股指标
+  jy_fin_TotalAssetTRate / ARTRate / InventoryTRate - 周转与效率
 
 PIT 原则:
-  - 对于某个交易日 T, 只读取公告日期 NOTICE_DATE <= T 的最近一期报告
-  - 这彻底消除了“先看财报结果再选股”的前视偏差 (Data Leakage)
-  - 训练时按公告日期对齐, 选股/实时预测时以最新已公布报告为准
-  - 对于缺失 NOTICE_DATE 的历史数据，采用保守估算（Q1/Q3+25天, Q2+55天, Q3+25天, Q4+20天）
+  - daily_features 已按 available_date (公告日) 存储，对应交易日 T 只读取
+    available_date <= T 的最近一期报告，彻底消除前视偏差 (Data Leakage)。
+  - 训练时按公告日期对齐, 选股/实时预测时以最新已公布报告为准。
+  - 本模块不再依赖 Baostock / stock_finance.db，所有特征由聚源一次性预处理完成，
+    避免在训练时重复抽取和重构中间产物。
 """
 
 import os
 import sqlite3
 import numpy as np
 import pandas as pd
+from contextlib import closing
 from typing import Optional, Dict, List, Tuple
 from functools import lru_cache
 
-from config.baostock_config import DATABASE_PATH
+from config.jydb_config import JYDB_FEATURE_DB_PATH, DATABASE_PATH
+
+
+# 聚源 LC_MainIndexNew 提供的 jy_fin_* 字段（已按 available_date 做 PIT 对齐）
+_JY_FIN_COLUMNS = (
+    "EPS", "BasicEPS", "DilutedEPS", "NetAssetPS", "ROE", "ROECut",
+    "ROEWeighted", "ROA", "ROIC", "GrossIncomeRatio", "NetProfitRatio",
+    "OperatingProfitRatio", "EBIT", "EBITDA", "OperatingRevenueGrowRate",
+    "NetProfitGrowRate", "TotalAssetGrowRate", "NetAssetGrowRate",
+    "CurrentRatio", "QuickRatio", "SuperQuickRatio", "DebtAssetsRatio",
+    "DebtEquityRatio", "InterestCover", "TotalAssetTRate", "ARTRate",
+    "ARTDays", "InventoryTRate", "InventoryTDays", "OperCycle",
+    "NetOperateCashFlow", "FreeCashFlow", "OperCashFlowPS",
+    "NetProfitCashCover", "OperatingRevenueCashCover",
+)
+
+# Baostock 时代 FundamentalFactors.NUMERIC_COLS 输出契约 → 聚源源字段映射。
+# 值为 None 的字段在聚源主指标中无直接对应，置 NaN（保持下游列结构不变）。
+_BAOSTOCK_TO_JYDB = {
+    "roeAvg": "ROE",
+    "npMargin": "NetProfitRatio",
+    "gpMargin": "GrossIncomeRatio",
+    "epsTTM": "EPS",
+    "MBRevenue": None,
+    "totalShare": None,
+    "liqaShare": None,
+    "YOYEquity": "NetAssetGrowRate",
+    "YOYAsset": "TotalAssetGrowRate",
+    "YOYNI": "NetProfitGrowRate",
+    "YOYEPSBasic": None,
+    "YOYPNI": "NetProfitGrowRate",
+    "currentRatio": "CurrentRatio",
+    "quickRatio": "QuickRatio",
+    "cashRatio": "SuperQuickRatio",
+    "YOYLiability": None,
+    "liabilityToAsset": "DebtAssetsRatio",
+    "assetToEquity": "DebtEquityRatio",
+    "dupontROE": "ROE",
+    "dupontAssetStoEquity": "DebtEquityRatio",
+    "dupontAssetTurn": "TotalAssetTRate",
+    "dupontPnitoni": "NetProfitRatio",
+    "dupontNitogr": "NetProfitRatio",
+    "dupontTaxBurden": None,
+    "dupontIntburden": None,
+    "dupontEbittogr": None,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -43,104 +90,78 @@ def _safe_float(val, default=np.nan) -> float:
         return default
 
 
-def _get_finance_conn(db_path: str) -> sqlite3.Connection:
-    """获取携带 finance 附加库的连接"""
-    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    db_dir = os.path.dirname(db_path)
-    finance_db = os.path.join(db_dir, 'stock_finance.db')
-    if os.path.exists(finance_db):
-        conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
-    return conn
-
-
 # ---------------------------------------------------------------------------
-# 核心类: FinanceReportFetcher
-#   - 从 finance_reports 表读取 PIT 财务数据
-#   - 支持单日查询和时间序列对齐
+# 核心类: FinanceReportFetcher (纯聚源 / JYDB 版)
+#   - 从 jydb_features.db.daily_features 读取 jy_fin_* PIT 财务数据
+#   - 支持单日查询和时间序列对齐（接口与原 Baostock 版保持一致）
 # ---------------------------------------------------------------------------
 
 class FinanceReportFetcher:
     """
-    Points-In-Time 财务数据读取器。
-    
+    Points-In-Time 财务数据读取器（聚源特征库版）。
+
     - 单日模式: 给定一个截止日期, 返回最近一期报表数据 (dict)
     - 时间序列模式: 给定一个日期序列, 逐日对齐最近期报表, 返回 DataFrame
     """
 
-    def __init__(self, db_path: str = DATABASE_PATH):
+    def __init__(self, db_path: str = DATABASE_PATH, feature_db: str = JYDB_FEATURE_DB_PATH):
         self.db_path = db_path
-        # 预加载所有报告到内存以加速批量查询
+        self.feature_db = feature_db
+        # 预加载每只股票的 PIT 财务序列到内存以加速批量查询
         self._cache: Dict[str, pd.DataFrame] = {}
 
-    def _get_conn(self) -> sqlite3.Connection:
-        return _get_finance_conn(self.db_path)
-
     def _load_reports_for_code(self, code: str) -> pd.DataFrame:
-        """加载某只股票的全部财务报告 (按 stat_date 升序)"""
+        """加载某只股票的聚源主要财务指标序列 (按 available_date 升序)。
+
+        返回带 announced_date 的 DataFrame，列为聚源原始字段名
+        （ROE / NetProfitRatio / ...），供 PIT 对齐后翻译为下游契约列。
+        """
         if code in self._cache:
             return self._cache[code]
 
-        conn = self._get_conn()
+        if not os.path.exists(self.feature_db):
+            self._cache[code] = pd.DataFrame()
+            return self._cache[code]
+
+        cols = ", ".join(f'"{c}"' for c in _JY_FIN_COLUMNS)
+        query = (
+            f'SELECT date, {cols} FROM daily_features '
+            f'WHERE code = ? ORDER BY date ASC'
+        )
         try:
-            # 基于 stat_date 将 4 张财务表连接为一个宽表
-            query = """
-                SELECT 
-                    p.code, p.pub_date, p.stat_date,
-                    p.roeAvg, p.npMargin, p.gpMargin, p.netProfit, p.epsTTM, p.MBRevenue, p.totalShare, p.liqaShare,
-                    g.YOYEquity, g.YOYAsset, g.YOYNI, g.YOYEPSBasic, g.YOYPNI,
-                    b.currentRatio, b.quickRatio, b.cashRatio, b.YOYLiability, b.liabilityToAsset, b.assetToEquity,
-                    d.dupontROE, d.dupontAssetStoEquity, d.dupontAssetTurn, d.dupontPnitoni, d.dupontNitogr, 
-                    d.dupontTaxBurden, d.dupontIntburden, d.dupontEbittogr
-                FROM finance.profit_ability p
-                LEFT JOIN finance.growth_ability g ON p.code = g.code AND p.stat_date = g.stat_date
-                LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
-                LEFT JOIN finance.dupont d ON p.code = d.code AND p.stat_date = d.stat_date
-                WHERE p.code = ?
-                ORDER BY p.stat_date ASC
-            """
-            df = pd.read_sql_query(query, conn, params=(code,))
+            with closing(sqlite3.connect(self.feature_db, timeout=30)) as conn:
+                df = pd.read_sql_query(query, conn, params=(code,))
         except Exception as e:
             import traceback
-            print(f"  [ERROR] 加载股票 {code} 财务数据失败: {e}")
+            print(f"  [ERROR] 加载股票 {code} 聚源财务数据失败: {e}")
             traceback.print_exc()
             df = pd.DataFrame()
-        finally:
-            conn.close()
 
         if not df.empty:
-            df['stat_date'] = pd.to_datetime(df['stat_date'], errors='coerce')
-            df['pub_date']  = pd.to_datetime(df['pub_date'], errors='coerce')
-            
-            # 估算缺失的公告日期 (pub_date 在 Baostock 中通常是准确的)
-            def _fill_notice_date(row):
-                if pd.notna(row['pub_date']):
-                    return row['pub_date']
-                rd = row['stat_date']
-                if pd.isna(rd): return pd.NaT
-                # 保守预估：Q1->4.25, Q2->8.25, Q3->10.25, Q4->4.20
-                if rd.month == 3: return rd.replace(month=4, day=25).replace(year=rd.year)
-                if rd.month == 6: return rd.replace(month=8, day=25).replace(year=rd.year)
-                if rd.month == 9: return rd.replace(month=10, day=25).replace(year=rd.year)
-                if rd.month == 12: return rd.replace(month=4, day=20).replace(year=rd.year+1)
-                return rd + pd.Timedelta(days=30)
-            
-            df['announced_date'] = df.apply(_fill_notice_date, axis=1)
-            df = df.dropna(subset=['announced_date']).sort_values('announced_date').reset_index(drop=True)
+            df['announced_date'] = pd.to_datetime(df['date'], errors='coerce')
+            df = df.drop(columns=['date'], errors='ignore')
+            df = df.dropna(subset=['announced_date']).sort_values(
+                'announced_date'
+            ).reset_index(drop=True)
+            for c in _JY_FIN_COLUMNS:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
 
         self._cache[code] = df
         return df
 
+    @staticmethod
+    def _translate_to_contract(raw_row: Dict) -> Dict:
+        """将聚源字段行翻译为 FundamentalFactors.NUMERIC_COLS 契约列。"""
+        out = {}
+        for contract_name, src in _BAOSTOCK_TO_JYDB.items():
+            out[contract_name] = raw_row.get(src, np.nan) if src else np.nan
+        return out
+
     def get_pit_report(self, code: str, as_of_date: str) -> Optional[Dict]:
         """
         获取 as_of_date 日期及之前最近一期财报 (单列 dict).
-        
-        参数:
-            code: 6位股票代码, 如 '000001'
-            as_of_date: 截止日期字符串 'YYYY-MM-DD'
-        
-        返回:
-            dict 或 None
+        输出的键为 FundamentalFactors.NUMERIC_COLS 契约列名。
         """
         df = self._load_reports_for_code(code)
         if df.empty:
@@ -151,37 +172,34 @@ class FinanceReportFetcher:
         if valid.empty:
             return None
 
-        row = valid.iloc[-1]
-        return dict(row)
+        row = valid.iloc[-1].to_dict()
+        return self._translate_to_contract(row)
 
     def get_pit_series(self, code: str, dates: pd.Series) -> pd.DataFrame:
         """
         为一组日期序列批量对齐 PIT 财务数据。
-        
-        参数:
-            code: 6位股票代码
-            dates: 与行情 DataFrame 对应的日期列 (datetime-like 或字符串)
-        
-        返回:
-            与 dates 等长的 DataFrame, 列为财务字段, 无法匹配的行填 NaN
+        返回列名为 FundamentalFactors.NUMERIC_COLS 契约列名。
         """
         df = self._load_reports_for_code(code)
         if df.empty:
             return pd.DataFrame(index=dates.index)
 
         dates_dt = pd.to_datetime(dates)
-        announced_dates = df['announced_date'].values  # sorted ascending numpy array
+        announced_dates = df['announced_date'].values  # sorted ascending
         report_rows = df.drop(columns=['announced_date'], errors='ignore')
-        
+
         # 用 searchsorted 快速找到每个交易日对应的“最新已公布”报告
         indices = np.searchsorted(announced_dates, dates_dt.values, side='right') - 1
+
+        # 预翻译：把每个聚源报告行转成契约列，便于按 index 取用
+        translated = [self._translate_to_contract(r) for r in report_rows.to_dict('records')]
 
         aligned_rows = []
         for idx in indices:
             if idx < 0:
-                aligned_rows.append({})
+                aligned_rows.append({name: np.nan for name in _BAOSTOCK_TO_JYDB})
             else:
-                aligned_rows.append(dict(report_rows.iloc[idx]))
+                aligned_rows.append(translated[idx])
 
         result = pd.DataFrame(aligned_rows, index=dates.index)
         return result
@@ -287,7 +305,8 @@ class FundamentalFactors:
         factors['inv_pb'] = 1.0 / factors['dynamic_pb'].replace(0, np.nan)
 
         # 市值计算 (单位: 亿)
-        factors['market_cap'] = (daily_data['close'] * factors['totalShare'] / 1e8)
+        total_share = factors['totalShare'].replace(0, np.nan)
+        factors['market_cap'] = (daily_data['close'] * total_share / 1e8)
 
         # --- 衍生交叉因子 ---
         factors = self._add_cross_factors(factors)

@@ -10,7 +10,10 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from core.data.jydb_feature_store import A_SHARE_FILTER, JYDBETL, iter_date_batches
+from core.data.jydb_feature_store import (
+    A_SHARE_FILTER, JYDBETL, iter_date_batches,
+    _build_fast, _apply_build_pragmas,
+)
 
 
 DAILY_QUOTE_SQL = f"""
@@ -87,10 +90,7 @@ class JYDBMarketETL:
     def initialize(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         with closing(sqlite3.connect(self.db_path, timeout=60)) as conn, conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=120000")
-            conn.execute("PRAGMA cache_size=-80000")
+            _apply_build_pragmas(conn)
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS daily_data (
@@ -174,11 +174,7 @@ class JYDBMarketETL:
         total = 0
         numeric = self._daily_numeric_cols()
         with closing(sqlite3.connect(self.db_path, timeout=60)) as target, target:
-            target.execute("PRAGMA journal_mode=WAL")
-            target.execute("PRAGMA synchronous=NORMAL")
-            target.execute("PRAGMA busy_timeout=120000")
-            target.execute("PRAGMA cache_size=-80000")
-            target.execute("PRAGMA wal_autocheckpoint=0")
+            _apply_build_pragmas(target)
             for chunk in chunks:
                 chunk = chunk.copy()
                 chunk["code"] = chunk["code"].astype(str).str.extract(r"(\d{6})", expand=False)
@@ -248,11 +244,7 @@ class JYDBMarketETL:
             events = events.dropna(subset=["code", "effective_date", "factor"])
 
         with closing(sqlite3.connect(self.db_path, timeout=60)) as conn, conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=120000")
-            conn.execute("PRAGMA cache_size=-80000")
-            conn.execute("PRAGMA wal_autocheckpoint=0")
+            _apply_build_pragmas(conn)
             daily_sql = "SELECT code,date FROM daily_data WHERE date>=? AND date<=?"
             daily_params = [start_date, end_date]
             if stock_codes:
@@ -341,11 +333,7 @@ class JYDBMarketETL:
 
         st_rows = []
         with closing(sqlite3.connect(self.db_path, timeout=60)) as conn, conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=120000")
-            conn.execute("PRAGMA cache_size=-80000")
-            conn.execute("PRAGMA wal_autocheckpoint=0")
+            _apply_build_pragmas(conn)
             daily_sql = "SELECT code,date FROM daily_data WHERE date>=? AND date<=?"
             daily_params = [start_date, end_date]
             if stock_codes:

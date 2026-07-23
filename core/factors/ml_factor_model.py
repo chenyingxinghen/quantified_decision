@@ -850,15 +850,29 @@ class MLFactorModel:
                 if len(g_ref) >= 10:
                     top1_idx = np.argmax(g_prob)
                     top5pct_threshold = np.percentile(g_ref, 95)
-                    top1_hits.append(1.0 if g_ref[top1_idx] >= top5pct_threshold else 0.0)
-                    
-                    # C. Top-5 精度：模型选的前 5 名中，有多少在组内前 20%
-                    n_top = min(5, len(g_ref))
-                    top5_idx = np.argsort(g_prob)[-n_top:]
                     top20pct_threshold = np.percentile(g_ref, 80)
-                    top5_precision = np.mean(g_ref[top5_idx] >= top20pct_threshold)
-                    top5_hits.append(top5_precision)
-                    
+                    # 随机基准：参考分布中本就落入前 5%/前 20% 的比例。
+                    # 当参考分布高度集中/不平衡（如 tradable_20d 近常量），
+                    # 该比例会很高，Top-N 精度失去区分度 -> 标记退化，不计入均值。
+                    base_top1 = float((g_ref >= top5pct_threshold).mean())
+                    base_top5 = float((g_ref >= top20pct_threshold).mean())
+                    metrics.setdefault('top1_baseline', []).append(base_top1)
+                    metrics.setdefault('top5_baseline', []).append(base_top5)
+                    _degenerate = (base_top1 > 0.5) or (base_top5 > 0.7)
+                    if _degenerate:
+                        metrics.setdefault('topn_degenerate_days', 0)
+                        metrics['topn_degenerate_days'] += 1
+                        top1_hits.append(float('nan'))
+                        top5_hits.append(float('nan'))
+                    else:
+                        top1_hits.append(1.0 if g_ref[top1_idx] >= top5pct_threshold else 0.0)
+
+                        # C. Top-5 精度：模型选的前 5 名中，有多少在组内前 20%
+                        n_top = min(5, len(g_ref))
+                        top5_idx = np.argsort(g_prob)[-n_top:]
+                        top5_precision = np.mean(g_ref[top5_idx] >= top20pct_threshold)
+                        top5_hits.append(top5_precision)
+
                     # D. 绝对胜率 (Win Rate)：Top-1 的真实收益是否大于 0
                     # 注意：如果 reference 是收益率 (returns)，则判断 > 0；如果是归一化后的 y，则判断是否大于中性值
                     is_win = (g_ref[top1_idx] > 0)
@@ -866,9 +880,12 @@ class MLFactorModel:
             
             metrics['rank_ic'] = np.mean(rank_ics) if rank_ics else 0.0
             metrics['rank_ic_std'] = np.std(rank_ics) if rank_ics else 0.0
-            metrics['top1_precision'] = np.mean(top1_hits) if top1_hits else 0.0
-            metrics['top5_precision'] = np.mean(top5_hits) if top5_hits else 0.0
+            metrics['top1_precision'] = float(np.nanmean(top1_hits)) if top1_hits else 0.0
+            metrics['top5_precision'] = float(np.nanmean(top5_hits)) if top5_hits else 0.0
             metrics['win_rate'] = np.mean(metrics.pop('win_rates')) if 'win_rates' in metrics else 0.0
+            if metrics.get('top1_baseline'):
+                metrics['top1_baseline'] = float(np.mean(metrics['top1_baseline']))
+                metrics['top5_baseline'] = float(np.mean(metrics['top5_baseline']))
             
             # 辅助统计：预测区分度
             prob_std = np.std(y_prob)
@@ -878,8 +895,14 @@ class MLFactorModel:
             print(f"    预测区分度: Std={prob_std:.4f}, Unique={unique_probs}")
             print(f"    Rank IC: {metrics['rank_ic']:.4f} ± {metrics['rank_ic_std']:.4f}")
             print(f"    Top-1 胜率 (收益>0): {metrics['win_rate']:.2%}")
-            print(f"    Top-1 精度 (命中前5%): {metrics['top1_precision']:.2%}")
-            print(f"    Top-5 精度 (命中前20%): {metrics['top5_precision']:.2%}")
+            _deg = metrics.get('topn_degenerate_days', 0)
+            if _deg:
+                print(f"    [警告] {_deg} 个交易日参考分布退化(高度不平衡)，Top-N 精度已忽略")
+                print(f"    Top-1 精度(有效日): {metrics['top1_precision']:.2%} (随机基准 {metrics['top1_baseline']:.2%})")
+                print(f"    Top-5 精度(有效日): {metrics['top5_precision']:.2%} (随机基准 {metrics['top5_baseline']:.2%})")
+            else:
+                print(f"    Top-1 精度 (命中前5%): {metrics['top1_precision']:.2%} (基准 {metrics.get('top1_baseline', 0):.2%})")
+                print(f"    Top-5 精度 (命中前20%): {metrics['top5_precision']:.2%} (基准 {metrics.get('top5_baseline', 0):.2%})")
         else:
             # 没有日期信息，退化为全局计算
             if len(np.unique(y_prob)) > 1 and len(np.unique(reference)) > 1:

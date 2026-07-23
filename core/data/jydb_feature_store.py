@@ -38,6 +38,29 @@ def iter_date_batches(
         cursor = batch_end + pd.Timedelta(days=1)
 
 
+def _build_fast() -> bool:
+    """是否启用高速构建模式（GEMINI_BUILD_FAST=1）。
+
+    高速模式下 SQLite 关闭 fsync（synchronous=OFF），依赖 raw 库可重跑；
+    构建中途被杀只需重跑本脚本即可补齐（upsert 幂等）。
+    """
+    return os.environ.get("GEMINI_BUILD_FAST") == "1"
+
+
+def _apply_build_pragmas(conn: sqlite3.Connection) -> None:
+    """统一设置构建期 SQLite PRAGMA。
+
+    高速模式: synchronous=OFF（跳过 fsync，仅靠结尾 checkpoint 落盘）；
+    默认: synchronous=NORMAL（WAL 下仅 checkpoint 时 fsync，安全）。
+    两者均禁用自动 checkpoint（wal_autocheckpoint=0），由主流程手动 TRUNCATE。
+    """
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=OFF" if _build_fast() else "PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=120000")
+    conn.execute("PRAGMA cache_size=-80000")       # 80 MB page cache
+    conn.execute("PRAGMA wal_autocheckpoint=0")    # 禁用自动 checkpoint；由主进程手动 TRUNCATE
+
+
 class JYDBFeatureStore:
     """统一的聚源 PIT 特征库。"""
 
@@ -49,11 +72,7 @@ class JYDBFeatureStore:
         if parent:
             os.makedirs(parent, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=60)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=120000")
-        conn.execute("PRAGMA cache_size=-80000")       # 80 MB page cache
-        conn.execute("PRAGMA wal_autocheckpoint=0")    # 禁用自动 checkpoint；由主进程手动 TRUNCATE
+        _apply_build_pragmas(conn)
         return conn
 
     @contextmanager

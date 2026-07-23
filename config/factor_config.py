@@ -111,7 +111,7 @@ class ModelConfig:
             elif model_type == 'lightgbm':
                 params['objective'] = 'regression'
         
-        if model_type == 'xgboost':
+        if model_type == 'xgboost' and not os.getenv('QD_DISABLE_GPU'):
             params.update(cls.GPU_PARAMS_XGB)
         return params
 
@@ -415,7 +415,7 @@ class OptimizationConfig:
 
     # 特征选择方法
     FEATURE_SELECTION_METHOD = 'hybrid'  # 'importance', 'correlation', 'mutual_info', 'rfe', 'hybrid'
-    N_FEATURES_TO_SELECT = 200  # 候选上限；最终数量仍受覆盖率、常量和相关性过滤约束
+    N_FEATURES_TO_SELECT = 400  # 候选上限；最终数量仍受覆盖率、常量和相关性过滤约束
 
     # 特征选择阈值
     FEATURE_IMPORTANCE_THRESHOLD = 0.001

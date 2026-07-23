@@ -48,7 +48,7 @@ if PROJECT_ROOT not in sys.path:
 from config.jydb_config import (
     JYDB_FEATURE_DB_PATH, JYDB_RAW_DB_PATH, DATABASE_PATH,
 )
-from core.data.jydb_feature_store import DEFAULT_TABLE_SPECS, iter_date_batches
+from core.data.jydb_feature_store import DEFAULT_TABLE_SPECS, iter_date_batches, _build_fast
 
 # ─── 优雅停止 ─────────────────────────────────────────────────────────────────────
 _stop_requested = False
@@ -435,6 +435,11 @@ def run_features(
                 prev = table_max_end.get(tbl)
                 if prev is None or b_end > prev:
                     table_max_end[tbl] = b_end
+                # 每批次完成即持久化水位线，支持中断后续跑（断点接续）
+                try:
+                    store.set_watermark(tbl, table_max_end[tbl])
+                except Exception:  # noqa: BLE001
+                    pass
                 elapsed = time.time() - t0
                 size_mb = os.path.getsize(feature_db) / 1024 / 1024 if os.path.exists(feature_db) else 0
                 speed = completed / elapsed * 60 if elapsed > 0 else 0
@@ -444,7 +449,7 @@ def run_features(
                 failed += 1
                 print(f"  [失败] {name} [{bs}..{be}]: {e}", file=sys.stderr, flush=True)
 
-            if time.time() - _last_ckpt > _CKPT_INTERVAL:
+            if (not _build_fast()) and time.time() - _last_ckpt > _CKPT_INTERVAL:
                 try:
                     with closing(sqlite3.connect(feature_db, timeout=60)) as _ckpt:
                         _ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -620,7 +625,7 @@ def run_market(
                 failed += 1
                 print(f"  [失败] daily_data [{bs}..{be}]: {e}", file=sys.stderr, flush=True)
 
-            if time.time() - _last_ckpt > _CKPT_INTERVAL:
+            if (not _build_fast()) and time.time() - _last_ckpt > _CKPT_INTERVAL:
                 try:
                     with closing(sqlite3.connect(market_db, timeout=60)) as _ckpt:
                         _ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -700,7 +705,13 @@ def main():
                         help="增量回看天数以捕获源表修订（默认 5）")
     parser.add_argument("--clear-market", action="store_true",
                         help="行情模式前先清空 daily_data/adjust_factor")
+    parser.add_argument("--fast", action="store_true",
+                        help="高速模式：synchronous=OFF + 仅结尾 checkpoint（依赖 raw 库可重跑；"
+                             "中途停止后可重跑本脚本断点接续）")
     args = parser.parse_args()
+
+    if args.fast:
+        os.environ["GEMINI_BUILD_FAST"] = "1"
 
     if args.batch_months <= 0:
         parser.error("--batch-months 必须为正整数")

@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--workers', type=int, default=default_workers, help=f'并行线程数 (默认{default_workers})')
     parser.add_argument('--objective-workers', type=int, default=1,
                         help='多目标训练并行进程数 (默认1=串行; >1 时各目标并行训练, 每进程自动限制 LightGBM 线程避免 oversubscription)')
+    parser.add_argument('--model-type', type=str, default='lightgbm', choices=['xgboost', 'lightgbm'],
+                        help='基学习器类型: xgboost 或 lightgbm (默认 lightgbm)')
 
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
@@ -265,7 +267,7 @@ def main():
     multi_model, results, selected_names = trainer.train_multiobjective_models(
         X, aligned, factor_names, dates,
         objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
-        model_type='lightgbm',
+        model_type=args.model_type,
         objective_workers=args.objective_workers,
     )
     import json, pickle, shutil

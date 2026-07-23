@@ -98,6 +98,8 @@ def main():
     ap = argparse.ArgumentParser(description="云端一键训练 + 回测 + 检验")
     ap.add_argument("--build-from-raw", action="store_true",
                     help="从 jydb_raw.db 重建中间库（数据未预处理时）")
+    ap.add_argument("--fast", action="store_true",
+                    help="高速构建模式（GEMINI_BUILD_FAST）：SQLite 关闭 fsync，配合断点续跑")
     ap.add_argument("--stocks", type=int, default=getattr(TrainingConfig, "STOCK_NUM", 6000))
     ap.add_argument("--out", default=None, help="分析报告/日志输出目录（默认 analysis/output 或 GEMINI_DATA_OUT）")
     ap.add_argument("--workers", type=int, default=getattr(TrainingConfig, "N_JOBS_FACTOR_CALC", 15))
@@ -169,9 +171,14 @@ def main():
 
     # ── 步骤 0: (可选) 从原始库重建 + 数据完整性自检 ──
     auto_build = args.build_from_raw or os.path.exists(_raw_db_path())
+    if args.fast:
+        os.environ["GEMINI_BUILD_FAST"] = "1"
     if auto_build:
         log("[1/4] 数据处理: 从 jydb_raw.db 重建中间库 ...")
-        _run([py, "-m", "scripts.build_intermediate_from_raw", "--mode", "both"], log)
+        build_cmd = [py, "-m", "scripts.build_intermediate_from_raw", "--mode", "both"]
+        if args.fast:
+            build_cmd.append("--fast")
+        _run(build_cmd, log)
     else:
         log("[1/4] 数据处理: 跳过重建（未检测到 jydb_raw.db 且未指定 --build-from-raw）")
 

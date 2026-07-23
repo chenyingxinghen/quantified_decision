@@ -117,4 +117,8 @@ xgboost==3.3.0
 # 不装 shap 时，分析报告自动改用 gain 重要性，功能不受影响。
 # shap==0.47.1
 
-paramiko
+# paramiko：仅 scripts/upload_to_gemini.py（本地往 Gemini 传文件的 SFTP 工具）用到，
+# 云端训练/回测/分析不导入。且其 manylinux wheel 在部分云端镜像/musl 容器上
+# 取不到（No matching distribution）。云端安装清单注释掉；本机需要上传时单独
+# 执行 `pip install paramiko` 即可。
+# paramiko

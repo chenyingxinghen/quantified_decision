@@ -2286,13 +2286,15 @@ class MLModelTrainer:
                     objective_result = result[model_type]
                     train_metrics = objective_result.get('train_metrics', {})
                     val_metrics = objective_result.get('val_metrics', {})
-                    if (
-                        objective.endswith('tradable_20d')
-                        and abs(float(train_metrics.get('rank_ic', 0.0))) < 1e-12
-                        and abs(float(val_metrics.get('rank_ic', 0.0))) < 1e-12
-                        and abs(float(val_metrics.get('auc', 0.5)) - 0.5) < 1e-12
-                    ):
-                        print(f"  [多目标训练] 跳过无预测区分度目标: {objective}")
+                    # 仅剔除无可学习信号的目标（如 tradable_20d：绝大多数股票可交易，
+                    # 标签近常量/高度不平衡，ndcg 可被刷到 1.0 但 Rank IC≈0）。
+                    # 旧阈值 1e-12 过严，导致 IC=0.03 的无效目标混入模型。
+                    # 新规则：训练集与验证集 Rank IC 的绝对值都低于 0.05 才跳过。
+                    _train_ic = abs(float(train_metrics.get('rank_ic', 0.0)))
+                    _val_ic = abs(float(val_metrics.get('rank_ic', 0.0)))
+                    if _train_ic < 0.05 and _val_ic < 0.05:
+                        print(f"  [多目标训练] 跳过无预测区分度目标 (Rank IC 过低): "
+                              f"{objective} train={_train_ic:.4f} val={_val_ic:.4f}")
                         self.models = {}
                         continue
                     trained_models[objective] = self.models[model_type]

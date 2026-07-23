@@ -43,7 +43,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from config.factor_config import TrainingConfig  # noqa: E402
-from config.jydb_config import DATABASE_PATH  # noqa: E402
+from config.jydb_config import DATABASE_PATH, JYDB_RAW_DB_PATH, JYDB_FEATURE_DB_PATH  # noqa: E402
 
 
 def _ts() -> str:
@@ -91,13 +91,18 @@ def _run(cmd, log: PipelineLog, fatal: bool = True):
 
 
 def _raw_db_path():
-    return os.path.join(os.path.dirname(DATABASE_PATH), "jydb_raw.db")
+    # raw 源库应跟随 JYDB_RAW_DB_PATH（通常指向 GEMINI_DATA_IN1 只读挂载），
+    # 不能从 DATABASE_PATH(行情库) 目录推断，否则在 raw/产物分离挂载时会找错位置。
+    return JYDB_RAW_DB_PATH
 
 
 def main():
     ap = argparse.ArgumentParser(description="云端一键训练 + 回测 + 检验")
     ap.add_argument("--build-from-raw", action="store_true",
                     help="从 jydb_raw.db 重建中间库（数据未预处理时）")
+    ap.add_argument("--skip-build", action="store_true",
+                    help="跳过数据重建步骤（中间库已存在时），直接进入训练；"
+                         "同时给训练传 --resume 以接续上次被中断的训练")
     ap.add_argument("--fast", action="store_true",
                     help="高速构建模式（GEMINI_BUILD_FAST）：SQLite 关闭 fsync，并隐含 --ram-build")
     ap.add_argument("--ram-build", action="store_true",
@@ -170,9 +175,18 @@ def main():
     else:
         log(f"回测(自定义): {bt_is_start} ~ {bt_is_end}")
     log("=" * 70)
+    log("数据库布局自检")
+    log(f"  raw 源库    : {JYDB_RAW_DB_PATH}  (存在={os.path.exists(JYDB_RAW_DB_PATH)})")
+    log(f"  特征库(产物): {JYDB_FEATURE_DB_PATH}  (可写={os.access(os.path.dirname(JYDB_FEATURE_DB_PATH) or '.', os.W_OK)})")
+    log(f"  行情库(产物): {DATABASE_PATH}  (可写={os.access(os.path.dirname(DATABASE_PATH) or '.', os.W_OK)})")
+    if os.environ.get("GEMINI_DATA_IN1"):
+        log(f"  GEMINI_DATA_IN1={os.environ['GEMINI_DATA_IN1']} (源挂载)")
+    if os.environ.get("GEMINI_DATA_OUT"):
+        log(f"  GEMINI_DATA_OUT={os.environ['GEMINI_DATA_OUT']} (输出目录)")
+    log("=" * 70)
 
     # ── 步骤 0: (可选) 从原始库重建 + 数据完整性自检 ──
-    auto_build = args.build_from_raw or os.path.exists(_raw_db_path())
+    auto_build = (args.build_from_raw or os.path.exists(_raw_db_path())) and not args.skip_build
     if args.fast:
         os.environ["GEMINI_BUILD_FAST"] = "1"
     if auto_build:
@@ -197,7 +211,11 @@ def main():
     # ── 步骤 1: 训练模型 ──
     log("[2/4] 模型训练: scripts.train_model ...")
     train_cmd = [py, "-m", "scripts.train_model", "--workers", str(args.workers),
+                 "--stocks", str(args.stocks),
                  "--start", train_start, "--end", train_end]
+    if args.skip_build:
+        # 跳过重建意味着中间库已就绪，训练接续上次中断（若有检查点）
+        train_cmd.append("--resume")
     _run(train_cmd, log)
 
     # ── 步骤 2: 回测（样本内 + 样本外，或单次自定义）──

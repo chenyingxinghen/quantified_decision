@@ -736,6 +736,23 @@ def main():
         args.raw_db, args.mode, args.start, args.end
     )
 
+    # ── 输出目录可写性自检（避免把产物写进只读挂载导致 cryptic 的 SQLite 报错）──
+    for _label, _p in (("特征库", args.feature_db), ("行情库", args.market_db)):
+        _d = os.path.dirname(os.path.abspath(_p))
+        if not os.path.isdir(_d):
+            try:
+                os.makedirs(_d, exist_ok=True)
+            except OSError as e:
+                parser.error(
+                    f"{_label}输出目录无法创建（只读挂载？）: {_d}\n    {e}\n"
+                    f"  解决: 设置 GEMINI_DATA_OUT 指向可写目录，或把 GEMINI_DATA_IN1 指向可写数据卷。"
+                )
+        elif not os.access(_d, os.W_OK):
+            parser.error(
+                f"{_label}输出目录不可写（只读挂载？）: {_d}\n"
+                f"  解决: 设置 GEMINI_DATA_OUT 指向可写目录，或把 GEMINI_DATA_IN1 指向可写数据卷。"
+            )
+
     # ── RAM 构建模式：把 raw 源与产物库放进 tmpfs，彻底绕开云盘 I/O ──
     # 云盘带宽才是真正的瓶颈（而非 CPU / fsync）。880GB 内存实例完全装得下几十 GB 的
     # raw + 特征库 + 行情库，放进 /dev/shm 后读写全是内存速度，48 核才能真正用上。
@@ -769,6 +786,8 @@ def main():
                 ram_dir = None
 
     print(f"本地源中间产物流水线 | 数据源: {os.path.abspath(args.raw_db)}")
+    print(f"  特征库输出 : {os.path.abspath(args.feature_db)}")
+    print(f"  行情库输出 : {os.path.abspath(args.market_db)}")
     print(f"请求区间 {args.start}..{args.end} | 对齐后 {eff_start}..{eff_end} | "
           f"模式 {args.mode} | 进程 {args.workers} | 批 {args.batch_months} 月"
           f"{' | [RAM构建]' if ram_dir else ''}", flush=True)

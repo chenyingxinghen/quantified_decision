@@ -14,6 +14,7 @@ from core.factors.train_ml_model import (
     MLModelTrainer,
     _read_factor_cache_version,
 )
+from core.factors.ml_factor_model import MultiObjectiveFactorModel
 from config.jydb_config import DATABASE_PATH
 from config.factor_config import TrainingConfig
 import pandas as pd
@@ -42,6 +43,9 @@ def main():
                         help='跳过增量缓存更新步骤，直接进入模型训练')
     parser.add_argument('--cache-end', type=str, default=None,
                         help='缓存更新截止日期 (YYYY-MM-DD)，默认=今天')
+    parser.add_argument('--resume', action='store_true',
+                        help='断点续跑：若上次训练被中断(如 OOM 被杀)，载入最新检查点继续，'
+                             '只训练未完成目标。需配合同一 latest 目录。')
 
     args = parser.parse_args()
 
@@ -264,20 +268,30 @@ def main():
     aligned = keys.merge(label_frame, on=['date', 'code'], how='left', sort=False)
     aligned = aligned.sort_values('__row_order').reset_index(drop=True)
 
+    # 断点续跑：检查点路径放在 latest 目录；若 --resume 且检查点存在则载入已有部分模型
+    latest_dir = os.path.join(TrainingConfig.SAVE_DIR, 'latest')
+    os.makedirs(latest_dir, exist_ok=True)
+    checkpoint_path = os.path.join(latest_dir, '.train_checkpoint.pkl')
+    resume_from = (MultiObjectiveFactorModel.load_model(checkpoint_path)
+                   if (args.resume and os.path.exists(checkpoint_path)) else None)
+    if resume_from is not None:
+        print(f"  [断点续跑] 载入检查点: {checkpoint_path} "
+              f"({len(resume_from.models)} 个已完成目标)")
+
     multi_model, results, selected_names = trainer.train_multiobjective_models(
         X, aligned, factor_names, dates,
         objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
         model_type=args.model_type,
         objective_workers=args.objective_workers,
+        resume_from=resume_from,
+        checkpoint_path=checkpoint_path,
     )
     import json, pickle, shutil
     archive_dir = os.path.join(
         TrainingConfig.SAVE_DIR,
         'multi_objective_' + datetime.now().strftime('%Y%m%d_%H%M%S'),
     )
-    latest_dir = os.path.join(TrainingConfig.SAVE_DIR, 'latest')
     os.makedirs(archive_dir, exist_ok=True)
-    os.makedirs(latest_dir, exist_ok=True)
     archive_model = os.path.join(archive_dir, 'multi_objective_factor_model.pkl')
     latest_model = os.path.join(latest_dir, 'multi_objective_factor_model.pkl')
     multi_model.save_model(archive_model)

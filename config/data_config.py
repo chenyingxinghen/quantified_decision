@@ -19,9 +19,18 @@ DATABASE_DIR = os.getenv("GEMINI_DATA_IN1", os.path.join(PROJECT_ROOT, "database
 #   - 训练主库（行情库）由 build_intermediate_from_raw.py 从 raw 重建 -> 指到 $GEMINI_DATA_OUT
 #   - 元数据库（market_sentiment）由 build 顺带产出 -> 指到 $GEMINI_DATA_OUT
 #   - 财务库为旧 Baostock 遗留，训练不使用，仅回测/选股用到
-DATABASE_PATH   = os.getenv("GEMINI_DATABASE_PATH", os.path.join(DATABASE_DIR, "stock_daily.db"))
-META_DB_PATH    = os.getenv("GEMINI_META_DB_PATH", os.path.join(DATABASE_DIR, "stock_meta.db"))
-FINANCE_DB_PATH = os.getenv("GEMINI_FINANCE_DB_PATH", os.path.join(DATABASE_DIR, "stock_finance.db"))
+# 云端适配（raw-only 策略）：以下"产出类"库可用环境变量覆盖到可写的 $GEMINI_DATA_OUT，
+# 仅把"源"库（jydb_raw.db）留在只读挂载点。本地不加这些变量时回退默认相对路径。
+#   - 训练主库（行情库）由 build_intermediate_from_raw.py 从 raw 重建 -> 指到 $GEMINI_DATA_OUT
+#   - 元数据库（market_sentiment）由 build 顺带产出 -> 指到 $GEMINI_DATA_OUT
+#   - 财务库为旧 Baostock 遗留，训练不使用，仅回测/选股用到
+# 回退链：专用覆盖变量 -> GEMINI_DATA_OUT -> DATABASE_DIR(=GEMINI_DATA_IN1 或项目 database/)
+DATABASE_PATH   = os.getenv("GEMINI_DATABASE_PATH",
+                            os.getenv("GEMINI_DATA_OUT", os.path.join(DATABASE_DIR, "stock_daily.db")))
+META_DB_PATH    = os.getenv("GEMINI_META_DB_PATH",
+                            os.getenv("GEMINI_DATA_OUT", os.path.join(DATABASE_DIR, "stock_meta.db")))
+FINANCE_DB_PATH = os.getenv("GEMINI_FINANCE_DB_PATH",
+                            os.getenv("GEMINI_DATA_OUT", os.path.join(DATABASE_DIR, "stock_finance.db")))
 
 # 用户数据数据库路径
 USER_DB_PATH = os.path.join(DATABASE_DIR, "user_data.db")

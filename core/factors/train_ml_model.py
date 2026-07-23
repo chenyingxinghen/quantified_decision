@@ -1998,7 +1998,7 @@ class MLModelTrainer:
                         cached_data = json.load(f)
                         # 只有当原始特征集完全一致时，才复用缓存
                         current_max_features = getattr(
-                            OptimizationConfig, 'N_FEATURES_TO_SELECT', 200
+                            OptimizationConfig, 'N_FEATURES_TO_SELECT', 400
                         )
                         if (
                             set(cached_data.get('original_features', [])) == set(original_factor_names)
@@ -2026,7 +2026,7 @@ class MLModelTrainer:
                             'original_features': original_factor_names,
                             'selected_features': factor_names,
                             'max_features': getattr(
-                                OptimizationConfig, 'N_FEATURES_TO_SELECT', 200
+                                OptimizationConfig, 'N_FEATURES_TO_SELECT', 400
                             ),
                             'preprocessing_version': 2,
                             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2172,6 +2172,8 @@ class MLModelTrainer:
         objective_weights: Dict[str, float] = None,
         model_type: str = 'lightgbm',
         objective_workers: int = 1,
+        resume_from: 'MultiObjectiveFactorModel' = None,
+        checkpoint_path: str = None,
     ):
         """训练多个方向统一的目标模型并返回组合模型及训练结果。
 
@@ -2237,7 +2239,7 @@ class MLModelTrainer:
             raise ValueError("所有多目标标签在训练样本中均无横截面变化")
 
         selector = CrossSectionalFeatureSelector(
-            max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 200),
+            max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 400),
             min_coverage=0.20,
             corr_threshold=getattr(OptimizationConfig, 'CORRELATION_THRESHOLD', 0.95),
         )
@@ -2260,19 +2262,67 @@ class MLModelTrainer:
         selected_indices = [factor_names.index(name) for name in selected_names]
         X_selected = X_fit[:, selected_indices]
 
+        # ── 断点续跑支持 ──
+        # resume_from: 上一次被中断运行已训练好的部分多目标模型。
+        # checkpoint_path: 每完成一个目标即增量落盘；被中断后重跑可跳过已完成目标，
+        #   只重训未完成目标，避免 SIGKILL(OOM) 等导致整段 90 分钟训练作废。
         trained_models = {}
+        skipped_set = set()
+        if resume_from is not None:
+            trained_models.update(resume_from.models)
+            # 进度侧车：记录被跳过(无区分度)的目标，避免续跑时重复训练。
+            _sidecar = (checkpoint_path or '') + '.json'
+            if os.path.exists(_sidecar):
+                try:
+                    import json as _json
+                    _prog = _json.load(open(_sidecar))
+                    skipped_set.update(_prog.get('skipped', []))
+                except Exception:
+                    pass
+            print(f"  [断点续跑] 已载入 {len(trained_models)} 个已完成目标，"
+                  f"{len(skipped_set)} 个已知跳过目标")
+
+        if checkpoint_path:
+            os.makedirs(os.path.dirname(checkpoint_path) or '.', exist_ok=True)
+
+        def _save_checkpoint():
+            if not checkpoint_path:
+                return
+            try:
+                _w = {name: normalized_weights.get(name, 1.0) for name in trained_models}
+                _wrapper = MultiObjectiveFactorModel(trained_models, _w)
+                _wrapper.save_model(checkpoint_path)
+                import json as _json
+                _json.dump(
+                    {'done': list(trained_models.keys()), 'skipped': list(skipped_set)},
+                    open(checkpoint_path + '.json', 'w'),
+                )
+                print(f"  [断点续跑] 检查点已落盘: {len(trained_models)}/{len(objective_cols)} 个目标")
+            except Exception as e:  # noqa: BLE001
+                print(f"  [警告] 增量检查点保存失败（不影响训练）: {e}")
+
         objective_results = {}
         previous_models = self.models
         try:
-            if objective_workers and objective_workers > 1 and len(objective_cols) > 1:
+            _done_names = set(trained_models.keys())
+            _pending = [o for o in objective_cols if o not in _done_names and o not in skipped_set]
+            if objective_workers and objective_workers > 1 and len(_pending) > 1:
                 # 并行路径：各目标在独立进程中训练，训练代码路径与串行完全一致
-                trained_models, objective_results = self._train_objectives_parallel(
-                    X_selected, y_fit, dates_fit, selected_names, objective_cols,
-                    normalized_weights, model_type, int(objective_workers),
+                _pending_idx = [objective_cols.index(o) for o in _pending]
+                _y_pending = y_fit[:, _pending_idx]
+                _parallel_done, objective_results = self._train_objectives_parallel(
+                    X_selected, _y_pending, dates_fit, selected_names, _pending,
+                    {n: normalized_weights[n] for n in _pending}, model_type, int(objective_workers),
                 )
+                for _o, _m in _parallel_done.items():
+                    trained_models[_o] = _m
+                _save_checkpoint()
             else:
-                # 串行路径（默认）：与历史行为一致
+                # 串行路径（默认）：与历史行为一致，且支持按目标增量落盘
                 for idx, objective in enumerate(objective_cols):
+                    if objective in _done_names or objective in skipped_set:
+                        print(f"\n[多目标训练] 跳过(已完成/已知跳过): {objective}")
+                        continue
                     print(f"\n[多目标训练] {objective} ({idx + 1}/{len(objective_cols)})")
                     objective_y = y_fit[:, idx]
                     result = self.train_models(
@@ -2295,13 +2345,19 @@ class MLModelTrainer:
                     if _train_ic < 0.05 and _val_ic < 0.05:
                         print(f"  [多目标训练] 跳过无预测区分度目标 (Rank IC 过低): "
                               f"{objective} train={_train_ic:.4f} val={_val_ic:.4f}")
+                        skipped_set.add(objective)
                         self.models = {}
+                        _save_checkpoint()
                         continue
                     trained_models[objective] = self.models[model_type]
                     objective_results[objective] = objective_result
                     self.models = {}
+                    _save_checkpoint()
         finally:
             self.models = previous_models
+
+        if not trained_models:
+            raise ValueError("没有任何目标被成功训练（全部被跳过或续跑载入为空）")
 
         wrapper = MultiObjectiveFactorModel(trained_models, {
             name: normalized_weights[name] for name in trained_models
@@ -2539,7 +2595,7 @@ class MLModelTrainer:
         from config.factor_config import OptimizationConfig
 
         selector = CrossSectionalFeatureSelector(
-            max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 200),
+            max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 400),
             min_coverage=0.20,
             corr_threshold=corr_threshold,
         )

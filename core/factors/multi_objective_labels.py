@@ -87,6 +87,33 @@ class MultiObjectiveLabelBuilder:
             return np.empty((0, span), dtype=float)
         return sliding_window_view(values[start_off:], span)[: n - end_off]
 
+    def _trailing_illiq(
+        self, close: np.ndarray, open_: np.ndarray, amount: np.ndarray, h: int, n: int
+    ) -> np.ndarray:
+        """t 日及之前 h 日窗口的 Amihud 非流动性（trailing，仅引用 ≤t 数据）。
+
+        与前向窗口对称：窗口为 [t-h+1 .. t]，入场取 open[t-h+1]，日收益基于
+        close[t-h+1..t]，成交额取 amount[t-h+1..t]。只用于构造「流动性变化」
+        目标（illiq_future − illiq_now）的 'now' 腿，不引入任何未来泄露。
+        """
+        out = np.full(n, np.nan, dtype=np.float32)
+        if n <= h:
+            return out
+        cw = sliding_window_view(close, h)[: n - h + 1]   # (n-h+1, h)：close[j..j+h-1]
+        aw = sliding_window_view(amount, h)[: n - h + 1]  # amount[j..j+h-1]
+        open_start = open_[: n - h + 1]                   # open_[j]
+        paths = np.concatenate([open_start[:, None], cw], axis=1)
+        daily_returns = paths[:, 1:] / paths[:, :-1] - 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            impact = np.abs(daily_returns) / aw
+        impact = np.where(np.isfinite(impact), impact, np.nan)
+        cnt = np.sum(np.isfinite(impact), axis=1)
+        imean = np.nansum(impact, axis=1) / np.maximum(cnt, 1)
+        imean = np.where(cnt == 0, np.nan, imean)
+        # 窗口结束于 i = j + h - 1（i ∈ [h-1, n-1]）
+        out[(h - 1):(h - 1) + len(imean)] = imean.astype(np.float32)
+        return out
+
     def _assert_forward_only(self) -> None:
         """防泄露闸门：任何 ≤0 的偏移都意味着引用了标签日或之前的数据。"""
         if self._max_forward_offset <= 0:
@@ -148,7 +175,7 @@ class MultiObjectiveLabelBuilder:
         valid_n = len(close_windows)
         mdd = np.full(n, np.nan, dtype=np.float32)
         downvol = np.full(n, np.nan, dtype=np.float32)
-        illiq = np.full(n, np.nan, dtype=np.float32)
+        illiq_future = np.full(n, np.nan, dtype=np.float32)
         tradable = np.full(n, np.nan, dtype=np.float32)
         if valid_n:
             paths = np.concatenate([entry[:valid_n, None], close_windows], axis=1)
@@ -171,14 +198,28 @@ class MultiObjectiveLabelBuilder:
             impact_count = np.sum(np.isfinite(impact), axis=1)
             impact_mean = np.nansum(impact, axis=1) / np.maximum(impact_count, 1)
             impact_mean[impact_count == 0] = np.nan
-            illiq[:valid_n] = impact_mean.astype(np.float32)
+            illiq_future[:valid_n] = impact_mean.astype(np.float32)
             tradable[:valid_n] = np.all(
                 np.isfinite(volume_windows) & (volume_windows > 0), axis=1
             ).astype(np.float32)
 
+        # ── 流动性「变化」目标：未来 h 日非流动性 − 当前 h 日非流动性 ───────
+        # 关键修复：原 y_illiq 为「水平值」，被 t 日已知流动性（成交额高度自相关）
+        # 近似确定性决定，ranking 退化为流动性排序（ndcg@5 恒=1）。改为「变化量」
+        # 后剔除了可预测的水平部分，目标只保留流动性真正变化的前向信息。
+        #   illiq_future[i] 有效区间 [0, n-h-1]；illiq_now[i] 有效区间 [h-1, n-1]
+        illiq_now = self._trailing_illiq(close, open_, amount, h, n)
+        illiq_chg = np.full(n, np.nan, dtype=np.float32)
+        lo, hi = h - 1, n - h - 1
+        if hi >= lo:
+            fv = illiq_future[lo:hi + 1]
+            nv = illiq_now[lo:hi + 1]
+            m = np.isfinite(fv) & np.isfinite(nv)
+            illiq_chg[lo:hi + 1][m] = (fv - nv)[m].astype(np.float32)
+
         result[f"y_mdd_{h}d"] = mdd
         result[f"y_downvol_{h}d"] = downvol
-        result[f"y_illiq_{h}d"] = illiq
+        result[f"y_illiq_{h}d"] = illiq_chg
         result[f"y_tradable_{h}d"] = tradable
 
         # ── 风险调整收益（前瞻 Sharpe 类）：未来收益 / |最大回撤| ─────────────
@@ -209,30 +250,32 @@ class MultiObjectiveLabelBuilder:
         return result
 
     def verify_no_lookahead(self, data: pd.DataFrame, tol: float = 1e-9) -> bool:
-        """实证防泄露：篡改 close[t] / open[t]（标签 t 的过去信息），标签 t 应不变。
+        """实证防泄露：篡改「前向窗口之外」的未来值，标签 t 应不变。
 
-        标签 t 只引用 open[t+1]（入场）与 close[t+horizon] 等未来数据，因此
-        对位于索引 i 处的 close/open 做改动，不应影响 result.loc[i] 的任何列。
-        返回 True 表示通过；否则抛出 AssertionError。
+        标签 t 最多只引用到 t + max_forward_offset（如 close[t+H]）。因此对索引
+        j = i + max_forward_offset + 1（严格超出标签 i 前向窗口的未来数据）做
+        改动，不应影响 result.loc[i] 的任何列。该检查同时适用于「纯前向」目标与
+        「流动性变化」类目标——后者其 'now' 腿合法引用 ≤t 数据，故不要求
+        close[t] 保持不变（那种断言会误报）。返回 True 表示通过；否则抛 AssertionError。
         """
         base = self.build(data)
 
-        # 单点扰动：只改动索引 i 处的 close/open（标签 i 的「过去」信息），
-        # 重建后标签 i 必须不变。若改的是 close[i+horizon]/open[i+1]（标签 i
-        # 合法引用的未来数据）则另当别论——这里只改同索引，恰好是标签 i 不
-        # 该引用的位置，从而精确区分「合法前向引用」与「泄露」。
         check_cols = [c for c in base.columns if c not in ("date", "code")]
         n = len(data)
         step = max(1, n // 40)  # 抽样若干索引，避免 O(n^2) 过慢
-        for i in range(step, n - self._max_forward_offset, step):
+        fwd = self._max_forward_offset
+        for i in range(step, n - fwd - 1, step):
+            j = i + fwd + 1  # 严格超出标签 i 前向窗口的未来索引
+            if j >= n:
+                continue
             mutated = data.copy()
             for col in ("close", "open"):
                 if col not in mutated.columns:
                     continue
                 arr = mutated[col].to_numpy(dtype=float).copy()
-                if not np.isfinite(arr[i]):
+                if not np.isfinite(arr[j]):
                     continue
-                arr[i] = arr[i] * 1.234 + 0.567
+                arr[j] = arr[j] * 1.234 + 0.567
                 mutated[col] = arr
             after = self.build(mutated)
             for c in check_cols:
@@ -240,8 +283,8 @@ class MultiObjectiveLabelBuilder:
                 a = float(after[c].to_numpy(dtype=float)[i])
                 if np.isfinite(b) and abs(b - a) > tol:
                     raise AssertionError(
-                        f"泄露检测到：列 {c} 在行 {i} 依赖了 t 日/更早数据 "
-                        f"(base={b}, mutated={a})"
+                        f"泄露检测到：列 {c} 在行 {i} 依赖了超出前向窗口的未来数据 "
+                        f"(索引 {j}, base={b}, mutated={a})"
                     )
         return True
 

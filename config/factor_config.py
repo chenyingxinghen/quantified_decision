@@ -30,8 +30,8 @@ class ModelConfig:
 
         'min_child_weight': 1,
         'min_gain_to_split': 0.01, # 最小分裂增益，剪掉无意义的分裂
-        'reg_alpha': 0.01,          # L1 正则，促进稀疏性
-        'reg_lambda': 0.01,         # L2 正则，平滑权重
+        'reg_alpha': 0.2,          # L1 正则，促进稀疏性
+        'reg_lambda': 0.2,         # L2 正则，平滑权重
 
         'subsample': 0.8,
         'colsample_bytree': 0.8,
@@ -44,7 +44,7 @@ class ModelConfig:
         'lambdarank_truncation_level': 50,
         'label_gain': [i//3*i**1.5 if i>2 else i for i in range(n_bins)],
 
-        'early_stopping_rounds': 200,
+        'early_stopping_rounds': 50,
         'n_jobs': -1,  # 使用所有CPU核心
         'verbosity': -1,
     }
@@ -68,7 +68,7 @@ class ModelConfig:
         'ndcg_exp_gain': False,  
 
         'n_jobs': -1,  # 使用所有CPU核心
-        'early_stopping_rounds': 200,
+        'early_stopping_rounds': 50,
         'verbosity': 1,
     }
 

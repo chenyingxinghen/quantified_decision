@@ -166,19 +166,40 @@ class NeuralNetFactorModel:
             sampler = None
             shuffle = True
 
-        train_ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(Xtr), torch.from_numpy(ytr)
-        )
+        use_cuda = "cuda" in str(self.device)
+        pin_memory = False
+        # 显存占用低时，把整份训练/验证数据一次性搬上 GPU，消除训练循环里
+        # 逐批的 CPU→GPU 小拷贝（这是低利用率的主要拖累）。显存不足则回退
+        # 到 CPU 常驻 + pin_memory 异步搬运，保证不 OOM。两种路径数值结果一致。
+        if use_cuda:
+            torch.backends.cudnn.benchmark = True
+            try:
+                Xtr_t = torch.from_numpy(Xtr).to(self.device)
+                ytr_t = torch.from_numpy(ytr).to(self.device)
+                if has_val:
+                    Xv_t = torch.from_numpy(Xv).to(self.device)
+                    yv_t = torch.from_numpy(yv).to(self.device)
+                # 整份数据已在 GPU，无需 pin_memory / 异步搬运
+            except RuntimeError:
+                # 显存不够（如 6GB 卡跑全市场）：回退 CPU + pin_memory
+                Xtr_t, ytr_t = torch.from_numpy(Xtr), torch.from_numpy(ytr)
+                if has_val:
+                    Xv_t, yv_t = torch.from_numpy(Xv), torch.from_numpy(yv)
+                pin_memory = True
+        else:
+            Xtr_t, ytr_t = torch.from_numpy(Xtr), torch.from_numpy(ytr)
+            if has_val:
+                Xv_t, yv_t = torch.from_numpy(Xv), torch.from_numpy(yv)
+        train_ds = torch.utils.data.TensorDataset(Xtr_t, ytr_t)
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=self.batch_size, shuffle=shuffle,
-            sampler=sampler, drop_last=False,
+            sampler=sampler, drop_last=False, pin_memory=pin_memory,
         )
         if has_val:
-            val_ds = torch.utils.data.TensorDataset(
-                torch.from_numpy(Xv), torch.from_numpy(yv)
-            )
+            val_ds = torch.utils.data.TensorDataset(Xv_t, yv_t)
             val_loader = torch.utils.data.DataLoader(
-                val_ds, batch_size=self.batch_size, shuffle=False
+                val_ds, batch_size=self.batch_size, shuffle=False,
+                pin_memory=pin_memory,
             )
 
         loss_fn = nn.MSELoss(reduction="mean")
@@ -197,31 +218,34 @@ class NeuralNetFactorModel:
 
         for epoch in range(1, self.epochs + 1):
             self.model.train()
-            running = 0.0
+            running = torch.zeros((), device=self.device)
             n = 0
             for xb, yb in train_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
+                xb = xb.to(self.device, non_blocking=pin_memory)
+                yb = yb.to(self.device, non_blocking=pin_memory)
                 optimizer.zero_grad()
                 pred = self.model(xb)
                 loss = loss_fn(pred, yb)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 optimizer.step()
-                running += loss.item() * xb.size(0)
+                # 累计用张量、不在每 batch 触发 CPU↔GPU 同步（结果中性）
+                running += loss * xb.size(0)
                 n += xb.size(0)
-            train_loss = running / max(n, 1)
+            train_loss = (running / max(n, 1)).item()
             train_losses.append(train_loss)
 
             if has_val:
                 self.model.eval()
-                v_running = 0.0
+                v_running = torch.zeros((), device=self.device)
                 v_n = 0
                 with torch.no_grad():
                     for xb, yb in val_loader:
-                        xb, yb = xb.to(self.device), yb.to(self.device)
-                        v_running += loss_fn(self.model(xb), yb).item() * xb.size(0)
+                        xb = xb.to(self.device, non_blocking=pin_memory)
+                        yb = yb.to(self.device, non_blocking=pin_memory)
+                        v_running += loss_fn(self.model(xb), yb) * xb.size(0)
                         v_n += xb.size(0)
-                val_loss = v_running / max(v_n, 1)
+                val_loss = (v_running / max(v_n, 1)).item()
                 val_losses.append(val_loss)
                 scheduler.step(val_loss)
                 if val_loss < best_val_loss - 1e-6:

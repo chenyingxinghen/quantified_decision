@@ -16,6 +16,7 @@ analysis/run_analysis.py — 分析编排入口（CLI）
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
 
@@ -94,6 +95,9 @@ def main():
     trainer.norm_stats = None
     Xn = normalize_features(trainer, X, dates, factor_names)
     scores = predict_scores(model, Xn, factor_names)
+    # X 之后不再需要（下游模块只用 scores/returns/dates/codes），立即释放 ~9.5GB
+    del X
+    gc.collect()
 
     # ── 3. 市场状态 ──
     regime_per_sample, market_daily, date_to_regime = classify_regimes(dates, returns)
@@ -121,6 +125,10 @@ def main():
             "consistency": {"skipped": True, "per_objective_rank_corr": {},
                             "mean_consistency": float("nan")},
         }
+
+    # SHAP 已完成（或跳过），释放归一化特征矩阵 ~9.5GB
+    del Xn
+    gc.collect()
 
     print("[analysis] 机制分析 ...")
     mechanism_res = mech.build_mechanism_narrative({

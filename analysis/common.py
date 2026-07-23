@@ -51,13 +51,22 @@ def load_full_dataset_from_parquet(path: str):
     """
     store = pd.read_parquet(path)
     meta = pickle.loads(store.attrs["meta"])
-    arrays = [store[f"arr_{i}"].to_numpy() for i in range(meta["n_arrays"])]
+    shapes = meta.get("shapes")
+    arrays = []
+    for i in range(meta["n_arrays"]):
+        arr = store[f"arr_{i}"].to_numpy()
+        # 二维数组（特征矩阵 X）落盘时被展平，读取时按记录的形状还原
+        if shapes is not None and len(shapes[i]) == 2:
+            arr = arr.reshape(shapes[i])
+        arrays.append(arr)
     factor_names = meta["factor_names"]
     # codes 是 object 列，需从单独列取回
     codes = store["codes"].to_numpy()
     # 把 codes 放回第 10 位（与 prepare_dataset 顺序一致）
     out = list(arrays)
     out.insert(10, codes)
+    # 加载后统一特征矩阵为 float32（与 build/评分一致，降低内存占用）
+    out[0] = np.ascontiguousarray(out[0], dtype=np.float32)
     return tuple(out)
 
 
@@ -68,12 +77,24 @@ def save_full_dataset_to_parquet(path: str, full_dataset) -> None:
     arrays = [X, y, returns, np.asarray(factor_names, dtype=object),
               np.asarray(dates, dtype=object), unbuyable_mask,
               limit_groups, path_scores, is_st_arr, w_sig_arr]
-    cols = {f"arr_{i}": pd.Series(a) for i, a in enumerate(arrays)}
+    cols = {}
+    shapes = []
+    for i, a in enumerate(arrays):
+        a = np.asarray(a)
+        shapes.append(a.shape)
+        if a.ndim == 1:
+            cols[f"arr_{i}"] = pd.Series(a)
+        elif a.ndim == 2:
+            # X 是二维特征矩阵，DataFrame 单列必须是一维；展平存储并记录形状以便恢复
+            cols[f"arr_{i}"] = pd.Series(a.reshape(-1))
+        else:
+            raise ValueError(f"不支持的数组维度 ndim={a.ndim} (arr_{i})")
     cols["codes"] = pd.Series(codes)
     df = pd.DataFrame(cols)
     meta = {
         "n_arrays": len(arrays),
         "factor_names": list(factor_names),
+        "shapes": shapes,
     }
     df.attrs["meta"] = pickle.dumps(meta)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -127,6 +148,11 @@ def build_full_dataset(
         use_factor_cache_only=True,
         return_codes=True,
     )
+    # 特征矩阵 X 降为 float32：与训练归一化 (Xn 为 float32) 一致，且把后续
+    # save 副本与评分阶段的多份副本内存减半，避免 analysis OOM / 缓存写不出导致的死亡循环。
+    fd = list(full_dataset)
+    fd[0] = np.ascontiguousarray(fd[0], dtype=np.float32)
+    full_dataset = tuple(fd)
     if cache_path:
         save_full_dataset_to_parquet(cache_path, full_dataset)
         print(f"[dataset] 已缓存到: {cache_path}")
@@ -175,10 +201,23 @@ def normalize_features(trainer, X: np.ndarray, dates: np.ndarray,
     return Xn
 
 
-def predict_scores(model, Xn: np.ndarray, factor_names: List[str]) -> np.ndarray:
-    """用多目标模型对归一化特征打分（加权总分）。"""
-    X_df = pd.DataFrame(Xn, columns=list(factor_names))
-    return np.asarray(model.predict(X_df), dtype=np.float32)
+def predict_scores(model, Xn: np.ndarray, factor_names: List[str],
+                   chunk_size: int = 200_000) -> np.ndarray:
+    """用多目标模型对归一化特征打分（加权总分）。
+
+    分块预测：避免一次性把全量特征矩阵 (178万×829) 包装成 float64 DataFrame
+    造成 ~19GB 内存峰值（analysis OOM 主因之一）。每块仍按 pandas 默认升 float64，
+    数值与原始全量预测逐元素一致。
+    """
+    factor_names = list(factor_names)
+    n = Xn.shape[0]
+    chunks = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        Xc = pd.DataFrame(np.ascontiguousarray(Xn[start:end]), columns=factor_names)
+        chunks.append(np.asarray(model.predict(Xc), dtype=np.float32))
+        del Xc
+    return np.concatenate(chunks, axis=0)
 
 
 # ════════════════════════════════════════════════════════════════════════

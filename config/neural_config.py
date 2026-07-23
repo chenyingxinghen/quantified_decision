@@ -18,7 +18,7 @@ class NeuralConfig:
 
     # ── 训练超参 ───────────────────────────────────────────────────────────
     LEARNING_RATE: float = 1e-3
-    BATCH_SIZE: int = 4096
+    BATCH_SIZE: int = 32768                       # GPU 训练主杠杆：数据常驻 GPU 后调大可进一步提升 CUDA 利用率（4096→16384→32768；显存够可试 65536）
     EPOCHS: int = 60
     WEIGHT_DECAY: float = 1e-5
     PATIENCE: int = 12                            # Early stopping 容忍轮数

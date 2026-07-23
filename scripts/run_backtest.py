@@ -41,6 +41,11 @@ def main():
                         help='固定持仓天数，覆盖默认 TIME_STOP_DAYS')
     parser.add_argument('--time-stop-max-return', type=float, default=None,
                         help='时间止损触发的最大收益率阈值 (默认0.3=亏30%%才退；设很大则到点必退)')
+    parser.add_argument('--max-positions', type=int, default=None,
+                        help='最大同时持仓数量 (默认使用 strategy_config.MAX_POSITIONS；覆盖以测试组合分散度)')
+    parser.add_argument('--portfolio', action='store_true', default=False,
+                        help='组合构建模式：用收益目标(ret_5/20/60d)组合分选股，风险目标(mdd/downvol)前置过滤，'
+                             '经均值-方差优化产出带权组合（多目标模型的正确用法，而非加权求和挑一只）')
     args = parser.parse_args()
 
     print("=" * 80)
@@ -90,6 +95,20 @@ def main():
         cache_dir=cache_dir,
         name="ML因子策略",
         single_objective=args.objective,
+        use_portfolio_optimizer=args.portfolio,
+        portfolio_config=(
+            {
+                'method': 'max_sharpe',
+                'max_weight': 0.2,
+                'min_weight': 0.0,
+                'drawdown_penalty': 0.3,
+                'candidate_pool': 40,
+                'lookback_days': 120,
+                'score_to_return_scale': 0.8,
+                'shrinkage': 0.1,
+                'risk_filter': {'min_mdd_score': 0.35, 'min_downvol_score': 0.35},
+            } if args.portfolio else None
+        ),
     )
     
     # 3. 创建回测引擎
@@ -99,7 +118,7 @@ def main():
         data_handler=data_handler,
         initial_capital=initial_capital,
         commission_rate=commission_rate,
-        max_positions=MAX_POSITIONS,
+        max_positions=args.max_positions if args.max_positions is not None else MAX_POSITIONS,
         time_stop_days=args.hold_days if args.hold_days else TIME_STOP_DAYS,
         time_stop_max_return_pct=(args.time_stop_max_return
                                   if args.time_stop_max_return is not None

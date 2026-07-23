@@ -258,7 +258,7 @@ def _train_objective_worker(payload):
     trainer = MLModelTrainer(db_path)
     res = trainer.train_models(
         _np.asarray(X), y, y, names, dates,
-        model_types=[model_type], task='ranking', apply_feature_selection=False,
+        model_types=[model_type], task='ranking', apply_feature_selection=True,
         skip_normalization=True,
     )
     model = trainer.models.get(model_type)
@@ -2015,7 +2015,7 @@ class MLModelTrainer:
                 print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
                 # 使用相关性过滤
                 X_train, factor_names = self._select_features(
-                    X_train, factor_names, y=y_train, corr_threshold=0.95,
+                    X_train, factor_names, y=y_train, corr_threshold=0.8,
                     feature_coverage=feature_coverage_train,
                 )
                 # 保存特征选择结果到缓存
@@ -2279,7 +2279,7 @@ class MLModelTrainer:
                         X_selected.copy(), objective_y.copy(), objective_y.copy(),
                         selected_names, dates_fit,
                         model_types=[model_type], task='ranking',
-                        apply_feature_selection=False,
+                        apply_feature_selection=True,
                     )
                     if model_type not in self.models or model_type not in result:
                         raise RuntimeError(f"目标 {objective} 训练失败")

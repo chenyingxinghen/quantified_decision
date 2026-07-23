@@ -277,7 +277,25 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     objective_components = self.model.predict_components(model_frame)
         else:
             probs = self.model.predict(X_arr)
-        
+
+        # ── 组合构建模式：用「收益目标组合分」作选股/打分信号，风险目标作前置过滤 ──
+        # 而非把收益与风险加权求和混成一个排序分（后者会让静态/失效的风险分霸榜，
+        # 导致头部股票几乎不变）。收益目标(ret_5/20/60d)是动态、健康的阿尔法来源；
+        # 风险目标(mdd/downvol)只用于剔除高回撤/高下行波动的票，不进入排序分。
+        portfolio_risk_thr = (0.35, 0.35)
+        if self.use_portfolio_optimizer and objective_components is not None:
+            _ret_objs = ['rank_y_ret_5d', 'rank_y_ret_20d', 'rank_y_ret_60d']
+            _rf = self.portfolio_config.get('risk_filter', {})
+            portfolio_risk_thr = (
+                float(_rf.get('min_mdd_score', 0.35)),
+                float(_rf.get('min_downvol_score', 0.35)),
+            )
+            _alpha = []
+            for i in range(len(stock_codes_with_data)):
+                _vals = [float(objective_components[o][i]) for o in _ret_objs if o in objective_components]
+                _alpha.append(float(np.mean(_vals)) if _vals else float(probs[i]))
+            probs = np.array(_alpha, dtype=np.float32)
+
         # 5. 生成信号
         candidates = []
         for i, code in enumerate(stock_codes_with_data):
@@ -292,6 +310,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     name: float(values[i])
                     for name, values in objective_components.items()
                 }
+            # 组合模式：风险目标前置过滤（剔除预测高回撤/高下行波动的票）
+            if objective_components is not None and getattr(self, 'use_portfolio_optimizer', False):
+                _thr_mdd, _thr_dv = portfolio_risk_thr
+                _cs = component_scores or {}
+                if _cs.get('rank_y_mdd_20d', 1.0) < _thr_mdd or _cs.get('rank_y_downvol_20d', 1.0) < _thr_dv:
+                    continue
             candidates.append({
                 'code': code, 'score': confidence + tie_breaker,
                 'prob': probs[i], 'objective_scores': component_scores,
@@ -332,7 +356,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
         from core.neural.portfolio import select_portfolio
 
         pcfg = self.portfolio_config or {}
-        pool_size = max(int(pcfg.get('candidate_pool', 30)), available_slots)
+        # 候选池上限 = 持仓数(max_positions)：否则优化器会把权重摊到几十只票，
+        # 违背"构建 N 只票的组合"的本意。candidate_pool 仅在下限不足时兜底。
+        _cfg_pool = int(pcfg.get('candidate_pool', 30))
+        pool_size = max(available_slots, min(_cfg_pool, available_slots))
         pool = candidates[:pool_size]
         scores = {c['code']: float(c['prob']) for c in pool}
 
@@ -455,7 +482,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
             conn.close()
 
         # ---- PIT 财务序列: 改用聚源 FinanceReportFetcher (jydb_features.db) ----
-        from core.factors.fundamental_factors import FinanceReportFetcher
+        from core.factors.fundamental_factors import FinanceReportFetcher, _JY_FIN_COLUMNS
         fetcher = FinanceReportFetcher(db_path=self.db_path)
         if not os.path.exists(fetcher.feature_db):
             print("  [WARN] 未找到聚源特征库 jydb_features.db，PIT 财务序列不可用"
@@ -471,19 +498,56 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 c2.close()
             except Exception:
                 codes = set()
+        if not codes:
+            return
 
-        # 契约列顺序必须与 _get_optimized_info_map 的取值索引一致: [EPSJB, totalShare, ZCFZL]
-        for code in codes:
-            df = fetcher._load_reports_for_code(code)
-            if df.empty:
+        # 一次性批量拉取所有股票的 PIT 财务序列（仅取筛选真实需要的 3 个契约列），
+        # 取代原实现中对每只股票单独打开 SQLite 连接 + 查询（5525 次连接/查询，极慢且 IO 阻塞）。
+        # 契约列顺序必须与 _get_optimized_info_map 的取值索引一致: [EPS, totalShare, ZCFZL]
+        need_feats = ['jy_fin_EPS', 'jy_fin_totalShare', 'jy_fin_DebtAssetsRatio']
+        placeholders = ','.join(['?'] * len(codes))
+        q = (
+            "SELECT code, available_date, revision, feature_name, feature_value "
+            "FROM pit_features "
+            "WHERE source_table = 'LC_MainIndexNew' "
+            f"AND code IN ({placeholders}) "
+            "AND feature_name IN (?, ?, ?)"
+        )
+        try:
+            conn = sqlite3.connect(fetcher.feature_db, timeout=60)
+            raw = pd.read_sql_query(q, conn, params=list(codes) + need_feats)
+            conn.close()
+        except Exception as _e:
+            print(f"  [WARN] 批量加载 PIT 财务序列失败: {_e}（筛选将退化为 None）")
+            return
+
+        if raw.empty:
+            print("  [INFO] PIT 财务序列为空（pe_ratio / zcfzl 退化为 None）")
+            return
+
+        # 长表 -> 按 code 分组，组内透视（去掉 jy_fin_ 前缀）为宽表
+        raw['feature_name'] = raw['feature_name'].astype(str).str.replace(r'^jy_fin_', '', regex=True)
+        n = 0
+        for code, g in raw.groupby('code', sort=False):
+            wide = g.pivot_table(index='available_date', columns='feature_name',
+                                 values='feature_value', aggfunc='last').reset_index()
+            for c in _JY_FIN_COLUMNS:
+                if c not in wide.columns:
+                    wide[c] = np.nan
+                wide[c] = pd.to_numeric(wide[c], errors='coerce')
+            wide['announced_date'] = pd.to_datetime(wide['available_date'], errors='coerce')
+            wide = wide.dropna(subset=['announced_date']).sort_values('announced_date').reset_index(drop=True)
+            if wide.empty:
                 continue
-            dates = df['announced_date'].dt.strftime('%Y-%m-%d').astype(str).to_numpy()
-            eps = df.get('EPS', pd.Series(np.nan, index=df.index)).to_numpy(dtype=np.float32, copy=True)
+            dates = wide['announced_date'].dt.strftime('%Y-%m-%d').astype(str).to_numpy()
+            eps = wide.get('EPS', pd.Series(np.nan, index=wide.index)).to_numpy(dtype=np.float32, copy=True)
             # 聚源主指标无 totalShare 对应字段 -> 恒为 NaN
-            ts = df.get('totalShare', pd.Series(np.nan, index=df.index)).to_numpy(dtype=np.float32, copy=True)
-            zcfzl = df.get('DebtAssetsRatio', pd.Series(np.nan, index=df.index)).to_numpy(dtype=np.float32, copy=True)
+            ts = wide.get('totalShare', pd.Series(np.nan, index=wide.index)).to_numpy(dtype=np.float32, copy=True)
+            zcfzl = wide.get('DebtAssetsRatio', pd.Series(np.nan, index=wide.index)).to_numpy(dtype=np.float32, copy=True)
             values = np.column_stack([eps, ts, zcfzl]).astype(np.float32, copy=False)
             self._finance_history[code] = (dates, values)
+            n += 1
+        print(f"  PIT 财务序列批量预缓存完成: {n}/{len(codes)} 只")
 
     def _get_optimized_info_map(self, target_date: str, market_data: Any) -> Dict[str, Dict]:
         """极速信息映射逻辑，复用预缓存信息"""

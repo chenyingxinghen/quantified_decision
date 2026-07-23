@@ -31,7 +31,7 @@ COMMISSION_RATE = 0.005
 
 # 基础参数
 INITIAL_CAPITAL = 1.0          # 初始资金
-MAX_POSITIONS = 1               
+MAX_POSITIONS = 10               
 
 # ATR相关参数（用于止损止盈计算）
 ATR_PERIOD = 14                     # ATR计算周期

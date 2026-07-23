@@ -159,8 +159,13 @@ class NeuralTrainer:
         dates = np.asarray(dataset["dates"])
         returns = np.asarray(dataset["returns"], dtype=np.float32)
 
-        weights = dict(objective_weights or
-                       getattr(TrainingConfig, "MULTI_OBJECTIVE_WEIGHTS", {}))
+        # 神经网络默认使用 NeuralConfig 的多目标权重（强调风险调整收益），
+        # 与 GBM 的 TrainingConfig.MULTI_OBJECTIVE_WEIGHTS 解耦。
+        if objective_weights is None:
+            from config import neural_config as _nc
+            weights = dict(_nc.NeuralConfig.MULTI_OBJECTIVE_WEIGHTS)
+        else:
+            weights = dict(objective_weights)
         objective_cols = []
         norm_weights = {}
         for raw_name, w in weights.items():

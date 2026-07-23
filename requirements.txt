@@ -99,4 +99,9 @@ Werkzeug==3.1.8
 
 xgboost==3.3.0
 
+# SHAP：用于全局/交互特征重要性与跨模型一致性（analysis 模块）。
+# 若云端离线环境无法安装，analysis/shap_analysis.py 会自动回退到
+# LightGBM gain 重要性 + 排列重要性，保证分析报告仍可生成。
+shap==0.47.1
+
 paramiko

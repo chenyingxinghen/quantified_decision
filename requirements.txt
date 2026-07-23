@@ -13,7 +13,9 @@ click==8.4.2
 
 colorama==0.4.6
 
-comtypes==1.4.16
+# 以下为 Windows 本地实盘自动化依赖，云端 Linux(Gemini) 无需且无法安装，
+# 已从云端安装清单注释掉。如需本地 Windows 实盘交易，请在该机单独安装。
+# comtypes==1.4.16
 
 contourpy==1.3.3
 
@@ -21,9 +23,9 @@ cssselect==1.4.0
 
 cycler==0.12.1
 
-easytrader==0.23.7
+# easytrader==0.23.7
 
-easyutils==0.1.7
+# easyutils==0.1.7
 
 Flask==3.1.3
 
@@ -59,7 +61,10 @@ pillow==12.3.0
 
 pyarrow==25.0.0
 
-pyodbc==5.3.0
+# pyodbc：仅用于聚源 ODBC 抽取路径（core/data/jydb_feature_store.py 中为可选 try/except
+# 导入，缺失不崩溃）。云端走 jydb_raw.db(sqlite) 不需要；且在 Linux 上缺 unixODBC
+# 开发头文件会构建失败，故云端安装清单注释掉。如需 ODBC 抽取，请单独装 unixODBC 后再装。
+# pyodbc==5.3.0
 
 pyparsing==3.3.2
 
@@ -71,7 +76,7 @@ python-dateutil==2.9.0.post0
 
 python-dotenv==1.2.2
 
-pywinauto==0.6.6
+# pywinauto==0.6.6
 
 requests==2.34.2
 
@@ -102,6 +107,14 @@ xgboost==3.3.0
 # SHAP：用于全局/交互特征重要性与跨模型一致性（analysis 模块）。
 # 若云端离线环境无法安装，analysis/shap_analysis.py 会自动回退到
 # LightGBM gain 重要性 + 排列重要性，保证分析报告仍可生成。
-shap==0.47.1
+#
+# 注意（2026-07-23）：云端 Gemini 镜像为 Python 3.12，shap 的核心依赖
+# numba 在 3.12 上没有可用的预编译 wheel，只能从源码构建，而旧版 numba
+# 的 setup 守卫拒绝 >=3.12，导致 `pip install -r requirements.txt` 整体失败。
+# 因此默认注释掉 shap；如需 SHAP，请先在 3.12 环境单独装好带 cp312 wheel 的
+#   pip install "numba>=0.58.1" llvmlite
+# 再手动 `pip install shap`（或升级到支持 3.12 的 shap/numba 组合）。
+# 不装 shap 时，分析报告自动改用 gain 重要性，功能不受影响。
+# shap==0.47.1
 
 paramiko

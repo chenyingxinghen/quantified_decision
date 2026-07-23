@@ -99,7 +99,9 @@ def main():
     ap.add_argument("--build-from-raw", action="store_true",
                     help="从 jydb_raw.db 重建中间库（数据未预处理时）")
     ap.add_argument("--fast", action="store_true",
-                    help="高速构建模式（GEMINI_BUILD_FAST）：SQLite 关闭 fsync，配合断点续跑")
+                    help="高速构建模式（GEMINI_BUILD_FAST）：SQLite 关闭 fsync，并隐含 --ram-build")
+    ap.add_argument("--ram-build", action="store_true",
+                    help="tmpfs 内存盘构建（绕开云盘 I/O）；--fast 已隐含")
     ap.add_argument("--stocks", type=int, default=getattr(TrainingConfig, "STOCK_NUM", 6000))
     ap.add_argument("--out", default=None, help="分析报告/日志输出目录（默认 analysis/output 或 GEMINI_DATA_OUT）")
     ap.add_argument("--workers", type=int, default=getattr(TrainingConfig, "N_JOBS_FACTOR_CALC", 15))
@@ -178,6 +180,8 @@ def main():
         build_cmd = [py, "-m", "scripts.build_intermediate_from_raw", "--mode", "both"]
         if args.fast:
             build_cmd.append("--fast")
+        if args.ram_build:
+            build_cmd.append("--ram-build")
         _run(build_cmd, log)
     else:
         log("[1/4] 数据处理: 跳过重建（未检测到 jydb_raw.db 且未指定 --build-from-raw）")

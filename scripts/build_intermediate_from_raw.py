@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import signal
 import sqlite3
 import sys
+import tempfile
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -449,10 +451,11 @@ def run_features(
                 failed += 1
                 print(f"  [失败] {name} [{bs}..{be}]: {e}", file=sys.stderr, flush=True)
 
-            if (not _build_fast()) and time.time() - _last_ckpt > _CKPT_INTERVAL:
+            _ckpt_mode = "TRUNCATE" if _build_fast() else "PASSIVE"
+            if time.time() - _last_ckpt > _CKPT_INTERVAL:
                 try:
                     with closing(sqlite3.connect(feature_db, timeout=60)) as _ckpt:
-                        _ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        _ckpt.execute(f"PRAGMA wal_checkpoint({_ckpt_mode})")
                     _last_ckpt = time.time()
                 except Exception:
                     pass
@@ -625,10 +628,11 @@ def run_market(
                 failed += 1
                 print(f"  [失败] daily_data [{bs}..{be}]: {e}", file=sys.stderr, flush=True)
 
-            if (not _build_fast()) and time.time() - _last_ckpt > _CKPT_INTERVAL:
+            _ckpt_mode = "TRUNCATE" if _build_fast() else "PASSIVE"
+            if time.time() - _last_ckpt > _CKPT_INTERVAL:
                 try:
                     with closing(sqlite3.connect(market_db, timeout=60)) as _ckpt:
-                        _ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        _ckpt.execute(f"PRAGMA wal_checkpoint({_ckpt_mode})")
                     _last_ckpt = time.time()
                 except Exception:
                     pass
@@ -707,10 +711,14 @@ def main():
                         help="行情模式前先清空 daily_data/adjust_factor")
     parser.add_argument("--fast", action="store_true",
                         help="高速模式：synchronous=OFF + 仅结尾 checkpoint（依赖 raw 库可重跑；"
-                             "中途停止后可重跑本脚本断点接续）")
+                             "中途停止后可重跑本脚本断点接续）。同时隐含 --ram-build。")
+    parser.add_argument("--ram-build", action="store_true",
+                        help="把 raw 源与产物库放进 tmpfs(/dev/shm) 构建，彻底绕开云盘 I/O；"
+                             "结束自动复制回持久盘。需实例内存足以容纳（通常几十 GB）。")
     args = parser.parse_args()
 
-    if args.fast:
+    ram_build = bool(args.ram_build) or bool(args.fast)
+    if ram_build:
         os.environ["GEMINI_BUILD_FAST"] = "1"
 
     if args.batch_months <= 0:
@@ -728,22 +736,73 @@ def main():
         args.raw_db, args.mode, args.start, args.end
     )
 
+    # ── RAM 构建模式：把 raw 源与产物库放进 tmpfs，彻底绕开云盘 I/O ──
+    # 云盘带宽才是真正的瓶颈（而非 CPU / fsync）。880GB 内存实例完全装得下几十 GB 的
+    # raw + 特征库 + 行情库，放进 /dev/shm 后读写全是内存速度，48 核才能真正用上。
+    persistent_feature = args.feature_db
+    persistent_market = args.market_db
+    persistent_meta = os.path.join(os.path.dirname(persistent_market), "stock_meta.db")
+    ram_dir = None
+    if ram_build:
+        shm = "/dev/shm"
+        if not os.path.isdir(shm):
+            print("[RAM构建] 未检测到 /dev/shm，回退普通磁盘构建", flush=True)
+        else:
+            ram_dir = tempfile.mkdtemp(prefix="qd_build_", dir=shm)
+            try:
+                ram_raw = os.path.join(ram_dir, "jydb_raw.db")
+                need_gb = os.path.getsize(args.raw_db) / 1e9 if os.path.exists(args.raw_db) else 0
+                print(f"[RAM构建] 复制 raw 库到内存盘 ({need_gb:.1f} GB) ...", flush=True)
+                shutil.copyfile(args.raw_db, ram_raw)
+                ram_feature = os.path.join(ram_dir, "jydb_features.db")
+                ram_market = os.path.join(ram_dir, "stock_daily.db")
+                # 已有部分产物则复制进内存以断点续跑
+                if os.path.exists(persistent_feature):
+                    shutil.copyfile(persistent_feature, ram_feature)
+                if os.path.exists(persistent_market):
+                    shutil.copyfile(persistent_market, ram_market)
+                args.raw_db, args.feature_db, args.market_db = ram_raw, ram_feature, ram_market
+                print(f"[RAM构建] 输出重定向到内存盘: {ram_dir}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[RAM构建] 初始化失败，回退磁盘构建: {e}", file=sys.stderr, flush=True)
+                shutil.rmtree(ram_dir, ignore_errors=True)
+                ram_dir = None
+
     print(f"本地源中间产物流水线 | 数据源: {os.path.abspath(args.raw_db)}")
     print(f"请求区间 {args.start}..{args.end} | 对齐后 {eff_start}..{eff_end} | "
-          f"模式 {args.mode} | 进程 {args.workers} | 批 {args.batch_months} 月", flush=True)
+          f"模式 {args.mode} | 进程 {args.workers} | 批 {args.batch_months} 月"
+          f"{' | [RAM构建]' if ram_dir else ''}", flush=True)
 
-    if args.mode in ("feature", "both"):
-        run_features(tables, eff_start, eff_end, args.raw_db, args.feature_db,
-                     args.workers, args.batch_months, args.chunksize,
-                     args.overlap_days)
+    try:
+        if args.mode in ("feature", "both"):
+            run_features(tables, eff_start, eff_end, args.raw_db, args.feature_db,
+                         args.workers, args.batch_months, args.chunksize,
+                         args.overlap_days)
 
-    if args.mode in ("market", "both") and not _stop_requested:
-        run_market(eff_start, eff_end, args.raw_db, args.market_db,
-                   args.workers, args.batch_months, args.chunksize, args.clear_market,
-                   args.overlap_days)
+        if args.mode in ("market", "both") and not _stop_requested:
+            run_market(eff_start, eff_end, args.raw_db, args.market_db,
+                       args.workers, args.batch_months, args.chunksize, args.clear_market,
+                       args.overlap_days)
 
-    # 区间一致性自检：raw 覆盖 vs features 水位 vs daily_data 覆盖
-    _self_check_coverage(args.raw_db, args.feature_db, args.market_db)
+        # 区间一致性自检：raw 覆盖 vs features 水位 vs daily_data 覆盖
+        _self_check_coverage(args.raw_db, args.feature_db, args.market_db)
+    finally:
+        # 无论正常结束 / 中断 / 异常，都把内存盘产物复制回持久盘，避免进度丢失。
+        if ram_dir:
+            try:
+                print("[RAM构建] 复制产物回持久盘 ...", flush=True)
+                if os.path.exists(args.feature_db):
+                    shutil.copyfile(args.feature_db, persistent_feature)
+                if os.path.exists(args.market_db):
+                    shutil.copyfile(args.market_db, persistent_market)
+                ram_meta = os.path.join(ram_dir, "stock_meta.db")
+                if os.path.exists(ram_meta):
+                    shutil.copyfile(ram_meta, persistent_meta)
+            except Exception as e:  # noqa: BLE001
+                print(f"[RAM构建] 复制回持久盘失败（产物仍在内存盘 {ram_dir}）: {e}",
+                      file=sys.stderr, flush=True)
+            else:
+                shutil.rmtree(ram_dir, ignore_errors=True)
 
     print("\n=== 流程结束 ===", flush=True)
 

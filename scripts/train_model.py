@@ -30,6 +30,8 @@ def main():
                         help=f'训练选取的股票数量 (默认{TrainingConfig.STOCK_NUM})')
     parser.add_argument('--force',  action='store_true', help='强制重新计算所有因子')
     parser.add_argument('--workers', type=int, default=default_workers, help=f'并行线程数 (默认{default_workers})')
+    parser.add_argument('--objective-workers', type=int, default=1,
+                        help='多目标训练并行进程数 (默认1=串行; >1 时各目标并行训练, 每进程自动限制 LightGBM 线程避免 oversubscription)')
 
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
@@ -264,6 +266,7 @@ def main():
         X, aligned, factor_names, dates,
         objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
         model_type='lightgbm',
+        objective_workers=args.objective_workers,
     )
     import json, pickle, shutil
     archive_dir = os.path.join(

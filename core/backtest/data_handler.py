@@ -112,13 +112,13 @@ class DataHandler:
         # 优化: 关联其他数据库
         db_dir = os.path.dirname(self.db_path)
         meta_db = os.path.join(db_dir, 'stock_meta.db')
-        finance_db = os.path.join(db_dir, 'stock_finance.db')
-        
+        # 注：Baostock 时代依赖的 stock_finance.db 已在数据源迁移至聚源 JYDB 后废弃；
+        # finance.* 表在回测数据读取路径中不再被任何代码引用，故不再 ATTACH。
+        # 财务数据统一改由 core.factors.fundamental_factors.FinanceReportFetcher 读取
+        # (jydb_features.db.pit_features, PIT 对齐)。
         if os.path.exists(meta_db):
             conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
-        if os.path.exists(finance_db):
-            conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
-        
+
         return conn
     
     def load_data(self, 

@@ -35,6 +35,8 @@ class BacktestEngine:
         initial_capital: float = 1.0,
         commission_rate: float = 0.01,
         max_positions: int = 1,
+        time_stop_days: int = TIME_STOP_DAYS,
+        time_stop_max_return_pct: float = TIME_STOP_MIN_LOSS_PCT,
     ):
         """
         初始化回测引擎
@@ -51,6 +53,8 @@ class BacktestEngine:
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.max_positions = max_positions
+        self.time_stop_days = time_stop_days
+        self.time_stop_max_return_pct = time_stop_max_return_pct
 
         self.portfolio = Portfolio(
             initial_capital=initial_capital,
@@ -277,7 +281,7 @@ class BacktestEngine:
             if position and verbose:
                 print(
                     f"[{next_date}] 买入 {signal.stock_code}: {entry_price:.2f} "
-                    f"(分配资金: {capital_per_position:.2f}, 置信度: {signal.confidence:.1f}%)"
+                    f"(分配资金: {capital_allocation:.2f}, 置信度: {signal.confidence:.1f}%)"
                 )
 
             # 策略回调
@@ -353,8 +357,8 @@ class BacktestEngine:
             enable_stop_loss=ENABLE_STOP_LOSS_EXIT,
             enable_take_profit=ENABLE_TAKE_PROFIT_EXIT,
             enable_time_stop=ENABLE_TIME_STOP_EXIT,
-            time_stop_days=TIME_STOP_DAYS,
-            time_stop_max_return_pct=TIME_STOP_MIN_LOSS_PCT,
+            time_stop_days=self.time_stop_days,
+            time_stop_max_return_pct=self.time_stop_max_return_pct,
         )
         if decision.should_exit:
             return True, close, decision.reason

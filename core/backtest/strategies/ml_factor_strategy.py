@@ -33,7 +33,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  db_path: str = None,
                  name: str = "ML因子策略",
                  use_portfolio_optimizer: bool = False,
-                 portfolio_config: dict = None):
+                 portfolio_config: dict = None,
+                 single_objective: str = None):
         """初始化策略"""
         super().__init__(name)
         self.model_path = (
@@ -51,6 +52,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 而非贪心 top-N 等权（向后兼容：默认关闭）。
         self.use_portfolio_optimizer = bool(use_portfolio_optimizer)
         self.portfolio_config = dict(portfolio_config or {})
+        # 单目标回测：只用某个子模型排序（隔离各训练目标自身预测力）
+        self.single_objective = single_objective
         
         if cache_dir is None:
             cache_dir = fc.TrainingConfig.CACHE_DIR
@@ -265,9 +268,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
         objective_components = None
         if getattr(self.model, 'models', None):
             model_frame = pd.DataFrame(X_arr, columns=feature_names)
-            probs = self.model.predict(model_frame)
-            if hasattr(self.model, 'predict_components'):
-                objective_components = self.model.predict_components(model_frame)
+            if self.single_objective:
+                # 单目标模式：直接用该子模型的预测分排序
+                probs = self.model.predict_components(model_frame)[self.single_objective]
+            else:
+                probs = self.model.predict(model_frame)
+                if hasattr(self.model, 'predict_components'):
+                    objective_components = self.model.predict_components(model_frame)
         else:
             probs = self.model.predict(X_arr)
         
@@ -413,16 +420,25 @@ class MLFactorBacktestStrategy(BaseStrategy):
         return wide
 
     def _precompute_pit_data(self):
-        """预加载元数据，消除循环内的 SQL 压力"""
+        """预加载元数据与 PIT 财务序列（聚源 JYDB 版，不再依赖 Baostock stock_finance.db）
+
+        元数据仍从 stock_meta.db 读取；财务数据改为 FinanceReportFetcher 从
+        jydb_features.db.pit_features（source_table='LC_MainIndexNew'）按 available_date
+        做 PIT 对齐读取。契约列保持与原 Baostock 版一致:
+          EPSJB      <- epsTTM  (聚源 EPS)
+          ZCFZL      <- liabilityToAsset (聚源 DebtAssetsRatio)
+          totalShare <- 聚源主指标无直接对应字段，恒为 NaN，故 market_cap 退化为 None
+        """
         db_dir = os.path.dirname(self.db_path)
         conn = sqlite3.connect(self.db_path)
         attached = set()
-        for db in ['stock_meta.db', 'stock_finance.db']:
-            path = os.path.join(db_dir, db)
-            if os.path.exists(path):
-                alias = db.split('_')[1].split('.')[0]
-                conn.execute(f"ATTACH DATABASE ? AS {alias}", (path,))
-                attached.add(alias)
+        # 仅保留对未来仍被引用的 stock_meta.db 的挂载（stock_finance.db 已废弃）
+        meta_db = os.path.join(db_dir, 'stock_meta.db')
+        if os.path.exists(meta_db):
+            conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
+            attached.add('meta')
+        # 兼容老测试: 始终保留空占位 DataFrame，且首行即初始化，避免 AttributeError
+        self._all_finance_df = pd.DataFrame()
         try:
             self._meta_map = {}
             self._finance_history = {}
@@ -435,33 +451,39 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 self._meta_map = pd.read_sql_query(
                     "SELECT code, code_name AS name FROM meta.stock_basic", conn
                 ).set_index('code')['name'].to_dict()
+        finally:
+            conn.close()
 
-            finance_tables = set()
-            if 'finance' in attached:
-                finance_tables = {
-                    row[0] for row in conn.execute(
-                        "SELECT name FROM finance.sqlite_master WHERE type='table'"
-                    ).fetchall()
-                }
-            if not {'profit_ability', 'balance_ability'}.issubset(finance_tables):
-                self._all_finance_df = pd.DataFrame()
-                return
+        # ---- PIT 财务序列: 改用聚源 FinanceReportFetcher (jydb_features.db) ----
+        from core.factors.fundamental_factors import FinanceReportFetcher
+        fetcher = FinanceReportFetcher(db_path=self.db_path)
+        if not os.path.exists(fetcher.feature_db):
+            print("  [WARN] 未找到聚源特征库 jydb_features.db，PIT 财务序列不可用"
+                  "（pe_ratio / market_cap / zcfzl 将退化为 None）")
+            return
 
-            self._all_finance_df = pd.read_sql_query("""
-                SELECT p.code, p.pub_date, p.stat_date, p.epsTTM AS EPSJB, p.totalShare, b.liabilityToAsset AS ZCFZL
-                FROM finance.profit_ability p
-                LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
-                WHERE p.pub_date IS NOT NULL AND p.pub_date != ''
-            """, conn)
-            num_cols = ['EPSJB', 'totalShare', 'ZCFZL']
-            for col in num_cols:
-                self._all_finance_df[col] = pd.to_numeric(self._all_finance_df[col], errors='coerce').astype('float32')
-            self._all_finance_df = self._all_finance_df.sort_values('pub_date')
-            for code, group in self._all_finance_df.groupby('code', sort=False):
-                dates = group['pub_date'].astype(str).str[:10].to_numpy()
-                values = group[num_cols].to_numpy(dtype=np.float32, copy=True)
-                self._finance_history[code] = (dates, values)
-        finally: conn.close()
+        # 仅对回测股票池预加载，避免全市场扫描；无股票池时退路取 daily_data 全部代码
+        codes = getattr(self, '_active_stock_codes', set())
+        if not codes:
+            try:
+                c2 = sqlite3.connect(self.db_path)
+                codes = {r[0] for r in c2.execute("SELECT DISTINCT code FROM daily_data")}
+                c2.close()
+            except Exception:
+                codes = set()
+
+        # 契约列顺序必须与 _get_optimized_info_map 的取值索引一致: [EPSJB, totalShare, ZCFZL]
+        for code in codes:
+            df = fetcher._load_reports_for_code(code)
+            if df.empty:
+                continue
+            dates = df['announced_date'].dt.strftime('%Y-%m-%d').astype(str).to_numpy()
+            eps = df.get('EPS', pd.Series(np.nan, index=df.index)).to_numpy(dtype=np.float32, copy=True)
+            # 聚源主指标无 totalShare 对应字段 -> 恒为 NaN
+            ts = df.get('totalShare', pd.Series(np.nan, index=df.index)).to_numpy(dtype=np.float32, copy=True)
+            zcfzl = df.get('DebtAssetsRatio', pd.Series(np.nan, index=df.index)).to_numpy(dtype=np.float32, copy=True)
+            values = np.column_stack([eps, ts, zcfzl]).astype(np.float32, copy=False)
+            self._finance_history[code] = (dates, values)
 
     def _get_optimized_info_map(self, target_date: str, market_data: Any) -> Dict[str, Dict]:
         """极速信息映射逻辑，复用预缓存信息"""

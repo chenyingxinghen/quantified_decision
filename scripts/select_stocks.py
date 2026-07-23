@@ -126,15 +126,16 @@ def load_smart_model(model_path: str):
 # 数据库辅助
 # ============================================================================
 def get_db_conn(db_path: str):
-    """获取带有关联库的连接 (meta + finance)"""
+    """获取带有关联库的连接 (仅 meta)
+
+    注：Baostock 时代的 stock_finance.db 已在数据源迁移至聚源 JYDB 后废弃，
+    finance.* 表不再被查询，故不再 ATTACH。财务数据改由 FinanceReportFetcher 读取。
+    """
     conn = sqlite3.connect(db_path)
     db_dir = os.path.dirname(db_path)
     meta_db = os.path.join(db_dir, 'stock_meta.db')
-    finance_db = os.path.join(db_dir, 'stock_finance.db')
     if os.path.exists(meta_db):
         conn.execute(f"ATTACH DATABASE '{meta_db}' AS meta")
-    if os.path.exists(finance_db):
-        conn.execute(f"ATTACH DATABASE '{finance_db}' AS finance")
     return conn
 def get_all_stock_codes(db_path: str) -> List[str]:
     """从数据库获取所有有行情数据的股票代码"""
@@ -147,9 +148,11 @@ def get_all_stock_codes(db_path: str) -> List[str]:
 def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
     """
     获取股票基本信息:
-    - 名称/ST标记: 来自 meta.stock_info_extended
-    - PE/PB (动态): 用最新收盘价 / finance_reports 最新期 EPS/BPS 计算
-      这样 PE/PB 是 PIT 的，避免使用快照静态数据
+    - 名称/ST标记: 来自 meta.stock_basic
+    - 财务(PIT): 来自聚源 jydb_features.db，由 FinanceReportFetcher 按 available_date
+      做 PIT 对齐读取 (迁移自 Baostock stock_finance.db)。
+      EPSJB<-epsTTM, ZCFZL<-liabilityToAsset；totalShare 在聚源无对应字段 -> None。
+    - PE/PB (动态): 用最新收盘价 / PIT EPS 计算，避免使用快照静态数据
     """
     def safe_float(val):
         try:
@@ -170,27 +173,9 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
         print(f"  [ERROR] 从 meta.stock_basic 加载元数据失败: {e}")
         traceback.print_exc()
         meta_df = pd.DataFrame(columns=['code', 'name'])
-    # 2. 从 finance 表读取最新一期财务数据 (按 code + 最大 pub_date)
-    try:
-        # 使用 p.stat_date 关联并以 p.pub_date 对齐最新公告
-        finance_df = pd.read_sql_query(
-            """
-            SELECT p.code, p.epsTTM AS EPSJB, p.totalShare, b.liabilityToAsset AS ZCFZL
-            FROM finance.profit_ability p
-            LEFT JOIN finance.balance_ability b ON p.code = b.code AND p.stat_date = b.stat_date
-            INNER JOIN (
-                SELECT code, MAX(pub_date) AS max_date
-                FROM finance.profit_ability
-                GROUP BY code
-            ) latest ON p.code = latest.code AND p.pub_date = latest.max_date
-            """,
-            conn
-        )
-    except Exception as e:
-        import traceback
-        print(f"  [ERROR] 从 finance 表加载财务数据失败: {e}")
-        traceback.print_exc()
-        finance_df = pd.DataFrame(columns=['code', 'EPSJB', 'totalShare', 'ZCFZL'])
+    # 2. PIT 财务数据填充推迟到 price_df 取得之后（需要 code 列表）；此处仅做占位声明
+    fin_map: Dict[str, Dict] = {}
+    empty_fin = {'EPSJB': None, 'totalShare': None, 'ZCFZL': None}
     # 3. 获取每只股票最新价格及动态快照 (is_st, pbMRQ)
     try:
         price_df = pd.read_sql_query(
@@ -209,26 +194,50 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
         traceback.print_exc()
         price_df = pd.DataFrame(columns=['code', 'close', 'pbMRQ', 'is_st'])
     conn.close()
-    # 构建映射
-    fin_map = {str(r.code): r for r in finance_df.itertuples()}
+
+    # 2b. PIT 财务数据改用聚源 FinanceReportFetcher (jydb_features.db)，不再 ATTACH stock_finance.db
+    #     契约列保持与原 Baostock 版一致: EPSJB<-epsTTM, ZCFZL<-liabilityToAsset,
+    #     totalShare 在聚源主指标中无对应字段 -> 恒为 None (market_cap 退化为 None)。
+    from core.factors.fundamental_factors import FinanceReportFetcher
+    db_dir = os.path.dirname(db_path)
+    feature_db = os.path.join(db_dir, 'jydb_features.db')
+    if os.path.exists(feature_db):
+        fetcher = FinanceReportFetcher(db_path=db_path, feature_db=feature_db)
+        as_of = pd.Timestamp.today().strftime('%Y-%m-%d')
+        for code in price_df['code'].astype(str).tolist():
+            rep = fetcher.get_pit_report(code, as_of)
+            if rep is None:
+                fin_map[code] = empty_fin
+                continue
+            fin_map[code] = {
+                'EPSJB':      safe_float(rep.get('epsTTM')),
+                'totalShare': safe_float(rep.get('totalShare')),  # 聚源无对应 -> None
+                'ZCFZL':      safe_float(rep.get('liabilityToAsset')),
+            }
+    else:
+        print("  [WARN] 未找到聚源特征库 jydb_features.db，财务数据不可用")
+        for code in price_df['code'].astype(str).tolist():
+            fin_map[code] = empty_fin
+
+    # 构建映射 (fin_map 已由 FinanceReportFetcher 填充；prc/meta 来自行情与元数据)
     prc_map = {str(r.code): r for r in price_df.itertuples()}
     meta_map = {str(r.code): r for r in meta_df.itertuples()}
-    
+
     # 构建最终 info_map (以 price_df 为基准)
     info_map = {}
     for r in price_df.itertuples():
         code = str(r.code)
-        fin = fin_map.get(code)
+        fin = fin_map.get(code, {'EPSJB': None, 'totalShare': None, 'ZCFZL': None})
         meta = meta_map.get(code)
-        
+
         close = r.close
-        eps = getattr(fin, 'EPSJB', None)
-        total_share = getattr(fin, 'totalShare', None)
-        
+        eps = fin.get('EPSJB')
+        total_share = fin.get('totalShare')
+
         dynamic_pe = close / eps if close and eps and eps > 0 else None
         # market_cap 以 “亿” 为单位
         mcap = (close * total_share / 1e8) if close and total_share else None
-        
+
         # 优先使用 daily_data 中的 is_st，因为它更及时
         is_st = getattr(r, 'is_st', 0)
         if is_st == 0 and meta:
@@ -238,7 +247,7 @@ def get_stock_info_map(db_path: str) -> Dict[str, Dict]:
             'market_cap':    mcap,
             'pe_ratio':      dynamic_pe,
             'pb_ratio':      getattr(r, 'pbMRQ', None), # 动态 PB
-            'zcfzl':         getattr(fin, 'ZCFZL', None),
+            'zcfzl':         fin.get('ZCFZL'),
             'current_price': close,
             'is_st':         int(is_st or 0),
         }

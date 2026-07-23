@@ -170,7 +170,9 @@ class MLFactorModel:
         # 1. 预处理
         # 优化：由 float64 改为 float32，避免内存翻倍。且预先在 prepare_dataset 中已完成填充，此处仅做校验。
         if not X.flags.c_contiguous: X = np.ascontiguousarray(X)
-        X = np.nan_to_num(X.astype(np.float32), copy=False, nan=0.0)
+        # copy=True 以支持只读 mmap 输入（并行训练时各 worker 以只读 mmap 共享特征矩阵，
+        # 避免在内存中复制整份大矩阵；串行路径下 X 本就可写，仅多一次微小拷贝）。
+        X = np.nan_to_num(X.astype(np.float32), copy=True, nan=0.0)
         
         # 标签清理：确保没有 NaN 或 Inf (针对 XGBoost 报错)
         if np.isnan(y).any() or np.isinf(y).any():

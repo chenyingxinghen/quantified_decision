@@ -220,6 +220,53 @@ def _normalize_chunk_worker(X, rank_cols_idx, chunk_start_row, group_starts, gro
     return None
 
 
+def _train_objective_worker(payload):
+    """多进程 worker：在独立进程中训练单个目标模型。
+
+    通过限制每个进程内的 LightGBM/XGBoost 线程数，避免
+    "多进程 × n_jobs=-1" 的 CPU oversubscription。
+    大特征矩阵以只读 mmap 文件共享，避免进程间重复序列化/拷贝。
+    """
+    import os as _os
+    import numpy as _np
+    from config.factor_config import ModelConfig
+
+    db_path = payload['db_path']
+    y = _np.asarray(payload['y'], dtype=_np.float32)
+    dates = _np.asarray(payload['dates'])
+    names = payload['names']
+    model_type = payload['model_type']
+    n_threads = max(1, int(payload.get('n_threads', 1)))
+
+    # 限制本进程内各数值库的线程数
+    for _ev in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+        _os.environ[_ev] = str(n_threads)
+    # 直接覆盖 ModelConfig 的 n_jobs（仅影响本 worker 进程）
+    try:
+        ModelConfig.LIGHTGBM_PARAMS = dict(ModelConfig.LIGHTGBM_PARAMS)
+        ModelConfig.LIGHTGBM_PARAMS['n_jobs'] = n_threads
+    except Exception:
+        pass
+    try:
+        ModelConfig.XGBOOST_PARAMS = dict(ModelConfig.XGBOOST_PARAMS)
+        ModelConfig.XGBOOST_PARAMS['n_jobs'] = n_threads
+    except Exception:
+        pass
+
+    X = _np.load(payload['x_path'], mmap_mode='r')
+    trainer = MLModelTrainer(db_path)
+    res = trainer.train_models(
+        _np.asarray(X), y, y, names, dates,
+        model_types=[model_type], task='ranking', apply_feature_selection=False,
+        skip_normalization=True,
+    )
+    model = trainer.models.get(model_type)
+    if model is None:
+        raise RuntimeError("目标训练未产出模型")
+    return (model, res.get(model_type))
+
+
 class MLModelTrainer:
     """机器学习模型训练器"""
     
@@ -504,12 +551,24 @@ class MLModelTrainer:
                 TrainingConfig, 'MULTI_OBJECTIVE_RETURN_HORIZONS', (5, 20, 60)
             ),
             risk_horizon=getattr(TrainingConfig, 'MULTI_OBJECTIVE_RISK_HORIZON', 20),
+            orthogonal_legs=getattr(TrainingConfig, 'MULTI_OBJECTIVE_ORTHOGONAL_LEGS', True),
+            use_matching_risk_for_sharpe=getattr(
+                TrainingConfig, 'MULTI_OBJECTIVE_MATCHING_RISK_SHARPE', True
+            ),
         )
-        labels = builder.build_universe(stocks_data, start_date, end_date)
+        orthogonalize = getattr(TrainingConfig, 'MULTI_OBJECTIVE_ORTHOGONALIZE', False)
+        labels = builder.build_universe(
+            stocks_data, start_date, end_date, orthogonalize=orthogonalize
+        )
         if labels.empty:
             return labels
         target_cols = list(getattr(TrainingConfig, 'MULTI_OBJECTIVE_WEIGHTS', {}).keys())
         target_cols = [col for col in target_cols if col in labels.columns]
+        if orthogonalize:
+            # 正交化后使用 orth_* 列作为训练目标（需与权重键对应）。
+            orth_cols = [f"orth_{c}" for c in target_cols]
+            if all(c in labels.columns for c in orth_cols):
+                target_cols = orth_cols
         return cross_sectional_rank_targets(
             labels,
             target_cols,
@@ -1711,9 +1770,10 @@ class MLModelTrainer:
                     model_types: List[str] = TrainingConfig.MODEL_TYPES,
                     path_scores: np.ndarray = None,
                     is_st_arr: np.ndarray = None,
-                    w_sig_arr: np.ndarray = None,
-                    task: str = None,
-                    apply_feature_selection: bool = True) -> Dict:
+                w_sig_arr: np.ndarray = None,
+                task: str = None,
+                apply_feature_selection: bool = True,
+                skip_normalization: bool = False) -> Dict:
         """
         训练多个模型
         """
@@ -1778,27 +1838,13 @@ class MLModelTrainer:
                 f"max={finite_values.max():.4f}"
             )
         
-        # 先进行时间序列划分 (增加 Embargo 阻隔期，防止数据泄漏)
-        forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
-        raw_split_idx = int(len(dates) * TrainingConfig.TRAIN_TEST_SPLIT)
-        split_date = dates[raw_split_idx]
-        
-        # 训练集：[0, split_idx)
-        split_idx = np.searchsorted(dates, split_date, side='left')
-        
-        # 验证集：[val_start_idx, len(dates))
-        # 阻隔期逻辑：由于样本标签包含未来 forward_days 的信息，
-        # 验证集的特征必须在训练集标签所涉及的最晚日期之后。
-        unique_dates = np.unique(dates)
-        split_date_idx = np.searchsorted(unique_dates, split_date)
-        # 验证集开始日期推迟 forward_days 个交易日
-        val_start_date = unique_dates[min(split_date_idx + forward_days, len(unique_dates)-1)]
-        val_start_idx = np.searchsorted(dates, val_start_date, side='left')
-        
-        print(f"  划分点 (Embargo): {split_date}, 阻隔期后起: {val_start_date}")
-        print(f"  训练集: {split_idx} 样本, 验证集: {len(dates) - val_start_idx} 样本")
-        print(f"  已剔除阻隔期重叠样本: {val_start_idx - split_idx} 个")
-        
+        # 时间序列划分 (Embargo 阻隔期) + 横截面归一化。
+        # skip_normalization=True 时仅返回划分点、不做任何写操作
+        # （并行训练：父进程已统一归一化并落盘为只读 mmap，worker 直接复用）。
+        split_idx, val_start_idx = self._normalize_train_val(
+            X, dates, factor_names, skip_normalization=skip_normalization
+        )
+
         # 重新定义切片范围
         X_train, X_val = X[:split_idx], X[val_start_idx:]
         y_train_full, y_val_full = y[:split_idx], y[val_start_idx:]
@@ -1809,29 +1855,10 @@ class MLModelTrainer:
 
         # 覆盖率必须在任何填充/归一化之前、且只用训练段计算。
         feature_coverage_train = np.isfinite(X_train).mean(axis=0)
-        
-        # 训练集：正常横截面排名归一化
-        print("\n  对训练样本进行横截面归一化...")
-        skip_col_stats = self._apply_cross_sectional_normalization_inplace(
-            X[:split_idx], dates[:split_idx], factor_names
-        )
-        # 持久化到实例，供 save_models 写入磁盘，推理时复用
-        self.norm_stats = {
-            'skip_col_stats': skip_col_stats,
-            'factor_names': factor_names,
-        }
-        
-        # 修复 Bug 1：使用 val_start_idx 而非 split_idx，排除阻隔期样本对验证集归一化的污染。
-        # 阻隔期内的样本（split_idx ~ val_start_idx）标签含未来信息，不应参与任何处理。
-        # 同时传入训练集的 skip_col_stats，确保情绪因子等全局列使用相同的缩放参数。
-        print("  对验证样本进行归一化...")
-        self._apply_cross_sectional_normalization_inplace(
-            X[val_start_idx:], dates[val_start_idx:], factor_names,
-            skip_col_stats=skip_col_stats
-        )
-        
+
         # 归一化后统计：正常情况下 mean≈0.5, std≈0.29, min≈0, max≈1
-        print(f"  特征统计(归一化后): mean={X_train.mean():.4f}, std={X_train.std():.4f}, min={X_train.min():.4f}, max={X_train.max():.4f}")
+        if not skip_normalization:
+            print(f"  特征统计(归一化后): mean={X_train.mean():.4f}, std={X_train.std():.4f}, min={X_train.min():.4f}, max={X_train.max():.4f}")
 
         # 分组信息
         _, train_group = np.unique(dates_train, return_counts=True)
@@ -2090,6 +2117,52 @@ class MLModelTrainer:
         
         return results
 
+    def _normalize_train_val(self, X: np.ndarray, dates: np.ndarray,
+                             factor_names: List[str],
+                             skip_normalization: bool = False):
+        """时间序列划分 (Embargo 阻隔期) + 横截面归一化，返回 (split_idx, val_start_idx)。
+
+        归一化只依赖 X 与 dates（与标签 y 无关），因此可由父进程统一做一次，
+        供并行训练的多个 worker 复用同一份已归一化矩阵，避免每个 worker 重复写大矩阵。
+
+        skip_normalization=True：仅计算并返回划分点，不做任何写操作
+        （用于并行训练 worker 在只读 mmap 上运行）。
+        """
+        forward_days = getattr(TrainingConfig, 'FUTURE_DAYS', 7)
+        raw_split_idx = int(len(dates) * TrainingConfig.TRAIN_TEST_SPLIT)
+        split_date = dates[raw_split_idx]
+
+        # 训练集：[0, split_idx)
+        split_idx = np.searchsorted(dates, split_date, side='left')
+
+        # 验证集：[val_start_idx, len(dates))
+        # 阻隔期逻辑：标签含未来 forward_days 信息，验证集特征必须在训练集标签最晚日期之后。
+        unique_dates = np.unique(dates)
+        split_date_idx = np.searchsorted(unique_dates, split_date)
+        val_start_date = unique_dates[min(split_date_idx + forward_days, len(unique_dates) - 1)]
+        val_start_idx = np.searchsorted(dates, val_start_date, side='left')
+
+        print(f"  划分点 (Embargo): {split_date}, 阻隔期后起: {val_start_date}")
+        print(f"  训练集: {split_idx} 样本, 验证集: {len(dates) - val_start_idx} 样本")
+        print(f"  已剔除阻隔期重叠样本: {val_start_idx - split_idx} 个")
+
+        if not skip_normalization:
+            print("\n  对训练样本进行横截面归一化...")
+            skip_col_stats = self._apply_cross_sectional_normalization_inplace(
+                X[:split_idx], dates[:split_idx], factor_names
+            )
+            # 持久化到实例，供 save_models 写入磁盘，推理时复用
+            self.norm_stats = {
+                'skip_col_stats': skip_col_stats,
+                'factor_names': factor_names,
+            }
+            print("  对验证样本进行归一化...")
+            self._apply_cross_sectional_normalization_inplace(
+                X[val_start_idx:], dates[val_start_idx:], factor_names,
+                skip_col_stats=skip_col_stats
+            )
+        return split_idx, val_start_idx
+
     def train_multiobjective_models(
         self,
         X: np.ndarray,
@@ -2098,6 +2171,7 @@ class MLModelTrainer:
         dates: np.ndarray,
         objective_weights: Dict[str, float] = None,
         model_type: str = 'lightgbm',
+        objective_workers: int = 1,
     ):
         """训练多个方向统一的目标模型并返回组合模型及训练结果。
 
@@ -2190,32 +2264,40 @@ class MLModelTrainer:
         objective_results = {}
         previous_models = self.models
         try:
-            for idx, objective in enumerate(objective_cols):
-                print(f"\n[多目标训练] {objective} ({idx + 1}/{len(objective_cols)})")
-                objective_y = y_fit[:, idx]
-                result = self.train_models(
-                    X_selected.copy(), objective_y.copy(), objective_y.copy(),
-                    selected_names, dates_fit,
-                    model_types=[model_type], task='ranking',
-                    apply_feature_selection=False,
+            if objective_workers and objective_workers > 1 and len(objective_cols) > 1:
+                # 并行路径：各目标在独立进程中训练，训练代码路径与串行完全一致
+                trained_models, objective_results = self._train_objectives_parallel(
+                    X_selected, y_fit, dates_fit, selected_names, objective_cols,
+                    normalized_weights, model_type, int(objective_workers),
                 )
-                if model_type not in self.models or model_type not in result:
-                    raise RuntimeError(f"目标 {objective} 训练失败")
-                objective_result = result[model_type]
-                train_metrics = objective_result.get('train_metrics', {})
-                val_metrics = objective_result.get('val_metrics', {})
-                if (
-                    objective.endswith('tradable_20d')
-                    and abs(float(train_metrics.get('rank_ic', 0.0))) < 1e-12
-                    and abs(float(val_metrics.get('rank_ic', 0.0))) < 1e-12
-                    and abs(float(val_metrics.get('auc', 0.5)) - 0.5) < 1e-12
-                ):
-                    print(f"  [多目标训练] 跳过无预测区分度目标: {objective}")
+            else:
+                # 串行路径（默认）：与历史行为一致
+                for idx, objective in enumerate(objective_cols):
+                    print(f"\n[多目标训练] {objective} ({idx + 1}/{len(objective_cols)})")
+                    objective_y = y_fit[:, idx]
+                    result = self.train_models(
+                        X_selected.copy(), objective_y.copy(), objective_y.copy(),
+                        selected_names, dates_fit,
+                        model_types=[model_type], task='ranking',
+                        apply_feature_selection=False,
+                    )
+                    if model_type not in self.models or model_type not in result:
+                        raise RuntimeError(f"目标 {objective} 训练失败")
+                    objective_result = result[model_type]
+                    train_metrics = objective_result.get('train_metrics', {})
+                    val_metrics = objective_result.get('val_metrics', {})
+                    if (
+                        objective.endswith('tradable_20d')
+                        and abs(float(train_metrics.get('rank_ic', 0.0))) < 1e-12
+                        and abs(float(val_metrics.get('rank_ic', 0.0))) < 1e-12
+                        and abs(float(val_metrics.get('auc', 0.5)) - 0.5) < 1e-12
+                    ):
+                        print(f"  [多目标训练] 跳过无预测区分度目标: {objective}")
+                        self.models = {}
+                        continue
+                    trained_models[objective] = self.models[model_type]
+                    objective_results[objective] = objective_result
                     self.models = {}
-                    continue
-                trained_models[objective] = self.models[model_type]
-                objective_results[objective] = objective_result
-                self.models = {}
         finally:
             self.models = previous_models
 
@@ -2223,6 +2305,77 @@ class MLModelTrainer:
             name: normalized_weights[name] for name in trained_models
         })
         return wrapper, objective_results, selected_names
+
+
+    def _train_objectives_parallel(self, X_selected, y_fit, dates_fit, selected_names,
+                                   objective_cols, normalized_weights, model_type,
+                                   objective_workers):
+        """并行训练多个目标。
+
+        设计要点：
+        - 大特征矩阵 X_selected 只落盘一次为 .npy，各 worker 以只读 mmap 共享，
+          避免把数百 MB 矩阵随每个任务 pickle 一份。
+        - 每个 worker 进程内把 LightGBM/XGBoost 线程数限制为 cpu//n_workers，
+          既保证多目标真正并发，又避免线程 oversubscription 导致反而变慢。
+        - 每个 worker 在独立进程里重建 MLModelTrainer 并调用 train_models，
+          训练逻辑与串行路径完全相同，结果可复现。
+        """
+        import os as _os
+        import tempfile
+        import multiprocessing as _mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        cpu = _mp.cpu_count()
+        n_workers = min(objective_workers, len(objective_cols))
+        threads_per = max(1, cpu // n_workers)
+        print(f"\n[多目标并行训练] 目标数={len(objective_cols)} 进程数={n_workers} "
+              f"每进程LightGBM线程≈{threads_per} (避免 oversubscription)")
+
+        # 大特征矩阵只归一化+落盘一次，worker 只读 mmap 共享（归一化与标签无关，做一次即可）
+        # 归一化会就地写回 X_selected（父进程内为可写副本），并设置 self.norm_stats 供落盘。
+        self._normalize_train_val(X_selected, dates_fit, selected_names)
+        tmpf = tempfile.NamedTemporaryFile(suffix='.npy', delete=False)
+        _np_save = __import__('numpy').save
+        _np_save(tmpf.name, np.asarray(X_selected, dtype=np.float32))
+        tmpf.close()
+        try:
+            futures = {}
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                for objective in objective_cols:
+                    idx = objective_cols.index(objective)
+                    payload = dict(
+                        db_path=self.db_path,
+                        x_path=tmpf.name,
+                        y=np.asarray(y_fit[:, idx], dtype=np.float32),
+                        dates=np.asarray(dates_fit),
+                        names=selected_names,
+                        model_type=model_type,
+                        n_threads=threads_per,
+                    )
+                    futures[objective] = ex.submit(_train_objective_worker, payload)
+                raw_results = {obj: fut.result() for obj, fut in futures.items()}
+        finally:
+            try:
+                _os.remove(tmpf.name)
+            except OSError:
+                pass
+
+        trained_models = {}
+        objective_results = {}
+        for objective, (model, objective_result) in raw_results.items():
+            train_metrics = (objective_result or {}).get('train_metrics', {})
+            val_metrics = (objective_result or {}).get('val_metrics', {})
+            if (
+                objective.endswith('tradable_20d')
+                and abs(float(train_metrics.get('rank_ic', 0.0))) < 1e-12
+                and abs(float(val_metrics.get('rank_ic', 0.0))) < 1e-12
+                and abs(float(val_metrics.get('auc', 0.5)) - 0.5) < 1e-12
+            ):
+                print(f"  [多目标并行训练] 跳过无预测区分度目标: {objective}")
+                continue
+            trained_models[objective] = model
+            objective_results[objective] = objective_result
+        return trained_models, objective_results
 
 
     def _apply_cross_sectional_normalization_inplace(self, X: np.ndarray, dates: np.ndarray, 
@@ -2370,7 +2523,7 @@ class MLModelTrainer:
 
     def _select_features(self, X: np.ndarray, feature_names: List[str],
                        y: np.ndarray = None,
-                       corr_threshold: float = 0.95,
+                       corr_threshold: float = 0.8,
                        method: str = 'target_aware',
                        feature_coverage: Optional[np.ndarray] = None) -> Tuple[np.ndarray, List[str]]:
         """

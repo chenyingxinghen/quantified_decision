@@ -112,7 +112,7 @@ def main():
     # ─────────────────────────────────────────────────────────────
     # STEP 2 — SHAP / 因子重要性
     # ─────────────────────────────────────────────────────────────
-    model_path = root_dir / "models" / "latest" / "xgboost_factor_model.pkl"
+    model_path = root_dir / "models" / "latest" / "multi_objective_factor_model.pkl"
     if not model_path.exists():
         safe_print(f"[ERROR] 模型文件不存在: {model_path}")
         sys.exit(1)

@@ -470,6 +470,83 @@ def run_features(
         print(" 提示: 失败批次可重跑本脚本补齐（upsert 幂等）。", file=sys.stderr)
 
 
+# ─── 元数据自举：从 raw 重建 stock_meta.db 的 stock_basic / stock_industry ────────
+def _sync_meta_from_raw(raw_db: str, meta_db: str) -> None:
+    """从 raw 库 (jydb_raw.db) 重建 stock_meta.db 的 stock_basic / stock_industry 两张表。
+
+    这样 stock_meta.db 与 jydb_features.db / stock_daily.db 一样完全可由 raw 派生，
+    支持 raw-only 云端策略（只保留并上传 jydb_raw.db，其余产物在云端 build 时重建）。
+
+    源映射:
+      stock_basic    <- SecuMain (code, SecuAbbr, ListedDate, ListedState, SecuCategory, XGRQ)
+      stock_industry <- LC_CSIIndustry (每 code 取 end_date 最新一期) + SecuMain 补 stock_name
+    注: outDate(退市日) 在聚源原始库无对应表，置 NULL（engine.py 已对缺失 outDate 优雅降级）。
+        sync_status 为孤儿死表（实际水位在 jydb_features.db.etl_watermarks），不处理。
+    """
+    if not os.path.exists(raw_db):
+        print("  [跳过] raw 库不存在，无法同步 stock_meta 元数据", file=sys.stderr, flush=True)
+        return
+    import pandas as pd
+    try:
+        raw_conn = sqlite3.connect(raw_db, timeout=60)
+        # --- stock_basic <- SecuMain ---
+        sm = pd.read_sql_query(
+            "SELECT code, SecuAbbr, ListedDate, ListedState, SecuCategory, XGRQ "
+            "FROM SecuMain WHERE code IS NOT NULL AND code != ''",
+            raw_conn,
+        )
+        if not sm.empty:
+            basic_df = pd.DataFrame({
+                'code':        sm['code'],
+                'code_name':  sm['SecuAbbr'],
+                'ipoDate':    sm['ListedDate'],
+                'outDate':    None,
+                'type':       sm['SecuCategory'].map(lambda c: 'stock' if c == 1 else None),
+                'status':     sm['ListedState'].apply(
+                    lambda x: str(int(x)) if pd.notna(x) else None),
+                'update_time': sm['XGRQ'],
+            })[['code', 'code_name', 'ipoDate', 'outDate', 'type', 'status', 'update_time']]
+        else:
+            basic_df = pd.DataFrame(columns=['code', 'code_name', 'ipoDate', 'outDate',
+                                            'type', 'status', 'update_time'])
+
+        # --- stock_industry <- LC_CSIIndustry (每 code 取最新一期) + SecuMain 补名 ---
+        ind = pd.read_sql_query(
+            "SELECT code, available_date, end_date, FstIndustryCSI "
+            "FROM LC_CSIIndustry WHERE code IS NOT NULL AND code != ''",
+            raw_conn,
+        )
+        if not ind.empty:
+            ind = ind.sort_values(['code', 'end_date', 'available_date'],
+                                  ascending=[True, False, False]).drop_duplicates('code', keep='last')
+            name_map = sm[['code', 'SecuAbbr']].rename(columns={'SecuAbbr': 'stock_name'})
+            ind = ind.merge(name_map, on='code', how='left')
+            industry_df = pd.DataFrame({
+                'code':                   ind['code'],
+                'update_date':           ind['end_date'],
+                'stock_name':            ind['stock_name'],
+                'industry':              ind['FstIndustryCSI'],
+                'industry_classification': '中信行业(CSI)',
+                'update_time':           ind['available_date'],
+            })[['code', 'update_date', 'stock_name', 'industry',
+               'industry_classification', 'update_time']]
+        else:
+            industry_df = pd.DataFrame(columns=['code', 'update_date', 'stock_name',
+                                                'industry', 'industry_classification', 'update_time'])
+        raw_conn.close()
+
+        with closing(sqlite3.connect(meta_db, timeout=60)) as mc:
+            basic_df.to_sql('stock_basic', mc, if_exists='replace', index=False)
+            industry_df.to_sql('stock_industry', mc, if_exists='replace', index=False)
+        print(f"  stock_meta 同步完成: stock_basic {len(basic_df):,} 行, "
+              f"stock_industry {len(industry_df):,} 行", flush=True)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print(f"  [警告] 从 raw 同步 stock_meta 元数据失败（不影响行情/特征）: {e}",
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+
+
 # ─── 行情并行 ETL ─────────────────────────────────────────────────────────────────
 def run_market(
     start: str, end: str, raw_db: str, market_db: str,
@@ -587,6 +664,13 @@ def run_market(
     sentiment_calc = MarketSentimentCalculator(market_db)
     sentiment_calc.check_and_update()
     print(f"  market_sentiment 更新完成, 耗时 {time.time() - t1:.1f}s", flush=True)
+
+    # 元数据表 stock_basic / stock_industry 由 raw 库重建（raw-only 自举，支持删除 stock_meta.db）
+    print("\n 从 raw 同步元数据表（stock_basic / stock_industry）...", flush=True)
+    t1 = time.time()
+    meta_db = os.path.join(os.path.dirname(market_db), "stock_meta.db")
+    _sync_meta_from_raw(raw_db, meta_db)
+    print(f"  元数据同步完成, 耗时 {time.time() - t1:.1f}s", flush=True)
 
     try:
         with closing(sqlite3.connect(market_db, timeout=60)) as _ckpt:

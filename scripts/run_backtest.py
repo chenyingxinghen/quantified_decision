@@ -23,6 +23,7 @@ from config.strategy_config import (
     COMMISSION_RATE,
     MAX_POSITIONS,
     SELECTOR_MARKETS, ENABLE_FUNDAMENTAL_FILTER,
+    TIME_STOP_DAYS, TIME_STOP_MIN_LOSS_PCT,
 )
 from datetime import datetime, timedelta
 
@@ -34,6 +35,12 @@ def main():
     parser.add_argument('--start', type=str, default=None, help='回测开始日期 (YYYY-MM-DD)')
     parser.add_argument('--end',   type=str, default=None, help='回测结束日期 (YYYY-MM-DD)')
     parser.add_argument('--output', type=str, default=None, help='结果输出目录 (默认自动生成)')
+    parser.add_argument('--objective', type=str, default=None,
+                        help='单目标回测：只用该子模型排序 (如 rank_y_ret_5d / rank_y_mdd_20d)')
+    parser.add_argument('--hold-days', type=int, default=None,
+                        help='固定持仓天数，覆盖默认 TIME_STOP_DAYS')
+    parser.add_argument('--time-stop-max-return', type=float, default=None,
+                        help='时间止损触发的最大收益率阈值 (默认0.3=亏30%%才退；设很大则到点必退)')
     args = parser.parse_args()
 
     print("=" * 80)
@@ -82,6 +89,7 @@ def main():
         use_cache=use_cache,
         cache_dir=cache_dir,
         name="ML因子策略",
+        single_objective=args.objective,
     )
     
     # 3. 创建回测引擎
@@ -91,7 +99,11 @@ def main():
         data_handler=data_handler,
         initial_capital=initial_capital,
         commission_rate=commission_rate,
-        max_positions=MAX_POSITIONS
+        max_positions=MAX_POSITIONS,
+        time_stop_days=args.hold_days if args.hold_days else TIME_STOP_DAYS,
+        time_stop_max_return_pct=(args.time_stop_max_return
+                                  if args.time_stop_max_return is not None
+                                  else TIME_STOP_MIN_LOSS_PCT),
     )
     
     # 提前获取股票代码
@@ -151,7 +163,9 @@ def main():
     model_category = model_name.split('_')[0]
     
     # 构造回测标识 (包含置信度和日期)
-    backtest_tag = f"conf{int(ML_FACTOR_MIN_CONFIDENCE)}_{start_date}_to_{end_date}"
+    tag_obj = ("obj_" + args.objective) if args.objective else "combined"
+    tag_hold = str(args.hold_days) if args.hold_days else "def"
+    backtest_tag = f"{tag_obj}_hold{tag_hold}_conf{int(ML_FACTOR_MIN_CONFIDENCE)}_{start_date}_to_{end_date}"
     
     # 创建归档路径: backtest_result/{archive_tag}/{model_category}/{backtest_tag}/
     result_dir = args.output if args.output else os.path.join('backtest_result', archive_tag, model_category, backtest_tag)

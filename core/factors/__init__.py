@@ -8,11 +8,21 @@ from .quantitative_factors import QuantitativeFactors
 from .candlestick_pattern_factors import CandlestickPatternFactors
 from .ml_factor_model import MLFactorModel
 from .ml_strategy import MLFactorStrategy, HybridStrategy
+from .multi_objective_labels import (
+    MultiObjectiveLabelBuilder,
+    cross_sectional_rank_targets,
+    orthogonalize_labels,
+    diagnose_label_orthogonality,
+)
 
 __all__ = [
     'QuantitativeFactors',
     'CandlestickPatternFactors',
     'MLFactorModel',
     'MLFactorStrategy',
-    'HybridStrategy'
+    'HybridStrategy',
+    'MultiObjectiveLabelBuilder',
+    'cross_sectional_rank_targets',
+    'orthogonalize_labels',
+    'diagnose_label_orthogonality',
 ]

@@ -86,6 +86,10 @@ class NeuralTrainer:
                 TrainingConfig, "MULTI_OBJECTIVE_RETURN_HORIZONS", (5, 20, 60)
             ),
             risk_horizon=getattr(TrainingConfig, "MULTI_OBJECTIVE_RISK_HORIZON", 20),
+            orthogonal_legs=getattr(TrainingConfig, "MULTI_OBJECTIVE_ORTHOGONAL_LEGS", True),
+            use_matching_risk_for_sharpe=getattr(
+                TrainingConfig, "MULTI_OBJECTIVE_MATCHING_RISK_SHARPE", True
+            ),
         )
         raw_labels = builder.build_universe(stocks_data, train_start_date, train_end_date)
         target_cols = [

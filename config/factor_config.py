@@ -147,6 +147,16 @@ class TrainingConfig:
     FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
     MULTI_OBJECTIVE_RETURN_HORIZONS = (5, 20, 60)
     MULTI_OBJECTIVE_RISK_HORIZON = 20
+    # 正交化相关开关（标签构造层）
+    #  True  → 构造「非重叠前向收益腿」y_ret_leg_1_5d / _6_20d / _21_60d，
+    #          该组目标窗口互不相交、按构造正交，是无泄露的正交目标基。
+    MULTI_OBJECTIVE_ORTHOGONAL_LEGS = True
+    #  True  → build_universe 后对目标做横截面 Gram-Schmidt 残差化（orth_* 列），
+    #          使任意目标集合在同日截面内两两正交；仅用当日截面，无泄露。
+    #  注意：开启后训练目标应改用 orth_* 列（需重新训练，旧模型不再对齐）。
+    MULTI_OBJECTIVE_ORTHOGONALIZE = False
+    # Sharpe 类标签是否使用「与收益同长」的回撤分母（修复跨期泄露，默认开启）。
+    MULTI_OBJECTIVE_MATCHING_RISK_SHARPE = True
     MULTI_OBJECTIVE_WEIGHTS = {
         'y_ret_5d': 0.20,
         'y_ret_20d': 0.25,

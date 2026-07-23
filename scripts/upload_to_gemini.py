@@ -38,6 +38,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 EXCLUDE_SUFFIXES = (".db-wal", ".db-shm", ".db-journal", ".tmp")
 EXCLUDE_NAMES = {"Thumbs.db"}
+# 因子缓存是训练时自动重算的，且云端只读挂载用不到（会写到 $GEMINI_DATA_OUT），
+# 上传既浪费带宽又占存储，直接跳过整个 factors_cache 目录。
+EXCLUDE_DIRS = {"factors_cache"}
+# raw-only 上传白名单：只传源库 jydb_raw.db（6.7GB）；其余（jydb_features.db /
+# stock_daily.db / stock_meta.db / 因子缓存）均在云端由 build_intermediate_from_raw.py
+# 与训练 Step0 重新产出。设为 None 则恢复上传 database/ 下全部（除排除项）。
+WHITELIST = {"jydb_raw.db"}
 
 
 def should_skip(name: str) -> bool:
@@ -79,8 +86,12 @@ def main():
     tasks = []  # (local_path, remote_path)
     total_bytes = 0
     for root, dirs, files in os.walk(local_base):
+        # 剪掉不需要上传的目录（如 factors_cache）
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
         for f in files:
             if should_skip(f):
+                continue
+            if WHITELIST and f not in WHITELIST:
                 continue
             lp = os.path.join(root, f)
             rel = os.path.relpath(lp, local_base)

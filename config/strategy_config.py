@@ -71,10 +71,10 @@ ENABLE_FUNDAMENTAL_FILTER = True
 MIN_MARKET_CAP = 0
 MAX_PE = None
 MAX_ZCFZL = None
-MIN_PRICE = 1
-MAX_PRICE = 20
-INCLUDE_ST = False
-SELECTOR_MARKETS = ['sh_main', 'sz_main']
+MIN_PRICE = None
+MAX_PRICE = None
+INCLUDE_ST = True
+SELECTOR_MARKETS = None
 
 # 说明：
 # 1. 后端场景：前端必须传入参数，不传或为 None 则不限制该条件

@@ -19,10 +19,11 @@ JYDB_ADO_PROVIDER = os.getenv("JYDB_ADO_PROVIDER", "SQLOLEDB")
 # 不直接依赖远端 SQL Server，以保证可复现性和运行稳定性。
 # 特征库是 build 的「产物」，必须可写。云端按 raw-only 策略：raw 留在只读挂载
 # (GEMINI_DATA_IN1)，特征/行情/元数据三个产物库写到可写输出 GEMINI_DATA_OUT。
-# 因此这里优先 GEMINI_FEATURE_DB_PATH，其次 GEMINI_DATA_OUT，最后回退 DATABASE_DIR。
+# 因此这里优先 GEMINI_FEATURE_DB_PATH，其次 GEMINI_DATA_OUT/<文件名>，最后回退 DATABASE_DIR。
+# 注意 GEMINI_DATA_OUT 是"输出目录"，需在其下拼接文件名（见 data_config._DATA_OUT 复用）。
 JYDB_FEATURE_DB_PATH = os.getenv(
     "GEMINI_FEATURE_DB_PATH",
-    os.getenv("GEMINI_DATA_OUT", os.path.join(DATABASE_DIR, "jydb_features.db")),
+    os.path.join(os.getenv("GEMINI_DATA_OUT", DATABASE_DIR), "jydb_features.db"),
 )
 JYDB_RAW_DB_PATH = os.getenv(
     "JYDB_RAW_DB_PATH",

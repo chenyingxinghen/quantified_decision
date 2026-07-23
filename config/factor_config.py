@@ -143,7 +143,7 @@ class TrainingConfig:
     YEARS_FOR_TRAINING   = 6         # 训练数据年数
     YEARS_FOR_BACKTEST   = 0.5         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
-    SHORT_PREDICTION     = True
+    SHORT_PREDICTION     = False
     FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
     MULTI_OBJECTIVE_RETURN_HORIZONS = (5, 20, 60)
     MULTI_OBJECTIVE_RISK_HORIZON = 20

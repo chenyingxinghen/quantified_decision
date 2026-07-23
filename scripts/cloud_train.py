@@ -4,7 +4,7 @@ scripts/cloud_train.py — 云端一键训练 + 回测 + 检验脚本（SUFE Gem
 完整流程（默认四个环节；--with-neural 时追加神经网络环节）:
   1. 数据处理:    (可选) 从 jydb_raw.db 重建中间库；训练前数据完整性自检（非阻断）
   2. 模型训练:    scripts/train_model.py（GBM 多目标，输出到 models/latest）
-  3. 回测:        scripts/run_backtest.py（多目标模型 → 资金曲线/交易/绩效）
+  3. 回测:        scripts/run_backtest.py（未给 --bt-start/--bt-end 时自动跑「样本内(训练区间)+样本外(训练后 oos_years 年)」双回测；给定则单次自定义）
   4. 分析报告:    analysis/run_analysis.py（稳健性/组合/SHAP → 报告 + 图表）
   4b/5. (可选) 神经网络: scripts.train_neural_model.py（输出 models/latest_neural）
         → 神经网络回测(backtest_neural) → 神经网络分析(analysis_neural, 自动跳过 SHAP)
@@ -17,9 +17,17 @@ scripts/cloud_train.py — 云端一键训练 + 回测 + 检验脚本（SUFE Gem
   GEMINI_DATA_OUT  -> 输出目录（报告/日志落盘位置，缺省用项目内 analysis/output）
 
 用法:
-  python scripts/cloud_train.py --build-from-raw --stocks 6000
-  python scripts/cloud_train.py                       # 仅训练+回测+分析（数据已就绪）
-  python scripts/cloud_train.py --bt-start 2025-01-01 --bt-end 2026-01-01
+  # build + 三年训练 + 样本内(3年)回测 + 样本外(1年)回测 + 报告（本需求）
+  python scripts/cloud_train.py --build-from-raw --train-years 3 --oos-years 1 --stocks 6000
+
+  # 默认 6 年训练 + 样本内/样本外双回测 + 报告（数据已就绪，不重建）
+  python scripts/cloud_train.py --stocks 6000
+
+  # 单次自定义回测（给定 --bt-start/--bt-end 时只跑一次，不拆内外样本）
+  python scripts/cloud_train.py --bt-start 2023-01-01 --bt-end 2026-01-01
+
+  # 含神经网络模型（训练+回测+分析，自动跳过 SHAP）
+  python scripts/cloud_train.py --build-from-raw --train-years 3 --oos-years 1 --with-neural
 """
 from __future__ import annotations
 
@@ -96,9 +104,13 @@ def main():
     ap.add_argument("--q", type=int, default=10)
     ap.add_argument("--cost", type=float, default=0.001)
     ap.add_argument("--shap-sample", type=int, default=5000)
-    ap.add_argument("--start", default=None, help="训练开始日期")
-    ap.add_argument("--end", default=None, help="训练结束日期")
-    ap.add_argument("--bt-start", default=None, help="回测开始日期（缺省用策略默认近期窗口）")
+    ap.add_argument("--start", default=None, help="训练开始日期（缺省按 --train-years/--oos-years 自动推算）")
+    ap.add_argument("--end", default=None, help="训练结束日期（缺省 = 现在 - oos_years 年，为样本外留出空间）")
+    ap.add_argument("--train-years", type=float, default=6.0,
+                    help="训练窗口长度（年）。默认 6；本需求用 3 表示三年训练")
+    ap.add_argument("--oos-years", type=float, default=1.0,
+                    help="训练结束日到现在的留白年数 = 样本外回测长度（年）。默认 1")
+    ap.add_argument("--bt-start", default=None, help="回测开始日期（与 --bt-end 同时给则单次自定义回测，否则自动跑样本内+样本外）")
     ap.add_argument("--bt-end", default=None, help="回测结束日期")
     ap.add_argument("--skip-verify", action="store_true", help="跳过训练前数据完整性自检")
     ap.add_argument("--with-neural", action="store_true",
@@ -116,10 +128,43 @@ def main():
     model_path = os.path.join("models", "latest", "multi_objective_factor_model.pkl")
     cache = os.path.join(PROJECT_ROOT, "analysis", "full_dataset.parquet")
 
+    # ── 推算训练窗口与回测窗口 ──
+    # 训练窗 [train_start, train_end]；train_end 默认 = 现在 - oos_years，
+    # 从而把最近 oos_years 年留给样本外回测；train_start = train_end - train_years。
+    now = datetime.datetime.now()
+    oos_years = float(args.oos_years)
+    train_years = float(args.train_years)
+    if args.end:
+        train_end = args.end
+    else:
+        train_end = (now - datetime.timedelta(days=365 * oos_years)).strftime("%Y-%m-%d")
+    if args.start:
+        train_start = args.start
+    else:
+        te = datetime.datetime.strptime(train_end, "%Y-%m-%d")
+        train_start = (te - datetime.timedelta(days=365 * train_years)).strftime("%Y-%m-%d")
+
+    if args.bt_start and args.bt_end:
+        bt_mode = "custom"
+        bt_is_start = bt_oos_start = args.bt_start
+        bt_is_end = bt_oos_end = args.bt_end
+    else:
+        bt_mode = "dual"
+        bt_is_start, bt_is_end = train_start, train_end
+        te = datetime.datetime.strptime(train_end, "%Y-%m-%d")
+        bt_oos_start = train_end
+        bt_oos_end = (te + datetime.timedelta(days=365 * oos_years)).strftime("%Y-%m-%d")
+
     log("=" * 70)
     log("云端一键流水线启动")
     log(f"输出目录: {out_dir}")
     log(f"训练股票数: {args.stocks}, workers: {args.workers}")
+    log(f"训练窗口: {train_start} ~ {train_end}（{train_years:g} 年）")
+    if bt_mode == "dual":
+        log(f"回测(样本内): {bt_is_start} ~ {bt_is_end}")
+        log(f"回测(样本外): {bt_oos_start} ~ {bt_oos_end}（{oos_years:g} 年）")
+    else:
+        log(f"回测(自定义): {bt_is_start} ~ {bt_is_end}")
     log("=" * 70)
 
     # ── 步骤 0: (可选) 从原始库重建 + 数据完整性自检 ──
@@ -134,29 +179,37 @@ def main():
         log("[1/4] 数据处理: 训练前数据完整性自检（非阻断）...")
         try:
             _run([py, "-m", "scripts.verify_data_completeness",
-                  "--recent-years", "4", "--train-years", "6"], log, fatal=False)
+                  "--recent-years", "4", "--train-years", str(int(train_years))], log, fatal=False)
         except Exception as e:  # noqa: BLE001
             log(f"  自检异常（已忽略）: {e}")
 
     # ── 步骤 1: 训练模型 ──
     log("[2/4] 模型训练: scripts.train_model ...")
-    train_cmd = [py, "-m", "scripts.train_model", "--workers", str(args.workers)]
-    if args.start:
-        train_cmd += ["--start", args.start]
-    if args.end:
-        train_cmd += ["--end", args.end]
+    train_cmd = [py, "-m", "scripts.train_model", "--workers", str(args.workers),
+                 "--start", train_start, "--end", train_end]
     _run(train_cmd, log)
 
-    # ── 步骤 2: 回测 ──
-    log("[3/4] 回测: scripts.run_backtest（多目标模型）...")
-    bt_cmd = [py, "-m", "scripts.run_backtest",
-              "--model", model_path,
-              "--output", os.path.join(out_dir, "backtest")]
-    if args.bt_start:
-        bt_cmd += ["--start", args.bt_start]
-    if args.bt_end:
-        bt_cmd += ["--end", args.bt_end]
-    _run(bt_cmd, log)
+    # ── 步骤 2: 回测（样本内 + 样本外，或单次自定义）──
+    if bt_mode == "custom":
+        log("[3/4] 回测(自定义窗口): scripts.run_backtest ...")
+        bt_cmd = [py, "-m", "scripts.run_backtest",
+                  "--model", model_path,
+                  "--output", os.path.join(out_dir, "backtest"),
+                  "--start", bt_is_start, "--end", bt_is_end]
+        _run(bt_cmd, log)
+    else:
+        log("[3/4] 回测(样本内): scripts.run_backtest（训练区间）...")
+        bt_is = [py, "-m", "scripts.run_backtest",
+                 "--model", model_path,
+                 "--output", os.path.join(out_dir, "backtest_insample"),
+                 "--start", bt_is_start, "--end", bt_is_end]
+        _run(bt_is, log)
+        log("[3/4] 回测(样本外): scripts.run_backtest（训练后一年）...")
+        bt_oos = [py, "-m", "scripts.run_backtest",
+                  "--model", model_path,
+                  "--output", os.path.join(out_dir, "backtest_oos"),
+                  "--start", bt_oos_start, "--end", bt_oos_end]
+        _run(bt_oos, log)
 
     # ── 步骤 3: 分析 + 报告 ──
     log("[4/4] 分析报告: analysis.run_analysis ...")
@@ -169,11 +222,8 @@ def main():
         "--q", str(args.q),
         "--cost", str(args.cost),
         "--shap-sample", str(args.shap_sample),
+        "--start", train_start, "--end", train_end,
     ]
-    if args.start:
-        analysis_cmd += ["--start", args.start]
-    if args.end:
-        analysis_cmd += ["--end", args.end]
     _run(analysis_cmd, log)
 
     # ── 步骤 4b (可选): 神经网络模型（与 GBM 平行，共用同一数据基础设施）──
@@ -183,22 +233,28 @@ def main():
 
         log("[4b/5] 神经网络训练: scripts.train_neural_model ...")
         nn_train_cmd = [py, "-m", "scripts.train_neural_model",
-                        "--workers", str(args.workers), "--stocks", str(args.stocks)]
-        if args.start:
-            nn_train_cmd += ["--start", args.start]
-        if args.end:
-            nn_train_cmd += ["--end", args.end]
+                        "--workers", str(args.workers), "--stocks", str(args.stocks),
+                        "--start", train_start, "--end", train_end]
         _run(nn_train_cmd, log)
 
         log("[5b/5] 神经网络回测: scripts.run_backtest（神经网络模型）...")
-        nn_bt_cmd = [py, "-m", "scripts.run_backtest",
-                     "--model", neural_model_path,
-                     "--output", os.path.join(out_dir, "backtest_neural")]
-        if args.bt_start:
-            nn_bt_cmd += ["--start", args.bt_start]
-        if args.bt_end:
-            nn_bt_cmd += ["--end", args.bt_end]
-        _run(nn_bt_cmd, log, fatal=False)
+        if bt_mode == "custom":
+            nn_bt_cmd = [py, "-m", "scripts.run_backtest",
+                         "--model", neural_model_path,
+                         "--output", os.path.join(out_dir, "backtest_neural"),
+                         "--start", bt_is_start, "--end", bt_is_end]
+            _run(nn_bt_cmd, log, fatal=False)
+        else:
+            nn_bt_is = [py, "-m", "scripts.run_backtest",
+                        "--model", neural_model_path,
+                        "--output", os.path.join(out_dir, "backtest_neural_insample"),
+                        "--start", bt_is_start, "--end", bt_is_end]
+            _run(nn_bt_is, log, fatal=False)
+            nn_bt_oos = [py, "-m", "scripts.run_backtest",
+                         "--model", neural_model_path,
+                         "--output", os.path.join(out_dir, "backtest_neural_oos"),
+                         "--start", bt_oos_start, "--end", bt_oos_end]
+            _run(nn_bt_oos, log, fatal=False)
 
         log("[5b/5] 神经网络分析报告: analysis.run_analysis（SHAP 对神经网络不适用，自动跳过）...")
         nn_analysis_cmd = [
@@ -210,24 +266,29 @@ def main():
             "--q", str(args.q),
             "--cost", str(args.cost),
             "--no-shap",
+            "--start", train_start, "--end", train_end,
         ]
-        if args.start:
-            nn_analysis_cmd += ["--start", args.start]
-        if args.end:
-            nn_analysis_cmd += ["--end", args.end]
         _run(nn_analysis_cmd, log, fatal=False)
 
     log("=" * 70)
     log("全部流程完成。产物:")
     log(f"  - 模型:        {model_path}")
-    log(f"  - 回测结果:    {os.path.join(out_dir, 'backtest')}/")
+    if bt_mode == "custom":
+        log(f"  - 回测结果:    {os.path.join(out_dir, 'backtest')}/")
+    else:
+        log(f"  - 回测(样本内): {os.path.join(out_dir, 'backtest_insample')}/")
+        log(f"  - 回测(样本外): {os.path.join(out_dir, 'backtest_oos')}/")
     log(f"  - 分析报告:    {os.path.join(out_dir, 'report.md')}")
     log(f"  - 指标表:      {os.path.join(out_dir, 'metrics.csv')}")
     log(f"  - 图表:        {os.path.join(out_dir, 'figures')}/")
     log(f"  - 流水线日志:  {log_path}")
     if args.with_neural:
         log(f"  - 神经网络模型: {os.path.join('models', 'latest_neural')}/")
-        log(f"  - 神经网络回测: {os.path.join(out_dir, 'backtest_neural')}/")
+        if bt_mode == "custom":
+            log(f"  - 神经网络回测: {os.path.join(out_dir, 'backtest_neural')}/")
+        else:
+            log(f"  - 神经网络回测(内): {os.path.join(out_dir, 'backtest_neural_insample')}/")
+            log(f"  - 神经网络回测(外): {os.path.join(out_dir, 'backtest_neural_oos')}/")
         log(f"  - 神经网络分析: {os.path.join(out_dir, 'analysis_neural', 'report.md')}")
     log("=" * 70)
     log.close()

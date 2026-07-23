@@ -23,7 +23,7 @@ ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型�
 
 
 # 交易费率
-COMMISSION_RATE = 0.005           
+COMMISSION_RATE = 0.0005           
 
 # ==============================================================================
 # 回测系统参数

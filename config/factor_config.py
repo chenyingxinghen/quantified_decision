@@ -72,6 +72,54 @@ class ModelConfig:
         'verbosity': 1,
     }
 
+    # ── LightGBM v2：针对回测暴露的 IS→OOS 过拟合与退化目标(illiq/tradable)做的正则化加强版 ──
+    # 依据 backtest_result/exp3yr 的 OOS 结果：三模型 IS Sharpe 4.8~5.2 暴跌至 OOS -2.5~0.3，
+    # 且 illiq_20d ndcg@5=1.0(疑似泄露)、tradable_20d 输出恒为常数(RankIC≈0)。
+    LIGHTGBM_PARAMS_V2: Dict[str, Any] = {
+        'n_estimators': 1500,
+        'num_leaves': 12,
+        'learning_rate': 0.02,
+
+        'min_child_samples': 100,    # 新增：限制叶节点最小样本，抑制过拟合
+        'min_gain_to_split': 0.05,   # 0.01→0.05，剪掉噪声分裂
+        'reg_alpha': 1.0,            # L1 0.2→1.0
+        'reg_lambda': 3.0,           # L2 0.2→3.0
+        'subsample': 0.7,            # 0.8→0.7 + bagging
+        'colsample_bytree': 0.6,     # 0.8→0.6
+        'subsample_freq': 1,
+        'path_smooth': 10,           # 新增：平滑树分裂增益，抑制 ranking 过拟合
+
+        'objective': 'lambdarank',
+        'metric': 'ndcg',
+        'eval_at': [5],
+        'lambdarank_truncation_level': 30,   # 50→30，降低对极端头部档位的过度优化
+        'label_gain': [i//3*i**1.5 if i>2 else i for i in range(n_bins)],
+
+        'early_stopping_rounds': 80, # 50→80
+        'n_jobs': -1,
+        'verbosity': -1,
+    }
+
+    # ── XGBoost v2：同上，针对过拟合加强正则 ──
+    XGBOOST_PARAMS_V2: Dict[str, Any] = {
+        'n_estimators': 1500,
+        'max_depth': 3,
+        'learning_rate': 0.02,
+
+        'subsample': 0.7,            # 0.8→0.7
+        'colsample_bytree': 0.5,
+        'min_child_weight': 10,      # 2.0→10，强叶正则
+        'gamma': 0.1,                # 0.01→0.1
+        'reg_alpha': 1.0,            # 0.2→1.0
+        'reg_lambda': 3.0,           # 0.2→3.0
+
+        'eval_metric': 'ndcg',
+        'ndcg_exp_gain': False,
+
+        'n_jobs': -1,
+        'early_stopping_rounds': 80, # 50→80
+        'verbosity': 1,
+    }
 
 
     # ── GPU 专用配置增量（XGBoost，当 USE_GPU=True 时叠加）───────────────
@@ -84,13 +132,18 @@ class ModelConfig:
     # ── 统一接口 ──────────────────────────────────────────────────────────
     @classmethod
     def get_model_params(cls, model_type: str, task: str = None) -> Dict[str, Any]:
-        """获取指定模型的超参数，根据任务类型动态设置目标"""
+        """获取指定模型的超参数，根据任务类型动态设置目标。
+
+        当环境变量 ``QD_MODEL_VERSION=v2`` 时返回 v2 正则化加强版超参
+        （见 LIGHTGBM_PARAMS_V2 / XGBOOST_PARAMS_V2），用于提升 OOS 稳定性。
+        """
         if task is None:
             task = TrainingConfig.TASK
-        
+
+        use_v2 = os.getenv('QD_MODEL_VERSION') == 'v2'
         params_map = {
-            'xgboost': cls.XGBOOST_PARAMS.copy(),
-            'lightgbm': cls.LIGHTGBM_PARAMS.copy(),
+            'xgboost': (cls.XGBOOST_PARAMS_V2 if use_v2 else cls.XGBOOST_PARAMS).copy(),
+            'lightgbm': (cls.LIGHTGBM_PARAMS_V2 if use_v2 else cls.LIGHTGBM_PARAMS).copy(),
         }
         params = params_map.get(model_type, {})
         
@@ -166,6 +219,25 @@ class TrainingConfig:
         'y_illiq_20d': 0.07,
         'y_tradable_20d': 0.05,
     }
+
+    # v2 多目标权重：剔除回测中暴露的退化/泄露目标
+    #   - y_illiq_20d：训练 ndcg@5=1.0（完美排序，疑似泄露或近确定性特征），OOS 输出恒为 0.29 → 无效
+    #   - y_tradable_20d：输出恒为常数、RankIC≈0.0000（Unique=1）→ 死权重
+    # 剩余 5 个有效目标重新归一化到权重和为 1。
+    MULTI_OBJECTIVE_WEIGHTS_V2 = {
+        'y_ret_5d': 0.24,
+        'y_ret_20d': 0.24,
+        'y_ret_60d': 0.22,
+        'y_mdd_20d': 0.18,
+        'y_downvol_20d': 0.12,
+    }
+
+    @staticmethod
+    def get_objective_weights() -> Dict[str, float]:
+        """按 QD_MODEL_VERSION 返回对应的多目标权重（默认 v1）。"""
+        if os.getenv('QD_MODEL_VERSION') == 'v2':
+            return dict(TrainingConfig.MULTI_OBJECTIVE_WEIGHTS_V2)
+        return dict(TrainingConfig.MULTI_OBJECTIVE_WEIGHTS)
 
 
     # ── 数据集划分 ─────────────────────────────────────────────────────────
@@ -416,6 +488,12 @@ class OptimizationConfig:
     # 特征选择方法
     FEATURE_SELECTION_METHOD = 'hybrid'  # 'importance', 'correlation', 'mutual_info', 'rfe', 'hybrid'
     N_FEATURES_TO_SELECT = 400  # 候选上限；最终数量仍受覆盖率、常量和相关性过滤约束
+
+    # 类别下限保证：相关性排名会把弱信号的财务/估值类挤出，这里强制每类至少保留若干。
+    # A 股短周期下财务类因子与未来收益相关性天然偏弱，但经济学上需保留基本面解释力。
+    # 键为 analysis/classify_features 的类别名（财务/交易/估值）；交易类数量充足无需下限。
+    # 仅 Universe 中实际存在的财务特征共 6 个，下限取 3 即可保证基本面被纳入。
+    CATEGORY_MIN_FEATURES = {'财务': 3, '估值': 5}
 
     # 特征选择阈值
     FEATURE_IMPORTANCE_THRESHOLD = 0.001

@@ -87,6 +87,7 @@ def main():
     (X, y, returns, factor_names, dates, unbuyable_mask,
      limit_groups, path_scores, is_st_arr, w_sig_arr, codes) = fd
     print(f"[analysis] 样本: X={X.shape}, 特征数={len(factor_names)}")
+    n_samples = X.shape[0]  # 在 del X 之前保存样本数，供末尾 results meta 使用
 
     # ── 2. 归一化 + 预测 ──
     from core.factors.train_ml_model import MLModelTrainer
@@ -143,7 +144,7 @@ def main():
         "shap": shap_res,
         "mechanism": mechanism_res,
         "meta": {
-            "n_samples": int(X.shape[0]),
+            "n_samples": int(n_samples),
             "train_range": f"{str(dates[0])[:10]}~{str(dates[-1])[:10]}",
         },
     }

@@ -16,7 +16,7 @@ from core.factors.train_ml_model import (
 )
 from core.factors.ml_factor_model import MultiObjectiveFactorModel
 from config.jydb_config import DATABASE_PATH
-from config.factor_config import TrainingConfig
+from config.factor_config import TrainingConfig, ModelConfig
 import pandas as pd
 import sqlite3 as _sqlite3
 
@@ -280,7 +280,7 @@ def main():
 
     multi_model, results, selected_names = trainer.train_multiobjective_models(
         X, aligned, factor_names, dates,
-        objective_weights=TrainingConfig.MULTI_OBJECTIVE_WEIGHTS,
+        objective_weights=TrainingConfig.get_objective_weights(),
         model_type=args.model_type,
         objective_workers=args.objective_workers,
         resume_from=resume_from,
@@ -303,6 +303,8 @@ def main():
             'selected_features': selected_names,
             'train_start_date': train_start_date,
             'train_end_date': train_end_date,
+            'model_version': os.getenv('QD_MODEL_VERSION', 'v1'),
+            'model_params': ModelConfig.get_model_params(args.model_type, TrainingConfig.TASK),
         }, f, ensure_ascii=False, indent=2)
     if getattr(trainer, 'norm_stats', None) is not None:
         for target_dir in (archive_dir, latest_dir):

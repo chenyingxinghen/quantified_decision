@@ -18,14 +18,96 @@ from scipy import stats
 from .common import classify_features, category_of_name
 
 
-def _get_boosters(model):
-    """提取每个目标的 LightGBM Booster（用于 SHAP / gain）。"""
-    boosters = {}
-    for obj, sub in model.models.items():
-        m = getattr(sub, "model", None)
-        booster = getattr(m, "booster_", None) or m
-        boosters[obj] = booster
-    return boosters
+def _get_submodels(model) -> dict:
+    """返回 {objective: MLFactorModel 子模型}。"""
+    return dict(model.models)
+
+
+def _booster_object(sub):
+    """返回 (booster, kind) 供 SHAP TreeExplainer / gain 提取使用。
+
+    - LightGBM: 取 m.booster_（sklearn 包装下的原生 Booster）
+    - XGBoost:  取 m.get_booster()（sklearn 包装下的原生 Booster）
+    """
+    m = getattr(sub, "model", None)
+    booster = getattr(m, "booster_", None)
+    if booster is not None:
+        return booster, "lgb"
+    if m is not None and hasattr(m, "get_booster"):
+        try:
+            return m.get_booster(), "xgb"
+        except Exception:
+            return m, "xgb"
+    return m, "unknown"
+
+
+def _gain_importance(sub, selected: list) -> np.ndarray:
+    """返回与 selected 顺序对齐的 gain 重要性数组（兼容 LightGBM / XGBoost）。
+
+    修复点：旧实现直接调用 b.feature_importance(importance_type="gain")，
+    该 API 仅 LightGBM 提供；XGBoost 的 sklearn 模型无此方法，会抛
+    AttributeError 并被外层捕获为全 0，导致三类边际贡献全部为 0.0%。
+
+    兼容以下三种底层形态（本项目 XGB 子模型 pickle 后 sub.model 即 xgb.Booster）：
+      - LightGBM Booster:        booster.feature_importance(importance_type="gain")
+      - XGBoost Booster (裸):     booster.get_score(importance_type="gain")
+      - XGBoost sklearn 包装:     model.get_booster().get_score(...)
+    并把 get_score 返回的 {特征名 / f0..索引: gain} 按 selected 顺序对齐
+    （f0/f1... 按索引映射，与训练列序一致，逻辑对齐
+     MLFactorModel._calculate_feature_importance）。
+    """
+    m = getattr(sub, "model", None)
+    if m is None:
+        return np.zeros(len(selected), dtype=float)
+
+    # ── LightGBM: sklearn 包装下的原生 Booster ──
+    booster = getattr(m, "booster_", None)
+    if booster is not None and hasattr(booster, "feature_importance"):
+        try:
+            gi = np.asarray(booster.feature_importance(importance_type="gain"),
+                            dtype=float)
+            if len(gi) == len(selected):
+                return gi
+        except Exception:
+            pass
+
+    # ── XGBoost: 取得 booster（裸 Booster 直接用 m，sklearn 包装用 get_booster）──
+    xgb_booster = None
+    if hasattr(m, "get_score") and not hasattr(m, "feature_importance"):
+        xgb_booster = m  # m 本身就是 xgb.Booster
+    elif hasattr(m, "get_booster"):
+        try:
+            xgb_booster = m.get_booster()
+        except Exception:
+            xgb_booster = None
+    if xgb_booster is not None and hasattr(xgb_booster, "get_score"):
+        try:
+            score = xgb_booster.get_score(importance_type="gain")
+        except Exception:
+            score = {}
+        if score:
+            first_key = next(iter(score))
+            # f0, f1, ... 默认索引命名 -> 按位映射回 selected
+            if (first_key.startswith("f") and first_key[1:].isdigit()
+                    and first_key not in selected):
+                gi = np.zeros(len(selected), dtype=float)
+                for k, v in score.items():
+                    if k.startswith("f") and k[1:].isdigit():
+                        idx = int(k[1:])
+                        if idx < len(selected):
+                            gi[idx] = float(v)
+                return gi
+            # 实际特征名命名
+            return np.asarray([float(score.get(name, 0.0)) for name in selected],
+                              dtype=float)
+
+    # ── sklearn-style attribute 兜底（极少触发）──
+    if hasattr(m, "feature_importances_"):
+        fi = np.asarray(m.feature_importances_, dtype=float)
+        if len(fi) == len(selected):
+            return fi
+
+    return np.zeros(len(selected), dtype=float)
 
 
 def _selected_matrix(Xn: np.ndarray, factor_names, selected, n_sample: int, rng):
@@ -52,35 +134,33 @@ def global_importance(
     rng = np.random.default_rng(seed)
     selected = list(model.feature_names)
     weights = model.weights
+    subs = _get_submodels(model)
     Xsel, _ = _selected_matrix(Xn, factor_names, selected, n_sample, rng)
 
-    boosters = _get_boosters(model)
     per_objective: dict = {}
     accum = np.zeros(len(selected), dtype=float)
 
     try:
         import shap  # 可选依赖
-        for obj, b in boosters.items():
+        for obj, sub in subs.items():
             try:
+                b, _ = _booster_object(sub)
                 exp = shap.TreeExplainer(b)
                 sv = np.asarray(exp.shap_values(Xsel), dtype=float)
                 if sv.ndim == 3:
                     sv = sv.sum(axis=2)  # 多分类保护（本模型为回归/排序，通常 2D）
                 mean_abs = np.abs(sv).mean(axis=0)
             except Exception:
-                mean_abs = np.asarray(b.feature_importance(importance_type="gain"), dtype=float)
+                mean_abs = _gain_importance(sub, selected)
             per_objective[obj] = dict(zip(selected, mean_abs))
-            accum += weights.get(obj, 1.0 / len(boosters)) * mean_abs
+            accum += weights.get(obj, 1.0 / len(subs)) * mean_abs
         method = "shap"
     except Exception:
-        # 回退：LightGBM gain 重要性
-        for obj, b in boosters.items():
-            try:
-                gi = np.asarray(b.feature_importance(importance_type="gain"), dtype=float)
-            except Exception:
-                gi = np.zeros(len(selected))
+        # 回退：gain 重要性（LightGBM / XGBoost 均已兼容）
+        for obj, sub in subs.items():
+            gi = _gain_importance(sub, selected)
             per_objective[obj] = dict(zip(selected, gi))
-            accum += weights.get(obj, 1.0 / len(boosters)) * gi
+            accum += weights.get(obj, 1.0 / len(subs)) * gi
         method = "gain"
 
     importance = dict(zip(selected, accum))
@@ -120,11 +200,12 @@ def interaction_effects(
     rng = np.random.default_rng(seed)
     Xsub, _ = _selected_matrix(Xn, factor_names, order, n_sample, rng)
 
-    boosters = _get_boosters(model)
-    obj0 = next(iter(boosters))
+    subs = _get_submodels(model)
+    obj0 = next(iter(subs))
     try:
         import shap
-        exp = shap.TreeExplainer(boosters[obj0])
+        b0, _ = _booster_object(subs[obj0])
+        exp = shap.TreeExplainer(b0)
         inter = np.asarray(exp.shap_interaction_values(Xsub), dtype=float)
         if inter.ndim == 4:
             inter = inter.sum(axis=2)

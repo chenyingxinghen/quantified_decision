@@ -43,62 +43,72 @@ def load_model(model_path: str):
         return MultiObjectiveNeuralModel.load_model(model_path)
 
 
+def _cache_dir(path: str) -> str:
+    """缓存路径约定：传入 xxx.parquet 时实际落到 xxx/ 目录（多文件存储）；
+    直接传目录则原样返回。统一收敛到目录，便于「每数组一个文件」的存储。"""
+    if path.endswith(".parquet"):
+        return path[: -len(".parquet")]
+    return path
+
+
 def load_full_dataset_from_parquet(path: str):
-    """从 parquet 缓存恢复 full_dataset。
+    """从目录式缓存（每个数组一个 .npy）恢复 full_dataset。
 
     返回: (X, y, returns, factor_names, dates, unbuyable_mask,
            limit_groups, path_scores, is_st_arr, w_sig_arr, codes)
     """
-    store = pd.read_parquet(path)
-    meta = pickle.loads(store.attrs["meta"])
-    shapes = meta.get("shapes")
+    d = _cache_dir(path)
+    with open(os.path.join(d, "meta.pkl"), "rb") as f:
+        meta = pickle.load(f)
+    shapes = meta["shapes"]
     arrays = []
     for i in range(meta["n_arrays"]):
-        arr = store[f"arr_{i}"].to_numpy()
-        # 二维数组（特征矩阵 X）落盘时被展平，读取时按记录的形状还原
-        if shapes is not None and len(shapes[i]) == 2:
+        arr = np.load(os.path.join(d, f"arr_{i}.npy"), allow_pickle=True)
+        if len(shapes[i]) == 2:
             arr = arr.reshape(shapes[i])
         arrays.append(arr)
-    factor_names = meta["factor_names"]
-    # codes 是 object 列，需从单独列取回
-    codes = store["codes"].to_numpy()
-    # 把 codes 放回第 10 位（与 prepare_dataset 顺序一致）
+    codes = np.load(os.path.join(d, "codes.npy"), allow_pickle=True)
     out = list(arrays)
     out.insert(10, codes)
     # 加载后统一特征矩阵为 float32（与 build/评分一致，降低内存占用）
     out[0] = np.ascontiguousarray(out[0], dtype=np.float32)
+    # factor_names 在内存构建路径中是 list；缓存以 object ndarray 存储，load 后需还原为
+    # list，否则 analysis/shap_analysis.py 中 factor_names.index(...) 会因 ndarray 无 index
+    # 而崩溃（AttributeError）。dates/codes 两条路径均为 ndarray，保持一致无需转换。
+    if isinstance(out[3], np.ndarray):
+        out[3] = out[3].tolist()
     return tuple(out)
 
 
 def save_full_dataset_to_parquet(path: str, full_dataset) -> None:
-    """把 full_dataset 存成单文件 parquet（便于分析阶段复用，避免重复拉库）。"""
+    """把 full_dataset 存成目录式多文件（每个数组一个 .npy）。
+
+    关键内存修正：之前用 pandas/pyarrow 写 X 时，pyarrow 会把 22 亿行的 X
+    整列再持有一份 8.8GB 缓冲，与已在内存的 X(8.8GB) 叠加 → ~17.6GB 峰值，
+    在本机 ~20GB 空闲下触发 OOM 被杀（无 Python traceback）。改用 np.save
+    直接落盘、零额外缓冲，保存峰值降到 ~8.8GB；同时每个数组独立文件，避免
+    长度不齐导致 DataFrame 按索引对齐成 22 亿行的问题。
+    """
+    d = _cache_dir(path)
+    os.makedirs(d, exist_ok=True)
     (X, y, returns, factor_names, dates, unbuyable_mask,
      limit_groups, path_scores, is_st_arr, w_sig_arr, codes) = full_dataset
     arrays = [X, y, returns, np.asarray(factor_names, dtype=object),
               np.asarray(dates, dtype=object), unbuyable_mask,
               limit_groups, path_scores, is_st_arr, w_sig_arr]
-    cols = {}
     shapes = []
     for i, a in enumerate(arrays):
-        a = np.asarray(a)
-        shapes.append(a.shape)
-        if a.ndim == 1:
-            cols[f"arr_{i}"] = pd.Series(a)
-        elif a.ndim == 2:
-            # X 是二维特征矩阵，DataFrame 单列必须是一维；展平存储并记录形状以便恢复
-            cols[f"arr_{i}"] = pd.Series(a.reshape(-1))
-        else:
-            raise ValueError(f"不支持的数组维度 ndim={a.ndim} (arr_{i})")
-    cols["codes"] = pd.Series(codes)
-    df = pd.DataFrame(cols)
+        a = np.ascontiguousarray(a)
+        shapes.append(list(a.shape))
+        np.save(os.path.join(d, f"arr_{i}.npy"), a.reshape(-1))
+    np.save(os.path.join(d, "codes.npy"), np.ascontiguousarray(codes))
     meta = {
         "n_arrays": len(arrays),
-        "factor_names": list(factor_names),
         "shapes": shapes,
+        "factor_names": list(np.asarray(factor_names, dtype=object)),
     }
-    df.attrs["meta"] = pickle.dumps(meta)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    df.to_parquet(path, index=False)
+    with open(os.path.join(d, "meta.pkl"), "wb") as f:
+        pickle.dump(meta, f)
 
 
 def build_full_dataset(
@@ -118,8 +128,9 @@ def build_full_dataset(
         cache_path:     缓存 parquet 路径；命中且非强制重建时直接返回
         force_rebuild:  True 时忽略缓存重建
     """
-    if cache_path and os.path.exists(cache_path) and not force_rebuild:
-        print(f"[dataset] 命中缓存: {cache_path}")
+    cache_dir = _cache_dir(cache_path)
+    if cache_dir and os.path.exists(cache_dir) and not force_rebuild:
+        print(f"[dataset] 命中缓存: {cache_dir}")
         return load_full_dataset_from_parquet(cache_path)
 
     from datetime import datetime, timedelta
@@ -222,71 +233,17 @@ def predict_scores(model, Xn: np.ndarray, factor_names: List[str],
 
 # ════════════════════════════════════════════════════════════════════════
 # 3. 特征归类: 财务 / 交易 / 估值 / 其他
+#    单一事实来源已上移至 core/factors/feature_categories.py（避免
+#    analysis<->core 环形依赖，供 core 内 feature_selector 按类别配额使用）。
+#    此处仅做再导出，保持 analysis 包内 classify_features/category_of_name
+#    可用名不变。
 # ════════════════════════════════════════════════════════════════════════
-# 估值类特征（显式名单 + 命名模式）
-_VALUATION_EXACT = {
-    "dynamic_pe", "dynamic_pb", "inv_pe", "inv_pb", "market_cap",
-    "peg", "roe_to_pb", "ep_ttm", "bp_ttm", "ps_ttm", "valuation_z",
-}
-_VALUATION_PREFIX = ("pe_", "pb_", "cap_", "ps_", "ev_", "pcf_")
-_VALUATION_SUBSTR = ("_pe", "_pb", "_cap", "_peg", "valuation", "market_cap")
-
-# 基础财务（非估值）显式名单
-_FINANCIAL_EXACT = {
-    "epsTTM", "roe", "roa", "roic", "liabilityToAsset", "assetToEquity",
-    "profit_yoy", "revenue_yoy", "net_profit_yoy", "sue", "eav",
-    "gross_margin", "operating_margin", "debt_to_asset", "current_ratio",
-    "eps", "bvps", "ocfps", "roe_x_np_growth", "np_growth",
-}
-_FINANCIAL_PREFIX = ("roe_", "roa_", "eps", "profit", "revenue", "margin_",
-                     "asset_", "debt_", "growth_", "sue", "eav", "equity_")
-
-
-def _is_valuation(name: str) -> bool:
-    if name in _VALUATION_EXACT:
-        return True
-    if any(name.startswith(p) for p in _VALUATION_PREFIX):
-        return True
-    if any(s in name for s in _VALUATION_SUBSTR):
-        return True
-    return False
-
-
-def _is_financial(name: str) -> bool:
-    if name in _FINANCIAL_EXACT:
-        return True
-    if any(name.startswith(p) for p in _FINANCIAL_PREFIX):
-        return True
-    return False
-
-
-def classify_features(factor_names: List[str]) -> Dict[str, str]:
-    """把每个特征名映射到四大类之一: 财务 / 交易 / 估值 / 其他。
-
-    归类规则（与 prepare_dataset 的特征审计一致，并进一步拆分基本面为财务/估值）:
-      - 估值: 市盈率/市净率/市值/PEG 等估值类
-      - 财务: 盈利/成长/偿债/质量等基本面（非估值）
-      - 交易: 技术面、量价、动量、波动、K线形态、市场情绪、状态、特征工程衍生
-      - 其他: 以上均未匹配
-    """
-    cat: Dict[str, str] = {}
-    for name in factor_names:
-        if _is_valuation(name):
-            cat[name] = "估值"
-        elif _is_financial(name):
-            cat[name] = "财务"
-        else:
-            # 交易面特征库（与审计中的 technical/advanced/candle/sentiment/status）
-            cat[name] = "交易"
-    return cat
-
-
-def category_of_name(name: str) -> str:
-    if _is_valuation(name):
-        return "估值"
-    if _is_financial(name):
-        return "财务"
-    return "交易"
+from core.factors.feature_categories import (  # noqa: E402
+    classify_features,
+    category_of_name,
+    _is_valuation,
+    _is_financial,
+)
 
 
 # ════════════════════════════════════════════════════════════════════════

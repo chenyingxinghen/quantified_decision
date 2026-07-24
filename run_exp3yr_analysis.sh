@@ -5,6 +5,11 @@
 # 数据集只构建一次（首个模型建并缓存，其余复用 --dataset）。
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Windows(git bash) 下 pwd 给出 /g/... 的 posix 路径，原生 Windows Python 无法解析
+# （会当成 G:\g\... 找不到）。转成 G:/... 形式，保证 --model/--dataset 等路径可被正确打开。
+if [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "cygwin"* ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"
+fi
 cd "$SCRIPT_DIR"
 
 if [[ "${OS:-}" == "Windows_NT" ]] || [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "cygwin"* ]]; then
@@ -18,7 +23,7 @@ ANALYSIS_END=2026-07-21
 BASE="backtest_result/exp3yr"
 LOGDIR="$BASE/logs"
 mkdir -p "$LOGDIR" "$BASE/analysis"
-DATASET_CACHE="$SCRIPT_DIR/analysis/full_dataset_exp3yr.parquet"
+DATASET_CACHE="$SCRIPT_DIR/analysis/full_dataset_exp3yr"   # 目录式缓存（多文件），xgb 建一次、lgb/neutral 复用
 STOCKS="${STOCKS:-3000}"   # 64GB cgroup 安全；如需全量 STOCKS=6000（分析可能 OOM）
 
 XGB_PKL="$SCRIPT_DIR/models/exp3yr_xgb/latest/multi_objective_factor_model.pkl"

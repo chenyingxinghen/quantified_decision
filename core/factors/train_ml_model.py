@@ -1996,13 +1996,17 @@ class MLModelTrainer:
                     import json
                     with open(selection_cache_file, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
-                        # 只有当原始特征集完全一致时，才复用缓存
+                        # 只有当原始特征集、max_features、类别下限与预处理版本完全一致时，才复用缓存
                         current_max_features = getattr(
                             OptimizationConfig, 'N_FEATURES_TO_SELECT', 400
+                        )
+                        current_category_min = getattr(
+                            OptimizationConfig, 'CATEGORY_MIN_FEATURES', None
                         )
                         if (
                             set(cached_data.get('original_features', [])) == set(original_factor_names)
                             and cached_data.get('max_features') == current_max_features
+                            and cached_data.get('category_min', None) == current_category_min
                             and cached_data.get('preprocessing_version') == 2
                         ):
                             factor_names = cached_data['selected_features']
@@ -2027,6 +2031,9 @@ class MLModelTrainer:
                             'selected_features': factor_names,
                             'max_features': getattr(
                                 OptimizationConfig, 'N_FEATURES_TO_SELECT', 400
+                            ),
+                            'category_min': getattr(
+                                OptimizationConfig, 'CATEGORY_MIN_FEATURES', None
                             ),
                             'preprocessing_version': 2,
                             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2598,6 +2605,7 @@ class MLModelTrainer:
             max_features=getattr(OptimizationConfig, 'N_FEATURES_TO_SELECT', 400),
             min_coverage=0.20,
             corr_threshold=corr_threshold,
+            category_min=getattr(OptimizationConfig, 'CATEGORY_MIN_FEATURES', None),
         )
         X_selected, selected = selector.fit_transform(
             X, feature_names, y, feature_coverage=feature_coverage,

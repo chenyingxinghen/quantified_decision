@@ -91,6 +91,7 @@ class NeuralNetFactorModel:
         epochs: int = 60,
         weight_decay: float = 1e-5,
         patience: int = 12,
+        min_delta: float = 1e-6,
         device: Optional[str] = None,
         seed: int = 42,
     ):
@@ -105,6 +106,7 @@ class NeuralNetFactorModel:
         self.epochs = int(epochs)
         self.weight_decay = float(weight_decay)
         self.patience = int(patience)
+        self.min_delta = float(min_delta)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.seed = int(seed)
 
@@ -248,7 +250,7 @@ class NeuralNetFactorModel:
                 val_loss = (v_running / max(v_n, 1)).item()
                 val_losses.append(val_loss)
                 scheduler.step(val_loss)
-                if val_loss < best_val_loss - 1e-6:
+                if val_loss < best_val_loss - self.min_delta:
                     best_val_loss = val_loss
                     best_state = {
                         k: v.detach().cpu().clone()

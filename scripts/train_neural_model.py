@@ -180,15 +180,16 @@ def main():
 
     # 5. 多目标神经网络训练
     print(f"\n[NN-Step 4] 训练多目标神经网络模型...")
-    model_kwargs = nc.NeuralConfig.to_model_kwargs()
+    model_kwargs = nc.NeuralConfig.current_model_kwargs()
     if args.epochs != nc.NeuralConfig.EPOCHS:
         model_kwargs["epochs"] = args.epochs
     # 注意：神经网络使用独立的 NeuralConfig 多目标权重（强调风险调整收益），
     # 与 GBM 的 TrainingConfig.MULTI_OBJECTIVE_WEIGHTS 不同；build_dataset 生成的
     # 标签列也来自 NeuralConfig，因此这里必须传 NeuralConfig 权重，否则会出现
     # 标签列与权重键不匹配、sharpe 类核心目标被静默丢弃的问题。
+    # current_weights / current_model_kwargs 会按 QD_MODEL_VERSION 自动切换 v2。
     multi_model, selected_names, norm_stats, results = trainer.train_multiobjective(
-        dataset, objective_weights=nc.NeuralConfig.MULTI_OBJECTIVE_WEIGHTS,
+        dataset, objective_weights=nc.NeuralConfig.current_weights(),
         model_kwargs=model_kwargs,
     )
 

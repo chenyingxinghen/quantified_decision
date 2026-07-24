@@ -1,11 +1,14 @@
 """面向横截面模型的可复现特征筛选。"""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+from .feature_categories import classify_features
 
 
 @dataclass
@@ -15,6 +18,7 @@ class FeatureSelectionReport:
     dropped_constant: List[str]
     dropped_redundant: List[str]
     scores: Dict[str, float]
+    category_min: Dict[str, int] = None  # 实际生效的类别下限（用于缓存键/审计）
 
 
 class CrossSectionalFeatureSelector:
@@ -22,6 +26,11 @@ class CrossSectionalFeatureSelector:
 
     该实现只在训练集上拟合。对单目标传入一维 y；多目标可传入二维
     ``targets``，最终得分为各目标绝对 Spearman 相关性的加权平均。
+
+    category_min: 可选 ``{类别: 最少保留数}``。在相关性贪心剪枝之后，对未达下限的
+    类别用其得分最高的候选补齐（即便与已选特征有一定冗余也保留，仅跳过近乎完全
+    重复的 corr>0.99）。用于保证基本面/估值等弱信号类别不被纯相关性排名完全挤出
+    （A 股短周期下财务类因子与未来收益相关性天然偏弱，但经济学上需要保留）。
     """
 
     def __init__(
@@ -30,11 +39,13 @@ class CrossSectionalFeatureSelector:
         min_coverage: float = 0.20,
         corr_threshold: float = 0.95,
         sample_size: int = 200_000,
+        category_min: Optional[Dict[str, int]] = None,
     ):
         self.max_features = max_features
         self.min_coverage = min_coverage
         self.corr_threshold = corr_threshold
         self.sample_size = sample_size
+        self.category_min = dict(category_min) if category_min else {}
         self.report_: Optional[FeatureSelectionReport] = None
 
     def fit(
@@ -112,12 +123,40 @@ class CrossSectionalFeatureSelector:
             if len(selected) >= self.max_features:
                 break
 
+        # ── 类别下限保证（category_min）──
+        # 在相关性贪心剪枝之后，对未达下限的类别用其得分最高的候选补齐。
+        # 即便与已选特征有一定冗余也保留（仅跳过 corr>0.99 的近完全重复），
+        # 以保证该经济学类别在模型中至少有一席之地。配额特征可能使最终数量
+        # 略超 max_features，这是设计预期（用户的明确诉求优先于硬性数量上限）。
+        if self.category_min:
+            cat_of = classify_features(candidates)
+            counts = Counter(cat_of[n] for n in selected)
+            for cat_name, min_n in self.category_min.items():
+                need = min_n - counts.get(cat_name, 0)
+                if need <= 0:
+                    continue
+                # 该类别尚未入选的候选，按得分降序
+                pool = [n for n in candidates if cat_of.get(n) == cat_name
+                        and n not in selected]
+                pool.sort(key=lambda n: -float(scores.get(n, 0.0)))
+                added = 0
+                for n in pool:
+                    # 仅排除近完全重复，保留有信息量的弱信号特征
+                    if any(corr.loc[n, kept] > 0.99 for kept in selected):
+                        continue
+                    selected.append(n)
+                    added += 1
+                    if added >= need:
+                        break
+                counts[cat_name] = counts.get(cat_name, 0) + added
+
         self.report_ = FeatureSelectionReport(
             selected_features=selected,
             dropped_low_coverage=dropped_low_coverage,
             dropped_constant=dropped_constant,
             dropped_redundant=dropped_redundant,
             scores=scores,
+            category_min=self.category_min,
         )
         return self
 

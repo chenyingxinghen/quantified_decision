@@ -73,7 +73,13 @@ signal.signal(signal.SIGTERM, _signal_handler)
 def _connect_source():
     """创建到聚源 SQL Server 的新连接，使用项目统一配置。"""
     import pyodbc
-    return pyodbc.connect(build_connection_string(), timeout=60)
+    conn = pyodbc.connect(build_connection_string(), timeout=60)
+    # 查询执行超时（秒）。仅 timeout=60 只管登录阶段；不设 cnxn.timeout 时，
+    # 聚源侧查询卡死会让进程在 C 层 recv 永久挂起（进程存活但零吞吐、零提交）。
+    # 设此值后，卡死的查询会在 300s 后抛 pyodbc.OperationalError，
+    # 被主循环 try/except 捕获→标记批次失败→watcher 自愈重试。
+    conn.timeout = 300
+    return conn
 
 
 # ─── 本地 SQLite 仓库（兼容 JYDBRawStore schema）─────────────────────────────────
@@ -93,7 +99,7 @@ class ParallelRawStore:
         conn = sqlite3.connect(self.db_path, timeout=120)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA busy_timeout=300000")
         return conn
 
     def _init_schema(self):
@@ -155,18 +161,36 @@ class ParallelRawStore:
                     data[col] = data[col].map(lambda v: float(v) if isinstance(v, Decimal) else v)
         return data.where(pd.notna(data), None)
 
+    def _upsert_checkpoint(self, table: str, batch_start: str, batch_end: str,
+                           row_count: int, sql_hash: str) -> None:
+        """写入/更新批次级 checkpoint（续传用）。空批次也会记录，避免断点续传
+        把 0 行结果的历史批次误判为未完成、反复重拉。"""
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO pull_checkpoint "
+                "(source_table, batch_start, batch_end, row_count, sql_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(source_table, batch_start, batch_end) DO UPDATE SET "
+                "row_count=excluded.row_count, sql_sha256=excluded.sql_sha256, "
+                "completed_at=excluded.completed_at",
+                (table, batch_start, batch_end, row_count, sql_hash,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+
     def save_batch(
         self, spec: RawQuerySpec, frame: pd.DataFrame,
         batch_start: str, batch_end: str,
     ) -> int:
         """多进程安全地写入一个批次数据，同时更新 raw_etl_manifest。"""
         data = self._normalize(frame)
-        if data.empty:
-            return 0
         sql_hash = hashlib.sha256(spec.sql.encode()).hexdigest()
+        if data.empty:
+            # 空结果批次也要记录 checkpoint，否则断点续传会一直认为它未完成
+            self._upsert_checkpoint(spec.name, batch_start, batch_end, 0, sql_hash)
+            return 0
         table_quoted = '"' + spec.name.replace('"', '""') + '"'
 
-        max_retries = 10
+        max_retries = 30
         for attempt in range(max_retries):
             try:
                 with closing(self._connect()) as conn, conn:
@@ -224,20 +248,11 @@ class ParallelRawStore:
                     )
 
                     # 记录批次级 checkpoint（续传用）
-                    conn.execute(
-                        "INSERT INTO pull_checkpoint "
-                        "(source_table, batch_start, batch_end, row_count, sql_sha256, completed_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT(source_table, batch_start, batch_end) DO UPDATE SET "
-                        "row_count=excluded.row_count, sql_sha256=excluded.sql_sha256, "
-                        "completed_at=excluded.completed_at",
-                        (spec.name, batch_start, batch_end, len(data), sql_hash,
-                         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                    )
+                    self._upsert_checkpoint(spec.name, batch_start, batch_end, len(data), sql_hash)
                 break  # 成功退出重试循环
             except sqlite3.OperationalError as e:
                 if "locked" in str(e).lower() and attempt < max_retries - 1:
-                    time.sleep(random.uniform(1.0, 5.0))
+                    time.sleep(random.uniform(2.0, 10.0))
                 else:
                     raise
         return len(data)

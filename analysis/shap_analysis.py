@@ -111,13 +111,27 @@ def _gain_importance(sub, selected: list) -> np.ndarray:
 
 
 def _selected_matrix(Xn: np.ndarray, factor_names, selected, n_sample: int, rng):
-    """按 selected 列抽取归一化特征矩阵（可采样）。"""
-    idx = [factor_names.index(f) for f in selected]
+    """按 selected 列抽取归一化特征矩阵（可采样）。
+
+    容错：若模型 feature_names 包含分析缓存里没有的特征（典型场景：缓存是
+    旧版本/旧 stock pool 建的，模型是新版训练后重存的），丢弃这些"漂移"特征，
+    仅保留交集，避免分析步因为一两列缺失就整段崩。命中时打印一次警告。
+    """
+    factor_set = set(factor_names)
+    if all(f in factor_set for f in selected):
+        idx = [factor_names.index(f) for f in selected]
+        sel_present = selected
+    else:
+        missing = [f for f in selected if f not in factor_set]
+        print(f"  [shap] 模型特征与缓存存在 {len(missing)} 列漂移，自动丢弃："
+              f"{missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        sel_present = [f for f in selected if f in factor_set]
+        idx = [factor_names.index(f) for f in sel_present]
     Xsub = Xn[:, idx]
     if n_sample and Xsub.shape[0] > n_sample:
         rows = rng.choice(Xsub.shape[0], n_sample, replace=False)
         Xsub = Xsub[rows]
-    return pd.DataFrame(Xsub, columns=selected), idx
+    return pd.DataFrame(Xsub, columns=sel_present), idx
 
 
 def global_importance(

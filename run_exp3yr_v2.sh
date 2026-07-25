@@ -79,6 +79,9 @@ should_run () {
 }
 
 # ── 训练阶段（带断点续跑：pkl 已存在则跳过；GBM 带 --resume）────────────────
+# 重要：lgb 在 64GB cgroup 下用 6000 只容易 OOM（joblib 6+ 进程 × path_smooth=10 × 5 目标），
+# 默认 3000 只；如机器更大可 LGB_STOCKS=6000 bash run_exp3yr_v2.sh。
+LGB_STOCKS="${LGB_STOCKS:-3000}"
 stage_xgb () {
   if [ "${SKIP_TRAIN:-0}" = "1" ]; then echo "[$(date +%H:%M:%S)] [skip] SKIP_TRAIN"; return 0; fi
   if [ -f "$XGB_PKL" ]; then echo "[$(date +%H:%M:%S)] [skip] xgb 模型已存在，跳过"; return 0; fi
@@ -90,11 +93,15 @@ stage_xgb () {
 stage_lgb () {
   if [ "${SKIP_TRAIN:-0}" = "1" ]; then echo "[$(date +%H:%M:%S)] [skip] SKIP_TRAIN"; return 0; fi
   if [ -f "$LGB_PKL" ]; then echo "[$(date +%H:%M:%S)] [skip] lgb 模型已存在，跳过"; return 0; fi
-  echo "##### [$(date +%H:%M:%S)] TRAIN lightgbm (CPU, v2) #####"
+  echo "##### [$(date +%H:%M:%S)] TRAIN lightgbm (CPU, v2, stocks=$LGB_STOCKS) #####"
   GEMINI_SAVE_DIR="$SCRIPT_DIR/models/exp3yr_v2_lgb" "$PY" -u scripts/train_model.py \
-    --model-type lightgbm --stocks 6000 --start $TRAIN_START --end $TRAIN_END \
+    --model-type lightgbm --stocks "$LGB_STOCKS" --start $TRAIN_START --end $TRAIN_END \
     --skip-cache-update --resume \
     2>&1 | tee -a "$LOGDIR/train_lgb.log"
+  # lgb 训练完成度自检：日志最末若没有 "训练完成" 字样则标记失败，便于上层重试
+  if ! tail -50 "$LOGDIR/train_lgb.log" 2>/dev/null | grep -qE "训练完成|=== 多目标模型训练完成"; then
+    echo "!! [$(date +%H:%M:%S)] lgb 训练未完成（检查 $LOGDIR/train_lgb.log），建议降低 LGB_STOCKS 重跑"
+  fi
 }
 stage_neutral () {
   if [ "${SKIP_TRAIN:-0}" = "1" ]; then echo "[$(date +%H:%M:%S)] [skip] SKIP_TRAIN"; return 0; fi

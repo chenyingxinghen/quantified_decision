@@ -19,6 +19,7 @@ import argparse
 import gc
 import os
 import sys
+from datetime import datetime
 
 import numpy as np
 
@@ -75,8 +76,27 @@ def main():
         print("[analysis] 合成数据模式（仅验证代码路径）")
         fd = make_synthetic_dataset(model, n_samples=max(5000, args.shap_sample * 2))
     elif args.dataset and os.path.exists(args.dataset):
-        from analysis.common import load_full_dataset_from_parquet
-        fd = load_full_dataset_from_parquet(args.dataset)
+        # 缓存失效检查：模型 pkl mtime 比缓存目录新 → 缓存里的 feature_names 可能
+        # 与当前模型不一致（典型：v1 训练后改代码 → v2 训练 → 缓存还是 v1 时期建的，
+        # SHAP 取交集时会因 'is_suspended' 等列漂移而崩）。自动重建。
+        cache_root = (args.dataset[:-len(".parquet")]
+                      if args.dataset.endswith(".parquet") else args.dataset)
+        cache_meta = os.path.join(cache_root, "meta.pkl")
+        cache_mtime = os.path.getmtime(cache_meta) if os.path.exists(cache_meta) else 0.0
+        model_mtime = os.path.getmtime(args.model) if os.path.exists(args.model) else 0.0
+        if model_mtime > cache_mtime + 1.0:
+            print(f"[dataset] 模型比缓存新（{datetime.fromtimestamp(model_mtime):%Y-%m-%d %H:%M:%S} "
+                  f"> {datetime.fromtimestamp(cache_mtime):%Y-%m-%d %H:%M:%S}），自动重建缓存")
+            import shutil as _sh
+            _sh.rmtree(cache_root, ignore_errors=True)
+            from core.factors.train_ml_model import MLModelTrainer as _TR
+            from config.jydb_config import DATABASE_PATH as _DB
+            _trainer = _TR(db_path=_DB)
+            fd = build_full_dataset(_trainer, start_date=args.start, end_date=args.end,
+                                    stocks=args.stocks, cache_path=args.cache)
+        else:
+            from analysis.common import load_full_dataset_from_parquet
+            fd = load_full_dataset_from_parquet(args.dataset)
     else:
         from core.factors.train_ml_model import MLModelTrainer
         from config.jydb_config import DATABASE_PATH

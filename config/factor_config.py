@@ -96,7 +96,10 @@ class ModelConfig:
         'label_gain': [i//3*i**1.5 if i>2 else i for i in range(n_bins)],
 
         'early_stopping_rounds': 80, # 50→80
-        'n_jobs': -1,
+        # n_jobs: 64GB cgroup + 6+ 进程 + path_smooth=10 + 5 目标时，-1 容易 OOM。
+        # 固定为 4，让每个 worker 拿到的特征子集更小，内存峰值更可控。
+        # 如机器内存大，可通过环境变量 LGB_JOBS 覆盖（get_model_params 已支持）。
+        'n_jobs': int(os.environ.get('LGB_JOBS', '4')),
         'verbosity': -1,
     }
 

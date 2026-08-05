@@ -172,4 +172,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     print(f"量化系统(前后端整合版) 启动中，监听端口: 8083")
-    uvicorn.run(app, host="0.0.0.0", port=8083)
+    uvicorn.run(app, host="127.0.0.1", port=8083)

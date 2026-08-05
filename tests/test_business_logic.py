@@ -10,6 +10,7 @@ import pandas as pd
 
 from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH
 from core.backtest.baostock_data_handler import _prepare_adjusted_stock_data
+from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
 from core.exit_rules import evaluate_exit
 from core.factors.train_ml_model import MLModelTrainer
 from scripts.select_stocks import _update_factor_cache_incremental
@@ -34,6 +35,26 @@ class TrainingLabelTests(unittest.TestCase):
         self.assertTrue(np.all(penalized_scores[unbuyable] < penalized_scores[~unbuyable]))
         self.assertTrue(np.all(penalized_returns[unbuyable] < penalized_returns[~unbuyable]))
         self.assertTrue(np.all(ranked[unbuyable] < ranked[~unbuyable].min()))
+
+    def test_recency_weights_follow_half_life_and_preserve_daily_groups(self):
+        dates = np.array([
+            '2020-01-01', '2020-01-01',
+            '2021-01-01', '2021-01-01',
+        ])
+        weights = MLModelTrainer._calculate_recency_weights(
+            dates, half_life_years=1.0, min_weight=0.01
+        )
+
+        self.assertAlmostEqual(weights[0], weights[1], places=6)
+        self.assertAlmostEqual(weights[2], weights[3], places=6)
+        self.assertAlmostEqual(float(weights.mean()), 1.0, places=6)
+        self.assertAlmostEqual(weights[0] / weights[2], 0.5, delta=0.002)
+
+    def test_recency_weights_validate_configuration(self):
+        with self.assertRaises(ValueError):
+            MLModelTrainer._calculate_recency_weights(
+                np.array(['2020-01-01']), half_life_years=0
+            )
 
 
 class ExitRuleTests(unittest.TestCase):
@@ -89,6 +110,102 @@ class AdjustmentTests(unittest.TestCase):
         adjusted_return = adjusted.loc[1, 'close'] / adjusted.loc[0, 'close'] - 1
         self.assertAlmostEqual(adjusted_return, 0.004478, places=5)
         self.assertAlmostEqual(adjusted.loc[0, 'raw_close'], 6.81, places=6)
+
+
+class BasicRiskFilterTests(unittest.TestCase):
+    def test_strategy_defaults_enable_independent_risk_controls(self):
+        strategy = MLFactorBacktestStrategy(model_path='unused.pkl')
+        self.assertEqual(strategy.risk_min_price, 1.0)
+        self.assertTrue(strategy.risk_exclude_st)
+
+    def test_rejects_low_price_stock(self):
+        self.assertFalse(
+            MLFactorBacktestStrategy._passes_basic_risk_filter(
+                {'raw_close': 4.99, 'close': 10.0, 'is_st': 0},
+                min_price=5.0,
+                exclude_st=False,
+            )
+        )
+
+    def test_rejects_st_stock(self):
+        self.assertFalse(
+            MLFactorBacktestStrategy._passes_basic_risk_filter(
+                {'raw_close': 12.0, 'is_st': 1},
+                min_price=5.0,
+                exclude_st=True,
+            )
+        )
+
+    def test_accepts_normal_stock(self):
+        self.assertTrue(
+            MLFactorBacktestStrategy._passes_basic_risk_filter(
+                {'raw_close': 12.0, 'is_st': 0},
+                min_price=5.0,
+                exclude_st=True,
+            )
+        )
+
+    def test_filter_and_existing_positions_do_not_change_prediction_cross_section(self):
+        class RecordingModel:
+            def __init__(self):
+                self.last_input = None
+
+            def predict(self, values):
+                self.last_input = np.asarray(values).copy()
+                return np.array([0.99, 0.90, 0.80], dtype=np.float32)
+
+        class MarketData:
+            def __init__(self):
+                self._codes = ['cheap', 'eligible', 'held']
+                self._bars = {
+                    'cheap': {'raw_close': 0.5, 'close': 0.5, 'is_st': 0},
+                    'eligible': {'raw_close': 10.0, 'close': 10.0, 'is_st': 0},
+                    'held': {'raw_close': 20.0, 'close': 20.0, 'is_st': 0},
+                }
+                self._history = pd.DataFrame({
+                    'high': np.full(15, 10.5),
+                    'low': np.full(15, 9.5),
+                    'close': np.full(15, 10.0),
+                })
+
+            def keys(self):
+                return self._codes
+
+            def get_bar(self, code):
+                return self._bars.get(code)
+
+            def __getitem__(self, code):
+                return self._history
+
+        strategy = object.__new__(MLFactorBacktestStrategy)
+        strategy.min_confidence = 0.0
+        strategy.risk_min_price = 1.0
+        strategy.risk_exclude_st = False
+        strategy.norm_stats = None
+        strategy.model = RecordingModel()
+        strategy._get_model_feature_names = lambda: ['factor']
+        factor_values = {
+            'cheap': np.array([0.0], dtype=np.float32),
+            'eligible': np.array([10.0], dtype=np.float32),
+            'held': np.array([20.0], dtype=np.float32),
+        }
+        strategy._get_factor_row_array = lambda code, _: factor_values[code]
+        strategy._calculate_atr = lambda _: 0.0
+
+        signals = strategy.generate_signals(
+            current_date='2026-01-05',
+            market_data=MarketData(),
+            portfolio_state={
+                'positions': {'held': object()},
+                'available_slots': 3,
+            },
+        )
+
+        np.testing.assert_allclose(
+            strategy.model.last_input[:, 0],
+            np.array([0.25, 0.50, 0.75], dtype=np.float32),
+        )
+        self.assertEqual([signal.stock_code for signal in signals], ['eligible'])
 
 
 class ArtifactAndCacheTests(unittest.TestCase):

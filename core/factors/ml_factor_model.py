@@ -304,23 +304,50 @@ class MLFactorModel:
                 xgb_params.pop('lambdarank_num_pair_per_sample', None)
                 xgb_params.pop('lambdarank_pair_method', None)
 
-            # ranking 模式不传 weight（由 group 承担），回归/分类模式传入样本权重
-            _w_for_dtrain = None if self.task == 'ranking' else w_train
+            # ── Ranking 权重语义（XGBoost 3.x QuantileDMatrix）────────────────
+            # 实测结论：QuantileDMatrix 做 ranking 时
+            #   (1) group 必须在【构造器】传入；后置 set_group 会触发 quantile 权重校验失败。
+            #   (2) 权重是 per-group（len==组数），表达"该查询组整体重要性"，
+            #       无法像 LightGBM 那样表达 per-instance 权重。
+            # 因此把 per-instance 的 w_train 按组聚合成 per-group 均值传入。
+            # 局限：ST 降权是 per-instance 的，按组求均值后被大量正常样本稀释，对 XGB 近乎无效；
+            #       但 ST 主防线是标签层的 ST_LABEL_SCORE（对两模型同等生效），此处仅保证 API 正确
+            #       并为未来 per-day 加权（如按市场状态调整整日权重）预留接口。
+            def _aggregate_group_weight(w, group):
+                if w is None or group is None:
+                    return None
+                grp = np.asarray(group)
+                bounds = np.concatenate([[0], np.cumsum(grp)]).astype(np.int64)
+                out = np.empty(len(grp), dtype=np.float32)
+                for gi in range(len(grp)):
+                    seg = w[bounds[gi]:bounds[gi + 1]]
+                    out[gi] = seg.mean() if len(seg) > 0 else 1.0
+                return out
 
-            dtrain = xgb.QuantileDMatrix(
-                X_train_raw, label=y_train, weight=_w_for_dtrain,
-                feature_names=self.feature_names,
-            )
-            if self.task == 'ranking' and group_train is not None:
-                dtrain.set_group(group_train)
-
-            dval = xgb.QuantileDMatrix(
-                X_val_raw, label=y_val,
-                feature_names=self.feature_names,
-                ref=dtrain,
-            )
-            if self.task == 'ranking' and group_val is not None:
-                dval.set_group(group_val)
+            if self.task == 'ranking':
+                _w_per_group_train = _aggregate_group_weight(w_train, group_train)
+                dtrain = xgb.QuantileDMatrix(
+                    X_train_raw, label=y_train,
+                    group=group_train,
+                    weight=_w_per_group_train,
+                    feature_names=self.feature_names,
+                )
+                dval = xgb.QuantileDMatrix(
+                    X_val_raw, label=y_val,
+                    group=group_val,
+                    feature_names=self.feature_names,
+                    ref=dtrain,
+                )
+            else:
+                dtrain = xgb.QuantileDMatrix(
+                    X_train_raw, label=y_train, weight=w_train,
+                    feature_names=self.feature_names,
+                )
+                dval = xgb.QuantileDMatrix(
+                    X_val_raw, label=y_val,
+                    feature_names=self.feature_names,
+                    ref=dtrain,
+                )
 
             # 所有任务均加入训练集采样监控，用于过拟合诊断（训练集 vs 验证集曲线对比）
             # ranking 任务：按日期采样完整 group，保证 NDCG 计算有意义
@@ -352,6 +379,11 @@ class MLFactorModel:
             evals_list = [(dtrain_monitor, 'train_monitor'), (dval, 'validation')]
 
             evals_result = {}
+            custom_obj = getattr(self, '_custom_obj', None)
+            if custom_obj is not None:
+                # 自定义目标：梯度由 obj 提供；objective 改为占位，避免内置 ranking 语义校验
+                xgb_params = dict(xgb_params)
+                xgb_params['objective'] = 'reg:squarederror'
             self.model = xgb.train(
                 xgb_params,
                 dtrain,
@@ -361,6 +393,7 @@ class MLFactorModel:
                 # 使用 _init_model 中从配置 pop 出来的值，保证与 ModelConfig 一致
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose_eval=50,
+                obj=custom_obj,
             )
             self._evals_result = evals_result
 
@@ -440,12 +473,18 @@ class MLFactorModel:
                             f"LightGBM eval_group[{i}] sum ({np.sum(eg)}) != eval_set[{i}] y len ({len(ev)})"
                         )
 
+            # 早停可关：es_rounds 为 None/0/负时不加 early_stopping 回调，训满 n_estimators
+            # 用全部树。根因见 config LIGHTGBM_PARAMS 注释——9M 样本下第 1 轮退化模型
+            # (Unique=7) ndcg 虚高恰为验证曲线全局最大，早停会回滚到该废模型；且
+            # stopping_rounds=0 会让 LightGBM 第 1 轮即判定"0 轮无提升"立即停止(只出 1 棵树)。
+            # 注意：生产走本分支(情况 B, MEMORY_EFFICIENT=True)，故修复必须落在此处。
             callbacks = [
-                early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
                 log_evaluation(50),
                 record_evaluation(lgb_evals_result),
             ]
-            
+            if es_rounds and es_rounds > 0:
+                callbacks.insert(0, early_stopping(stopping_rounds=es_rounds, first_metric_only=True))
+
             self.model.fit(X_train, y_train, callbacks=callbacks, feature_name=self.feature_names, **fit_params)
             self._evals_result = lgb_evals_result
 
@@ -544,11 +583,18 @@ class MLFactorModel:
                         'eval_set': [(X_train_monitor, y_train_monitor), (X_val, y_val)],
                         'eval_names': ['train_monitor', 'valid'],
                     })
+                # 早停可关：当 es_rounds 为 None/0/负时，不加 early_stopping 回调，
+                # 训练满 n_estimators 轮并保留【最后一轮】模型（而非 best_iteration）。
+                # 根因——9M 大样本下 lambdarank 第 1 轮近乎空模型(Unique=7)的截面随机
+                # 排名在 15 档标签上 ndcg 虚高(0.384)，恰为整条验证曲线全局最大，
+                # 早停会把 best_iteration 回滚到该退化模型。关掉回滚训满固定轮数即可绕过。
+                # (3.6M 样本不触发此病态，xgb 吃连续标签亦无此下探。)
                 callbacks = [
-                    early_stopping(stopping_rounds=es_rounds, first_metric_only=True),
                     record_evaluation(lgb_evals_result),
                     log_evaluation(period=50),
                 ]
+                if es_rounds and es_rounds > 0:
+                    callbacks.insert(0, early_stopping(stopping_rounds=es_rounds, first_metric_only=True))
                 self.model.fit(X_train, y_train, callbacks=callbacks, **fit_params)
                 self._evals_result = lgb_evals_result
             else:
@@ -645,9 +691,11 @@ class MLFactorModel:
                     dmat = xgb.DMatrix(X, feature_names=self.feature_names) if not isinstance(X, pd.DataFrame) else xgb.DMatrix(X)
                     preds = self._predict_xgb_booster(self.model.get_booster(), dmat)
                 else:
-                    if not isinstance(X, pd.DataFrame) and self.feature_names:
-                        X = pd.DataFrame(X, columns=self.feature_names)
-                    preds = self.model.predict(X)
+                    # 一致性修复：CPU-sklearn 分支此前直接 predict(X) 用【全部树】，
+                    # 而 GPU/Booster 分支用 best_iteration。若训练早停在中途（如第 63 轮），
+                    # 两条推理路径会给出不同预测。统一改为经 booster 应用 best_iteration。
+                    dmat = xgb.DMatrix(X) if isinstance(X, pd.DataFrame) else xgb.DMatrix(X, feature_names=self.feature_names)
+                    preds = self._predict_xgb_booster(self.model.get_booster(), dmat)
         else:
             if not isinstance(X, pd.DataFrame) and self.feature_names:
                 X = pd.DataFrame(X, columns=self.feature_names)
@@ -829,6 +877,9 @@ class MLFactorModel:
             rank_ics = []
             top1_hits = []
             top5_hits = []
+            top1_returns = []
+            top5_returns = []
+            universe_returns = []
             
             for d in eval_dates:
                 mask = dates_eval == d
@@ -856,6 +907,12 @@ class MLFactorModel:
                     top20pct_threshold = np.percentile(g_ref, 80)
                     top5_precision = np.mean(g_ref[top5_idx] >= top20pct_threshold)
                     top5_hits.append(top5_precision)
+
+                    if returns is not None:
+                        g_returns = returns[mask]
+                        top1_returns.append(float(g_returns[top1_idx]))
+                        top5_returns.append(float(np.mean(g_returns[top5_idx])))
+                        universe_returns.append(float(np.mean(g_returns)))
                     
                     # D. 绝对胜率 (Win Rate)：Top-1 的真实收益是否大于 0
                     # 注意：如果 reference 是收益率 (returns)，则判断 > 0；如果是归一化后的 y，则判断是否大于中性值
@@ -864,9 +921,26 @@ class MLFactorModel:
             
             metrics['rank_ic'] = np.mean(rank_ics) if rank_ics else 0.0
             metrics['rank_ic_std'] = np.std(rank_ics) if rank_ics else 0.0
+            metrics['rank_ic_ir'] = (
+                metrics['rank_ic'] / metrics['rank_ic_std']
+                if metrics['rank_ic_std'] > 0 else 0.0
+            )
+            metrics['positive_ic_ratio'] = (
+                np.mean(np.asarray(rank_ics) > 0) if rank_ics else 0.0
+            )
             metrics['top1_precision'] = np.mean(top1_hits) if top1_hits else 0.0
             metrics['top5_precision'] = np.mean(top5_hits) if top5_hits else 0.0
             metrics['win_rate'] = np.mean(metrics.pop('win_rates')) if 'win_rates' in metrics else 0.0
+            if top1_returns:
+                metrics['top1_mean_return'] = np.mean(top1_returns)
+                metrics['top5_mean_return'] = np.mean(top5_returns)
+                metrics['universe_mean_return'] = np.mean(universe_returns)
+                metrics['top1_excess_return'] = (
+                    metrics['top1_mean_return'] - metrics['universe_mean_return']
+                )
+                metrics['top5_excess_return'] = (
+                    metrics['top5_mean_return'] - metrics['universe_mean_return']
+                )
             
             # 辅助统计：预测区分度
             prob_std = np.std(y_prob)
@@ -875,9 +949,16 @@ class MLFactorModel:
             print(f"  [{dataset_name}] {eval_type}评估 ({len(eval_dates)} 个交易日):")
             print(f"    预测区分度: Std={prob_std:.4f}, Unique={unique_probs}")
             print(f"    Rank IC: {metrics['rank_ic']:.4f} ± {metrics['rank_ic_std']:.4f}")
+            print(f"    ICIR: {metrics['rank_ic_ir']:.4f}, 正 IC 日期: {metrics['positive_ic_ratio']:.2%}")
             print(f"    Top-1 胜率 (收益>0): {metrics['win_rate']:.2%}")
             print(f"    Top-1 精度 (命中前5%): {metrics['top1_precision']:.2%}")
             print(f"    Top-5 精度 (命中前20%): {metrics['top5_precision']:.2%}")
+            if top1_returns:
+                print(
+                    f"    未来收益: Top-1={metrics['top1_mean_return']:.2%}, "
+                    f"Top-5={metrics['top5_mean_return']:.2%}, "
+                    f"截面均值={metrics['universe_mean_return']:.2%}"
+                )
         else:
             # 没有日期信息，退化为全局计算
             if len(np.unique(y_prob)) > 1 and len(np.unique(reference)) > 1:
@@ -987,18 +1068,32 @@ class EnsembleFactorModel:
 
     def predict(self, factors: pd.DataFrame) -> np.ndarray:
         """
-        获取集成模型的预测结果
+        获取集成模型的预测结果。
+
+        关键：先把每个子模型的输出转成【批内截面百分位排名】，再做加权平均。
+        原因——xgb (连续 rank→sigmoid) 与 lgb (lambdarank raw→sigmoid) 的输出量纲/分布
+        不同，直接对原始概率平均会让分布更宽的那个模型主导，等权失去意义。
+        本方法每次接收的 factors 是【当日整个候选截面】(generate_signals 每日调用一次)，
+        故批内排名即截面排名，与训练期验证 (exp_ensemble) 使用的融合方式完全一致，
+        实测 IR 较最优单模型 +31% (见 [[ensemble-beats-single]])。
         """
         if not self.is_trained:
             raise ValueError("集成模型中的所有子模型必须先经过训练")
-            
-        all_predictions = []
+
+        n = len(factors)
+        all_ranks = []
         for model in self.models:
             model_factors = factors[model.feature_names] if hasattr(model, 'feature_names') and model.feature_names else factors
-            all_predictions.append(model.predict(model_factors))
-            
-        # 加权平均
-        ensemble_pred = np.average(np.array(all_predictions), axis=0, weights=self.weights)
+            p = np.asarray(model.predict(model_factors), dtype=np.float64)
+            if n > 1:
+                # argsort().argsort() 得到 0..n-1 的名次，再归一化到 (0,1)
+                r = p.argsort().argsort().astype(np.float64) / (n + 1)
+            else:
+                r = np.full(n, 0.5, dtype=np.float64)
+            all_ranks.append(r)
+
+        # 对截面排名做加权平均，输出仍落在 (0,1)，语义为“集成截面强弱”
+        ensemble_pred = np.average(np.array(all_ranks), axis=0, weights=self.weights)
         return ensemble_pred
 
     def save_model(self, filepath: str):

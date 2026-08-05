@@ -30,7 +30,16 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 from config import DATABASE_PATH
 from config.factor_config import TrainingConfig
-from config.strategy_config import MIN_MARKET_CAP, MAX_PE, MIN_PRICE, MAX_PRICE, INCLUDE_ST, SELECTOR_MARKETS
+from config.strategy_config import (
+    MIN_MARKET_CAP,
+    MAX_PE,
+    MIN_PRICE,
+    MAX_PRICE,
+    INCLUDE_ST,
+    SELECTOR_MARKETS,
+    ML_FACTOR_RISK_MIN_PRICE,
+    ML_FACTOR_RISK_EXCLUDE_ST,
+)
 from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.train_ml_model import MLModelTrainer
@@ -387,11 +396,21 @@ def select_stocks(
         'apply_filter':   apply_filter,  # 后端场景：必须显式传入，不传则为 False
     }
 
+    # 基础风险默认始终生效；明确开启动态筛选时，用户的价格/ST 选项可覆盖默认值。
+    effective_risk_min_price = ML_FACTOR_RISK_MIN_PRICE
+    effective_risk_exclude_st = ML_FACTOR_RISK_EXCLUDE_ST
+    if apply_filter and min_price is not None:
+        effective_risk_min_price = min_price
+    if apply_filter and include_st is not None:
+        effective_risk_exclude_st = not include_st
+
     strategy = MLFactorBacktestStrategy(
         model_path=model_path,
         min_confidence=min_confidence,
         cache_dir=cache_dir,
         norm_stats_path=norm_stats_path,
+        risk_min_price=effective_risk_min_price,
+        risk_exclude_st=effective_risk_exclude_st,
     )
     try:
         strategy.initialize()

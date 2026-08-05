@@ -602,6 +602,54 @@ class FeatureEngineer:
             collected_features.update(cross_features)
             stats['长短线背离交叉特征'] = len(self.generated_features) - pre_count
 
+        # === 新增：市场情绪 × 个股因子 交互项 (Market Regime Conditioning) ===
+        # 动机：市场情绪因子（up_ratio / breadth_ma20 / mean_return 等）当日全市场取值相同，
+        #       在日截面上方差为 0，直接作为特征进入 ranker 无法区分任何两只股票，
+        #       却会让树用它们“背诵行情/日期”，制造 NDCG 与 IC 背离 + regime flip。
+        # 正解：与“每只股票不同”的个股因子相乘，乘积在当日截面才有方差。
+        # 关键：市场乘数必须能变号，否则 `正乘数 × 个股因子` 归一化后与个股因子等价（废特征）。
+        #       因此对以 0.5 为中枢的广度/占比类做去中性化 (-0.5)，mean_return 天然以 0 为界。
+        #       乘数符号 = 行情方向 → 截面 rank 后个股因子排序“涨势保持、跌势翻转”，
+        #       即“该因子在什么行情下有效”的 regime conditioning，可穿过归一化存活。
+        pre_count = len(self.generated_features)
+        market_features = {}
+
+        def _centered_market(col: str) -> Optional[pd.Series]:
+            """返回去中性化后的市场乘数（可正可负）；列不存在则 None。"""
+            if col not in df.columns:
+                return None
+            s = pd.to_numeric(df[col], errors='coerce')
+            if col == 'mean_return':
+                return s  # 天然以 0 为界
+            # 广度/占比类以 0.5 为中枢
+            return s - 0.5
+
+        # (市场乘数列, 个股因子列) —— 每对都有明确经济含义
+        market_interaction_pairs = [
+            ('mean_return',  'atr_14'),        # 高波动在涨势占优 / 跌势受损
+            ('mean_return',  'momentum_5d'),   # 动量-反转随行情切换
+            ('mean_return',  'bias_18'),       # 乖离在不同行情下方向不同
+            ('breadth_ma20', 'momentum_5d'),   # 普涨环境动量更有效
+            ('breadth_ma20', 'return_5d'),     # 广度调节短期收益延续性
+            ('breadth_ma20', 'atr_14'),        # 广度调节高波动的价值
+            ('up_ratio',     'rsi_21'),        # 强市中超买信号更值得重视
+            ('up_ratio',     'return_5d'),     # 普涨中短期强势更易延续
+        ]
+
+        for mkt_col, stock_col in market_interaction_pairs:
+            mkt_series = _centered_market(mkt_col)
+            if mkt_series is None or stock_col not in df.columns:
+                continue
+            feature_name = f'{mkt_col}_regime_{stock_col}'
+            stock_series = pd.to_numeric(df[stock_col], errors='coerce')
+            interaction = (mkt_series * stock_series).replace([np.inf, -np.inf], np.nan).fillna(0).astype(np.float32)
+            market_features[feature_name] = interaction
+            self.generated_features.append(feature_name)
+
+        if market_features:
+            collected_features.update(market_features)
+            stats['市场Regime交互特征'] = len(self.generated_features) - pre_count
+
         # 3. 最终合并 (仅一次)
         if collected_features:
             new_df = pd.DataFrame(collected_features, index=df.index)

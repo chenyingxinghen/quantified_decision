@@ -461,8 +461,13 @@ class QuantitativeFactors:
         # fillna(0) 对 pandas Series 中的 inf 无效，必须显式替换
         with np.errstate(divide='ignore', invalid='ignore'):
             cr = (p1 / p2.replace(0, np.nan)) * 100
-            
-        return np.nan_to_num(cr.values, nan=100.0, posinf=500.0, neginf=0.0)
+
+        # 仅防 p2==0 不够：p2 为极小正数（浮点噪声，如 1e-16）时比值会变成
+        # 1e16 量级的【有限】大数，nan_to_num 只处理 nan/inf 拦不住它。
+        # 实测缓存中出现过 cr_52≈2.2e16（CR 正常区间 0~400）。
+        # 与本函数既有的 posinf=500.0 上界语义一致，统一 clip 到 [0, 500]。
+        cr = np.nan_to_num(cr.values, nan=100.0, posinf=500.0, neginf=0.0)
+        return np.clip(cr, 0.0, 500.0)
     
     # ==================== 综合计算方法 ====================
     

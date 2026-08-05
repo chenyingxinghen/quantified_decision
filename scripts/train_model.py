@@ -23,6 +23,24 @@ def main():
                         help=f'训练选取的股票数量 (默认{TrainingConfig.STOCK_NUM})')
     parser.add_argument('--force',  action='store_true', help='强制重新计算所有因子')
     parser.add_argument('--workers', type=int, default=15, help='并行线程数')
+    parser.add_argument(
+        '--models',
+        nargs='+',
+        choices=('lightgbm', 'xgboost'),
+        default=list(TrainingConfig.MODEL_TYPES),
+        help='本次训练的模型列表，默认使用配置中的全部模型',
+    )
+    parser.add_argument(
+        '--label-exponent',
+        type=float,
+        default=None,
+        help='覆盖本次 XGBoost ranking 连续标签指数',
+    )
+    parser.add_argument(
+        '--no-update-latest',
+        action='store_true',
+        help='仅保存归档模型，不更新 models/latest（用于候选模型验证）',
+    )
 
     # ── 增量缓存控制 ──
     parser.add_argument('--update-cache-only', action='store_true',
@@ -33,6 +51,11 @@ def main():
                         help='缓存更新截止日期 (YYYY-MM-DD)，默认=今天')
 
     args = parser.parse_args()
+
+    if args.label_exponent is not None:
+        if args.label_exponent <= 0:
+            parser.error('--label-exponent 必须大于 0')
+        TrainingConfig.LABEL_WEIGHT_EXPONENT = args.label_exponent
 
     # ── 1. 自动设置训练日期范围 ───────────────────────────────────────────
     train_end_date = (
@@ -51,6 +74,8 @@ def main():
     print(f"训练数据范围: {train_start_date} 至 {train_end_date}")
     print(f"缓存更新截止: {train_start_date} 至 {cache_end_date}")
     print(f"股票样本: 前 {args.stocks} 只")
+    print(f"训练模型: {', '.join(args.models)}")
+    print(f"XGBoost 标签指数: {TrainingConfig.LABEL_WEIGHT_EXPONENT:g}")
     print(f"不可买入样本处理: {TrainingConfig.UNBUYABLE_HANDLING}")
 
     # ── 2. 初始化训练器 ──────────────────────────────────────────────────
@@ -240,7 +265,8 @@ def main():
         limit_groups=limit_groups,
         path_scores=path_scores,
         is_st_arr=is_st_arr,
-        w_sig_arr=w_sig_arr
+        w_sig_arr=w_sig_arr,
+        model_types=args.models,
     )
 
     # ── 8. 对比与保存 ────────────────────────────────────────────────────
@@ -254,7 +280,9 @@ def main():
     archive_dir = trainer.save_models(
         save_dir=TrainingConfig.SAVE_DIR,
         years=TrainingConfig.YEARS_FOR_TRAINING,
-        stocks=len(trainer_stocks)
+        stocks=len(trainer_stocks),
+        update_latest=not args.no_update_latest,
+        training_results=results,
     )
 
     trainer.save_factor_summary(factor_names, save_dir=archive_dir)

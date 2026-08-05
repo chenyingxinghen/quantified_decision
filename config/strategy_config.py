@@ -17,6 +17,8 @@ from config.factor_config import *
 # ML因子策略参数
 ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
 ML_FACTOR_MODEL_PATH = 'models/latest/xgboost_factor_model.pkl'  # 默认模型路径
+ML_FACTOR_RISK_MIN_PRICE = 1.0   # 独立于基本面筛选，排除极端低价退市风险
+ML_FACTOR_RISK_EXCLUDE_ST = True # 独立于基本面筛选，默认排除 ST / *ST
 
 
 
@@ -31,7 +33,7 @@ COMMISSION_RATE = 0.005
 
 # 基础参数
 INITIAL_CAPITAL = 1.0          # 初始资金
-MAX_POSITIONS = 1               
+MAX_POSITIONS = 5
 
 # ATR相关参数（用于止损止盈计算）
 ATR_PERIOD = 14                     # ATR计算周期
@@ -67,7 +69,7 @@ MIN_TOUCHES = 2                     # 趋势线最少触点数
 # 前端中基本面选股的默认过滤参数 默认不启用
 # 回测场景：使用以下 sc 配置
 # ==============================================================================
-ENABLE_FUNDAMENTAL_FILTER = True
+ENABLE_FUNDAMENTAL_FILTER = False
 MIN_MARKET_CAP = 0
 MAX_PE = None
 MAX_ZCFZL = None

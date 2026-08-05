@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import sys
 
 # 添加项目根目录到路径
@@ -20,6 +21,8 @@ from config.strategy_config import (
     COMMISSION_RATE,
     MAX_POSITIONS,
     SELECTOR_MARKETS, ENABLE_FUNDAMENTAL_FILTER,
+    ML_FACTOR_RISK_MIN_PRICE,
+    ML_FACTOR_RISK_EXCLUDE_ST,
 )
 from datetime import datetime, timedelta
 
@@ -30,14 +33,54 @@ def main():
     print("回测系统")
     print("=" * 80)
     
+    # 命令行参数：允许固定模型与回测区间，保证多模型对照完全一致。
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser()
+    _parser.add_argument('--model', type=str, default=None, help='模型路径(pkl文件或目录)，覆盖配置默认值')
+    _parser.add_argument('--start', type=str, default=None, help='回测开始日期 (YYYY-MM-DD)')
+    _parser.add_argument('--end', type=str, default=None, help='回测结束日期 (YYYY-MM-DD)')
+    _parser.add_argument(
+        '--min-confidence',
+        type=float,
+        default=ML_FACTOR_MIN_CONFIDENCE,
+        help='最低模型置信度（百分制）',
+    )
+    _parser.add_argument(
+        '--risk-min-price',
+        type=float,
+        default=ML_FACTOR_RISK_MIN_PRICE,
+        help='独立风险过滤：最低当日原始收盘价',
+    )
+    _parser.add_argument(
+        '--no-risk-min-price',
+        action='store_const',
+        const=None,
+        dest='risk_min_price',
+        help='关闭独立最低价风险过滤',
+    )
+    _st_group = _parser.add_mutually_exclusive_group()
+    _st_group.add_argument('--exclude-st', action='store_true', dest='exclude_st', help='独立风险过滤：排除当日 ST 股票')
+    _st_group.add_argument('--include-st', action='store_false', dest='exclude_st', help='关闭独立 ST 风险过滤')
+    _parser.set_defaults(exclude_st=ML_FACTOR_RISK_EXCLUDE_ST)
+    _parser.add_argument('--tag', type=str, default=None, help='结果目录附加标签，用于区分实验流水线')
+    _parser.add_argument('--max-positions', type=int, default=None,
+                        help='覆盖最大持仓数（默认用 sc.MAX_POSITIONS）；设为 20 即回测 Top-20 头部区间策略')
+    _args, _ = _parser.parse_known_args()
+
+    _max_positions = _args.max_positions if _args.max_positions is not None else MAX_POSITIONS
+
     # 配置参数
-    start_date = (datetime.now() - timedelta(days=365*TrainingConfig.YEARS_FOR_BACKTEST)).strftime('%Y-%m-%d')
-    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (
+        _args.start
+        if _args.start
+        else (datetime.now() - timedelta(days=365 * TrainingConfig.YEARS_FOR_BACKTEST)).strftime('%Y-%m-%d')
+    )
+    end_date = _args.end if _args.end else datetime.now().strftime('%Y-%m-%d')
     initial_capital = INITIAL_CAPITAL
     commission_rate = COMMISSION_RATE
-    
-    # 模型路径
-    model_path = ML_FACTOR_MODEL_PATH
+
+    # 模型路径：优先命令行 --model，其次配置默认值
+    model_path = _args.model if _args.model else ML_FACTOR_MODEL_PATH
     if not os.path.isabs(model_path):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         model_path = os.path.join(project_root, model_path)
@@ -68,9 +111,12 @@ def main():
     
     strategy = MLFactorBacktestStrategy(
         model_path=model_path,
-        min_confidence=ML_FACTOR_MIN_CONFIDENCE,
+        min_confidence=_args.min_confidence,
         use_cache=use_cache,
         cache_dir=cache_dir,
+        risk_min_price=_args.risk_min_price,
+        risk_exclude_st=_args.exclude_st,
+        max_positions=_max_positions,
         name="ML因子策略",
     )
     
@@ -81,7 +127,7 @@ def main():
         data_handler=data_handler,
         initial_capital=initial_capital,
         commission_rate=commission_rate,
-        max_positions=MAX_POSITIONS
+        max_positions=_max_positions
     )
     
     # 提前获取股票代码
@@ -136,8 +182,21 @@ def main():
     # 解析模型类别 (如 xgboost)
     model_category = model_name.split('_')[0]
     
-    # 构造回测标识 (包含置信度和日期)
-    backtest_tag = f"conf{int(ML_FACTOR_MIN_CONFIDENCE)}_{start_date}_to_{end_date}"
+    # 构造回测标识 (包含置信度、风险过滤参数和日期)
+    variant_tags = []
+    if _args.tag:
+        safe_tag = re.sub(r'[^A-Za-z0-9_.-]+', '-', _args.tag).strip('.-')
+        if not safe_tag:
+            raise ValueError('--tag 必须至少包含一个字母、数字、点、下划线或连字符')
+        variant_tags.append(safe_tag)
+    if _args.risk_min_price is not None:
+        price_tag = f"{_args.risk_min_price:g}".replace('.', 'p')
+        variant_tags.append(f"minp{price_tag}")
+    if _args.exclude_st:
+        variant_tags.append("nost")
+    variant_suffix = f"_{'_'.join(variant_tags)}" if variant_tags else ""
+    confidence_tag = f"{_args.min_confidence:g}".replace('.', 'p')
+    backtest_tag = f"conf{confidence_tag}{variant_suffix}_{start_date}_to_{end_date}"
     
     # 创建归档路径: backtest_result/{archive_tag}/{model_category}/{backtest_tag}/
     result_dir = os.path.join('backtest_result', archive_tag, model_category, backtest_tag)

@@ -30,6 +30,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  use_cache: bool = True,
                  cache_dir: str = None,
                  norm_stats_path: str = None,
+                 risk_min_price: Optional[float] = sc.ML_FACTOR_RISK_MIN_PRICE,
+                 risk_exclude_st: bool = sc.ML_FACTOR_RISK_EXCLUDE_ST,
+                 max_positions: int = None,
                  name: str = "ML因子策略"):
         """初始化策略"""
         super().__init__(name)
@@ -42,7 +45,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
             else os.path.join(PROJECT_ROOT, norm_stats_path)
         )
         self.min_confidence = min_confidence
+        self.risk_min_price = risk_min_price
+        self.risk_exclude_st = risk_exclude_st
         self.use_cache = use_cache
+        # 头部区间大小：回测按模型打分取 Top-K。默认 sc.MAX_POSITIONS；
+        # 传入更大值（如 20）即回测"Top-20 头部区间"策略（用户反馈 Top-1 太极端）。
+        self.max_positions = max_positions if max_positions is not None else sc.MAX_POSITIONS
         
         if cache_dir is None:
             cache_dir = fc.TrainingConfig.CACHE_DIR
@@ -133,12 +141,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if 'available_slots' in portfolio_state:
             available_slots = portfolio_state['available_slots']
         else:
-            available_slots = sc.MAX_POSITIONS - len(existing_positions)
+            available_slots = self.max_positions - len(existing_positions)
             
         if available_slots <= 0: return signals
 
-        # 1. 获取所有股票列表
-        all_codes = market_data.keys()
+        # 1. 获取所有股票列表。风险资格与已有持仓必须在模型打分后处理，
+        # 否则会改变横截面排名，导致其他股票的模型输入随持仓/过滤参数漂移。
+        all_codes = list(market_data.keys())
 
         # 筛选逻辑：
         # 1. 回测场景：criteria 为 None，完全使用 sc 配置
@@ -175,8 +184,6 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if not feature_names:
             return signals
         for code in predict_codes:
-            if code in existing_positions:
-                continue
             feature_row = self._get_factor_row_array(code, current_date)
             if feature_row is None:
                 continue
@@ -235,6 +242,15 @@ class MLFactorBacktestStrategy(BaseStrategy):
         for i, code in enumerate(stock_codes_with_data):
             confidence = float(probs[i] * 100)
             if confidence < effective_min_confidence or code in existing_positions: continue
+
+            # 仅在完整横截面完成归一化和预测后执行 PIT 风险资格判断。
+            if self.risk_min_price is not None or self.risk_exclude_st:
+                if not self._passes_basic_risk_filter(
+                    market_data.get_bar(code),
+                    min_price=self.risk_min_price,
+                    exclude_st=self.risk_exclude_st,
+                ):
+                    continue
             
             # 使用 md5 哈希在概率相同时保持排序稳定
             tie_breaker = int(hashlib.md5(code.encode()).hexdigest(), 16) % 1000 / 100000.0
@@ -473,6 +489,23 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 
             passed.append(code)
         return passed, {}
+
+    @staticmethod
+    def _passes_basic_risk_filter(
+        bar: Optional[Dict[str, Any]],
+        min_price: Optional[float],
+        exclude_st: bool,
+    ) -> bool:
+        """使用当日行情执行最低价和 ST 风险过滤。"""
+        if bar is None:
+            return False
+        if exclude_st and int(bar.get('is_st', 0)) == 1:
+            return False
+        if min_price is not None:
+            price = float(bar.get('raw_close', bar.get('close', np.nan)))
+            if not np.isfinite(price) or price < min_price:
+                return False
+        return True
 
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
         """ATR 计算"""

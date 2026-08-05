@@ -12,6 +12,8 @@
 
 import sys
 import os
+import hashlib
+import json
 import warnings
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -52,6 +54,52 @@ from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.factor_filler import FactorFiller, fill_factors_with_defaults
 from core.data.market_sentiment_calculator import MarketSentimentCalculator
 from config import DATABASE_PATH, TrainingConfig, FactorConfig, MARKET_LIMITS, MARKET_PREFIXES,ModelConfig
+
+
+# ============================================================================
+# 原始市场情绪因子（全市场当日同值）：在特征工程阶段用于生成 *_regime_* 交互项，
+# 但其本身在当日截面上方差为 0、无区分度，不应作为孤立列进入 ranker 特征矩阵。
+# 留着只会让树去"记忆行情状态"（regime overfitting），损害样本外 IC。
+# 因此在两条特征提取路径的 drop_cols 中统一剔除。
+# ============================================================================
+_RAW_MARKET_SENTIMENT_COLS = [
+    'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio',
+    'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio',
+    'breadth_ma20',
+]
+_RAW_MARKET_SENTIMENT_SET = set(_RAW_MARKET_SENTIMENT_COLS)
+
+
+def _feature_selection_data_signature(
+    X: np.ndarray,
+    dates: np.ndarray,
+    feature_names: List[str],
+    corr_threshold: float,
+    sample_rows: int = 4096,
+) -> str:
+    """Build a deterministic fingerprint for feature-selection cache reuse."""
+    dates_array = np.asarray(dates).astype(str)
+    unique_dates, date_counts = np.unique(dates_array, return_counts=True)
+    row_indices = np.linspace(
+        0, max(len(X) - 1, 0), min(sample_rows, len(X)), dtype=np.int64
+    )
+
+    digest = hashlib.sha256()
+    metadata = {
+        'version': 1,
+        'shape': list(X.shape),
+        'feature_names': list(feature_names),
+        'corr_threshold': corr_threshold,
+        'date_start': unique_dates[0] if len(unique_dates) else None,
+        'date_end': unique_dates[-1] if len(unique_dates) else None,
+    }
+    digest.update(json.dumps(metadata, sort_keys=True).encode('utf-8'))
+    digest.update('\0'.join(unique_dates.tolist()).encode('utf-8'))
+    digest.update(date_counts.astype(np.int64, copy=False).tobytes())
+    if len(row_indices):
+        sampled = np.ascontiguousarray(X[row_indices], dtype=np.float32)
+        digest.update(sampled.tobytes())
+    return digest.hexdigest()
 
 
 # ============================================================================
@@ -733,7 +781,10 @@ class MLModelTrainer:
         base_score = (f_returns_norm * w_final) + (upside * w_upside) + (downside * w_downside)
 
         # ── 2. 波动率调整：ATR 越大爆发力越强 ────────────────────────────
-        vol_booster = 1.0 + (rel_atr * 10.0)
+        # 系数可配置：诊断发现高波动股未来收益反而偏低（A股低波动异象，单变量 IC≈-0.07），
+        # 正的 vol_booster 会把标签往与该 alpha 相反的方向拉。VOL_BOOSTER_COEF=0 可关闭。
+        _vol_coef = getattr(TrainingConfig, 'VOL_BOOSTER_COEF', 10.0)
+        vol_booster = 1.0 + (rel_atr * _vol_coef)
 
         # ── 5. 路径形态奖惩 (f_high_idx vs f_low_idx) ────────────────────
         #   f_high_idx：持仓期内最高点出现在第几天（0-based）
@@ -877,9 +928,10 @@ class MLModelTrainer:
                 if final_valid_idx.sum() > 0:
                     # 准备 X
                     # is_suspended: 状态位，在训练样本中几乎全为 0（停牌股已被 unbuyable 过滤），方差为 0 无区分度
-                    drop_cols = ['date', 'is_st', 'is_suspended', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate']
-                    
-                    
+                    # 原始市场情绪因子已用于生成 *_regime_* 交互项，此处剔除其孤立列（截面零方差）
+                    drop_cols = ['date', 'is_st', 'is_suspended', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate'] + _RAW_MARKET_SENTIMENT_COLS
+
+
                     X_df = factors[final_valid_idx].drop(columns=[c for c in drop_cols if c in factors.columns], errors='ignore')
                     
                     return {
@@ -930,14 +982,23 @@ class MLModelTrainer:
             if target_features:
                 missing_features = [c for c in target_features if c not in factors.columns]
                 if missing_features:
-                    missing_df = pd.DataFrame(0.5, index=factors.index, columns=missing_features)
+                    # 缺失整列用 0.0（原始因子约定）而非 0.5：此阶段特征仍是【原始值】，
+                    # 尚未经横截面 rank 归一化。0.5 只对【已归一化】特征才是中性值；
+                    # 对原始 RSI/价格/波动率而言 0.5 无意义。缓存写入端用的也是 0
+                    # (comprehensive_factor_calculator.fill_nan_values(zero))，此处保持一致。
+                    # 一整列全 0 在后续横截面 rank 后自然变为均匀中性档，行为正确。
+                    missing_df = pd.DataFrame(0.0, index=factors.index, columns=missing_features)
                     factors = pd.concat([factors, missing_df], axis=1)
                 factor_value_cols = [c for c in target_features if c in factors.columns]
             if not factor_value_cols:
                 return None
             factors[factor_value_cols] = factors[factor_value_cols].apply(pd.to_numeric, errors='coerce')
+            # 语义统一说明：非缓存路径用 ~isna().any() 丢弃任一列含 NaN 的行（预热期整行丢弃），
+            # 缓存路径无法完全对齐——因子在【写入 parquet 时】已 fill_nan(zero)，预热期 NaN 早已变 0，
+            # 事后无从区分"真实 0"与"预热填充 0"。这里保留 all() 丢弃全 NaN 行（merge 缺失日期），
+            # 单列缺失填 0.0（与原始因子约定一致），而非此前会污染排序的 0.5。
             valid_factor_idx = ~factors[factor_value_cols].isna().all(axis=1)
-            factors[factor_value_cols] = factors[factor_value_cols].fillna(0.5)
+            factors[factor_value_cols] = factors[factor_value_cols].fillna(0.0)
 
             close = data['close'].values
             high = data['high'].values
@@ -1018,9 +1079,16 @@ class MLModelTrainer:
             if final_valid_idx.sum() <= 0:
                 return None
 
-            drop_cols = ['date', 'is_st', 'is_suspended', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate']
+            # 原始市场情绪因子已用于生成 *_regime_* 交互项，此处剔除其孤立列（截面零方差）
+            drop_cols = ['date', 'is_st', 'is_suspended', 'code', 'fore_adjust_factor', 'back_adjust_factor', 'days_to_delist', 'amount', 'turnover_rate'] + _RAW_MARKET_SENTIMENT_COLS
+            # 缓存路径此前仅排除市场情绪列，漏掉了 drop_cols 里的状态位/原始列
+            # （is_suspended 截面零方差、amount/turnover_rate 未归一化不可截面比较），
+            # 导致缓存路径比非缓存路径多混入 is_suspended 等噪声列，两条路径特征集不一致。
+            # 统一用 drop_cols 全集过滤，与非缓存路径 (else 分支) 行为完全对齐。
+            _drop_set = set(drop_cols)
             if target_features:
-                X_df = factors.loc[final_valid_idx, factor_value_cols]
+                keep_cols = [c for c in factor_value_cols if c not in _drop_set]
+                X_df = factors.loc[final_valid_idx, keep_cols]
             else:
                 X_df = factors[final_valid_idx].drop(columns=[c for c in drop_cols if c in factors.columns], errors='ignore')
             return {
@@ -1264,7 +1332,8 @@ class MLModelTrainer:
                        train_end_date: str = None,
                        include_fundamentals: bool = True,
                        target_features: Optional[List[str]] = None,
-                       use_factor_cache_only: bool = False) -> tuple:
+                       use_factor_cache_only: bool = False,
+                       return_sample_metadata: bool = False) -> tuple:
         """
         准备训练数据集
         
@@ -1280,9 +1349,12 @@ class MLModelTrainer:
             target_features: 外部传入的完整特征列表；若提供则跳过内部特征发现，
                              与 batch_update_factor_cache 共享同一列表以保证缓存命中
             use_factor_cache_only: 仅从 parquet 因子缓存读取特征，stocks_data 只用于生成标签
+            return_sample_metadata: 在默认返回值末尾附加逐样本诊断元数据。仅用于离线分析，
+                                    默认关闭以保持现有训练调用契约和内存占用不变
         
         返回:
             (X, y, returns, factor_names, dates, unbuyable, limit_groups, y_raw, is_st, w_sig)
+            return_sample_metadata=True 时再附加 sample_metadata DataFrame
         """
 
         # print("\n正在计算量化因子（技术指标 + K线形态 + 基本面）...")
@@ -1378,11 +1450,26 @@ class MLModelTrainer:
         inverse_sort[sort_idx] = np.arange(len(sort_idx), dtype=sort_idx.dtype)
         
         factor_names = all_X[0].columns.tolist()
+        factor_names_set = set(factor_names)
         X_arr = np.empty((len(sort_idx), len(factor_names)), dtype=np.float32)
         offset = 0
         for part_idx, x_part in enumerate(all_X):
             n_rows = len(x_part)
             dest_idx = inverse_sort[offset:offset + n_rows]
+            # 关键防御：按位置散写要求每个分片的列顺序与全局 factor_names 完全一致。
+            # 增量更新与全量重算两条缓存路径可能产生不同的列顺序（列集合相同、排列不同），
+            # 若不校验会导致特征值被静默写入错误的列名下（张冠李戴），且 numpy 不报错。
+            # 因此这里强制按 factor_names 重排；列集合不一致时直接报错，绝不静默污染。
+            if x_part.columns.tolist() != factor_names:
+                if set(x_part.columns) != factor_names_set:
+                    missing = factor_names_set - set(x_part.columns)
+                    extra = set(x_part.columns) - factor_names_set
+                    raise ValueError(
+                        f"特征分片 #{part_idx} 列集合与全局 factor_names 不一致，无法对齐散写。"
+                        f" 缺失列={sorted(missing)[:10]}, 多余列={sorted(extra)[:10]}"
+                    )
+                # 列集合相同、仅顺序不同：按全局顺序重排后再散写
+                x_part = x_part[factor_names]
             X_arr[dest_idx, :] = x_part.to_numpy(dtype=np.float32, copy=False)
             offset += n_rows
             all_X[part_idx] = None
@@ -1402,6 +1489,13 @@ class MLModelTrainer:
         unbuyable_arr = comps_df['unbuyable'].values
         limit_groups_arr = comps_df['limit_thresholds'].values
         is_st_arr = (comps_df['is_st'] == 1).values
+        sample_metadata = None
+        if return_sample_metadata:
+            metadata_cols = [
+                'date', 'code', 'atr_rel', 'intraday_intensity', 'volume_ratio',
+                'relative_intensity', 'is_st', 'days_to_delist',
+            ]
+            sample_metadata = comps_df[metadata_cols].copy()
         
         y_final_arr = y_ranked
         raw_scores_arr = raw_scores
@@ -1424,6 +1518,8 @@ class MLModelTrainer:
                 dates_arr        = dates_arr[keep_mask]
                 limit_groups_arr = limit_groups_arr[keep_mask]
                 is_st_arr        = is_st_arr[keep_mask]
+                if sample_metadata is not None:
+                    sample_metadata = sample_metadata.loc[keep_mask].reset_index(drop=True)
                 w_sig_arr        = w_sig_arr[keep_mask]
                 raw_scores_arr   = raw_scores_arr[keep_mask]
                 unbuyable_arr    = unbuyable_arr[keep_mask]
@@ -1553,7 +1649,11 @@ class MLModelTrainer:
         print("="*50 + "\n")
         
         # 统一输出 float32 以节省模型训练阶段的内存，XGB/LGB 内部也会转成 32 位
-        return X_arr, y_final_arr, returns_arr, all_cols, dates_arr, unbuyable_arr, limit_groups_arr, raw_scores_arr, is_st_arr, w_sig_arr
+        result = (X_arr, y_final_arr, returns_arr, all_cols, dates_arr,
+                  unbuyable_arr, limit_groups_arr, raw_scores_arr, is_st_arr, w_sig_arr)
+        if sample_metadata is not None:
+            return result + (sample_metadata,)
+        return result
 
     def _apply_cross_sectional_normalization(self, X_df: pd.DataFrame, dates: np.ndarray) -> pd.DataFrame:
         """
@@ -1592,12 +1692,21 @@ class MLModelTrainer:
                     path_scores: np.ndarray = None,
                     is_st_arr: np.ndarray = None,
                     w_sig_arr: np.ndarray = None,
-                    task: str = None) -> Dict:
+                    query_regime_values: np.ndarray = None,
+                    task: str = None,
+                    train_eval_sample_ratio: float = 0.05,
+                    val_eval_sample_ratio: float = 0.3) -> Dict:
         """
         训练多个模型
         """
         if task is None:
             task = getattr(TrainingConfig, 'TASK', 'ranking')
+        for name, ratio in (
+            ('train_eval_sample_ratio', train_eval_sample_ratio),
+            ('val_eval_sample_ratio', val_eval_sample_ratio),
+        ):
+            if not 0 < ratio <= 1:
+                raise ValueError(f"{name} 必须位于 (0, 1] 区间")
 
         # 数据验证和清理
         print("\n数据验证...")
@@ -1724,18 +1833,28 @@ class MLModelTrainer:
                         _y_sub[_ds:_de] = np.power(ranks.astype(np.float32), _label_exponent)
                     else:
                         _y_sub[_ds:_de] = ranks
-                    try:
-                        # 需要 _n_bins+1 个边界点才能产生 _n_bins 个 bin
-                        bin_0_watershed = 1/_n_bins
-                        q_skewed = np.concatenate([
-                            [0.0, bin_0_watershed],
-                            np.linspace(bin_0_watershed, 1.0, _n_bins)
-                        ])
-                        bins = pd.qcut(scores, q=q_skewed, labels=False, duplicates='drop')
-                        _y_discrete_lgb[_ds:_de] = bins.astype(np.int32)
-
-                    except ValueError:
-                        raise ValueError(f"  {_dates_sub[_ds:_de]} 样本标签分布不均匀，请检查数据质量。")
+                    # 离散化 (LightGBM lambdarank 档位)：
+                    # 关键修复——不再对【原始 scores】做 pd.qcut。原始分数在涨跌停/零收益日
+                    # 存在大量并列值，qcut 的分位边界会重合，duplicates='drop' 静默丢弃后
+                    # labels=False 重新编号，导致不同日期产生不同档位数（有的 15 档、有的 8 档），
+                    # 使同一"档位 k"在不同 query 间语义不可比，直接损害 lambdarank 训练信号。
+                    #
+                    # 改为对已算好的【连续 rank】(近似均匀、几乎无并列) 做【固定边界】pd.cut，
+                    # 保证每个截面都恰好切成 _n_bins 档、边界语义跨日完全一致。
+                    # 保留原 skewed 设计意图：bin 0 更窄 (仅覆盖最低 1/_n_bins 分位)，
+                    # 其余档位在剩余分位上等宽。边界固定，与当日分布无关。
+                    bin_0_watershed = 1.0 / _n_bins
+                    fixed_edges = np.concatenate([
+                        [0.0],
+                        np.linspace(bin_0_watershed, 1.0, _n_bins),
+                    ])
+                    # rank ∈ (0,1)，include_lowest 覆盖下界，clip 防浮点越界
+                    ranks_clipped = np.clip(ranks, 1e-6, 1.0 - 1e-9)
+                    bins = pd.cut(ranks_clipped, bins=fixed_edges,
+                                  labels=False, include_lowest=True)
+                    # pd.cut 对落在边界外或 NaN 返回 NaN；兜底填中间档，保证无 NaN 进 LightGBM
+                    bins = np.nan_to_num(bins, nan=float(_mid_bin)).astype(np.int32)
+                    _y_discrete_lgb[_ds:_de] = np.clip(bins, 0, _n_bins - 1)
                 else:
                     _y_discrete_lgb[_ds:_de] = _mid_bin
                     _y_sub[_ds:_de] = 0.5
@@ -1759,7 +1878,109 @@ class MLModelTrainer:
         if is_st_train is not None and st_weight_factor is not None and st_weight_factor < 1.0:
             sample_weight_train *= np.where(is_st_train, st_weight_factor, 1.0).astype(np.float32)
 
-        # 3. 叠加正交优化权重 (改为每日排名分档逻辑)
+        # 3. 叠加时间衰减权重。权重在同一交易日内保持一致，因此不会扭曲 query 内排序；
+        # XGBoost ranking 聚合为 per-group 权重后也能完整保留该训练策略。
+        if getattr(TrainingConfig, 'USE_RECENCY_WEIGHT', False):
+            recency_weight = self._calculate_recency_weights(
+                dates_train,
+                half_life_years=getattr(TrainingConfig, 'RECENCY_HALF_LIFE_YEARS', 4.0),
+                min_weight=getattr(TrainingConfig, 'RECENCY_MIN_WEIGHT', 0.1),
+            )
+            sample_weight_train *= recency_weight
+            print(
+                "\n[时间衰减] "
+                f"half_life={getattr(TrainingConfig, 'RECENCY_HALF_LIFE_YEARS', 4.0):g} 年, "
+                f"oldest={recency_weight.min():.3f}, newest={recency_weight.max():.3f}"
+            )
+
+        # 4. 可选的 query 级标签离散度权重。XGBoost ranking 只接受 per-group
+        # 权重，因此同一交易日内保持常数；IQR 比标准差更不受极端路径分影响。
+        query_weight_mode = getattr(
+            TrainingConfig, 'QUERY_LABEL_DISPERSION_WEIGHT', 'off'
+        )
+        if query_weight_mode != 'off':
+            if query_weight_mode not in {'high', 'low'}:
+                raise ValueError(
+                    f"Unknown QUERY_LABEL_DISPERSION_WEIGHT: {query_weight_mode}"
+                )
+            _, query_starts, query_counts = np.unique(
+                dates_train, return_index=True, return_counts=True
+            )
+            label_iqr = np.empty(len(query_starts), dtype=np.float64)
+            train_label_source = _label_source[:split_idx]
+            for qi, (query_start, query_count) in enumerate(
+                zip(query_starts, query_counts)
+            ):
+                query_scores = train_label_source[
+                    query_start:query_start + query_count
+                ]
+                q25, q75 = np.percentile(query_scores, [25.0, 75.0])
+                label_iqr[qi] = q75 - q25
+            dispersion_rank = _fast_rankdata_1d(label_iqr) / (len(label_iqr) + 1)
+            if query_weight_mode == 'low':
+                dispersion_rank = 1.0 - dispersion_rank
+            weight_min = float(getattr(TrainingConfig, 'QUERY_LABEL_WEIGHT_MIN', 0.75))
+            weight_max = float(getattr(TrainingConfig, 'QUERY_LABEL_WEIGHT_MAX', 1.25))
+            query_weights = weight_min + (weight_max - weight_min) * dispersion_rank
+            for query_start, query_count, query_weight in zip(
+                query_starts, query_counts, query_weights
+            ):
+                sample_weight_train[
+                    query_start:query_start + query_count
+                ] *= query_weight
+            print(
+                "\n[Query 标签离散度权重] "
+                f"mode={query_weight_mode}, IQR median={np.median(label_iqr):.4f}, "
+                f"weight={query_weights.min():.3f}~{query_weights.max():.3f}"
+            )
+
+        query_atr_mode = getattr(
+            TrainingConfig, 'QUERY_ATR_REGIME_WEIGHT', 'off'
+        )
+        if query_atr_mode != 'off':
+            if query_atr_mode not in {'high', 'low'}:
+                raise ValueError(
+                    f"Unknown QUERY_ATR_REGIME_WEIGHT: {query_atr_mode}"
+                )
+            if query_regime_values is None:
+                raise ValueError(
+                    "QUERY_ATR_REGIME_WEIGHT requires query_regime_values"
+                )
+            query_regime_values = np.asarray(query_regime_values, dtype=np.float64)
+            if len(query_regime_values) != len(dates_train):
+                raise ValueError(
+                    "query_regime_values length must match the training sample count"
+                )
+            _, query_starts, query_counts = np.unique(
+                dates_train, return_index=True, return_counts=True
+            )
+            query_atr = np.empty(len(query_starts), dtype=np.float64)
+            train_regime_source = query_regime_values[:split_idx]
+            for qi, (query_start, query_count) in enumerate(
+                zip(query_starts, query_counts)
+            ):
+                query_atr[qi] = float(np.nanmean(
+                    train_regime_source[query_start:query_start + query_count]
+                ))
+            atr_rank = _fast_rankdata_1d(query_atr) / (len(query_atr) + 1)
+            if query_atr_mode == 'low':
+                atr_rank = 1.0 - atr_rank
+            atr_weight_min = float(getattr(TrainingConfig, 'QUERY_ATR_WEIGHT_MIN', 0.75))
+            atr_weight_max = float(getattr(TrainingConfig, 'QUERY_ATR_WEIGHT_MAX', 1.25))
+            query_weights = atr_weight_min + (atr_weight_max - atr_weight_min) * atr_rank
+            for query_start, query_count, query_weight in zip(
+                query_starts, query_counts, query_weights
+            ):
+                sample_weight_train[
+                    query_start:query_start + query_count
+                ] *= query_weight
+            print(
+                "\n[Query ATR regime 权重] "
+                f"mode={query_atr_mode}, atr_rel median={np.median(query_atr):.4f}, "
+                f"weight={query_weights.min():.3f}~{query_weights.max():.3f}"
+            )
+
+        # 5. 叠加正交优化权重 (改为每日排名分档逻辑)
         if w_sig_arr is not None and getattr(TrainingConfig, 'USE_SAMPLE_WEIGHT', False):
             # 获取训练集和验证集的权重数据
             w_sig_train = w_sig_arr[:split_idx]
@@ -1802,6 +2023,13 @@ class MLModelTrainer:
         
         # 记录原始特征列表，用于同步过滤 X_val
         original_factor_names = list(factor_names)
+        feature_selection_corr_threshold = 0.8
+        selection_data_signature = _feature_selection_data_signature(
+            X_train,
+            dates_train,
+            original_factor_names,
+            feature_selection_corr_threshold,
+        )
 
         apply_feature_selection=True
         if apply_feature_selection:        
@@ -1812,11 +2040,17 @@ class MLModelTrainer:
                     import json
                     with open(selection_cache_file, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
-                        # 只有当原始特征集完全一致时，才复用缓存
-                        if set(cached_data.get('original_features', [])) == set(original_factor_names):
+                        cache_matches = (
+                            cached_data.get('data_signature') == selection_data_signature
+                            and cached_data.get('original_features') == original_factor_names
+                            and cached_data.get('corr_threshold') == feature_selection_corr_threshold
+                        )
+                        if cache_matches:
                             factor_names = cached_data['selected_features']
                             print(f"\n[特征优化] 从缓存加载特征选择结果 (保留 {len(factor_names)} 个核心特征)")
                             loaded_from_cache = True
+                        else:
+                            print("\n[特征优化] 缓存签名与当前训练数据不一致，将重新选择特征")
                 except Exception as e:
                     print(f"  读取特征选择缓存失败: {e}")
 
@@ -1824,7 +2058,7 @@ class MLModelTrainer:
                 print(f"\n[特征优化] 正在进行特征选择 (原始特征数: {len(factor_names)})...")
                 # 使用相关性过滤
                 X_train, factor_names = self._select_features(
-                    X_train, factor_names, 0.8
+                    X_train, factor_names, feature_selection_corr_threshold
                 )
                 # 保存特征选择结果到缓存
                 try:
@@ -1833,6 +2067,9 @@ class MLModelTrainer:
                         json.dump({
                             'original_features': original_factor_names,
                             'selected_features': factor_names,
+                            'corr_threshold': feature_selection_corr_threshold,
+                            'data_signature': selection_data_signature,
+                            'signature_version': 1,
                             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         }, f, ensure_ascii=False, indent=4)
                 except Exception as e:
@@ -1862,6 +2099,17 @@ class MLModelTrainer:
             try:
                 model = MLFactorModel(model_type=model_type, task=task)
 
+                # ── 自定义头部加权目标（T031 头部约束范式，默认关闭）────────────
+                # 仅当 TrainingConfig.XGBOOST_CUSTOM_OBJECTIVE 被设置为工厂可调用对象时生效。
+                # 工厂在训练期实际标签与 group 上构造 obj 闭包，保证与 DMatrix 行序一致。
+                custom_obj_factory = getattr(TrainingConfig, 'XGBOOST_CUSTOM_OBJECTIVE', None)
+                if (custom_obj_factory is not None
+                        and model_type == 'xgboost' and model.task == 'ranking'):
+                    self._custom_obj = custom_obj_factory(y_train, train_group)
+                    model._custom_obj = self._custom_obj
+                else:
+                    self._custom_obj = None
+
                 # ── Early Stopping 验证集策略 ──────────────────────────────────
                 # 直接使用外部纯净验证集（阻隔期后）做 early stopping，
                 # 避免内部切分验证集时间分布与外部验证集不一致导致的过早停止。
@@ -1869,8 +2117,32 @@ class MLModelTrainer:
                 _, es_val_group = np.unique(dates_val, return_counts=True)
                 if model.task == 'ranking':
                     if model_type == 'xgboost':
-                        y_train_rank = y_train
-                        y_val_rank = y_val
+                        xgb_objective = getattr(
+                            TrainingConfig,
+                            'XGBOOST_RANKING_OBJECTIVE',
+                            'rank:ndcg',
+                        )
+                        if xgb_objective == 'rank:pairwise':
+                            # XGBoost 3.x 的 NDCG 评估要求 relevance 为非负整数。
+                            # 固定 15 档标签同时保留跨 query 一致的排序语义。
+                            y_train_rank = y_train_discrete
+                            y_val_rank = y_val_discrete
+                        else:
+                            if getattr(self, '_custom_obj', None) is not None:
+                                # 自定义目标：喂离散 15 档标签供内置 ndcg 早停；
+                                # 头部 pair 由连续标签在工厂内构造，唯一差异是目标函数本身。
+                                y_train_rank = y_train_discrete
+                                y_val_rank = y_val_discrete
+                            else:
+                                # 默认喂连续标签（rank^exp）。T032 测试 ndcg_exp_gain
+                                # 时需整数标签，故允许通过 XGBOOST_FORCE_DISCRETE_LABEL
+                                # 强制喂离散档位标签，从而隔离"增益形状"这一单一变量。
+                                if getattr(TrainingConfig, 'XGBOOST_FORCE_DISCRETE_LABEL', False):
+                                    y_train_rank = y_train_discrete
+                                    y_val_rank = y_val_discrete
+                                else:
+                                    y_train_rank = y_train
+                                    y_val_rank = y_val
                     else:
                         y_train_rank = y_train_discrete
                         y_val_rank = y_val_discrete
@@ -1904,11 +2176,17 @@ class MLModelTrainer:
                         dates=dates_train,
                     )
                 # 训练集评估（采样，用于与验证集对比学习效果）
-                train_eval = model._evaluate(X_train, y_train, "训练集", returns=returns_train, dates=dates_train,sample_ratio=0.03)
+                train_eval = model._evaluate(
+                    X_train, y_train, "训练集", returns=returns_train,
+                    dates=dates_train, sample_ratio=train_eval_sample_ratio,
+                )
                 train_result['train_metrics'] = train_eval
 
                 # 在验证集（阻隔期后）上做最终评估
-                val_eval = model._evaluate(X_val, y_val, "验证集", returns=returns_val, dates=dates_val,sample_ratio=0.5)
+                val_eval = model._evaluate(
+                    X_val, y_val, "验证集", returns=returns_val,
+                    dates=dates_val, sample_ratio=val_eval_sample_ratio,
+                )
                 train_result['val_metrics'] = val_eval
                 
                 self.models[model_type] = model
@@ -1919,7 +2197,30 @@ class MLModelTrainer:
                 print(traceback.format_exc())
                 continue
         
+        self.last_training_results = results
         return results
+
+    @staticmethod
+    def _calculate_recency_weights(
+        dates: np.ndarray,
+        half_life_years: float,
+        min_weight: float = 0.1,
+    ) -> np.ndarray:
+        """按自然日指数衰减生成训练权重，并归一化到均值 1。"""
+        if len(dates) == 0:
+            return np.empty(0, dtype=np.float32)
+        if half_life_years <= 0:
+            raise ValueError("RECENCY_HALF_LIFE_YEARS 必须大于 0")
+        if not 0 < min_weight <= 1:
+            raise ValueError("RECENCY_MIN_WEIGHT 必须位于 (0, 1] 区间")
+
+        date_values = np.asarray(dates, dtype="datetime64[D]")
+        newest_date = date_values.max()
+        age_days = (newest_date - date_values).astype(np.float64)
+        weights = np.power(0.5, age_days / (365.25 * half_life_years))
+        weights = np.maximum(weights, min_weight)
+        weights /= weights.mean()
+        return weights.astype(np.float32)
 
 
     def _apply_cross_sectional_normalization_inplace(self, X: np.ndarray, dates: np.ndarray, 
@@ -2147,7 +2448,14 @@ class MLModelTrainer:
         
         return best_model[0]
     
-    def save_models(self, save_dir: str = 'models', years: int = 5, stocks: int = 5000):
+    def save_models(
+        self,
+        save_dir: str = 'models',
+        years: int = 5,
+        stocks: int = 5000,
+        update_latest: bool = True,
+        training_results: Dict = None,
+    ):
         """
         保存所有训练好的模型，并根据任务、天数、阈值等元数据自动归档
         
@@ -2155,6 +2463,8 @@ class MLModelTrainer:
             save_dir: 基础保存目录
             years: 训练数据年数
             stocks: 训练股票数量
+            update_latest: 是否同步归档到 latest 目录
+            training_results: 本次 train_models 返回值；不传时使用最近一次训练结果
             
         返回:
             归档目录路径
@@ -2218,23 +2528,37 @@ class MLModelTrainer:
             print(f"  [OK] 归一化统计量已保存: norm_stats.pkl")
         
         # 保存训练配置信息
-        self._save_training_config(archive_dir, years, stocks, forward_days)
+        if training_results is None:
+            training_results = getattr(self, 'last_training_results', None)
+        self._save_training_config(
+            archive_dir, years, stocks, forward_days, training_results
+        )
             
-        # 8. 同时更新一个 "latest" 目录，方便自动调用
-        latest_dir = os.path.join(save_dir, 'latest')
-        import shutil
-        if os.path.exists(latest_dir):
-            try: shutil.rmtree(latest_dir)
-            except: pass
-        try:
-            shutil.copytree(archive_dir, latest_dir)
-            print(f"  [OK] 已同步至最新目录: {latest_dir}")
-        except Exception as e:
-            print(f"  [Error] 同步最新目录失败: {e}")
+        # 8. 生产训练默认更新 latest；候选实验可只保留独立归档。
+        if update_latest:
+            latest_dir = os.path.join(save_dir, 'latest')
+            import shutil
+            if os.path.exists(latest_dir):
+                try: shutil.rmtree(latest_dir)
+                except: pass
+            try:
+                shutil.copytree(archive_dir, latest_dir)
+                print(f"  [OK] 已同步至最新目录: {latest_dir}")
+            except Exception as e:
+                print(f"  [Error] 同步最新目录失败: {e}")
+        else:
+            print("  [INFO] 候选模式：未更新 latest 目录")
             
         return archive_dir
     
-    def _save_training_config(self, save_dir: str, years: int, stocks: int, forward_days: int):
+    def _save_training_config(
+        self,
+        save_dir: str,
+        years: int,
+        stocks: int,
+        forward_days: int,
+        training_results: Dict = None,
+    ):
         """
         保存训练配置信息到JSON文件
         
@@ -2246,6 +2570,45 @@ class MLModelTrainer:
         """
         import json
         from config.factor_config import TrainingConfig, ModelConfig
+
+        def _json_value(value):
+            if isinstance(value, dict):
+                return {str(k): _json_value(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_json_value(v) for v in value]
+            if isinstance(value, np.ndarray):
+                return [_json_value(v) for v in value.tolist()]
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+
+        performance = {
+            'model_count': len(self.models),
+            'trained_models': list(self.models.keys()),
+            'models': {},
+        }
+        for model_type, model in self.models.items():
+            result = (training_results or {}).get(model_type, {})
+            best_iteration = None
+            if model_type == 'xgboost' and getattr(model, 'model', None) is not None:
+                booster = (
+                    model.model if hasattr(model.model, 'attr')
+                    else model.model.get_booster()
+                )
+                best_iteration = model._get_xgb_best_iteration(booster)
+            elif getattr(model, 'model', None) is not None:
+                best_iteration = getattr(model.model, 'best_iteration_', None)
+
+            diagnosis = model._overfitting_diagnosis()
+            performance['models'][model_type] = {
+                'best_iteration': best_iteration,
+                'train_metrics': result.get('train_metrics', {}),
+                'val_metrics': result.get('val_metrics', {}),
+                'curve_diagnosis': diagnosis,
+                'feature_count': len(getattr(model, 'feature_names', [])),
+            }
         
         config_info = {
             'training_info': {
@@ -2267,33 +2630,45 @@ class MLModelTrainer:
                 'short_prediction': getattr(TrainingConfig, 'SHORT_PREDICTION', False),
                 'train_test_split': getattr(TrainingConfig, 'TRAIN_TEST_SPLIT', 0.7),
                 'unbuyable_handling': getattr(TrainingConfig, 'UNBUYABLE_HANDLING', 'punish'),
-                'weight_exponent': getattr(TrainingConfig, 'WEIGHT_EXPONENT', 1.5)
+                'weight_exponent': getattr(TrainingConfig, 'WEIGHT_EXPONENT', 1.5),
+                'label_weighted_for_xgb': getattr(TrainingConfig, 'LABEL_WEIGHTED_FOR_XGB', False),
+                'label_weight_exponent': getattr(TrainingConfig, 'LABEL_WEIGHT_EXPONENT', 1.0),
+                'xgboost_ranking_objective': getattr(
+                    TrainingConfig, 'XGBOOST_RANKING_OBJECTIVE', 'rank:ndcg'
+                ),
+                'use_recency_weight': getattr(TrainingConfig, 'USE_RECENCY_WEIGHT', False),
+                'recency_half_life_years': getattr(TrainingConfig, 'RECENCY_HALF_LIFE_YEARS', None),
+                'recency_min_weight': getattr(TrainingConfig, 'RECENCY_MIN_WEIGHT', None),
+                'query_label_dispersion_weight': getattr(
+                    TrainingConfig, 'QUERY_LABEL_DISPERSION_WEIGHT', 'off'
+                ),
+                'query_label_weight_min': getattr(
+                    TrainingConfig, 'QUERY_LABEL_WEIGHT_MIN', None
+                ),
+                'query_label_weight_max': getattr(
+                    TrainingConfig, 'QUERY_LABEL_WEIGHT_MAX', None
+                ),
+                'query_atr_regime_weight': getattr(
+                    TrainingConfig, 'QUERY_ATR_REGIME_WEIGHT', 'off'
+                ),
+                'query_atr_weight_min': getattr(
+                    TrainingConfig, 'QUERY_ATR_WEIGHT_MIN', None
+                ),
+                'query_atr_weight_max': getattr(
+                    TrainingConfig, 'QUERY_ATR_WEIGHT_MAX', None
+                ),
             },
             'model_config': {
                 'n_bins': ModelConfig.get_n_bins(),
-                'xgboost_params': {
-                    'n_estimators': ModelConfig.XGBOOST_PARAMS.get('n_estimators'),
-                    'max_depth': ModelConfig.XGBOOST_PARAMS.get('max_depth'),
-                    'learning_rate': ModelConfig.XGBOOST_PARAMS.get('learning_rate'),
-                    'objective': ModelConfig.XGBOOST_PARAMS.get('objective')
-                },
-                'lightgbm_params': {
-                    'n_estimators': ModelConfig.LIGHTGBM_PARAMS.get('n_estimators'),
-                    'max_depth': ModelConfig.LIGHTGBM_PARAMS.get('max_depth'),
-                    'num_leaves': ModelConfig.LIGHTGBM_PARAMS.get('num_leaves'),
-                    'learning_rate': ModelConfig.LIGHTGBM_PARAMS.get('learning_rate'),
-                    'objective': ModelConfig.LIGHTGBM_PARAMS.get('objective')
-                }
+                'xgboost_params': ModelConfig.get_model_params('xgboost', self.task),
+                'lightgbm_params': ModelConfig.get_model_params('lightgbm', self.task),
             },
-            'performance_metrics': {
-                'model_count': len(self.models),
-                'trained_models': list(self.models.keys())
-            }
+            'performance_metrics': performance,
         }
         
         config_path = os.path.join(save_dir, 'training_config.json')
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config_info, f, ensure_ascii=False, indent=2)
+            json.dump(_json_value(config_info), f, ensure_ascii=False, indent=2)
         
         print(f"  [OK] 训练配置已保存: training_config.json")
     

@@ -1,0 +1,92 @@
+"""
+控制变量实验：训练回看长度对验证集 Rank IC 的影响（验证期固定）。
+
+怀疑：17 年老数据（2007-2016）与近期市场 regime 差异大，可能稀释预测力。
+方法：加载最长窗口一次，对每个训练起始日重算数据集，并动态设置 TRAIN_TEST_SPLIT，
+      使验证期始终≈最近 VAL_YEARS 年，从而公平对比"训练用多久的历史"。
+
+用法:
+    EXP_STOCKS=1500 EXP_WINDOWS=6,10,15 EXP_VAL_YEARS=1.5 python scripts/exp_window.py
+"""
+import sys, os, time
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+from datetime import datetime, timedelta
+
+from core.factors.train_ml_model import MLModelTrainer
+from config.baostock_config import DATABASE_PATH
+from config.factor_config import TrainingConfig
+from core.data.baostock_main import BaostockDataManager
+
+
+def run_once(trainer, stocks_data, start, end, val_years, total_years, model_types):
+    """用给定训练起始日重算数据集并训练。TRAIN_TEST_SPLIT 动态设置以固定验证期。"""
+    # 验证集 ≈ 最近 val_years 年 → split 比例 = 1 - val_years/total_years
+    split_frac = max(0.5, 1.0 - val_years / total_years)
+    TrainingConfig.TRAIN_TEST_SPLIT = split_frac
+    print(f"\n{'#'*70}\n# 实验: 训练回看 {total_years}y (start={start}), "
+          f"split={split_frac:.3f}, 验证期≈最近 {val_years}y\n{'#'*70}")
+
+    ds = trainer.prepare_dataset(
+        stocks_data, train_start_date=start, train_end_date=end,
+        include_fundamentals=True, n_jobs=15,
+        target_features=None, use_factor_cache_only=True,
+    )
+    X, y, returns, factor_names, dates, unbuyable, limit_groups, path_scores, is_st, w_sig = ds
+
+    results = trainer.train_models(
+        X, y, returns, factor_names, dates,
+        unbuyable_mask=unbuyable, limit_groups=limit_groups,
+        path_scores=path_scores, is_st_arr=is_st, w_sig_arr=w_sig,
+        model_types=model_types,
+    )
+    out = {}
+    for mt, r in results.items():
+        tr = r.get('train_metrics', {}).get('rank_ic', float('nan'))
+        va = r.get('val_metrics', {}).get('rank_ic', float('nan'))
+        t1 = r.get('val_metrics', {}).get('top1_precision', float('nan'))
+        win = r.get('val_metrics', {}).get('win_rate', float('nan'))
+        out[mt] = (tr, va, t1, win)
+    return out
+
+
+def main():
+    N_STOCKS = int(os.environ.get('EXP_STOCKS', '1500'))
+    windows = [int(w) for w in os.environ.get('EXP_WINDOWS', '6,10,15').split(',')]
+    val_years = float(os.environ.get('EXP_VAL_YEARS', '1.5'))
+    model_types = os.environ.get('EXP_MODELS', 'xgboost').split(',')
+
+    max_years = max(windows)
+    end = (datetime.now() - timedelta(days=365 * TrainingConfig.YEARS_FOR_BACKTEST)).strftime('%Y-%m-%d')
+    load_start = (datetime.now() - timedelta(days=365 * (TrainingConfig.YEARS_FOR_BACKTEST + max_years))).strftime('%Y-%m-%d')
+
+    print(f"=== 训练窗口对照实验 ===")
+    print(f"股票: {N_STOCKS}, 加载窗口: {load_start} ~ {end}")
+    print(f"回看对照: {windows}y, 验证期固定≈最近 {val_years}y, 模型: {model_types}")
+
+    trainer = MLModelTrainer(db_path=DATABASE_PATH)
+    manager = BaostockDataManager()
+    codes = manager.get_stock_list_from_db()['code'].tolist()[:N_STOCKS]
+    manager.close()
+
+    t0 = time.time()
+    stocks_data = trainer.load_label_data(codes, load_start, end)
+    print(f"标签行情加载: {len(stocks_data)} 只, {time.time()-t0:.1f}s")
+
+    all_results = {}
+    for w in windows:
+        start = (datetime.now() - timedelta(days=365 * (TrainingConfig.YEARS_FOR_BACKTEST + w))).strftime('%Y-%m-%d')
+        all_results[w] = run_once(trainer, stocks_data, start, end, val_years, w, model_types)
+
+    print(f"\n\n{'='*70}\n对照汇总 (验证期固定 ≈ 最近 {val_years}y)\n{'='*70}")
+    print(f"{'回看':>5} | {'model':>10} | {'train_ic':>9} | {'val_ic':>8} | {'top1':>7} | {'win':>7}")
+    print('-'*70)
+    for w in windows:
+        for mt, (tr, va, t1, win) in all_results[w].items():
+            print(f"{w:>4}y | {mt:>10} | {tr:>9.4f} | {va:>8.4f} | {t1:>7.2%} | {win:>7.2%}")
+    print('='*70)
+
+
+if __name__ == '__main__':
+    main()

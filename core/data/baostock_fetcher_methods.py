@@ -6,31 +6,60 @@ import os
 import sqlite3
 from datetime import datetime
 from typing import Optional, List, Any
-from config import MARKET_PREFIXES, ADJUST_FLAG, REQUEST_INTERVAL
+from config import MARKET_PREFIXES, ADJUST_FLAG, REQUEST_INTERVAL, API_DAILY_QUOTA
 
 class QuotaExceededError(Exception):
     pass
 
-def _check_and_increment_quota():
+def _register_api_call(n: int = 1, gate: bool = True):
+    """
+    登记一次（或 n 次）Baostock API 调用到每日配额表。
+
+    - gate=True  : 原子地「检查上限 + 计数」，若已超限则抛 QuotaExceededError（用于正式数据请求前的拦截）。
+    - gate=False : 仅计数（用于 login / 交易日查询等前置调用，永不拦截）。
+
+    计数在单条 SQLite UPDATE 内原子完成，避免原先「先 SELECT 再 UPDATE」的非原子竞态。
+    配额表缺失 / 锁等待等异常不再静默吞掉，改为打印告警，防止配额保护在出错时悄悄失效。
+    """
     from config.baostock_config import META_DB_PATH
-    max_quota = 48000
+    max_quota = API_DAILY_QUOTA
     today = datetime.now().strftime('%Y-%m-%d')
-    try:
-        with sqlite3.connect(META_DB_PATH, timeout=5.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT count FROM api_quota WHERE date = ?", (today,))
-            row = cursor.fetchone()
-            if row:
-                count = row[0]
-                if count >= max_quota:
-                    raise QuotaExceededError(f"Daily Baostock API quota exceeded ({count}/{max_quota})")
-                cursor.execute("UPDATE api_quota SET count = count + 1 WHERE date = ?", (today,))
-            else:
-                cursor.execute("INSERT INTO api_quota (date, count) VALUES (?, 1)", (today,))
-            conn.commit()
-    except sqlite3.OperationalError:
-        # Ignore lock timeouts to not block requests strictly
-        pass
+    last_err = None
+    # 短暂重试以应对瞬时 database is locked（如另一进程正在写 sync_status）；非跨进程互斥锁
+    for _ in range(3):
+        try:
+            with sqlite3.connect(META_DB_PATH, timeout=5.0) as conn:
+                cur = conn.cursor()
+                cur.execute("PRAGMA busy_timeout=5000")
+                # 确保当日行存在
+                cur.execute("INSERT OR IGNORE INTO api_quota(date, count) VALUES (?, 0)", (today,))
+                if gate:
+                    # 仅当 count + n <= max_quota 时才累加；否则不累加并抛出
+                    cur.execute(
+                        "UPDATE api_quota SET count = count + ? WHERE date = ? AND count + ? <= ?",
+                        (n, today, n, max_quota),
+                    )
+                    if cur.rowcount == 0:
+                        cur.execute("SELECT count FROM api_quota WHERE date = ?", (today,))
+                        row = cur.fetchone()
+                        cnt = row[0] if row else '?'
+                        raise QuotaExceededError(f"Daily Baostock API quota exceeded ({cnt}/{max_quota})")
+                else:
+                    # 仅计数：到顶后不再累加，但不拦截
+                    cur.execute(
+                        "UPDATE api_quota SET count = count + ? WHERE date = ? AND count + ? <= ?",
+                        (n, today, n, max_quota),
+                    )
+                conn.commit()
+            return
+        except QuotaExceededError:
+            raise
+        except sqlite3.OperationalError as e:
+            last_err = e
+            time.sleep(0.1)
+            continue
+    # 重试后仍失败（表缺失 / 持续锁等待等）：记录告警，避免配额保护在出错时悄悄失效
+    print(f"[quota] 警告: 配额登记失败 ({last_err})")
 
 class CachedResultSet:
     """模拟 Baostock ResultSet 的对象，预抓取所有数据以保证线程安全"""
@@ -62,14 +91,16 @@ def _bs_query(method_name: str, **kwargs) -> Any:
     max_retries = 3
     last_error = ""
     method = getattr(bs, method_name)
-    
+
+    # 每个逻辑请求在正式发起前登记一次配额：原子地检查上限并计数，超限即抛异常拦截。
+    # 放在重试循环之外 => 每个逻辑请求只计一次（含其内部重试），杜绝原先每次重试重复计数的问题。
+    _register_api_call(1, gate=True)
+
     for attempt in range(max_retries):
         try:
             if REQUEST_INTERVAL > 0:
                 time.sleep(REQUEST_INTERVAL)
-            
-            _check_and_increment_quota()
-                
+
             rs = method(**kwargs)
             
             if rs is None:
@@ -248,7 +279,16 @@ def fetch_performance_forecast(code: str, start_date: str, end_date: str) -> pd.
     if not data: return pd.DataFrame()
     df = pd.DataFrame(data, columns=rs.fields)
     if 'code' in df.columns: df['code'] = df['code'].apply(_from_bs_symbol)
-    return df.rename(columns={'pubDate': 'pub_date', 'statDate': 'stat_date'})
+    # query_forecast_report 的字段名和其它财务接口不一样：没有 pubDate/statDate，
+    # 而是 profitForcastExpPubDate（预告披露日）/ profitForcastExpStatDate（报告期）。
+    # 老代码只按 pubDate/statDate 改名 => 永远改不到，下游 dropna(subset=['pub_date'])
+    # 把每只票都清空，落库 0 行却一声不响（E10「抓不到预告」的真因）。
+    df = df.rename(columns={'pubDate': 'pub_date', 'statDate': 'stat_date'})
+    if 'pub_date' not in df.columns and 'profitForcastExpPubDate' in df.columns:
+        df['pub_date'] = df['profitForcastExpPubDate']
+    if 'stat_date' not in df.columns and 'profitForcastExpStatDate' in df.columns:
+        df['stat_date'] = df['profitForcastExpStatDate']
+    return df
 
 
 def get_stock_list(markets:Optional[List[str]] = None) -> pd.DataFrame:

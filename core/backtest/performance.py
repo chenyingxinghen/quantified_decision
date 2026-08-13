@@ -71,8 +71,15 @@ class PerformanceAnalyzer:
             max_drawdown = PerformanceAnalyzer._calculate_max_drawdown(cumulative_returns) * 100
         
         # 夏普比率
+        # 旧口径（保留作对照）：按「每笔交易收益」计算并 ×√252。
+        # 这是错误的——每笔交易平均持仓十余天且多仓并行，逐笔收益不是日收益，
+        # ×√252 会系统性地放大数值。仅保留为 trade_sharpe 供历史结果对齐。
         returns = trades_df['pnl_pct']
-        sharpe_ratio = PerformanceAnalyzer._calculate_sharpe_ratio(returns)
+        trade_sharpe = PerformanceAnalyzer._calculate_sharpe_ratio(returns)
+
+        # 正确口径：由日频资金曲线计算年化收益/波动/夏普。
+        daily_stats = PerformanceAnalyzer._daily_curve_stats(equity_curve)
+        sharpe_ratio = daily_stats['sharpe'] if daily_stats['n_days'] > 1 else trade_sharpe
         
         # 持仓天数统计
         avg_holding_days = trades_df['holding_days'].mean()
@@ -97,6 +104,10 @@ class PerformanceAnalyzer:
             'profit_factor': profit_factor,
             'max_drawdown': max_drawdown,
             'sharpe_ratio': sharpe_ratio,
+            'trade_sharpe': trade_sharpe,
+            'annual_return_pct': daily_stats['annual_return_pct'],
+            'annual_vol_pct': daily_stats['annual_vol_pct'],
+            'equity_days': daily_stats['n_days'],
             'avg_holding_days': avg_holding_days,
             'exit_reasons': exit_reasons,
             'best_trade': trades_df.loc[best_trade_idx].to_dict(),
@@ -119,6 +130,10 @@ class PerformanceAnalyzer:
             'profit_factor': 0,
             'max_drawdown': 0,
             'sharpe_ratio': 0,
+            'trade_sharpe': 0,
+            'annual_return_pct': 0,
+            'annual_vol_pct': 0,
+            'equity_days': 0,
             'avg_holding_days': 0,
             'exit_reasons': {},
             'best_trade': None,
@@ -132,6 +147,29 @@ class PerformanceAnalyzer:
         drawdown = (equity_series - running_max) / running_max
         return drawdown.min() * 100
     
+    @staticmethod
+    def _daily_curve_stats(equity_curve) -> Dict:
+        """由资金曲线计算日频年化指标（收益/波动/夏普）。"""
+        empty = {'n_days': 0, 'annual_return_pct': 0.0,
+                 'annual_vol_pct': 0.0, 'sharpe': 0.0}
+        if not equity_curve or len(equity_curve) < 2:
+            return empty
+        vals = np.asarray([float(e[1]) for e in equity_curve], dtype=float)
+        if np.any(vals <= 0):
+            return empty
+        ret = pd.Series(vals).pct_change().dropna()
+        if len(ret) < 2 or ret.std(ddof=1) == 0:
+            return empty
+        total = vals[-1] / vals[0] - 1.0
+        years = len(ret) / 252.0
+        ann = (1.0 + total) ** (1.0 / years) - 1.0 if years > 0 and total > -1 else float('nan')
+        return {
+            'n_days': int(len(ret)),
+            'annual_return_pct': float(ann) * 100.0,
+            'annual_vol_pct': float(ret.std(ddof=1) * np.sqrt(252)) * 100.0,
+            'sharpe': float(ret.mean() / ret.std(ddof=1) * np.sqrt(252)),
+        }
+
     @staticmethod
     def _calculate_sharpe_ratio(returns: pd.Series, risk_free_rate: float = 0) -> float:
         """计算夏普比率"""
@@ -172,10 +210,16 @@ class PerformanceAnalyzer:
         print(f"  平均盈利: {metrics['avg_win_pct']:.2f}%")
         print(f"  平均亏损: {metrics['avg_loss_pct']:.2f}%")
         
+        if metrics.get('equity_days'):
+            print(f"  年化收益率: {metrics['annual_return_pct']:.2f}%")
+            print(f"  年化波动率: {metrics['annual_vol_pct']:.2f}%")
+
         print("\n【风险指标】")
         print(f"  盈亏比: {metrics['profit_factor']:.2f}")
         print(f"  最大回撤: {metrics['max_drawdown']:.2f}%")
-        print(f"  夏普比率: {metrics['sharpe_ratio']:.2f}")
+        print(f"  夏普比率: {metrics['sharpe_ratio']:.2f}  (日频资金曲线口径)")
+        if 'trade_sharpe' in metrics:
+            print(f"  逐笔夏普: {metrics['trade_sharpe']:.2f}  (旧口径，仅供历史对照，勿用于决策)")
         
         if metrics.get('exit_reasons'):
             print("\n【退出原因】")

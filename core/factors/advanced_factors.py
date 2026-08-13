@@ -201,10 +201,12 @@ class RiskFactors:
         close = data['close']
         returns = close.pct_change()
         
-        # 1. 下行风险 (Rolling Standard Deviation of Negative Returns)
-        negative_returns = returns.copy()
-        negative_returns[negative_returns > 0] = np.nan
-        features['downside_risk'] = negative_returns.rolling(20).std()
+        # 1. 下行偏差（Sortino downside deviation）
+        # 正收益应按 0 计入 20 日窗口，而不是置 NaN。旧实现把正收益置 NaN 后直接
+        # rolling(20).std()，默认要求窗口内 20 个非 NaN，几乎等价于连续 20 日下跌，
+        # 导致该列长期 NaN 并在缓存收尾阶段被填成 0，横截面完全退化。
+        downside = returns.clip(upper=0.0)
+        features['downside_risk'] = np.sqrt(downside.pow(2).rolling(20).mean())
         
         # 2. 回撤
         cumulative_returns = (1 + returns.fillna(0)).cumprod()

@@ -94,6 +94,12 @@ class BaostockFetcher:
             if lg.error_code == '0':
                 cls._global_bs_logged_in = True
                 print(f"Baostock 登录成功 (PID: {os.getpid()})")
+                # 登录本身也是一次 API 调用，纳入每日配额计数（仅计数，不拦截登录）
+                try:
+                    from .baostock_fetcher_methods import _register_api_call
+                    _register_api_call(1, gate=False)
+                except Exception:
+                    pass
             else:
                 print(f"Baostock 登录失败 (PID: {os.getpid()}): {lg.error_msg}")
                 # 如果是特定错误，可以不抛异常，由上层处理
@@ -305,11 +311,21 @@ class BaostockFetcher:
         """初始化元数据数据库表结构"""
         meta_db_path = META_DB_PATH
         with sqlite3.connect(meta_db_path, timeout=30.0) as conn:
+            # 元数据库开启 WAL，降低并发写（配额计数 / 同步状态）时的 database is locked 概率
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS sync_status (
                     code TEXT PRIMARY KEY,
                     last_daily_sync TEXT,
                     last_finance_sync TEXT
+                )
+            ''')
+            # 每日 Baostock API 请求配额计数器（防止单日请求超过上限被拉黑）
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS api_quota (
+                    date TEXT PRIMARY KEY,
+                    count INTEGER NOT NULL DEFAULT 0
                 )
             ''')
             # 基础股票列表缓存

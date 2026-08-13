@@ -33,8 +33,25 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  risk_min_price: Optional[float] = sc.ML_FACTOR_RISK_MIN_PRICE,
                  risk_exclude_st: bool = sc.ML_FACTOR_RISK_EXCLUDE_ST,
                  max_positions: int = None,
+                 max_rel_atr: Optional[float] = None,
+                 regime_filter: str = 'off',
+                 risk_penalty_lambda: float = 0.0,
+                 risk_penalty_feature: str = 'max_drawdown_20',
+                 risk_penalty_direction: str = 'low',
+                 ensemble_model_paths: Optional[List[str]] = None,
+                 preload_start: Optional[str] = None,
+                 preload_end: Optional[str] = None,
                  name: str = "ML因子策略"):
-        """初始化策略"""
+        """初始化策略
+
+        风控层参数（T040）：
+        - ``max_rel_atr``：入场前波动率上限。候选股 ATR14/close 超过该值直接剔除，
+          不占用仓位。None 表示关闭。典型值 0.04~0.06。
+        - ``regime_filter``：宏观 regime 空仓开关。
+          ``'off'`` 关闭；``'trend'`` 在合成指数处于均线下方且 MA20 斜率为负时
+          停止一切新开仓（已有持仓仍由引擎按止损/止盈正常了结）。
+          所有判定只用 t 及之前数据，无前视。
+        """
         super().__init__(name)
         self.model_path = (
             model_path if os.path.isabs(model_path)
@@ -51,10 +68,36 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # 头部区间大小：回测按模型打分取 Top-K。默认 sc.MAX_POSITIONS；
         # 传入更大值（如 20）即回测"Top-20 头部区间"策略（用户反馈 Top-1 太极端）。
         self.max_positions = max_positions if max_positions is not None else sc.MAX_POSITIONS
+        self.max_rel_atr = max_rel_atr
+        self.regime_filter = (regime_filter or 'off').lower()
+        self.risk_penalty_lambda = float(risk_penalty_lambda or 0.0)
+        self.risk_penalty_feature = str(risk_penalty_feature or 'max_drawdown_20')
+        self.risk_penalty_direction = str(risk_penalty_direction or 'low').lower()
+        self.ensemble_model_paths = [
+            p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+            for p in (ensemble_model_paths or []) if p
+        ]
+        self.ensemble_models = []
+        if self.risk_penalty_lambda < 0:
+            raise ValueError('risk_penalty_lambda 必须 >= 0')
+        if self.risk_penalty_direction not in {'high', 'low'}:
+            raise ValueError("risk_penalty_direction 必须为 'high' 或 'low'")
+        self._risk_on_dates = None      # np.ndarray[str]，regime 允许开仓的交易日
+        self._risk_on_flags = None      # np.ndarray[bool]，与上者同序
+        self._regime_blocked_days = 0
+        self._volcap_rejected = 0
         
         if cache_dir is None:
             cache_dir = fc.TrainingConfig.CACHE_DIR
         self.cache_dir = cache_dir
+
+        # R2（2026-08-12）：因子面板按回测窗口裁剪日期。
+        # 全量常驻 = 5,448 只 × 约 2,525 行 × 219 列 float32 ≈ 12 GB，而回测只用窗口内
+        # 的 484 个交易日。裁剪后约 2.3 GB，多种子并行才不会打爆内存（08-08 事故根因）。
+        # 数值完全不变：多留窗口起点之前的 1 行，_get_factor_row_array 的
+        # searchsorted(..., 'right') - 1 在窗口内取到的行与全量时逐位相同。
+        self.preload_start = preload_start
+        self.preload_end = preload_end
         
         self.model = None
         self._factors_cache = {}  # 内存缓存，用于存放 parquet 加载全量因子数据
@@ -86,6 +129,17 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     return _load_smart_model(latest_pkl)
                 return None
             if not os.path.exists(target_path): return None
+            # NAMGateModel（NAM 专家 + 宏观 regime 门控）存档需先嗅探再加载，
+            # 否则会被 EnsembleFactorModel.load_model 误吞。
+            try:
+                from core.factors.nam_gate_model import NAMGateModel
+                if NAMGateModel.is_nam_gate_archive(target_path):
+                    m = NAMGateModel()
+                    m.load_model(target_path)
+                    print(f"  已识别 NAMGateModel: {target_path}")
+                    return m
+            except Exception as _e:
+                print(f"  NAMGate 嗅探跳过: {_e}")
             try:
                 return EnsembleFactorModel.load_model(target_path)
             except:
@@ -95,6 +149,30 @@ class MLFactorBacktestStrategy(BaseStrategy):
 
         self.model = _load_smart_model(self.model_path)
         if self.model is None: raise ValueError(f"无法加载模型: {self.model_path}")
+        self.ensemble_models = [self.model]
+        for _path in self.ensemble_model_paths:
+            _m = _load_smart_model(_path)
+            if _m is None:
+                raise ValueError(f"无法加载集成子模型: {_path}")
+            if list(getattr(_m, 'feature_names', [])) != list(getattr(self.model, 'feature_names', [])):
+                raise ValueError(f"集成子模型特征顺序不一致: {_path}")
+            self.ensemble_models.append(_m)
+        if len(self.ensemble_models) > 1:
+            print(f"  已启用横截面分位集成: {len(self.ensemble_models)} 个模型")
+
+        # NAMGateModel 需要逐日的宏观 regime 向量作为门控输入，在此一次性挂载
+        self.is_nam_gate = self.model.__class__.__name__ == 'NAMGateModel'
+        if self.is_nam_gate:
+            try:
+                from config import DATABASE_PATH as _DB
+                from core.factors.regime_features import build_regime_matrix
+                _rm = build_regime_matrix(_DB)
+                for _m in self.ensemble_models:
+                    if _m.__class__.__name__ == 'NAMGateModel':
+                        _m.attach_regime(_rm)
+                print(f"  已挂载 regime 矩阵: {_rm.shape[0]} 日 × {_rm.shape[1]} 维")
+            except Exception as _e:
+                raise RuntimeError(f"NAMGateModel 需要 regime 矩阵，但构建失败: {_e}")
 
         # 加载归一化统计量（与模型同目录的 norm_stats.pkl）
         import pickle as _pickle
@@ -115,14 +193,53 @@ class MLFactorBacktestStrategy(BaseStrategy):
         else:
             if self.norm_stats_path:
                 raise FileNotFoundError(f"指定的归一化统计量不存在: {_norm_path}")
+            # 缺失 norm_stats 会让 skip-rank 连续列以原始量纲进入模型，与训练端
+            # 的 robust-sigmoid 归一化严重错配，回测结果完全不可信（曾导致多轮
+            # NAM 实验结果雷同且被市值类大数主导）。默认必须硬失败。
+            if os.environ.get('ALLOW_MISSING_NORM_STATS') != '1':
+                raise FileNotFoundError(
+                    f"模型目录缺少 norm_stats.pkl，回测拒绝运行（训练/推理特征尺度会错配）: {_model_dir}\n"
+                    f"  → 请用训练脚本重新导出该文件；确需跳过请设 ALLOW_MISSING_NORM_STATS=1")
             print(f"  警告: 模型目录缺少 norm_stats.pkl，跳过全局列归一化: {_model_dir}")
             self.norm_stats = None
+
+        # 风控层：预构建 regime 空仓日历（只用历史，无前视）
+        if self.regime_filter != 'off':
+            self._build_risk_on_calendar()
 
         if self.use_cache:
             self._preload_factor_cache()
         
-        print(f"策略初始化完成: {self.name} (已启用 PIT 预缓存 ✓)")
+        print(f"策略初始化完成: {self.name} (已启用 PIT 预缓存)")
     
+    @staticmethod
+    def _risk_adjusted_scores(probs: np.ndarray,
+                              risk_values: np.ndarray,
+                              penalty_lambda: float,
+                              direction: str = 'high') -> np.ndarray:
+        """在横截面分位空间施加风险惩罚，并拒绝退化风险列。"""
+        from scipy.stats import rankdata as _rankdata
+
+        pred = np.asarray(probs, dtype=float)
+        risk = np.asarray(risk_values, dtype=float)
+        if pred.ndim != 1 or risk.ndim != 1 or len(pred) != len(risk):
+            raise ValueError('模型分数与风险值必须是一维等长数组')
+        if not np.all(np.isfinite(risk)):
+            raise ValueError('风险惩罚横截面包含非有限值')
+        unique_ratio = len(np.unique(risk)) / max(len(risk), 1)
+        if len(risk) > 1 and (np.ptp(risk) <= 1e-8 or unique_ratio < 0.05):
+            raise RuntimeError(
+                f'风险惩罚特征横截面已退化（唯一值占比 {unique_ratio:.2%}），拒绝静默运行'
+            )
+        if direction not in {'high', 'low'}:
+            raise ValueError("direction 必须为 'high' 或 'low'")
+
+        model_pct = _rankdata(pred, method='average') / (len(pred) + 1)
+        risk_pct = _rankdata(risk, method='average') / (len(risk) + 1)
+        if direction == 'low':
+            risk_pct = 1.0 - risk_pct
+        return model_pct - float(penalty_lambda) * risk_pct
+
     def generate_signals(self,
                         current_date: str,
                         market_data: Any,
@@ -144,6 +261,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
             available_slots = self.max_positions - len(existing_positions)
             
         if available_slots <= 0: return signals
+
+        # 风控层 1：regime 空仓开关。下行 regime 直接放弃当日全部新开仓，
+        # 已有持仓仍由引擎按止损/止盈正常了结。
+        if self.regime_filter != 'off' and not self._is_risk_on(current_date):
+            self._regime_blocked_days += 1
+            return signals
 
         # 1. 获取所有股票列表。风险资格与已有持仓必须在模型打分后处理，
         # 否则会改变横截面排名，导致其他股票的模型输入随持仓/过滤参数漂移。
@@ -232,16 +355,61 @@ class MLFactorBacktestStrategy(BaseStrategy):
                             # 必须与训练端保持一致；训练端零 IQR 列固定为 0.0。
                             X_arr[:, arr_idx] = 0.0
         X_arr = np.nan_to_num(X_arr, nan=0.5, posinf=1.0, neginf=0.0)
-        if getattr(self.model, 'models', None):
+        if len(self.ensemble_models) > 1:
+            from scipy.stats import rankdata as _rankdata
+            _model_ranks = []
+            _frame = pd.DataFrame(X_arr, columns=feature_names)
+            for _m in self.ensemble_models:
+                if _m.__class__.__name__ == 'NAMGateModel':
+                    _m.set_context_date(current_date)
+                    _pred = np.asarray(_m.predict(_frame), dtype=float)
+                elif getattr(_m, 'models', None):
+                    _pred = np.asarray(_m.predict(_frame), dtype=float)
+                else:
+                    _pred = np.asarray(_m.predict(X_arr), dtype=float)
+                # 每个模型独立分位化，消除初始化引起的输出温度/尺度差异。
+                _model_ranks.append(_rankdata(_pred, method='average') / (len(_pred) + 1))
+            probs = np.mean(np.vstack(_model_ranks), axis=0)
+        elif getattr(self, 'is_nam_gate', False):
+            # 门控依赖"当前交易日"的市场状态，必须在打分前显式告知
+            self.model.set_context_date(current_date)
+            probs = self.model.predict(pd.DataFrame(X_arr, columns=feature_names))
+        elif getattr(self.model, 'models', None):
             probs = self.model.predict(pd.DataFrame(X_arr, columns=feature_names))
         else:
             probs = self.model.predict(X_arr)
         
-        # 5. 生成信号
+        # 5. 生成信号。可选的下行风险惩罚采用横截面分位组合：
+        # adjusted_score = model_percentile - lambda * risk_percentile。
+        # 不直接从 NAM 原始分数减风险值，因为不同随机种子的 NAM 输出温度/量纲并不一致；
+        # 分位化后两者都落在 (0,1)，lambda 才具有跨模型可比含义。
+        # risk 值来自当日 PIT 因子缓存，只使用 t 及之前数据，无前视。
+        adjusted_scores = np.asarray(probs, dtype=float).copy()
+        risk_values = None
+        if self.risk_penalty_lambda > 0:
+            try:
+                risk_idx = feature_names.index(self.risk_penalty_feature)
+            except ValueError as exc:
+                raise ValueError(
+                    f"风险惩罚特征不在模型输入中: {self.risk_penalty_feature}"
+                ) from exc
+            # X_arr 已完成与训练一致的横截面 rank；风险方向由参数显式声明。
+            risk_values = X_arr[:, risk_idx].astype(float)
+            adjusted_scores = self._risk_adjusted_scores(
+                adjusted_scores,
+                risk_values,
+                self.risk_penalty_lambda,
+                self.risk_penalty_direction,
+            )
+
         candidates = []
         for i, code in enumerate(stock_codes_with_data):
             confidence = float(probs[i] * 100)
-            if confidence < effective_min_confidence or code in existing_positions: continue
+            # min_confidence <= 0 语义为"不设阈值"。排序类模型（NAM/LambdaRank）的输出
+            # 无界且可为负，负分只代表横截面靠后而非无效，若沿用概率语义做 `< 0` 截断，
+            # 会把整个候选池砍空（曾导致某次回测仅成交 1 笔）。
+            if effective_min_confidence > 0 and confidence < effective_min_confidence: continue
+            if code in existing_positions: continue
 
             # 仅在完整横截面完成归一化和预测后执行 PIT 风险资格判断。
             if self.risk_min_price is not None or self.risk_exclude_st:
@@ -254,11 +422,32 @@ class MLFactorBacktestStrategy(BaseStrategy):
             
             # 使用 md5 哈希在概率相同时保持排序稳定
             tie_breaker = int(hashlib.md5(code.encode()).hexdigest(), 16) % 1000 / 100000.0
-            candidates.append({'code': code, 'score': confidence + tie_breaker, 'prob': probs[i]})
+            # 保持 StrategySignal.confidence 的百分制历史语义；lambda 本身仍作用在 0~1 分位空间。
+            score = (float(adjusted_scores[i]) * 100.0
+                     if self.risk_penalty_lambda > 0 else confidence)
+            candidates.append({
+                'code': code,
+                'score': score + tie_breaker,
+                'prob': probs[i],
+                'risk_value': None if risk_values is None else float(risk_values[i]),
+            })
             
         candidates.sort(key=lambda x: x['score'], reverse=True)
-        
-        for cand in candidates[:available_slots]:
+
+        # 诊断插桩：设置 MLFS_DEBUG_RANK=<文件路径> 时逐日落盘候选池规模与 Top10 打分，
+        # 用于验证"不同模型是否真的产生不同选股"。默认关闭，零开销。
+        _dbg = os.environ.get('MLFS_DEBUG_RANK')
+        if _dbg:
+            with open(_dbg, 'a', encoding='utf-8') as _fh:
+                _top = [(c['code'], round(float(c['prob']), 6)) for c in candidates[:10]]
+                _fh.write(f"{current_date}\tn_pred={len(stock_codes_with_data)}"
+                          f"\tn_cand={len(candidates)}\tslots={available_slots}\ttop10={_top}\n")
+
+        # 风控层 2：入场前波动率上限。按打分顺序逐个体检，被剔除的高波动股
+        # 不占用仓位（由下一名顺延），因此需要遍历全部候选而非前 N 名。
+        for cand in candidates:
+            if len(signals) >= available_slots:
+                break
             code = cand['code']
             bar = market_data.get_bar(code)
             if bar is None: continue
@@ -266,14 +455,74 @@ class MLFactorBacktestStrategy(BaseStrategy):
             # 获取 ATR 需要历史数据
             hist_df = market_data[code]
             atr = self._calculate_atr(hist_df)
+            if self.max_rel_atr is not None:
+                close_px = float(bar['close']) if np.isfinite(bar['close']) else float('nan')
+                rel_atr = (atr / close_px) if (atr > 0 and np.isfinite(close_px) and close_px > 0) else float('nan')
+                # 无法计算波动率的标的一律拒绝：宁可少开仓，不可裸奔
+                if not np.isfinite(rel_atr) or rel_atr > self.max_rel_atr:
+                    self._volcap_rejected += 1
+                    continue
             signals.append(StrategySignal(
                 stock_code=code, signal_type='buy', timestamp=current_date, 
                 price=bar['close'], confidence=cand['score'], 
                 stop_loss=bar['close'] - sc.ATR_STOP_MULTIPLIER * atr, 
                 take_profit=bar['close'] + sc.ATR_TARGET_MULTIPLIER * atr,
-                metadata={'strategy': 'ml_factor_integrated', 'prediction': cand['prob']}
+                metadata={
+                    'strategy': 'ml_factor_integrated',
+                    'prediction': cand['prob'],
+                    'adjusted_score': cand['score'],
+                    'risk_penalty_feature': self.risk_penalty_feature,
+                    'risk_value': cand.get('risk_value'),
+                }
             ))
         return signals
+
+    def _build_risk_on_calendar(self):
+        """构建逐日 risk-on 标记：False 的交易日禁止一切新开仓。
+
+        判据（``regime_filter='trend'``）：合成全市场指数同时满足
+        ``trend_ma20_dev >= 0``（指数在 20 日均线上方）与
+        ``trend_ma20_slope >= 0``（均线本身在上行）才视为 risk-on。
+        两列均由 ``build_regime_matrix(..., return_raw=True)`` 提供，
+        全部为 t 及之前的滚动量，不含未来信息。
+        """
+        from core.factors.regime_features import build_regime_matrix
+        raw = build_regime_matrix(DATABASE_PATH, normalize=False, return_raw=True)
+        if raw is None or raw.empty:
+            raise RuntimeError('regime_filter 已启用，但市场状态矩阵为空')
+
+        if self.regime_filter == 'trend':
+            dev = raw.get('trend_ma20_dev')
+            slope = raw.get('trend_ma20_slope')
+            if dev is None or slope is None:
+                raise RuntimeError('regime 矩阵缺少 trend_ma20_dev / trend_ma20_slope')
+            flags = (dev.to_numpy() >= 0.0) & (slope.to_numpy() >= 0.0)
+        else:
+            raise ValueError(f'未知 regime_filter: {self.regime_filter}')
+
+        self._risk_on_dates = raw.index.strftime('%Y-%m-%d').to_numpy()
+        self._risk_on_flags = np.asarray(flags, dtype=bool)
+        on_ratio = float(self._risk_on_flags.mean())
+        print(f"  regime 空仓开关已启用({self.regime_filter}): "
+              f"历史 risk-on 日占比 {on_ratio:.1%} / {len(self._risk_on_flags)} 日")
+
+    def _is_risk_on(self, current_date: str) -> bool:
+        """当前交易日是否允许开仓。日期缺失时回溯最近一个有效判定。"""
+        if self._risk_on_flags is None:
+            return True
+        idx = np.searchsorted(self._risk_on_dates, current_date, side='right') - 1
+        if idx < 0:
+            return False  # 热身期信息不足，保守空仓
+        return bool(self._risk_on_flags[idx])
+
+    def _relative_atr(self, hist_df: pd.DataFrame, close: float) -> float:
+        """相对波动率 = ATR14 / 收盘价。无法计算时返回 nan。"""
+        if hist_df is None or close is None or not np.isfinite(close) or close <= 0:
+            return float('nan')
+        atr = self._calculate_atr(hist_df)
+        if atr <= 0:
+            return float('nan')
+        return float(atr / close)
 
     def _precompute_pit_data(self):
         """预加载元数据，消除循环内的 SQL 压力"""
@@ -348,7 +597,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
             return
 
         scope = "当前回测股票池" if active_codes else "全部缓存"
-        print(f"正在预加载因子缓存({scope}): {len(files)} 个 parquet...")
+        lo_key = str(self.preload_start)[:10] if self.preload_start else None
+        hi_key = str(self.preload_end)[:10] if self.preload_end else None
+        window = f", 日期裁剪 {lo_key or '-inf'}~{hi_key or '+inf'}" if (lo_key or hi_key) else ""
+        print(f"正在预加载因子缓存({scope}{window}): {len(files)} 个 parquet...")
 
         def _load_one(filename):
             code = filename[:-len('_factors.parquet')]
@@ -369,6 +621,21 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 if not np.all(order == np.arange(len(order))):
                     df = df.iloc[order].reset_index(drop=True)
                     dates = dates[order]
+
+                # R2：按回测窗口裁剪。lo 多留 1 行（窗口起点之前最近的一行），
+                # 以保证 PIT 取行 searchsorted(dates, d, 'right') - 1 与全量一致。
+                if lo_key is not None or hi_key is not None:
+                    lo = 0
+                    if lo_key is not None:
+                        lo = max(0, int(np.searchsorted(dates, lo_key, side='right')) - 1)
+                    hi = len(dates)
+                    if hi_key is not None:
+                        hi = int(np.searchsorted(dates, hi_key, side='right'))
+                    if hi <= lo:
+                        return None
+                    if lo > 0 or hi < len(dates):
+                        df = df.iloc[lo:hi]
+                        dates = dates[lo:hi]
 
                 matrix = np.full((len(df), len(feature_names)), 0.5, dtype=np.float32)
                 for col_idx, col in enumerate(feature_names):
@@ -663,4 +930,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
     def cleanup(self):
         """清理缓存"""
         self._factors_cache.clear()
+        if self.regime_filter != 'off' or self.max_rel_atr is not None:
+            print(f"  风控层统计: regime 空仓 {self._regime_blocked_days} 日, "
+                  f"波动率上限剔除 {self._volcap_rejected} 次候选")
         print(f"策略清理完成: {self.name}")

@@ -91,18 +91,28 @@ class Portfolio:
     def __init__(self, 
                  initial_capital: float,
                  commission_rate: float = 0.001,
-                 max_positions: int = 1):
+                 max_positions: int = 1,
+                 buy_cost_rate: float = None,
+                 sell_cost_rate: float = None):
         """
         初始化投资组合
         
         参数:
             initial_capital: 初始资金
-            commission_rate: 手续费率
+            commission_rate: 手续费率（对称口径，向后兼容）
             max_positions: 最大持仓数量
+            buy_cost_rate: 买入单边成本率（佣金+规费+滑点）。None 时退回 commission_rate
+            sell_cost_rate: 卖出单边成本率（佣金+规费+滑点+印花税）。None 时退回 commission_rate
+
+        说明：A 股买卖成本本就不对称（印花税仅卖出方缴纳），用单一 commission_rate
+        会同时高估买入成本、低估卖出税负。高换手策略对这个口径极其敏感——
+        平均持仓 6.6 天时，费率差 0.4%/边 就是两年 60pp 以上的收益差。
         """
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.commission_rate = commission_rate
+        self.buy_cost_rate = commission_rate if buy_cost_rate is None else buy_cost_rate
+        self.sell_cost_rate = commission_rate if sell_cost_rate is None else sell_cost_rate
         self.max_positions = max_positions
         
         self.positions: Dict[str, Position] = {}
@@ -174,8 +184,8 @@ class Portfolio:
         if capital_allocation <= 0:
             return None
         
-        # 计算手续费
-        commission = capital_allocation * self.commission_rate
+        # 计算手续费（买入单边）
+        commission = capital_allocation * self.buy_cost_rate
         available_capital = capital_allocation - commission
         
         # 计算股数
@@ -234,14 +244,14 @@ class Portfolio:
         # 计算卖出金额（基于成本和价格变化率）
         sell_amount = position.cost_basis * (1 + price_change_rate)
         
-        # 计算手续费
-        commission = abs(sell_amount) * self.commission_rate
+        # 计算手续费（卖出单边，含印花税）
+        commission = abs(sell_amount) * self.sell_cost_rate
         
         # 净收入
         net_proceeds = sell_amount - commission
         
         # 计算盈亏
-        total_cost = position.cost_basis + position.cost_basis * self.commission_rate
+        total_cost = position.cost_basis + position.cost_basis * self.buy_cost_rate
         pnl = net_proceeds - total_cost
         pnl_pct = pnl / total_cost if total_cost != 0 else 0
         
@@ -302,3 +312,5 @@ class Portfolio:
                 'holding_days': pos.holding_days
             } for code, pos in self.positions.items()}
         }
+
+

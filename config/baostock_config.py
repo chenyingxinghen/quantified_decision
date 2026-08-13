@@ -42,6 +42,9 @@ WORKERS_NUM = 1
 # 请求间隔（秒）
 REQUEST_INTERVAL = 0.01
 
+# 每日 Baostock API 请求配额上限（硬上限为 5 万，此处留冗余给 login / 交易日查询等未单独计数的调用）
+API_DAILY_QUOTA = 45000
+
 
 # 增量更新配置
 INCREMENTAL_UPDATE = True  # 默认使用增量更新
@@ -142,6 +145,7 @@ __all__ = [
     'FINANCE_YEARS',
     'WORKERS_NUM',
     'REQUEST_INTERVAL',
+    'API_DAILY_QUOTA',
     'INCREMENTAL_UPDATE',
     'CHECK_LAST_N_DAYS',
     'AUTO_FILL_GAPS',

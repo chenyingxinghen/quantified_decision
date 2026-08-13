@@ -49,6 +49,8 @@ def main():
                         help='跳过增量缓存更新步骤，直接进入模型训练')
     parser.add_argument('--cache-end', type=str, default=None,
                         help='缓存更新截止日期 (YYYY-MM-DD)，默认=今天')
+    parser.add_argument('--cache-dir', type=str, default=None,
+                        help='独立因子缓存目录；显式指定时启用公式版本清单与模型绑定')
 
     args = parser.parse_args()
 
@@ -79,7 +81,7 @@ def main():
     print(f"不可买入样本处理: {TrainingConfig.UNBUYABLE_HANDLING}")
 
     # ── 2. 初始化训练器 ──────────────────────────────────────────────────
-    trainer = MLModelTrainer(db_path=DATABASE_PATH)
+    trainer = MLModelTrainer(db_path=DATABASE_PATH, cache_dir=args.cache_dir)
 
     # ── 3. 获取股票列表 ──────────────────────────────────────────────────
     from core.data.baostock_main import BaostockDataManager
@@ -163,34 +165,41 @@ def main():
         # 优化：预先检查已经是最新的缓存，避免全量加载行情数据到内存
         import pyarrow.parquet as pq
         import sqlite3 as _sqlite3
-        cache_dir = TrainingConfig.CACHE_DIR
+        cache_dir = trainer.factors_cache_dir
         stocks_to_update = []
         skipped_count = 0
 
         # 用数据库中实际最新交易日作为跳过基准，而非"今天"
         # 避免非交易日/盘后运行时，缓存日期永远 < 今天，导致所有缓存被误判为需要更新
-        _actual_latest_date = cache_end_date  # 兜底：若查询失败则退回原逻辑
+        _actual_first_date = train_start_date
+        _actual_latest_date = cache_end_date
         try:
             _conn = _sqlite3.connect(DATABASE_PATH)
-            _row = _conn.execute("SELECT MAX(date) FROM daily_data").fetchone()
+            _row = _conn.execute(
+                "SELECT MIN(date), MAX(date) FROM daily_data WHERE date >= ? AND date <= ?",
+                (train_start_date, cache_end_date),
+            ).fetchone()
             _conn.close()
-            if _row and _row[0]:
-                _actual_latest_date = str(_row[0])
+            if _row and _row[0] and _row[1]:
+                _actual_first_date = str(_row[0])
+                _actual_latest_date = str(_row[1])
         except Exception:
             pass
         
         def _scan_one_cache(code):
             cache_file = os.path.join(cache_dir, f'{code}_factors.parquet')
+            if args.force:
+                return code, True
             if os.path.exists(cache_file):
                 try:
-                    pf = pq.ParquetFile(cache_file)
-                    if pf.num_row_groups > 0:
-                        table = pf.read_row_group(pf.num_row_groups - 1, columns=['date'])
-                    else:
-                        table = pq.read_table(cache_file, columns=['date'])
+                    table = pq.read_table(cache_file, columns=['date'])
                     if table.num_rows > 0:
+                        cache_first_date = str(table.column('date')[0].as_py())[:10]
                         cache_last_date = str(table.column('date')[-1].as_py())[:10]
-                        return code, cache_last_date < _actual_latest_date
+                        return code, (
+                            cache_first_date > _actual_first_date
+                            or cache_last_date < _actual_latest_date
+                        )
                 except Exception:
                     pass
             return code, True
@@ -220,7 +229,8 @@ def main():
                 stocks_data=cache_data,
                 include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS,
                 target_features=target_features,
-                n_jobs=args.workers
+                n_jobs=args.workers,
+                force=args.force,
             )
             del cache_data  # 释放内存
             import gc; gc.collect()

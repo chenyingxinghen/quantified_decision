@@ -11,7 +11,7 @@ from .baostock_fetcher_methods import (
     fetch_kline_data, fetch_adjust_factor,
     fetch_profit_ability, fetch_growth_ability, 
     fetch_balance_ability, fetch_dupont,
-    get_stock_list
+    get_stock_list, _register_api_call
 )
 
 
@@ -155,6 +155,11 @@ class BaostockDataManager(BaostockFetcher):
     def _get_trade_days(self, start_date: str, end_date: str) -> List[str]:
         """获取指定时间段内的交易日列表"""
         rs = bs.query_trade_dates(start_date=start_date, end_date=end_date)
+        # 交易日查询也是一次 API 调用，纳入每日配额计数（仅计数，不拦截）
+        try:
+            _register_api_call(1, gate=False)
+        except Exception:
+            pass
         days = []
         while rs.next():
             row = rs.get_row_data()

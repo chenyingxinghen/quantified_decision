@@ -31,7 +31,7 @@ def update_single_stock(symbol, incremental=False, start_date=None, end_date=Non
 def update_multiple_stocks(symbols, incremental=True, workers=None, start_date=None, end_date=None):
     """批量更新多只股票数据"""
     if workers is None:
-        workers = getattr(config, 'WORKERS_NUM', 5)
+        workers = config.WORKERS_NUM
         
     print(f"\n正在批量更新 {len(symbols)} 只股票 (并发数: {workers}) | 模式: {'增量' if incremental else '全量'}")
     manager = BaostockDataManager()
@@ -49,7 +49,7 @@ def update_multiple_stocks(symbols, incremental=True, workers=None, start_date=N
 def update_all_stocks(incremental=True, workers=None, start_date=None, end_date="2030-01-01"):
     """更新所有股票数据"""
     if workers is None:
-        workers = getattr(config, 'WORKERS_NUM', 5)
+        workers = config.WORKERS_NUM
     
     print(f"\n=== 开始同步全市场数据 (源: Baostock) | 模式: {'增量' if incremental else '全量'} ===")
     manager = BaostockDataManager()

@@ -611,8 +611,16 @@ class FeatureEngineer:
         #       因此对以 0.5 为中枢的广度/占比类做去中性化 (-0.5)，mean_return 天然以 0 为界。
         #       乘数符号 = 行情方向 → 截面 rank 后个股因子排序“涨势保持、跌势翻转”，
         #       即“该因子在什么行情下有效”的 regime conditioning，可穿过归一化存活。
+        #
+        # 开关化 (2026-08)：手工乘积本质是"截面零方差"的 workaround，特征数膨胀且编码低效。
+        # NAM + RegimeGate 方案改用独立的市场状态矩阵 M（core/factors/regime_features.py），
+        # 由门控端到端学习行情调节，不再需要人造交互列。
+        # 置 TrainingConfig.ENABLE_MARKET_INTERACTION = False 即可关闭（受控 A/B 用）。
+        # 注意：现有因子 parquet 缓存已包含这些列，关闭需重算缓存；
+        #       若只想在实验中排除，更省的做法是装载后剔除 `*_regime_*` 列。
         pre_count = len(self.generated_features)
         market_features = {}
+        _enable_market_interaction = getattr(TrainingConfig, 'ENABLE_MARKET_INTERACTION', True)
 
         def _centered_market(col: str) -> Optional[pd.Series]:
             """返回去中性化后的市场乘数（可正可负）；列不存在则 None。"""
@@ -636,7 +644,7 @@ class FeatureEngineer:
             ('up_ratio',     'return_5d'),     # 普涨中短期强势更易延续
         ]
 
-        for mkt_col, stock_col in market_interaction_pairs:
+        for mkt_col, stock_col in (market_interaction_pairs if _enable_market_interaction else []):
             mkt_series = _centered_market(mkt_col)
             if mkt_series is None or stock_col not in df.columns:
                 continue

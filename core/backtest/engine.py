@@ -35,6 +35,8 @@ class BacktestEngine:
         initial_capital: float = 1.0,
         commission_rate: float = 0.01,
         max_positions: int = 1,
+        buy_cost_rate: float = None,
+        sell_cost_rate: float = None,
     ):
         """
         初始化回测引擎
@@ -43,19 +45,25 @@ class BacktestEngine:
             strategy: 策略实例
             data_handler: 数据处理器
             initial_capital: 初始资金
-            commission_rate: 手续费率
+            commission_rate: 手续费率（buy/sell 未显式给出时的回退值）
             max_positions: 最大持仓数
+            buy_cost_rate: 买入单边总成本率（佣金+规费+滑点）
+            sell_cost_rate: 卖出单边总成本率（佣金+规费+滑点+印花税）
         """
         self.strategy = strategy
         self.data_handler = data_handler
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
+        self.buy_cost_rate = buy_cost_rate if buy_cost_rate is not None else commission_rate
+        self.sell_cost_rate = sell_cost_rate if sell_cost_rate is not None else commission_rate
         self.max_positions = max_positions
 
         self.portfolio = Portfolio(
             initial_capital=initial_capital,
             commission_rate=commission_rate,
             max_positions=max_positions,
+            buy_cost_rate=self.buy_cost_rate,
+            sell_cost_rate=self.sell_cost_rate,
         )
 
         self.performance_analyzer = PerformanceAnalyzer()
@@ -101,7 +109,11 @@ class BacktestEngine:
             print(f"策略: {self.strategy.name}")
             print(f"时间范围: {start_date} 至 {end_date}")
             print(f"初始资金: {self.initial_capital}")
-            print(f"手续费率: {self.commission_rate * 100:.2f}%")
+            print(
+                f"交易成本: 买入 {self.buy_cost_rate * 100:.3f}% / "
+                f"卖出 {self.sell_cost_rate * 100:.3f}% "
+                f"(往返 {(self.buy_cost_rate + self.sell_cost_rate) * 100:.3f}%)"
+            )
             print(f"最大持仓: {self.max_positions}")
             print("=" * 80)
 
@@ -402,10 +414,10 @@ class BacktestEngine:
             conn.close()
             delist_map = dict(zip(df["code"], df["outDate"]))
             if delist_map:
-                print(f"  ℹ 已加载 {len(delist_map)} 只股票退市日期")
+                print(f"  [INFO] 已加载 {len(delist_map)} 只股票退市日期")
             return delist_map
         except Exception as e:
-            print(f"  ⚠ 加载退市日期失败: {e}")
+            print(f"  [WARN] 加载退市日期失败: {e}")
             return {}
 
     def _check_delist_exit(self, stock_code: str, current_date: str) -> Optional[tuple]:

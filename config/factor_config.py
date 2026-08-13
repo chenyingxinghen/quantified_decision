@@ -165,6 +165,15 @@ class TrainingConfig:
     INCLUDE_FUNDAMENTALS = True      # 是否包含基本面因子
     INCLUDE_CANDLE_PATTERN = False
 
+    # ── 市场 Regime 注入方式 ───────────────────────────────────────────────
+    # True  : 沿用手工 {mkt}_regime_{stock} 乘积交互（feature_engineering.py），
+    #         即 tag `baseline-xgb-7d` 的生产行为。因子 parquet 缓存中已含这些列，
+    #         改动会使缓存与 feature_names 失配，故默认保持 True。
+    # False : 关闭手工交互。市场状态改由 core/factors/regime_features.py 的
+    #         多时间尺度矩阵 M 提供，交给 NAMGateModel 的 RegimeGate 端到端学习。
+    #         NAM 实验线若复用已有缓存，可不改此开关，直接在装载后剔除 *_regime_* 列。
+    ENABLE_MARKET_INTERACTION = True
+
     # 标签变换：回归与 XGBoost ranking 共用连续标签变换；LightGBM ranking 由 label_gain 控制
     LABEL_WEIGHTED_FOR_XGB= True
     # 2026-08 多窗口验证：0.8 在 2019/2021/2023 起始的三个验证阶段均提高 Rank IC，
@@ -305,7 +314,11 @@ class TrainingConfig:
         return False
 
     # ── 路径 ───────────────────────────────────────────────────────────────
-    CACHE_DIR            = 'database/system_data/factors_cache'  # 因子缓存目录
+    CACHE_DIR            = 'database/system_data/factors_cache'  # 旧版共享缓存；历史模型继续使用
+    # 因子公式契约版本。公式语义变化时必须升级，并写入独立缓存目录的 manifest；
+    # 禁止原地覆盖旧缓存，否则历史模型的训练/推理输入会静默漂移。
+    FACTOR_DEFINITION_VERSION = '2026-08-06-downside-risk-v2-strict'
+    CACHE_MANIFEST_NAME = 'factor_cache_manifest.json'
     SAVE_DIR             = 'models'                              # 模型保存目录
 
     # ── 训练股票池过滤（与 strategy_config 中的选股条件对齐）──────────────

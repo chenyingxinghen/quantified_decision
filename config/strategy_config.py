@@ -24,8 +24,19 @@ ML_FACTOR_RISK_EXCLUDE_ST = True # 独立于基本面筛选，默认排除 ST / 
 
 
 
-# 交易费率
-COMMISSION_RATE = 0.005           
+# 交易费率（A 股实际口径）
+#   券商佣金 + 规费/过户费 : 单边约 0.03%（万 2.5~万 3）
+#   印花税                : 仅卖出 0.05%（2023-08 由 0.1% 下调）
+#   滑点                  : 单边 0.05%（次日成交的保守估计）
+# 历史值为 0.005（单边 0.5%，往返 1%），比实际高约一个数量级。
+# 在平均持仓 6.6 天、两年 84 次全仓换手的配置下它单独吃掉 84pp 收益，
+# 足以把真实为正的选股 alpha 压成负数（见 TRAINING_ITERATIONS.md T048）。
+COMMISSION_RATE = 0.0003          # 单边佣金（含规费）
+STAMP_DUTY_RATE = 0.0005          # 印花税，仅卖出
+SLIPPAGE_RATE = 0.0005            # 单边滑点
+
+BUY_COST_RATE = COMMISSION_RATE + SLIPPAGE_RATE                     # 0.0008
+SELL_COST_RATE = COMMISSION_RATE + SLIPPAGE_RATE + STAMP_DUTY_RATE  # 0.0013
 
 # ==============================================================================
 # 回测系统参数

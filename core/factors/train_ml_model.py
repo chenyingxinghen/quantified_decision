@@ -143,20 +143,20 @@ def _cache_worker(args):
 
 
 def _scan_cache_file(args):
-    """并行扫描单个缓存文件状态，返回 (code, needs_update: bool)"""
-    code, data_last_date, cache_file, target_features = args
+    """并行扫描缓存日期覆盖与列完整性，返回 (code, needs_update)。"""
+    code, data_first_date, data_last_date, cache_file, target_features = args
     try:
         import pyarrow.parquet as pq
         if not os.path.exists(cache_file):
             return code, True
-        pf = pq.read_table(cache_file, columns=['date'])
-        last_row = pf.to_pandas().tail(1)
-        if last_row.empty:
+        date_table = pq.read_table(cache_file, columns=['date']).to_pandas()
+        if date_table.empty:
             return code, True
-        cache_last_date = str(last_row['date'].iloc[0])
-        if cache_last_date < data_last_date:
+        cache_first_date = str(date_table['date'].iloc[0])[:10]
+        cache_last_date = str(date_table['date'].iloc[-1])[:10]
+        if cache_first_date > data_first_date or cache_last_date < data_last_date:
             return code, True
-        # 日期已是最新，检查列是否匹配
+        # 日期已覆盖目标区间，检查列是否匹配
         if target_features is not None:
             cached_cols = set(pq.read_schema(cache_file).names)
             missing = [f for f in target_features if f not in cached_cols]
@@ -169,13 +169,26 @@ def _scan_cache_file(args):
 
 def _fast_rankdata_1d(a):
     """
-    使用 numpy argsort 实现的超快速 rankdata (等价于 scipy.stats.rankdata(..., method='average'))。
-    在没有重复值（Ties）时快数倍，在有重复值时也极其高效。
+    使用 numpy argsort 实现的超快速 average rank。
+
+    特征缺失值在排名时直接映射到中性分位 0.5，与回测输入的中性缺失语义一致。
+    若不处理，numpy.argsort 会把 NaN 排到末尾并赋予高分位，且排名结果已不含 NaN，
+    后续 nan_to_num 无法再纠正这种静默偏置。
     """
     n = len(a)
     if n <= 1:
         return np.array([1.0], dtype=np.float32)
-    
+    nan_mask = np.isnan(a)
+    if nan_mask.any():
+        # 调用方固定除以 (n+1)，因此先对有限子集求百分位，再映射回同一分母；
+        # 缺失项直接对应 0.5 分位，不依赖该列原始量纲。
+        out = np.full(n, (n + 1) * 0.5, dtype=np.float32)
+        finite = a[~nan_mask]
+        if len(finite) > 0:
+            finite_pct = _fast_rankdata_1d(finite) / (len(finite) + 1)
+            out[~nan_mask] = finite_pct * (n + 1)
+        return out
+
     sorter = np.argsort(a)
     
     # 检查是否有重复值
@@ -226,21 +239,40 @@ def _normalize_chunk_worker(X, rank_cols_idx, chunk_start_row, group_starts, gro
 class MLModelTrainer:
     """机器学习模型训练器"""
     
-    def __init__(self, db_path: str = DATABASE_PATH, punish_unbuyable: bool = False):
+    def __init__(self, db_path: str = DATABASE_PATH, punish_unbuyable: bool = False,
+                 cache_dir: str = None):
         """
         初始化训练器
 
         参数:
             db_path: 数据库路径
             punish_unbuyable: 保留参数，用于归档目录命名（实际处理逻辑由 UNBUYABLE_HANDLING 控制）
+            cache_dir: 因子缓存目录；新公式必须使用独立目录，避免覆盖历史模型缓存
         """
         self.db_path = db_path
         self.task = TrainingConfig.TASK
         self.punish_unbuyable = punish_unbuyable
         self.factor_calculator = ComprehensiveFactorCalculator(db_path)
         self.models = {}
-        self.factors_cache_dir = TrainingConfig.CACHE_DIR
+        self.factors_cache_dir = os.path.abspath(cache_dir or TrainingConfig.CACHE_DIR)
+        self.uses_versioned_cache = cache_dir is not None
         os.makedirs(self.factors_cache_dir, exist_ok=True)
+        if self.uses_versioned_cache:
+            from core.factors.cache_manifest import (
+                load_manifest, validate_cache_manifest, write_cache_manifest,
+            )
+            _manifest = load_manifest(self.factors_cache_dir)
+            _has_parquet = any(
+                name.endswith('.parquet') for name in os.listdir(self.factors_cache_dir)
+            )
+            if _manifest is None and _has_parquet:
+                raise RuntimeError(
+                    f'显式缓存目录已有 parquet 但缺少版本清单，拒绝使用: {self.factors_cache_dir}'
+                )
+            if _manifest is None:
+                write_cache_manifest(self.factors_cache_dir)
+            else:
+                validate_cache_manifest(self.factors_cache_dir)
 
     @property
     def tech_calculator(self):
@@ -662,7 +694,8 @@ class MLModelTrainer:
                                  include_fundamentals: bool = True,
                                  target_features: Optional[List[str]] = None,
                                  n_jobs: int = None,  # 默认使用配置值
-                                 verbose: bool = False):
+                                 verbose: bool = False,
+                                 force: bool = False):
         """
         并行批量更新因子的持久化缓存到最新行情日期。
         
@@ -671,6 +704,7 @@ class MLModelTrainer:
             include_fundamentals: 是否包含基本面
             n_jobs: 并行进程数（使用 ProcessPoolExecutor 实现真正的多核并行）
             verbose: 是否输出详细信息
+            force: 是否忽略缓存日期与列完整性，强制重算传入的全部股票
         """
         from concurrent.futures import ProcessPoolExecutor, as_completed
         import multiprocessing
@@ -689,18 +723,23 @@ class MLModelTrainer:
             data = stocks_data[code]
             if data.empty:
                 continue
+            if force:
+                to_update[code] = data
+                continue
             cache_file = os.path.join(self.factors_cache_dir, f'{code}_factors.parquet')
-            data_last_date = str(data['date'].max())
-            scan_args.append((code, data_last_date, cache_file, target_features))
-        
+            data_first_date = str(data['date'].min())[:10]
+            data_last_date = str(data['date'].max())[:10]
+            scan_args.append((code, data_first_date, data_last_date, cache_file, target_features))
+
         # 用线程池并行扫描（I/O 密集型，线程足够）
-        scan_workers = min(32, len(scan_args))
-        with ThreadPoolExecutor(max_workers=scan_workers) as scan_executor:
-            for code, needs_update in scan_executor.map(_scan_cache_file, scan_args):
-                if needs_update:
-                    to_update[code] = stocks_data[code]
-                else:
-                    skipped += 1
+        if scan_args:
+            scan_workers = min(32, len(scan_args))
+            with ThreadPoolExecutor(max_workers=scan_workers) as scan_executor:
+                for code, needs_update in scan_executor.map(_scan_cache_file, scan_args):
+                    if needs_update:
+                        to_update[code] = stocks_data[code]
+                    else:
+                        skipped += 1
 
         if skipped > 0:
             print(f"  已跳过 {skipped} 只已同步的股票缓存")
@@ -2229,29 +2268,11 @@ class MLModelTrainer:
         """
         使用并行化处理和内存视图，原位对特征矩阵进行横截面归一化，降低内存占用并大幅提升性能。
         """
-        # 跳过横截面排名归一化的特征集合
-        _skip_normalization = {
-            'up_ratio', 'strong_up_ratio', 'down_ratio', 'limit_up_ratio', 
-            'limit_down_ratio', 'mean_return', 'total_volume', 'adv_vol_ratio', 
-            'breadth_ma20', 'market_type',
-            'is_limit_up', 'is_suspended',
-            'white_candle', 'black_candle', 'doji', 'hammer', 'hanging_man',
-            'shooting_star', 'inverted_hammer', 'marubozu', 'spinning_top',
-            'bullish_engulfing', 'bearish_engulfing', 'piercing_line',
-            'dark_cloud_cover', 'morning_star', 'evening_star', 'harami',
-            'three_white_soldiers', 'three_black_crows',
-        }
-        
-        def _should_skip(col: str) -> bool:
-            if col in _skip_normalization: return True
-            if col.startswith(('industry_', 'sector_', 'is_', 'days_to_')):
-                if col.endswith('_encoded'): return False
-                return True
-            if col.startswith(('mkt_', 'market_', 'index_', 'sentiment_', 'vix_')):
-                return True
-            return False
-
-        rank_cols_mask = np.array([not _should_skip(col) for col in factor_names])
+        # 单一事实来源：训练与回测必须共用 TrainingConfig.should_skip_rank。
+        # 旧代码在此复制了一份私有规则，当前特征集虽一致，但新增列时极易漂移。
+        rank_cols_mask = np.array([
+            not TrainingConfig.should_skip_rank(col) for col in factor_names
+        ])
         rank_cols_idx = np.where(rank_cols_mask)[0]
         skip_cols_idx = np.where(~rank_cols_mask)[0]
 
@@ -2533,7 +2554,11 @@ class MLModelTrainer:
         self._save_training_config(
             archive_dir, years, stocks, forward_days, training_results
         )
-            
+        if getattr(self, 'uses_versioned_cache', False):
+            from core.factors.cache_manifest import bind_model_to_cache
+            bind_model_to_cache(archive_dir, self.factors_cache_dir)
+            print(f"  [OK] 模型已绑定因子缓存: {self.factors_cache_dir}")
+
         # 8. 生产训练默认更新 latest；候选实验可只保留独立归档。
         if update_latest:
             latest_dir = os.path.join(save_dir, 'latest')

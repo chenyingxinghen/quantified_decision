@@ -56,8 +56,8 @@ Thumbs.db
 
 # 模型
 models/
-backtest_result/
-t.py
+backtest_result/*
+!backtest_result/README.md
 
 quantification-system/frontend/node_modules
 quantification-system/frontend/dist
@@ -68,10 +68,19 @@ new_data/*
 
 database/*
 .*
+# 诊断产出：数据不进 git，说明文档进。
+# 注意：`diagnose_output/*` 把 `archive/` **目录本身**也排除了，git 于是不再往里走，
+# `!diagnose_output/archive/README.md` 成了一条永不生效的死规则（2026-08-17 发现，
+# 那个 README 从来没进过 git）。必须先放行目录、再排除目录内容。
 diagnose_output/*
-diagnose_output/factor_ic_report.csv
-diagnose_output/factor_quality.png
-diagnose_output/ic_timeseries.png
-diagnose_output/label_distribution.png
+!diagnose_output/archive/
+diagnose_output/archive/*
+!diagnose_output/archive/README.md
+!diagnose_output/archive/DELETED_ARTIFACTS.txt
 
-scripts/archive/*
+# ⚠ 不要再忽略 scripts/archive/ ——
+# 那里是已关轴实验的**代码证据**，`scripts/archive/README.md` 明写「判定写在台账，
+# 代码留在这里，两边对得上」。而 `scripts/archive/*` 这条忽略规则让整条证据链对 git
+# 不可见：2026-08-17 复核时 63 个文件一个都没提交过。这与 2026-08-14 丢掉
+# `exp_head_features.py` 等三个文件那次事故是同一根因 —— 文件只存在于磁盘。
+# 归档 ≠ 忽略。

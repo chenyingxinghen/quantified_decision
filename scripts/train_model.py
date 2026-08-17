@@ -11,7 +11,7 @@ if project_root not in sys.path:
 
 from core.factors.train_ml_model import MLModelTrainer
 from config.baostock_config import DATABASE_PATH
-from config.factor_config import TrainingConfig
+from config.factor_config import TrainingConfig, ModelConfig
 import pandas as pd
 
 
@@ -51,8 +51,16 @@ def main():
                         help='缓存更新截止日期 (YYYY-MM-DD)，默认=今天')
     parser.add_argument('--cache-dir', type=str, default=None,
                         help='独立因子缓存目录；显式指定时启用公式版本清单与模型绑定')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='注入 ModelConfig.MODEL_SEED（树的 subsample/colsample 抽样）。'
+                             '不传则沿用框架默认，与历史训练逐位一致。'
+                             '仅用于配对多种子判定 —— 会在模型目录名后缀加 _sN 防止互相覆盖')
 
     args = parser.parse_args()
+
+    if args.seed is not None:
+        ModelConfig.MODEL_SEED = args.seed
+        print(f"  [种子] MODEL_SEED={args.seed}（模型目录将带 _s{args.seed} 后缀）")
 
     if args.label_exponent is not None:
         if args.label_exponent <= 0:

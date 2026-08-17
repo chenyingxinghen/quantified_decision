@@ -50,21 +50,19 @@ class MLFactorStrategy:
             print(f"警告: 模型文件不存在: {model_path}")
     
     def _dynamic_adjust(self, df: pd.DataFrame) -> pd.DataFrame:
-        """动态复权修正价格序列跳变"""
-        if df is None or df.empty or 'fore_adjust_factor' not in df.columns:
+        """完整前复权修正价格序列跳变。
+
+        改自原来的 `fore_adjust_factor` bfill/ffill 口径——那张表只覆盖 42.5% 的
+        除权事件，剩下的跳变会直接进因子。这里走 `preclose/close` 反推，
+        与训练侧 `train_ml_model.apply_forward_adjust` 同一个函数，
+        推理与训练的价格口径必须逐位一致（T043 同类纪律）。
+        """
+        if df is None or df.empty:
             return df
-        
-        valid_adj = df['fore_adjust_factor'].dropna()
-        if not valid_adj.empty:
-            base_val = float(valid_adj.iloc[-1])
-            if base_val != 0:
-                # bfill 先向后填充（处理开头缺失），再 ffill 向前填充（处理中间缺失）
-                # 避免纯 ffill 在序列开头缺失时回退到 fillna(1.0) 导致价格跳变
-                ratio = df['fore_adjust_factor'].bfill().ffill().fillna(1.0) / base_val
-                for col in ['open', 'high', 'low', 'close', 'preclose']:
-                    if col in df.columns:
-                        df[col] = df[col] * ratio
-        return df
+        from core.factors.train_ml_model import apply_forward_adjust
+        if 'preclose' not in df.columns or 'close' not in df.columns:
+            return df
+        return apply_forward_adjust(df.sort_values('date').reset_index(drop=True))
 
     def _get_stock_data_from_db(self, stock_code: str, days: int = 300) -> Optional[pd.DataFrame]:
         """
@@ -82,9 +80,8 @@ class MLFactorStrategy:
             # 从数据库查询
             conn = sqlite3.connect(DATABASE_PATH)
             query = '''
-                SELECT k.date, k.open, k.high, k.low, k.close, k.preclose, k.volume, k.amount, k.turnover_rate, k.is_st, a.fore_adjust_factor
+                SELECT k.date, k.open, k.high, k.low, k.close, k.preclose, k.volume, k.amount, k.turnover_rate, k.is_st
                 FROM daily_data k
-                LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
                 WHERE k.code = ? AND k.date >= ? AND k.date <= ?
                 ORDER BY k.date ASC
             '''

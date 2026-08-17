@@ -236,6 +236,81 @@ def _normalize_chunk_worker(X, rank_cols_idx, chunk_start_row, group_starts, gro
     return None
 
 
+# ---------------------------------------------------------------------------
+# 复权
+# ---------------------------------------------------------------------------
+
+# 除权识别阈值：|preclose_t / close_{t-1} - 1| 超过它才当作真实除权事件。
+# 0.3% 足以滤掉浮点噪声，又低于 A 股最小有意义的分红除权幅度。
+_EXDIV_EPS = 0.003
+# 单日除权比例的合理区间。超出即视为脏数据（拆股 1:10 也只到 0.1，
+# 但库里确实存在 preclose 缺失/错位的行），落回 1.0 而不是把价格炸掉。
+_RATIO_LO, _RATIO_HI = 0.05, 20.0
+
+PRICE_COLS_FULL = ('open', 'high', 'low', 'close', 'preclose')
+
+
+def compute_forward_adjust_factor(close: np.ndarray, preclose: np.ndarray) -> np.ndarray:
+    """从 preclose / close 反推**完整**前复权因子（不依赖稀疏的 adjust_factor 表）。
+
+    原理：baostock 的 `preclose` 是**已除权**的昨收，`close` 是未复权收盘价，
+    所以 ``r_t = preclose_t / close_{t-1}`` 就是 t 日的除权比例（无事件时 = 1）。
+    前复权（保持最新价不变）的因子是**未来所有比例的累乘**：
+        f_t = Π_{u > t} r_u,     adj_close_t = close_t * f_t
+
+    为什么必须换掉原来的 `LEFT JOIN adjust_factor`：那张表只有 21,778 行，
+    实测只覆盖 42.5% 的除权事件（T087 / 2026-08-14 复查）。未覆盖的事件会在
+    价格序列上留下跳变，滚动窗口因子随之被污染——实测 60 日回看窗有 7.79% 的行
+    受影响，`return_60d` 与完整复权口径的日均截面 Spearman 只有 0.9746
+    （最差日 0.79），即约 2.5% 的排名信息是假的。本函数覆盖率 100%，
+    且不需要联网。
+
+    返回与输入同长的 float64 因子数组（最后一日恒为 1.0）。
+    """
+    close = np.asarray(close, dtype=np.float64)
+    preclose = np.asarray(preclose, dtype=np.float64)
+    n = len(close)
+    if n == 0:
+        return np.ones(0, dtype=np.float64)
+
+    prev_close = np.empty(n, dtype=np.float64)
+    prev_close[0] = np.nan
+    prev_close[1:] = close[:-1]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = preclose / prev_close
+    bad = ~np.isfinite(ratio) | (ratio < _RATIO_LO) | (ratio > _RATIO_HI) \
+        | ~np.isfinite(prev_close) | (prev_close <= 0) | (preclose <= 0)
+    ratio[bad] = 1.0
+    # 只保留真实事件，其余强制为 1：否则每日 ±0.05% 的舍入噪声会在 13 年里
+    # 累乘成显著漂移（3200 个交易日 × 0.05% 的随机游走 ≈ 数个百分点）
+    ratio[np.abs(ratio - 1.0) <= _EXDIV_EPS] = 1.0
+
+    # f_t = Π_{u>t} r_u ⇒ 从后往前累乘，且 t 自身的 r_t 不计入
+    f = np.ones(n, dtype=np.float64)
+    if n > 1:
+        f[:-1] = np.cumprod(ratio[:0:-1])[::-1]
+    return f
+
+
+def apply_forward_adjust(stock_df: 'pd.DataFrame',
+                         price_cols=PRICE_COLS_FULL) -> 'pd.DataFrame':
+    """就地对价格列施加完整前复权。要求 stock_df 已按 date 升序且含 close/preclose。
+
+    缺 `preclose` 时**硬失败**——静默退回未复权正是上一轮埋了 2.5% 排名噪声的
+    原因，宁可让调用方崩掉去补 SELECT 列。
+    """
+    if 'preclose' not in stock_df.columns:
+        raise KeyError('apply_forward_adjust 需要 preclose 列（完整前复权的唯一来源）；'
+                       '请在 SQL 里 SELECT k.preclose')
+    f = compute_forward_adjust_factor(stock_df['close'].to_numpy(),
+                                      stock_df['preclose'].to_numpy())
+    for col in price_cols:
+        if col in stock_df.columns:
+            stock_df[col] = (stock_df[col].to_numpy(dtype=np.float64) * f).astype(np.float32)
+    return stock_df
+
+
 class MLModelTrainer:
     """机器学习模型训练器"""
     
@@ -341,41 +416,30 @@ class MLModelTrainer:
             batch_codes = stock_codes[i:i+batch_size]
             placeholders = ','.join(['?' for _ in batch_codes])
             
-            # 重要改进：增加对 adjust_factor 的关联查询，实现动态复权，消除数据库增量更新导致的跳变
+            # 复权：用 preclose/close 反推的**完整**前复权因子（覆盖 100%）。
+            # 原来是 LEFT JOIN adjust_factor + bfill/ffill，那张表只覆盖 42.5% 的
+            # 除权事件，未覆盖的会在价格上留跳变并污染全部滚动窗口因子。
+            # 校验：120 只覆盖最好的股票上，1948 个共同事件的比例与官方表逐位一致
+            # （中位相对差 0），另有 54 个官方漏记、仅 1 个本算法漏记。
             query = f'''
                 SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.preclose, k.volume, k.amount, k.turnover_rate,
-                       k.is_st, k.peTTM, k.pbMRQ, a.fore_adjust_factor
+                       k.is_st, k.peTTM, k.pbMRQ
                 FROM daily_data k
-                LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
                 WHERE k.code IN ({placeholders}) AND k.date >= ? AND k.date <= ?
                 ORDER BY k.code, k.date ASC
             '''
-            
+
             params = list(batch_codes) + [str(start_date), str(end_date)]
             df = pd.read_sql_query(query, conn, params=tuple(params))
-            
+
             if df.empty:
                 continue
 
             # 按股票分组并执行动态复权。groupby 避免为每只股票重复构造整批布尔掩码。
             for code, stock_df in df.groupby('code', sort=False):
                 stock_df = stock_df.sort_values('date').reset_index(drop=True)
-                
-                # 动态复权处理
-                if 'fore_adjust_factor' in stock_df.columns:
-                    # 获取该段数据最后的复权因子作为基准 (最新日期的 qfq)
-                    valid_adj = stock_df['fore_adjust_factor'].dropna()
-                    if not valid_adj.empty:
-                        base_factor = float(valid_adj.iloc[-1])
-                        # 仅在基准非零时处理
-                        if base_factor != 0:
-                            # bfill 先向后填充（处理开头缺失），再 ffill 向前填充（处理中间缺失）
-                            # 避免纯 ffill 在序列开头缺失时回退到 fillna(1.0) 导致价格跳变
-                            ratio = stock_df['fore_adjust_factor'].bfill().ffill().fillna(1.0) / base_factor
-                            for col in ['open', 'high', 'low', 'close', 'preclose']:
-                                if col in stock_df.columns:
-                                    stock_df[col] = stock_df[col] * ratio
-                
+
+                apply_forward_adjust(stock_df)
                 if len(stock_df) < 100:
                     continue
                 
@@ -451,10 +515,9 @@ class MLModelTrainer:
             batch_codes = stock_codes[i:i+batch_size]
             placeholders = ','.join(['?' for _ in batch_codes])
             query = f'''
-                SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.volume,
-                       k.is_st, a.fore_adjust_factor
+                SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.preclose, k.volume,
+                       k.is_st
                 FROM daily_data k
-                LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
                 WHERE k.code IN ({placeholders}) AND k.date >= ? AND k.date <= ?
                 ORDER BY k.code, k.date ASC
             '''
@@ -467,15 +530,12 @@ class MLModelTrainer:
             for code, stock_df in df.groupby('code', sort=False):
                 stock_df = stock_df.sort_values('date').reset_index(drop=True)
 
-                if 'fore_adjust_factor' in stock_df.columns:
-                    valid_adj = stock_df['fore_adjust_factor'].dropna()
-                    if not valid_adj.empty:
-                        base_factor = float(valid_adj.iloc[-1])
-                        if base_factor != 0:
-                            ratio = stock_df['fore_adjust_factor'].bfill().ffill().fillna(1.0) / base_factor
-                            for col in ['open', 'high', 'low', 'close']:
-                                stock_df[col] = stock_df[col] * ratio
-                    stock_df = stock_df.drop(columns=['fore_adjust_factor'])
+                # 完整前复权（见 compute_forward_adjust_factor）。
+                # ⚠ 这里复权的是**标签口径**的价格：7 日前向收益直接由 close 算出，
+                # 所以这一改会改变标签本身，台账里所有绝对 IC 数值不再与旧基线可比，
+                # 必须重跑 T083_base 四种子建立新基线。
+                apply_forward_adjust(stock_df)
+                stock_df = stock_df.drop(columns=['preclose'])
 
                 if len(stock_df) < 100:
                     continue
@@ -2531,7 +2591,12 @@ class MLModelTrainer:
         task_abbr = self.task[:2] if len(self.task) > 2 else self.task
         
         # 构建文件夹名称 (更简洁的格式)
-        archive_name = f"{model_abbr}_{forward_days}d_{years}y_{stocks}s_{config_str}_{task_abbr}_{timestamp}"
+        # 显式设了 MODEL_SEED 时追加 _sN：配对多种子判定会连训 4 份，时间戳精度只到
+        # 分钟，同一分钟落盘两份就会互相覆盖。未设种子时不加后缀，历史命名不变。
+        _seed = getattr(ModelConfig, 'MODEL_SEED', None)
+        seed_sfx = f"_s{int(_seed)}" if _seed is not None else ''
+        archive_name = (f"{model_abbr}_{forward_days}d_{years}y_{stocks}s_"
+                        f"{config_str}_{task_abbr}_{timestamp}{seed_sfx}")
         archive_dir  = os.path.join(save_dir, archive_name)
         os.makedirs(archive_dir, exist_ok=True)
         

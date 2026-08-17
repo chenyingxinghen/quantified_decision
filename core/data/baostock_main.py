@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, BrokenExecutor
 import time
 import pandas as pd
+import numpy as np
 import sqlite3
 
 from .baostock_fetcher import BaostockFetcher
@@ -90,29 +91,25 @@ class BaostockDataManager(BaostockFetcher):
             
             # 获取K线数据
             kline_df = fetch_kline_data(code, start_str, end_str)
+            kline_written = False
             if not kline_df.empty:
                 self._save_kline_data(kline_df)
+                kline_written = True
             else:
                 # 如果是空且不是因为日期范围问题，可能需要警告，但 fetch_kline_data 已经打印了错误
                 pass
             
-            # 获取复权因子（前复权因子历史会随除权除息全量重算，最新日值恒为1）
-            if sync_info['daily'] is None or datetime.strptime(sync_info['daily'],'%Y-%m-%d') - datetime.strptime(today_str,'%Y-%m-%d')>=timedelta(days=30): # 兜底逻辑
-                full_start = '2009-03-03'
-            else:
-                full_start = start_str
-            adjust_df = fetch_adjust_factor(code, full_start, end_str)
-            if not adjust_df.empty:
-                cursor = self.conn.cursor()
-                cursor.execute("DELETE FROM adjust_factor WHERE code = ?", (code,))
-                self._save_adjust_factor(adjust_df)
-            
+            # 复权因子不再在每日增量里全量重抓（每只 1 次 × 全市场 ≈ 5480 次/天，
+            # 99% 与昨日完全相同）。改由 `update_adjust_factor_data` 挂在财务月更上
+            # 低频刷新（与财报获取同频，约每月一次），adjust_factor 表保留供调试/可视化。
+            pass
             # 填补数据缺口
             if AUTO_FILL_GAPS:
                 self.fill_data_gaps(code)
             
-            # 同步成功后记录状态
-            if incremental:
+            # 仅在实际写入日线数据时才记录同步日；若 baostock 返回空（被拉黑/网络错/真无交易日），
+            # 不Stamp，保留旧状态，使下次增量运行能自动重试，也避免“假成功”状态掩盖数据缺口。
+            if incremental and kline_written:
                 self._update_sync_status(code, 'daily', today_str)
             pass
             
@@ -207,6 +204,10 @@ class BaostockDataManager(BaostockFetcher):
                 # incremental=true则根据上次更新时间判断是否获取最新季度的数据
                 if sync_info['finance'] == current_month:
                     return
+                # 复权因子低频刷新：与财务月更同频（每月一次），不再每日全量重抓。
+                # adjust_factor 表保留供调试/可视化；缺失股（多为已退市）baostock
+                # 仍返回空，属结构性缺失，本调用静默跳过。
+                self.update_adjust_factor_data(code)
                 # 抓取最近两年的数据（在上市退市区间内）
                 years_to_fetch = [y for y in [end_year - 1, end_year] if base_year <= y <= end_year]
             else:
@@ -227,6 +228,7 @@ class BaostockDataManager(BaostockFetcher):
                 return
             # 并行获取所有财务表
             task_tables = FINANCE_TABLES
+            saved_any = False
             if task_tables:
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     for year in years_to_fetch:
@@ -246,15 +248,43 @@ class BaostockDataManager(BaostockFetcher):
                                     df = future.result()
                                     if df is not None and not df.empty:
                                         self._save_finance_data(df, table)
+                                        saved_any = True
                                 except Exception as e:
                                     print(f"  ✗ {code} 获取 {table} ({year}Q{quarter}) 失败: {e}")
-            # 同步完成后记录月度状态
-            self._update_sync_status(code, 'finance', current_month)
+            # 仅在实际写入财务数据时才记录月度状态，避免“假成功”状态掩盖缺口
+            if saved_any:
+                self._update_sync_status(code, 'finance', current_month)
             pass
             
         except Exception as e:
             print(f"✗ {code} 财务数据更新失败: {e}")
     
+    def update_adjust_factor_data(self, code: str, end_date: Optional[str] = None):
+        """低频刷新单只股票的复权因子（挂在财务月更上，约每月一次）。
+
+        前复权因子历史会随除权除息整体重算，所以单只内必须全量重取；但频率已从
+        每日降到每月（与财报获取同频），把每天的 ~5480 次全量请求压成每月一次。
+        adjust_factor 表保留用于调试/可视化。已退市等结构性缺失股 baostock 返回空，
+        此处静默跳过，不报错、不 stamp。
+        """
+        try:
+            if end_date is None:
+                now = datetime.now()
+                trade_target_date = now.strftime('%Y-%m-%d')
+                if now.hour < 17 or (now.hour == 17 and now.minute < 30):
+                    trade_target_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+                end_date = trade_target_date
+
+            self._bs_login()
+            full_start = '2009-03-03'
+            adjust_df = fetch_adjust_factor(code, full_start, end_date)
+            if not adjust_df.empty:
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM adjust_factor WHERE code = ?", (code,))
+                self._save_adjust_factor(adjust_df)
+        except Exception as e:
+            print(f"✗ {code} 复权因子刷新失败: {e}")
+
     def init_all_stocks(self, incremental: bool = True, workers: Optional[int] = None, 
                        mode: str = 'all', start_date: Optional[str] = None, end_date: Optional[str] = None):
         """
@@ -276,12 +306,17 @@ class BaostockDataManager(BaostockFetcher):
         stock_df = get_stock_list()
         if stock_df.empty:
             print("未获取到股票列表")
+            self.logout()  # 释放主进程会话锁，避免常驻占用导致 worker 拿不到锁
             return
         
         # 过滤A股
         if 'type' in stock_df.columns:
             stock_df = stock_df[stock_df['type'].isin(['1'])]
         codes = stock_df['code'].tolist()
+        
+        # 主进程仅用于取列表，取完即注销并释放跨进程会话锁；
+        # 真正的 API 请求交给 worker 进程各自登录，确保任意时刻全机器仅 1 个 baostock 会话。
+        self.logout()
         
         print(f"开始更新 {len(codes)} 只股票 [Mode: {mode}]...")
         worker_func = {
@@ -458,8 +493,8 @@ class BaostockDataManager(BaostockFetcher):
     def get_adjusted_kline(self, code: str, start_date: str, end_date: str, 
                           adjust_date: Optional[str] = None) -> pd.DataFrame:
         """
-        获取动态前复权K线数据
-        
+        获取动态前复权K线数据（用 preclose/close 反推，覆盖 100%，不再依赖 adjust_factor 表）
+
         参数:
             code: 股票代码
             start_date: 开始日期
@@ -472,11 +507,11 @@ class BaostockDataManager(BaostockFetcher):
         if adjust_date is None:
             adjust_date = end_date
         
-        # 获取原始K线
+        # 获取原始K线（含 preclose，作为完整前复权的唯一来源）
         query = '''
-            SELECT k.*, a.fore_adjust_factor
+            SELECT k.date, k.open, k.high, k.low, k.close, k.preclose,
+                   k.volume, k.amount
             FROM daily_data k
-            LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
             WHERE k.code = ? AND k.date >= ? AND k.date <= ?
             ORDER BY k.date
         '''
@@ -485,28 +520,24 @@ class BaostockDataManager(BaostockFetcher):
         if df.empty:
             return df
         
-        # 获取基准日的复权因子
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT fore_adjust_factor FROM adjust_factor 
-            WHERE code = ? AND date <= ? 
-            ORDER BY date DESC LIMIT 1
-        ''', (code, adjust_date))
-        result = cursor.fetchone()
+        # 从 preclose/close 反推完整前向复权因子（锚定在窗口末日 = end_date）
+        from core.factors.train_ml_model import compute_forward_adjust_factor
+        f = compute_forward_adjust_factor(
+            df['close'].to_numpy(dtype=np.float64),
+            df['preclose'].to_numpy(dtype=np.float64),
+        )
+        # 以 adjust_date 的原始价为锚，把整段重新缩放（forward-adjust 的平移是统一比例缩放）
+        dates = list(df['date'])
+        base_idx = dates.index(adjust_date) if adjust_date in dates else len(df) - 1
+        f_base = f[base_idx]
+        if f_base == 0 or pd.isna(f_base):
+            f_base = 1.0
+        scale = f / f_base
         
-        if not result or result[0] is None:
-            print(f"警告: {code} 在 {adjust_date} 没有复权因子，返回不复权数据")
-            return df
-        
-        base_factor = result[0]
-        
-        # 动态前复权计算
-        df['fore_adjust_factor'] = df['fore_adjust_factor'].fillna(1.0)
-        df['adj_factor_ratio'] = df['fore_adjust_factor'] / base_factor
-        
-        # 复权价格 = 原始价格 * (当日复权因子 / 基准日复权因子)
         for col in ['open', 'high', 'low', 'close', 'preclose']:
-            df[f'adj_{col}'] = df[col] * df['adj_factor_ratio']
+            raw = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=np.float64)
+            df[col] = (raw * scale).astype(np.float32)
+            df[f'adj_{col}'] = df[col]
         
         # 成交量不需要复权
         df['adj_volume'] = df['volume']

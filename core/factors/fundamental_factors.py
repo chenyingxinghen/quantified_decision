@@ -219,6 +219,118 @@ class FundamentalFactors:
         self.fetcher = FinanceReportFetcher(db_path)
 
     # ------------------------------------------------------------------
+    # 业绩预告（T090 / E18 新增因子组 forecast）
+    # ------------------------------------------------------------------
+
+    # 预告类型 → 方向分数。正=盈利改善，负=恶化。数值只用于截面排序，绝对刻度无意义。
+    # 覆盖库内全部 11 个非空类型（T088 落库统计，共 106,589 行 / 5,453 只）。
+    FORECAST_TYPE_SCORE = {
+        '预增': 2.0, '略增': 1.0, '扭亏': 1.5, '续盈': 0.5, '减亏': 0.5,
+        '略减': -1.0, '预减': -2.0, '增亏': -1.5, '首亏': -2.0, '续亏': -2.0,
+        '不确定': 0.0,
+    }
+    # 事件窗口：预告发布后多少个自然日内仍视为有效信息（之后认为已被价格吸收）。
+    # 60 天来自 T089 零训练筛查——该窗口下单因子残差 IC 最高。
+    FORECAST_FRESH_DAYS = 60
+    FORECAST_COLS = ('fc_type_60d', 'fc_chg_log', 'fc_recency', 'fc_type_any')
+
+    def _load_forecast_for_code(self, code: str) -> pd.DataFrame:
+        """读取单只股票的业绩预告，按 pub_date 升序。
+
+        PIT 纪律：只用 `pub_date`（披露日），**绝不用 `stat_date`（报告期）**——
+        用报告期对齐等于让 d 日看到几个月后才公布的数字。
+        """
+        try:
+            conn = self._get_conn() if hasattr(self, '_get_conn') else _get_finance_conn(self.db_path)
+        except Exception:
+            return pd.DataFrame(columns=['pub_date', 'type_score', 'chg_mid'])
+        try:
+            df = pd.read_sql_query(
+                "SELECT pub_date, profitForcastType AS ftype, "
+                "profitForcastChgPctUp AS up, profitForcastChgPctDwn AS dwn "
+                "FROM finance.performance_forecast "
+                "WHERE code = ? AND pub_date IS NOT NULL AND pub_date != '' "
+                "ORDER BY pub_date ASC", conn, params=(code,))
+        except Exception:
+            return pd.DataFrame(columns=['pub_date', 'type_score', 'chg_mid'])
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if df.empty:
+            return pd.DataFrame(columns=['pub_date', 'type_score', 'chg_mid'])
+        df['up'] = pd.to_numeric(df['up'], errors='coerce')
+        df['dwn'] = pd.to_numeric(df['dwn'], errors='coerce')
+        df['type_score'] = (df['ftype'].fillna('').astype(str).str.strip()
+                            .map(self.FORECAST_TYPE_SCORE))
+        # 幅度中值：上下限都缺则 NaN；只有一侧则用该侧
+        df['chg_mid'] = df[['up', 'dwn']].mean(axis=1, skipna=True)
+        return df[['pub_date', 'type_score', 'chg_mid']]
+
+    def _forecast_series(self, code: str, dates: pd.Series) -> pd.DataFrame:
+        """按 (code, date) 前向对齐最近一条 `pub_date <= date` 的预告，生成 4 列。
+
+        列的选择来自 T089 的零训练筛查（`scripts/exp/diag_forecast_ic.py`）：
+          fc_type_60d  事件窗内的类型方向分（val 残差 IC +0.0285, t=8.9）
+          fc_chg_log   sign·log1p(|幅度|)，事件窗内（val 残差 IC +0.0313, t=9.9，最强）
+          fc_recency   新鲜度 `exp(-age/60)` ∈ (0,1]；预告年龄的镜像信号（bear IC −0.033）
+          fc_type_any  不设事件窗的类型分，用来让模型自己学「多久算过期」
+        残差化对照的是已在用的 `sue`/`YOYNI`/`YOYPNI`，残差 IC 反而高于原始 IC
+        ⇒ 是新信息，不是这些事后盈利列的换皮。
+
+        **缺失值编码必须让 0 是正确的中性值**：因子写入 parquet 时统一
+        `fill_nan(zero)`（见 `train_ml_model.py:1100` 的注释），事后无从区分
+        「真实 0」与「缺失填 0」。所以：
+          - `fc_type_60d` / `fc_type_any` 缺失 → 0 = 方向中性（与「不确定」同义），OK；
+          - `fc_chg_log` 缺失 → 0 = 无幅度信息，OK；
+          - `fc_recency` **不能**用 `-age`：那样缺失填 0 会变成「今天刚发」——
+            正好是最新鲜的一端，方向完全反了。改用 `exp(-age/60)`，
+            缺失填 0 = 无限久远/根本没有，单调性正确。
+        """
+        idx = dates.index
+        out = pd.DataFrame(index=idx)
+        fc = self._load_forecast_for_code(code)
+        if fc.empty:
+            for c in self.FORECAST_COLS:
+                out[c] = np.nan
+            return out
+
+        left = pd.DataFrame({'_d': pd.to_datetime(dates, errors='coerce')}, index=idx)
+        left['_row'] = np.arange(len(left))
+        right = fc.copy()
+        right['_d'] = pd.to_datetime(right['pub_date'], errors='coerce')
+        right = right.dropna(subset=['_d']).sort_values('_d')
+        # merge_asof 会吃掉 on 列，显式留一份披露日用来算年龄
+        right['_pub'] = right['_d']
+        if right.empty:
+            for c in self.FORECAST_COLS:
+                out[c] = np.nan
+            return out
+
+        m = pd.merge_asof(left.dropna(subset=['_d']).sort_values('_d'),
+                          right[['_d', '_pub', 'type_score', 'chg_mid']],
+                          on='_d', direction='backward', allow_exact_matches=True)
+        age = (m['_d'] - m['_pub']).dt.days
+        fresh = age <= self.FORECAST_FRESH_DAYS
+        chg_fresh = m['chg_mid'].where(fresh)
+        vals = pd.DataFrame({
+            '_row': m['_row'].to_numpy(),
+            'fc_type_60d': m['type_score'].where(fresh).to_numpy(),
+            'fc_chg_log': (np.sign(chg_fresh) * np.log1p(chg_fresh.abs())).to_numpy(),
+            'fc_recency': np.where(
+                age.notna(),
+                np.exp(-age.to_numpy(dtype=np.float64) / float(self.FORECAST_FRESH_DAYS)),
+                np.nan),
+            'fc_type_any': m['type_score'].to_numpy(),
+        })
+        for c in self.FORECAST_COLS:
+            col = np.full(len(idx), np.nan, dtype=np.float64)
+            col[vals['_row'].to_numpy(dtype=int)] = vals[c].to_numpy(dtype=np.float64)
+            out[c] = col
+        return out
+
+    # ------------------------------------------------------------------
     # 对外主接口: 时间序列对齐
     # ------------------------------------------------------------------
 
@@ -239,10 +351,14 @@ class FundamentalFactors:
             与 daily_data 等长的基本面因子 DataFrame
         """
         dates = pd.to_datetime(daily_data['date'], errors='coerce')
-        
+
         # 1. 获取 PIT 对齐的原始财务数据
         raw = self.fetcher.get_pit_series(code, dates)
-        
+
+        # 业绩预告：与财报表无关，即使该股没有任何财报也可能有预告，
+        # 所以两条返回路径都要带上，否则列结构不一致会让特征集合在股票间漂移。
+        forecast = self._forecast_series(code, daily_data['date'])
+
         if raw.empty or len(raw) == 0:
             # 无财务数据时返回全 NaN 的占位 DataFrame，保证列结构与有数据的股票一致
             # 这样特征工程阶段能匹配到相同的基本面列名，避免衍生特征集合不一致
@@ -259,6 +375,8 @@ class FundamentalFactors:
             placeholder['peg']         = np.nan
             placeholder['sue']         = np.nan
             placeholder['eav']         = np.nan
+            for c in self.FORECAST_COLS:
+                placeholder[c] = forecast[c].to_numpy()
             return placeholder
 
         # 2. 构建因子
@@ -311,6 +429,10 @@ class FundamentalFactors:
 
         # EAV (盈利加速度) - YOYPNI 的环比变化 (假设 YOYPNI 是季度数据, 20个交易日约1个月)
         factors['eav'] = factors['YOYPNI'].diff(20) # 约一月的变化加速度
+
+        # 5. 业绩预告（forecast 因子组，PIT 只用 pub_date）
+        for c in self.FORECAST_COLS:
+            factors[c] = forecast[c].to_numpy()
 
         # 3. 统一清理
         factors = factors.replace([np.inf, -np.inf], np.nan)

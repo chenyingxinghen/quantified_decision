@@ -19,34 +19,22 @@ _PRICE_COLUMNS = ('open', 'high', 'low', 'close', 'preclose')
 
 def _prepare_adjusted_stock_data(
     stock_df: pd.DataFrame,
-    prior_fore_factor: float = None,
-    prior_back_factor: float = None,
 ) -> pd.DataFrame:
-    """Build one continuous, corporate-action-adjusted price series.
+    """对价格列施加完整前复权（与训练/策略同一函数，preclose/close 反推，覆盖 100%）。
 
-    Baostock stores adjustment factors only on corporate-action dates. The
-    effective factor is therefore carried forward after an event and the first
-    known factor is carried backward to earlier rows. Raw prices are retained
-    for point-in-time price/market-cap filters; the standard OHLC columns are
-    replaced with ``raw_price * fore_adjust_factor`` so entry and exit prices
-    remain comparable across dividends and share distributions.
+    不再依赖 ``adjust_factor`` 表：该表只覆盖 42.5% 的除权事件，且对缺失股票
+    fillna(1.0) 退化为不复权，与训练/策略口径不一致，会在价格上留下跳变并污染
+    滚动窗口因子。原始价格保留为 ``raw_*`` 供历史时点的价格/市值筛选。
     """
     stock_df = stock_df.sort_values('date').reset_index(drop=True).copy()
-    fore = pd.to_numeric(stock_df.get('fore_adjust_factor'), errors='coerce')
-    back = pd.to_numeric(stock_df.get('back_adjust_factor'), errors='coerce')
-    if prior_fore_factor is not None and len(fore) > 0 and pd.isna(fore.iloc[0]):
-        fore.iloc[0] = prior_fore_factor
-    if prior_back_factor is not None and len(back) > 0 and pd.isna(back.iloc[0]):
-        back.iloc[0] = prior_back_factor
-    stock_df['fore_adjust_factor'] = fore.ffill().bfill().fillna(1.0)
-    stock_df['back_adjust_factor'] = back.ffill().bfill().fillna(1.0)
-
+    # 先快照原始价格，供 point-in-time 过滤使用
     for col in _PRICE_COLUMNS:
-        raw = pd.to_numeric(stock_df[col], errors='coerce')
-        stock_df[f'raw_{col}'] = raw
-        adjusted = raw * stock_df['fore_adjust_factor']
-        stock_df[col] = adjusted
-        stock_df[f'adj_{col}'] = adjusted
+        stock_df[f'raw_{col}'] = pd.to_numeric(stock_df[col], errors='coerce')
+    # 完整前复权（要求含 preclose；缺则硬失败，由调用方补 SELECT 列）
+    from core.factors.train_ml_model import apply_forward_adjust
+    apply_forward_adjust(stock_df)
+    for col in _PRICE_COLUMNS:
+        stock_df[f'adj_{col}'] = stock_df[col]
 
     return stock_df
 
@@ -63,43 +51,24 @@ def _load_stock_batch_baostock(args):
     
     placeholders = ','.join(['?' for _ in stock_codes])
     
-    # 加载K线和复权因子
+    # 加载K线（复权由 _prepare_adjusted_stock_data 用 preclose/close 反推，不再 LEFT JOIN adjust_factor）
     query = f'''
         SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.preclose,
                k.volume, k.amount, k.turnover_rate, k.tradestatus, k.pctChg,
-               k.peTTM, k.pbMRQ, k.psTTM, k.pcfNcfTTM, k.is_st,
-               a.fore_adjust_factor, a.back_adjust_factor
+               k.peTTM, k.pbMRQ, k.psTTM, k.pcfNcfTTM, k.is_st
         FROM daily_data k
-        LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
         WHERE k.code IN ({placeholders}) AND k.date >= ? AND k.date <= ?
         ORDER BY k.code, k.date
     '''
-    
+
     params = stock_codes + [start_date, end_date]
     df = pd.read_sql_query(query, conn, params=params)
-    prior_query = f'''
-        SELECT af.code, af.fore_adjust_factor, af.back_adjust_factor
-        FROM adjust_factor af
-        INNER JOIN (
-            SELECT code, MAX(date) AS max_date
-            FROM adjust_factor
-            WHERE code IN ({placeholders}) AND date < ?
-            GROUP BY code
-        ) latest ON latest.code = af.code AND latest.max_date = af.date
-    '''
-    prior_df = pd.read_sql_query(prior_query, conn, params=stock_codes + [start_date])
     conn.close()
-    prior_map = prior_df.set_index('code').to_dict('index') if not prior_df.empty else {}
-    
+
     # 按股票分组，避免为每只股票重复构造整批布尔掩码
     result = {}
     for code, stock_df in df.groupby('code', sort=False):
-        prior = prior_map.get(code, {})
-        stock_df = _prepare_adjusted_stock_data(
-            stock_df,
-            prior.get('fore_adjust_factor'),
-            prior.get('back_adjust_factor'),
-        )
+        stock_df = _prepare_adjusted_stock_data(stock_df)
         numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
         numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
         if numeric_cols:
@@ -199,41 +168,18 @@ class BaostockDataHandler:
         query = f'''
             SELECT k.code, k.date, k.open, k.high, k.low, k.close, k.preclose,
                    k.volume, k.amount, k.turnover_rate, k.tradestatus, k.pctChg,
-                   k.peTTM, k.pbMRQ, k.psTTM, k.pcfNcfTTM, k.is_st,
-                   a.fore_adjust_factor, a.back_adjust_factor
+                   k.peTTM, k.pbMRQ, k.psTTM, k.pcfNcfTTM, k.is_st
         FROM daily_data k
-        LEFT JOIN adjust_factor a ON k.code = a.code AND k.date = a.date
         WHERE k.code IN ({placeholders}) AND k.date >= ? AND k.date <= ?
         ORDER BY k.code, k.date
     '''
-        
+
         params = stock_codes + [start_date, end_date]
         df = pd.read_sql_query(query, self.conn, params=params)
-        prior_query = f'''
-            SELECT af.code, af.fore_adjust_factor, af.back_adjust_factor
-            FROM adjust_factor af
-            INNER JOIN (
-                SELECT code, MAX(date) AS max_date
-                FROM adjust_factor
-                WHERE code IN ({placeholders}) AND date < ?
-                GROUP BY code
-            ) latest ON latest.code = af.code AND latest.max_date = af.date
-        '''
-        prior_df = pd.read_sql_query(
-            prior_query,
-            self.conn,
-            params=stock_codes + [start_date],
-        )
-        prior_map = prior_df.set_index('code').to_dict('index') if not prior_df.empty else {}
-        
+
         result = {}
         for code, stock_df in df.groupby('code', sort=False):
-            prior = prior_map.get(code, {})
-            stock_df = _prepare_adjusted_stock_data(
-                stock_df,
-                prior.get('fore_adjust_factor'),
-                prior.get('back_adjust_factor'),
-            )
+            stock_df = _prepare_adjusted_stock_data(stock_df)
             numeric_cols = stock_df.select_dtypes(include=['float64', 'int64']).columns
             numeric_cols = [c for c in numeric_cols if c not in ('code', 'date')]
             if numeric_cols:
@@ -283,7 +229,11 @@ class BaostockDataHandler:
         self._date_index = {}
         self._daily_bars = {}
         self._bar_cache = {}
-        
+        # 逐股票的「列名 → ndarray」视图，供 get_bar_data 免 Series 构造地取行。
+        # **惰性构建**：预建全部 4934 只要 17s（arrow→numpy 转换），而 1 个月回测
+        # 的逐日循环只省 6s，短窗口净亏。改成首次查到该股票时才建，长短窗口都不亏。
+        self._col_arrays = {}
+
         for code, df in self._data_cache.items():
             date_list = df['date'].tolist()
             self._date_index[code] = {d: i for i, d in enumerate(date_list)}
@@ -363,26 +313,26 @@ class BaostockDataHandler:
         """
         if df.empty:
             return df
-        
-        # 获取基准日的复权因子
+
+        # _prepare_adjusted_stock_data 已把价格施加前向复权（锚定在窗口末日），
+        # 并把原始价格存于 raw_*。此处以 base_date 的原始价为锚，把整段重新缩放，
+        # 等价于把复权基准从窗口末日平移到 base_date（forward-adjust 的平移是统一比例缩放）。
         base_row = df[df['date'] == base_date]
         if base_row.empty:
             base_row = df.iloc[-1:]
-        
-        base_factor = base_row['fore_adjust_factor'].iloc[0]
-        if pd.isna(base_factor) or base_factor == 0:
-            base_factor = 1.0
-        
-        # 计算复权比例，并始终从保留的原始价格重新生成，避免重复复权。
+
+        base_adj = base_row['close'].iloc[0]
+        base_raw = base_row['raw_close'].iloc[0] if 'raw_close' in base_row.columns else base_adj
+        if pd.isna(base_adj) or base_adj == 0 or pd.isna(base_raw) or base_raw == 0:
+            return df
+        scale = base_raw / base_adj  # = 1 / f_base
+
         df = df.copy()
-        df['adj_factor_ratio'] = df['fore_adjust_factor'] / base_factor
-        
         for col in _PRICE_COLUMNS:
-            raw_col = f'raw_{col}'
-            raw = df[raw_col] if raw_col in df.columns else df[col]
-            df[col] = raw * df['adj_factor_ratio']
+            src = df[col]  # 已前向复权（锚定末日）
+            df[col] = src * scale
             df[f'adj_{col}'] = df[col]
-        
+
         return df
     
     def get_bar_data(self, stock_code: str, date: str, adjusted: bool = True) -> Optional[dict]:
@@ -405,7 +355,20 @@ class BaostockDataHandler:
         if stock_code in self._date_index:
             idx = self._date_index[stock_code].get(date)
             if idx is not None:
-                bar = self._data_cache[stock_code].iloc[idx].to_dict()
+                # 从预存的列数组直接取标量，避免 `df.iloc[idx].to_dict()` 的
+                # Series 构造 + 索引对齐。原实现约 1ms/次，19,772 次调用耗 20.5s，
+                # 占 generate_signals 的 87%（cProfile 实测，1 个月回测）。
+                # `.item()` 把 numpy 标量转回 Python 原生类型，与 Series.to_dict
+                # 的 maybe_box_native 行为一致，保证下游取值语义不变。
+                arrs = self._col_arrays.get(stock_code)
+                if arrs is None:
+                    _df = self._data_cache[stock_code]
+                    arrs = {c: _df[c].to_numpy() for c in _df.columns}
+                    self._col_arrays[stock_code] = arrs
+                bar = {}
+                for col, arr in arrs.items():
+                    v = arr[idx]
+                    bar[col] = v.item() if hasattr(v, 'item') else v
                 if not adjusted:
                     for col in _PRICE_COLUMNS:
                         raw_col = f'raw_{col}'

@@ -58,6 +58,60 @@ def auto_fill_paper_trading_prices():
         if paper_conn: paper_conn.close()
         if data_conn: data_conn.close()
 
+def verify_daily_update():
+    """
+    更新后校验：统计实际覆盖到目标交易日的股票数，并核对 sync_status 是否撒谎、
+    今日 API 配额用量。把“假成功”变成可见的 WARNING 日志，便于第一时间发现数据缺口。
+    """
+    try:
+        import sqlite3
+        from config.baostock_config import DATABASE_PATH, META_DB_PATH
+        from datetime import datetime, timedelta
+
+        now = datetime.now()
+        target = now.strftime('%Y-%m-%d')
+        if now.hour < 17 or (now.hour == 17 and now.minute < 30):
+            target = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+
+        dconn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
+        try:
+            # daily_data 在主库，sync_status/api_quota 在 meta 库；ATTACH 后统一查询
+            dconn.execute(f"ATTACH DATABASE '{META_DB_PATH}' AS meta")
+            total = dconn.execute("SELECT count(DISTINCT code) FROM daily_data").fetchone()[0]
+            covered = dconn.execute(
+                "SELECT count(*) FROM (SELECT code FROM daily_data GROUP BY code HAVING MAX(date) >= ?)",
+                (target,),
+            ).fetchone()[0]
+            missing = total - covered
+            # sync_status 谎言：状态标到 >= target，但实际 MAX(date) < target
+            lied = dconn.execute(
+                "SELECT count(*) FROM meta.sync_status s WHERE s.last_daily_sync >= ? "
+                "AND (SELECT MAX(date) FROM daily_data d WHERE d.code = s.code) < ?",
+                (target, target),
+            ).fetchone()[0]
+            qrow = dconn.execute("SELECT count FROM meta.api_quota WHERE date = ?", (target,)).fetchone()
+            quota_used = qrow[0] if qrow else 0
+        finally:
+            dconn.close()
+
+        if missing > 0 or lied > 0:
+            logger.warning(
+                f"更新校验 ⚠ 目标交易日={target} | 已覆盖 {covered}/{total} 只 | 缺失 {missing} 只 | "
+                f"sync_status谎言 {lied} 只 | 今日API {quota_used}"
+            )
+            logger.warning(
+                "部分股票未更新到目标交易日（多为 Baostock 返回空/被拉黑）；"
+                "下次增量运行会以 MAX(date) 为起点自动回填（前提：当时未被拉黑）。"
+            )
+        else:
+            logger.info(
+                f"更新校验 ✓ 目标交易日={target} | 已覆盖 {covered}/{total} 只 | 缺失 0 只 | "
+                f"今日API {quota_used}"
+            )
+    except Exception as e:
+        logger.error(f"更新校验失败（不影响数据写入）: {e}")
+
+
 async def daily_data_update_job():
     """
     工作日定时执行的更新任务。
@@ -70,7 +124,9 @@ async def daily_data_update_job():
         logger.info("Starting full incremental update...")
         await asyncio.get_event_loop().run_in_executor(None, lambda: update_all_stocks(incremental=True))
         
-        logger.info("Daily data update finished. Triggering paper trading price auto-fill...")
+        logger.info("Daily data update finished. Verifying coverage...")
+        verify_daily_update()
+        logger.info("Triggering paper trading price auto-fill...")
         await asyncio.get_event_loop().run_in_executor(None, auto_fill_paper_trading_prices)
     except Exception as e:
         logger.error(f"Error in scheduled daily update: {e}")

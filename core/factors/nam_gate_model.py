@@ -116,8 +116,8 @@ class RegimeGate(_Module):
     ``mode='multiplicative'``：``w = lo + (hi-lo)·sigmoid(logits)``，
     各族独立缩放、互不竞争 —— 观察到坍塌时的兜底方案。
     ``mode='scalar'``（E6/T073）：**不用 MLP**。取单一 regime 列 s（由
-    ``scalar_idx`` 指定，已是滚动分位归一化到 [0,1]，内部中心化为 2s−1），
-    令 ``logits = a · (2s−1)``，``a ∈ R^{n_groups}`` 是**唯一**的门控参数
+    ``scalar_idx`` 指定，滚动分位归一化后已在 [-1,1]、0=历史中位），
+    令 ``logits = a · s``，``a ∈ R^{n_groups}`` 是**唯一**的门控参数
     （13 族 = 13 个参数），再走与 softmax 模式相同的 ``K·softmax``。
     立论：T046 的 oracle IC +128% 说明条件结构存在，但可实现增益≈0 的原因是
     在约 90 个独立块上学不动 (64,32) MLP 的 2000+ 参数（台账 E6 节）。
@@ -154,8 +154,12 @@ class RegimeGate(_Module):
 
     def forward(self, m: "torch.Tensor", temperature: float = 1.0) -> "torch.Tensor":
         if self.mode == 'scalar':
-            s = m[:, self.scalar_idx:self.scalar_idx + 1]        # [B,1]，滚动分位 ∈[0,1]
-            logits = self.a.unsqueeze(0) * (2.0 * s - 1.0)       # [B,K]
+            # regime 矩阵已由 _rolling_pct_normalize 映射到 [-1,1]、0=历史中位，
+            # 直接用即可。2026-08-14 修复：原先在这里又做了一次 2s-1，复合成
+            # 4r-3 —— 均匀锚点被推到 75 分位、低波半区杠杆是高波半区的 3 倍、
+            # 缺失日填 0 变成满档倾斜。E6 的判定建立在这个畸变实现上。
+            s = m[:, self.scalar_idx:self.scalar_idx + 1]        # [B,1] ∈ [-1,1]
+            logits = self.a.unsqueeze(0) * s                     # [B,K]
             return torch.softmax(logits / max(temperature, 1e-3), dim=-1) * self.n_groups
         logits = self.net(m)
         if self.mode == 'softmax':

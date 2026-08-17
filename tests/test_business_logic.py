@@ -19,8 +19,14 @@ from core.factors.cache_manifest import (
 )
 from core.factors.train_ml_model import MLModelTrainer, _fast_rankdata_1d, _scan_cache_file
 from scripts.migrate_downside_risk_cache import _migrate_one
-from scripts.diag_random_null import simulate
-from scripts.exp_nam_gate import _topk_excess
+# 2026-08-14：实验脚本集中到 scripts/exp/（见 scripts/exp/README.md）
+from scripts.exp.diag_random_null import simulate
+# exp_nam_gate 顶层 import torch，而 torch 只装在 workbuddy 的 3.13.12 解释器里、
+# pytest 只装在 .venv 里 —— 顶层导入会让**整个文件收集失败**。改成惰性导入 + skip。
+try:
+    from scripts.exp.exp_nam_gate import _topk_excess
+except ImportError:  # torch 缺失
+    _topk_excess = None
 from scripts.select_stocks import _update_factor_cache_incremental
 
 
@@ -71,6 +77,7 @@ class TrainingLabelTests(unittest.TestCase):
 
 
 class NamSelectionMetricTests(unittest.TestCase):
+    @unittest.skipIf(_topk_excess is None, 'torch 不可用（只装在 workbuddy 解释器）')
     def test_topk_excess_remains_a_diagnostic_metric(self):
         pred = np.array([4.0, 3.0, 2.0, 1.0])
         returns = np.array([0.04, 0.03, -0.02, -0.01])
@@ -79,12 +86,12 @@ class NamSelectionMetricTests(unittest.TestCase):
         self.assertEqual(value, float('-inf'))
 
     def test_best_epoch_index_contract_is_zero_based(self):
-        source = (PROJECT_ROOT / 'scripts' / 'exp_nam_gate.py').read_text(encoding='utf-8')
+        source = (PROJECT_ROOT / 'scripts' / 'exp' / 'exp_nam_gate.py').read_text(encoding='utf-8')
         self.assertIn('best_epoch_idx = len(history) - 1', source)
         self.assertNotIn('best_epoch_idx = len(history)\n', source)
 
     def test_rank_ic_remains_default_selection_metric(self):
-        source = (PROJECT_ROOT / 'scripts' / 'exp_nam_gate.py').read_text(encoding='utf-8')
+        source = (PROJECT_ROOT / 'scripts' / 'exp' / 'exp_nam_gate.py').read_text(encoding='utf-8')
         self.assertIn("select_metric='rank_ic'", source)
         self.assertIn("default='rank_ic'", source)
 
@@ -157,6 +164,12 @@ class ExitRuleTests(unittest.TestCase):
 
 class AdjustmentTests(unittest.TestCase):
     def test_adjusted_prices_capture_corporate_action_return(self):
+        # 2026-08-15：回测处理器改用 preclose/close 反推的完整前复权
+        # （见 core/backtest/baostock_data_handler._prepare_adjusted_stock_data）。
+        # 旧口径依赖 adjust_factor 表 + prior_* 接续参数，该表只覆盖 42.5% 的
+        # 除权事件、缺失时 fillna(1.0) 退化为不复权，已弃用。
+        # 这里的复权比 r = preclose_t / close_{t-1} = 6.70 / 6.81，与旧用例里
+        # fore_adjust_factor 给出的比值一致，所以复权后收益率仍是 0.004478。
         raw = pd.DataFrame({
             'date': ['2024-08-05', '2024-08-06'],
             'open': [6.82, 6.79],
@@ -164,18 +177,17 @@ class AdjustmentTests(unittest.TestCase):
             'low': [6.80, 6.67],
             'close': [6.81, 6.73],
             'preclose': [6.84, 6.70],
-            'fore_adjust_factor': [np.nan, 0.977396],
-            'back_adjust_factor': [np.nan, 1.081856],
         })
-        adjusted = _prepare_adjusted_stock_data(
-            raw,
-            prior_fore_factor=0.961608,
-            prior_back_factor=1.064381,
-        )
+        adjusted = _prepare_adjusted_stock_data(raw)
 
         adjusted_return = adjusted.loc[1, 'close'] / adjusted.loc[0, 'close'] - 1
         self.assertAlmostEqual(adjusted_return, 0.004478, places=5)
         self.assertAlmostEqual(adjusted.loc[0, 'raw_close'], 6.81, places=6)
+        # 最后一行的复权因子恒为 1：前复权以最新价为基准
+        self.assertAlmostEqual(adjusted.loc[1, 'close'], 6.73, places=5)
+        # adj_* 与复权后的价格列同值，供策略侧显式引用
+        self.assertAlmostEqual(adjusted.loc[0, 'adj_close'],
+                               adjusted.loc[0, 'close'], places=6)
 
 
 class BasicRiskFilterTests(unittest.TestCase):

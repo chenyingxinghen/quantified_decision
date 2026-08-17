@@ -9,6 +9,7 @@ import pandas as pd
 import sqlite3
 import os
 import sys
+import time
 import baostock as bs
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
@@ -17,7 +18,68 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from config.baostock_config import DATABASE_PATH, META_DB_PATH, FINANCE_DB_PATH
 
-# Baostock API 内部不再使用全局锁
+# Baostock 限制同一账号/IP 同时只有 1 个登录会话，并发连接会触发黑名单。
+# 用跨进程文件锁把“登录→注销”包成全局临界区：任意时刻全机器最多 1 个 baostock 会话。
+_BS_LOCK_PATH = os.path.join(os.path.dirname(DATABASE_PATH), '.baostock_session.lock')
+_BS_LOCK_FD = None
+# 等待其他进程释放会话锁的最长阻塞时间（秒）。正常 cron 不重叠；手动并发跑则超时放弃，优于被拉黑。
+BS_SESSION_LOCK_TIMEOUT = 3600.0
+
+
+def _acquire_bs_session_lock(timeout: float = BS_SESSION_LOCK_TIMEOUT) -> int:
+    """阻塞获取跨进程 baostock 会话锁，返回锁文件 fd；超时抛 TimeoutError。"""
+    global _BS_LOCK_FD
+    fd = os.open(_BS_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    os.lseek(fd, 0, os.SEEK_SET)
+    deadline = time.time() + timeout
+    waited = False
+    while True:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _BS_LOCK_FD = fd
+            if waited:
+                print(f"[baostock-lock] 已获取会话锁 (PID: {os.getpid()})")
+            return fd
+        except (OSError, IOError):
+            if not waited:
+                waited = True
+                print(f"[baostock-lock] 等待其他进程的 baostock 会话锁 (最多 {timeout:.0f}s, PID: {os.getpid()})...")
+            if time.time() >= deadline:
+                os.close(fd)
+                raise TimeoutError(
+                    f"等待 baostock 会话锁超时 ({timeout:.0f}s)，可能另有进程正在访问 Baostock API；"
+                    f"并发连接会触发黑名单，已主动放弃本次登录"
+                )
+            time.sleep(2)
+
+
+def _release_bs_session_lock():
+    """释放跨进程 baostock 会话锁（进程退出时 OS 也会自动释放，作为兜底）。"""
+    global _BS_LOCK_FD
+    fd = _BS_LOCK_FD
+    if fd is None:
+        return
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except (OSError, IOError):
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        _BS_LOCK_FD = None
 
 
 class BaostockFetcher:
@@ -88,22 +150,28 @@ class BaostockFetcher:
     
     @classmethod
     def _bs_login(cls) -> bool:
-        """登录 baostock"""
+        """登录 baostock（含跨进程会话锁，保证全机器同时仅 1 个会话）"""
         if not cls._global_bs_logged_in:
-            lg = bs.login()
-            if lg.error_code == '0':
-                cls._global_bs_logged_in = True
-                print(f"Baostock 登录成功 (PID: {os.getpid()})")
-                # 登录本身也是一次 API 调用，纳入每日配额计数（仅计数，不拦截登录）
-                try:
-                    from .baostock_fetcher_methods import _register_api_call
-                    _register_api_call(1, gate=False)
-                except Exception:
-                    pass
-            else:
-                print(f"Baostock 登录失败 (PID: {os.getpid()}): {lg.error_msg}")
-                # 如果是特定错误，可以不抛异常，由上层处理
-                return False
+            # 先拿跨进程锁，再登录；锁在 logout() 时释放
+            _acquire_bs_session_lock()
+            try:
+                lg = bs.login()
+                if lg.error_code == '0':
+                    cls._global_bs_logged_in = True
+                    print(f"Baostock 登录成功 (PID: {os.getpid()})")
+                    # 登录本身也是一次 API 调用，纳入每日配额计数（仅计数，不拦截登录）
+                    try:
+                        from .baostock_fetcher_methods import _register_api_call
+                        _register_api_call(1, gate=False)
+                    except Exception:
+                        pass
+                else:
+                    print(f"Baostock 登录失败 (PID: {os.getpid()}): {lg.error_msg}")
+                    _release_bs_session_lock()  # 登录失败同样要释放锁
+                    return False
+            except Exception:
+                _release_bs_session_lock()  # 异常时释放锁，避免死锁
+                raise
         return cls._global_bs_logged_in
     
     def close(self):
@@ -113,11 +181,13 @@ class BaostockFetcher:
             self._conn = None
     
     def logout(self):
-        """显式注销 baostock"""
+        """显式注销 baostock（释放跨进程会话锁）"""
         if BaostockFetcher._global_bs_logged_in:
             bs.logout()
             BaostockFetcher._global_bs_logged_in = False
             print("Baostock 已注销")
+        # 无论是否曾登录，都确保锁被释放（幂等）
+        _release_bs_session_lock()
     
     def init_database(self):
         """初始化数据库表结构"""

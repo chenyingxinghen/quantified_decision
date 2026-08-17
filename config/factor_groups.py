@@ -50,6 +50,7 @@ FACTOR_GROUPS: List[str] = [
     'market_regime',  # 手工市场交互（遗留）
     'status',         # 状态位/标的属性
     'indrel',         # 行业内相对位置（``*__ind``，见 E7）
+    'forecast',       # 业绩预告（``fc_*``，见 T089/T090 = E18）
     'other',          # 未匹配兜底
 ]
 
@@ -161,6 +162,12 @@ def assign_group(name: str) -> str:
     # （剥离了行业共同驱动），门控应该能独立放大/压制它。
     if name.endswith('__ind'):
         return 'indrel'
+    # E18：业绩预告自成一族。它既不是事后财务（growth 里的 YOY*）也不是价格派生，
+    # 是**前瞻**信息；而且事件驱动、覆盖率只有 19~39%，行为与其他族差别很大，
+    # 门控应该能独立控制它的权重。必须放在交叉项判定之前——`fc_chg_log` 含
+    # `_log`，落到关键词兜底会被误分。
+    if name.startswith('fc_'):
+        return 'forecast'
     if _RE_CROSS_FUND.search(name):
         return 'cross_fund'
     if _RE_CROSS_TECH.search(name):

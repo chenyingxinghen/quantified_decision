@@ -91,6 +91,13 @@ class ModelConfig:
     }
 
     # ── 统一接口 ──────────────────────────────────────────────────────────
+    # 全局随机种子。None = 沿用各框架默认（xgb seed=0 / lgb 固定默认），
+    # 与 2026-08-15 之前的全部历史训练逐位一致，所以默认值必须保持 None。
+    # 树只有 subsample/colsample 抽样受它影响，敏感度远低于 NAM；设它的唯一
+    # 用途是**配对多种子判定**（T092 量化过：单种子回测熊市 MDE≈64pp，
+    # n=4 配对能压到≈13pp），由 train_model.py --seed 注入。
+    MODEL_SEED: Any = None
+
     @classmethod
     def get_model_params(cls, model_type: str, task: str = None) -> Dict[str, Any]:
         """获取指定模型的超参数，根据任务类型动态设置目标"""
@@ -124,6 +131,10 @@ class ModelConfig:
         
         if model_type == 'xgboost':
             params.update(cls.GPU_PARAMS_XGB)
+        # 两个框架的 sklearn wrapper 都认 random_state（xgb 内部映射到 seed）。
+        # 只在显式设置时注入，未设置时不写这个键 —— 保持历史训练的逐位可复现。
+        if cls.MODEL_SEED is not None:
+            params['random_state'] = int(cls.MODEL_SEED)
         return params
 
     @classmethod
@@ -317,7 +328,11 @@ class TrainingConfig:
     CACHE_DIR            = 'database/system_data/factors_cache'  # 旧版共享缓存；历史模型继续使用
     # 因子公式契约版本。公式语义变化时必须升级，并写入独立缓存目录的 manifest；
     # 禁止原地覆盖旧缓存，否则历史模型的训练/推理输入会静默漂移。
-    FACTOR_DEFINITION_VERSION = '2026-08-06-downside-risk-v2-strict'
+    # 2026-08-14 本次两处语义变化（合并一次重建，见 TRAINING_ITERATIONS.md）：
+    #   ① 价格复权换成 preclose/close 累乘的**完整**前复权（旧的稀疏
+    #      adjust_factor + bfill/ffill 只覆盖 42.5% 除权事件，污染全部滚动窗口因子）；
+    #   ② 新增 4 列业绩预告 fc_*（forecast 族）。
+    FACTOR_DEFINITION_VERSION = '2026-08-14-fwdadjust-preclose-forecast-v1'
     CACHE_MANIFEST_NAME = 'factor_cache_manifest.json'
     SAVE_DIR             = 'models'                              # 模型保存目录
 

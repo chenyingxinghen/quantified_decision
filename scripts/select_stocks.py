@@ -53,10 +53,55 @@ DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
 MIN_DATA_ROWS = 35                 # 最少需要的行情数据条数 (与 ml_factor_strategy.py 一致)
 DEFAULT_WORKERS = 15                # 默认并行线程数
-DEFAULT_CACHE_DIR = os.path.join(PROJECT_ROOT, TrainingConfig.CACHE_DIR)
+# 历史遗留共享缓存。仅作**兜底**：无绑定清单的旧模型才落到这里。
+# 新模型（T090 起）在存档目录里带 factor_cache_manifest.json，指向自己训练时
+# 用的版本化缓存，由 resolve_production_cache_dir() 解析。
+LEGACY_CACHE_DIR = os.path.join(PROJECT_ROOT, TrainingConfig.CACHE_DIR)
+DEFAULT_CACHE_DIR = LEGACY_CACHE_DIR   # 向后兼容的别名，勿在新代码里用
 # ============================================================================
 # 辅助函数
 # ============================================================================
+def resolve_production_cache_dir(model_path: str) -> str:
+    """
+    按模型存档里的绑定清单解析该用哪个因子缓存（与 run_backtest.py 同一口径）。
+
+    为什么不能直接用 TrainingConfig.CACHE_DIR：那是 2026-08 复权修复**之前**的
+    旧缓存，且没有 T115 的 idx_* 列。拿它喂 224 列的 NAM，5 个新列会被填成常数
+    0.5 —— 现在会被 ml_factor_strategy 的列完整性护栏拦下来硬失败，但正确做法是
+    一开始就取模型自己绑定的那个目录。旧模型无清单时回退到历史缓存，行为不变。
+    """
+    from core.factors.cache_manifest import resolve_model_cache
+
+    if not os.path.isabs(model_path):
+        model_path = os.path.join(PROJECT_ROOT, model_path)
+    model_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+    return resolve_model_cache(model_dir, LEGACY_CACHE_DIR)
+
+
+def load_model_feature_names(model_path: str) -> Optional[List[str]]:
+    """
+    读取模型的特征清单（存档里的 feature_names.json 边车文件），用作增量缓存
+    更新的 target_features —— 缓存扫描据此判断「列不全」并触发重算，
+    否则新加的 idx_* 永远不会被补进已有 parquet（日期是齐的，只有列缺）。
+
+    读不到就返回 None（退化成只按日期判断是否需要更新），不阻断选股。
+    """
+    if not os.path.isabs(model_path):
+        model_path = os.path.join(PROJECT_ROOT, model_path)
+    model_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+    sidecar = os.path.join(model_dir, 'feature_names.json')
+    if not os.path.exists(sidecar):
+        return None
+    try:
+        import json
+        with open(sidecar, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        names = payload if isinstance(payload, list) else payload.get('feature_names')
+        return list(names) if names else None
+    except Exception:
+        return None
+
+
 def find_latest_model(base_dir: str) -> Optional[str]:
     """
     在指定目录下寻找最新的模型。
@@ -293,7 +338,7 @@ def select_stocks(
     top_n: int = DEFAULT_TOP_N,
     apply_filter: bool = False,
     workers: int = DEFAULT_WORKERS,
-    cache_dir: str = DEFAULT_CACHE_DIR,
+    cache_dir: Optional[str] = None,
     only_cache: bool = False,
     save_csv: bool = True,
     skip_cache_update: bool = True,
@@ -318,7 +363,7 @@ def select_stocks(
         top_n:           输出前 N 只股票
         apply_filter:    是否使用基础条件预筛选（后端必须显式传入）
         workers:         并行线程数（用于缓存更新）
-        cache_dir:       因子缓存目录
+        cache_dir:       因子缓存目录；None = 按模型绑定清单解析（推荐）
         only_cache:      保留参数，暂不使用（缓存由策略内部管理）
         save_csv:        是否将结果保存为 CSV
         skip_cache_update: 跳过增量缓存更新
@@ -350,11 +395,22 @@ def select_stocks(
     if norm_stats_path and not os.path.isabs(norm_stats_path):
         norm_stats_path = os.path.join(PROJECT_ROOT, norm_stats_path)
 
+    # 因子缓存：未显式指定时按模型绑定清单解析，保证喂进模型的面板和它训练时
+    # 用的那一份是同一个公式版本（缺列/错版会在策略 initialize 里硬失败）。
+    model_features = load_model_feature_names(model_path)
+    if cache_dir is None:
+        cache_dir = resolve_production_cache_dir(model_path)
+    elif not os.path.isabs(cache_dir):
+        cache_dir = os.path.join(PROJECT_ROOT, cache_dir)
+
     print("=" * 80)
     print("📊 量化因子选股系统")
     print("=" * 80)
     print(f"\n🕐 运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f" 最低置信度: {min_confidence:.1f}% | top_n: {top_n}")
+    print(f" 模型: {os.path.relpath(model_path, PROJECT_ROOT)}"
+          f"{f' ({len(model_features)} 列)' if model_features else ''}")
+    print(f" 因子缓存: {cache_dir}")
 
     # ------------------------------------------------------------------
     # Step 1: 增量更新因子缓存
@@ -369,6 +425,8 @@ def select_stocks(
                 codes=all_codes,
                 cache_dir=cache_dir,
                 workers=workers,
+                # 传模型特征清单，缓存扫描才会发现「日期齐但列不全」并触发重算。
+                target_features=model_features,
             )
         except Exception as _e:
             import traceback
@@ -528,8 +586,8 @@ def parse_args():
         help=f'并行线程数 (默认: {DEFAULT_WORKERS})',
     )
     parser.add_argument(
-        '--cache-dir', type=str, default=DEFAULT_CACHE_DIR,
-        help=f'因子缓存目录 (默认: {DEFAULT_CACHE_DIR})',
+        '--cache-dir', type=str, default=None,
+        help='因子缓存目录 (默认: 按模型存档的绑定清单解析；旧模型回退历史缓存)',
     )
     parser.add_argument(
         '--only-cache', action='store_true', default=False,

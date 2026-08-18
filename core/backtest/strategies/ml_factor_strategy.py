@@ -617,6 +617,12 @@ class MLFactorBacktestStrategy(BaseStrategy):
         lo_key = str(self.preload_start)[:10] if self.preload_start else None
         hi_key = str(self.preload_end)[:10] if self.preload_end else None
         window = f", 日期裁剪 {lo_key or '-inf'}~{hi_key or '+inf'}" if (lo_key or hi_key) else ""
+
+        # 抽样预检：整列缺失是 schema 级事实，抽 32 个文件就能判定，不必等
+        # 全量预加载（实测 5446 个 parquet 约 200s）跑完才报错。实盘在 09:15
+        # 的买入窗里，晚 200 秒失败和立刻失败是两回事。
+        self._assert_columns_present(files[:32], feature_names, exact=False)
+
         print(f"正在预加载因子缓存({scope}{window}): {len(files)} 个 parquet...")
 
         def _load_one(filename):
@@ -664,7 +670,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                         a = a[row_idx]
                     matrix[:, feat_pos[c]] = np.nan_to_num(
                         a[lo:hi], nan=0.5, posinf=1.0, neginf=0.0)
-                return code, dates, matrix
+                return code, dates, matrix, present
             except Exception:
                 return None
 
@@ -673,15 +679,64 @@ class MLFactorBacktestStrategy(BaseStrategy):
         # GIL），线程数才吃得到多核。上限跟随机器核数，不再写死 8。
         workers = min(max(4, (os.cpu_count() or 8)), max(1, len(files)))
         loaded = 0
+        covered_cols = set()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for item in executor.map(_load_one, files):
                 if item is None:
                     continue
-                code, dates, matrix = item
+                code, dates, matrix, present = item
                 self._factor_dates_cache[code] = dates
                 self._factor_matrix_cache[code] = matrix
+                covered_cols.update(present)
                 loaded += 1
         print(f"  因子缓存预加载完成: {loaded}/{len(files)}")
+
+        # 精确复核：上面是抽样，这里用**全部**已加载文件的列并集再判一次。
+        if loaded > 0:
+            self._assert_columns_present(None, feature_names, exact=True,
+                                         covered=covered_cols, n_files=loaded)
+
+    def _assert_columns_present(self, files, feature_names, exact,
+                                covered=None, n_files=0):
+        """
+        模型面板必须真实存在于缓存里，否则硬失败。
+
+        缺失列一律填 0.5（rank 后的中性分位），对**个别**股票缺数据是正确语义；
+        但某列若在整个缓存里都不存在，那是模型面板与缓存版本对不上——模型会
+        拿到一根常数列照常出票，不报错、不留痕。T115（224 列，含 5 个 idx_*）
+        配上旧的 219/242 列缓存就是这个情形。
+        """
+        if covered is None:
+            import pyarrow.parquet as pq
+            covered = set()
+            n_files = 0
+            for filename in files or []:
+                try:
+                    covered.update(pq.read_schema(
+                        os.path.join(self.cache_dir, filename)).names)
+                    n_files += 1
+                except Exception:
+                    continue
+            if n_files == 0:
+                return
+
+        absent = [c for c in feature_names if c not in covered]
+        if not absent:
+            return
+
+        where = f"全部 {n_files} 个" if exact else f"抽样的 {n_files} 个"
+        msg = (
+            f"因子缓存缺少模型所需的 {len(absent)} 列（在{where} parquet 里都不存在）: "
+            f"{absent[:12]}{' ...' if len(absent) > 12 else ''}\n"
+            f"  缓存目录: {self.cache_dir}\n"
+            f"  这些列会被填成常数 0.5，模型将在残缺面板上打分且不报错。\n"
+            f"  处理：改用模型绑定清单里的缓存目录（core.factors.cache_manifest."
+            f"resolve_model_cache），或用当前因子公式重建缓存。\n"
+            f"  确知无害时可设 ALLOW_MISSING_FACTOR_COLUMNS=1 放行。"
+        )
+        if os.environ.get('ALLOW_MISSING_FACTOR_COLUMNS') != '1':
+            raise RuntimeError(msg)
+        print(f"  [警告] {msg}")
 
     def _get_factor_row_array(self, stock_code: str, current_date: str) -> Optional[np.ndarray]:
         """按股票和日期快速取得 PIT 特征行。"""

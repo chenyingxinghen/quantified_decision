@@ -328,11 +328,16 @@ class TrainingConfig:
     CACHE_DIR            = 'database/system_data/factors_cache'  # 旧版共享缓存；历史模型继续使用
     # 因子公式契约版本。公式语义变化时必须升级，并写入独立缓存目录的 manifest；
     # 禁止原地覆盖旧缓存，否则历史模型的训练/推理输入会静默漂移。
-    # 2026-08-14 本次两处语义变化（合并一次重建，见 TRAINING_ITERATIONS.md）：
+    # 2026-08-14 两处语义变化：
     #   ① 价格复权换成 preclose/close 累乘的**完整**前复权（旧的稀疏
     #      adjust_factor + bfill/ffill 只覆盖 42.5% 除权事件，污染全部滚动窗口因子）；
     #   ② 新增 4 列业绩预告 fc_*（forecast 族）。
-    FACTOR_DEFINITION_VERSION = '2026-08-14-fwdadjust-preclose-forecast-v1'
+    # 2026-08-18 一处语义变化（T115 晋级后把公式搬进生产计算器）：
+    #   ③ 新增 5 列指数相对因子 idx_*（index_rel 族），见
+    #      core/factors/index_relative_factors.py。必须 bump：不 bump 的话，
+    #      改动前后建出来的缓存版本串一模一样却列数不同，正是这套契约要防的
+    #      「同名不同公式」静默错配。
+    FACTOR_DEFINITION_VERSION = '2026-08-18-fwdadjust-preclose-forecast-idxrel-v1'
     CACHE_MANIFEST_NAME = 'factor_cache_manifest.json'
     SAVE_DIR             = 'models'                              # 模型保存目录
 

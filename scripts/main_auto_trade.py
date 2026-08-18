@@ -138,21 +138,32 @@ def get_latest_signals() -> List[Dict]:
     """
     from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH, AUTO_TOP_N
     from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
-    from config.factor_config import TrainingConfig
     from config.baostock_config import DATABASE_PATH
+    from scripts.select_stocks import (
+        _update_factor_cache_incremental, get_all_stock_codes,
+        load_model_feature_names, resolve_production_cache_dir,
+    )
 
     logger.info("正在获取今日信号")
     logger.info(f"  配置: top_n={AUTO_TOP_N}, min_confidence={AUTO_MIN_CONFIDENCE}")
 
+    # 缓存目录按模型绑定清单解析，不再写死 TrainingConfig.CACHE_DIR（那是复权
+    # 修复前的旧共享缓存，也没有 T115 的 idx_* 列）。清单缺失/错版会直接抛，
+    # 实盘宁可不出票也不能在错版面板上打分。
+    cache_dir = resolve_production_cache_dir(AUTO_MODEL_PATH)
+    model_features = load_model_feature_names(AUTO_MODEL_PATH)
+    logger.info(f"  因子缓存: {cache_dir}"
+                f"{f' (模型 {len(model_features)} 列)' if model_features else ''}")
+
     # 先刷新因子缓存，确保 select_for_live 使用最新数据
     try:
-        from scripts.select_stocks import _update_factor_cache_incremental, get_all_stock_codes
         logger.info("正在增量更新因子缓存...")
         all_codes = get_all_stock_codes(DATABASE_PATH)
         _update_factor_cache_incremental(
             db_path=DATABASE_PATH,
             codes=all_codes,
-            cache_dir=TrainingConfig.CACHE_DIR,
+            cache_dir=cache_dir,
+            target_features=model_features,
         )
         logger.info(f"因子缓存更新完成，覆盖 {len(all_codes)} 只股票。")
     except Exception as e:
@@ -162,7 +173,7 @@ def get_latest_signals() -> List[Dict]:
         strategy = MLFactorBacktestStrategy(
             model_path=AUTO_MODEL_PATH,
             min_confidence=AUTO_MIN_CONFIDENCE,
-            cache_dir=TrainingConfig.CACHE_DIR,
+            cache_dir=cache_dir,
             norm_stats_path=AUTO_NORM_STATS_PATH,
         )
         strategy.initialize()

@@ -884,13 +884,16 @@ def export_interpretability(model, gates_va, va_dates, history, out_dir, top_n=1
         nrow = int(np.ceil(len(curves) / ncol))
         fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 2.8 * nrow))
         for ax, (name, (g, v)) in zip(np.ravel(axes), curves.items()):
+            # 去掉每条曲线的常数偏置再画：偏置 ~10 而形状幅度 ~0.1，纵轴从 0 画起
+            # 时所有曲线都是水平线，图完全不可读（T098 一批的历史图即如此）。
+            v = v - v.mean()
             ax.plot(g, v, color='#c0392b', lw=1.8)
             ax.axhline(0, color='#999', lw=0.6, ls='--')
             ax.set_title(name, fontsize=9)
             ax.tick_params(labelsize=7)
         for ax in np.ravel(axes)[len(curves):]:
             ax.axis('off')
-        fig.suptitle('因子形状函数 f_i(x_i)：横轴=当日截面分位，纵轴=对得分的贡献', fontsize=11)
+        fig.suptitle('因子形状函数 f_i(x_i)−均值：横轴=当日截面分位，纵轴=对得分的贡献（已去常数偏置）', fontsize=11)
         fig.tight_layout()
         p = os.path.join(out_dir, 'shape_functions.png')
         fig.savefig(p, dpi=130)
@@ -1049,6 +1052,12 @@ def main():
                     help='保留手工 *_regime_* 交互列（默认剔除，改由门控学习）')
     ap.add_argument('--drop-groups', default='',
                     help='逗号分隔的因子族名，训练前整族剔除（依据 group_effectiveness.csv 的 effective IC）')
+    ap.add_argument('--drop-features', default='',
+                    help='逗号分隔的因子名，训练前逐列剔除（T114 瘦身轴）。未知名硬失败，'
+                         '防止拼错列名后静默训练在错误面板上')
+    ap.add_argument('--drop-features-file', default=None,
+                    help='文本文件，每行一个因子名（# 开头为注释行）；与 --drop-features 取并集。'
+                         '用于把杀名单固化成可审计的文件而不是命令行长串')
     ap.add_argument('--folds', default='0.7:0.8,0.8:1.0',
                     help='折列表，形如 "0.7:0.8,0.8:1.0"')
     ap.add_argument('--skip-baseline', action='store_true',
@@ -1142,6 +1151,25 @@ def main():
         print(f"  按族裁剪 {sorted(_drop)}: 特征 {len(nam_features)} → {len(_keep)}")
         nam_features = _keep
         group_names, group_ids = build_group_index(nam_features)
+
+    # 逐列裁剪（T114 瘦身轴）：死亡交集 / 精确重复 / 低覆盖列
+    _dropf = {s.strip() for s in args.drop_features.split(',') if s.strip()}
+    if args.drop_features_file:
+        with open(args.drop_features_file, encoding='utf-8') as _fh:
+            for _ln in _fh:
+                # 行尾注释要剥掉：杀名单用 `列名  # [dead]` 记录每列的杀因来源，
+                # 只跳整行注释会把整条 "名字 # 标签" 当成列名，撞上下面的硬失败。
+                _name = _ln.split('#', 1)[0].strip()
+                if _name:
+                    _dropf.add(_name)
+    if _dropf:
+        _unknown = _dropf - set(nam_features)
+        if _unknown:
+            raise ValueError(f"--drop-features 含未知/已被剔除的因子名: {sorted(_unknown)[:10]}"
+                             f"（共 {len(_unknown)} 个）")
+        nam_features = [f for f in nam_features if f not in _dropf]
+        group_names, group_ids = build_group_index(nam_features)
+        print(f"  逐列裁剪 {len(_dropf)} 列: 特征 → {len(nam_features)}")
 
     print(f"  因子族 K={len(group_names)}: {group_names}")
 
@@ -1321,6 +1349,7 @@ def main():
                     'stocks': args.stocks, 'years': args.years, 'end': end,
                     'future_days': 7,
                     'nam_features': len(nam_features), 'dropped_manual_interaction': dropped,
+                    'dropped_features': sorted(_dropf) if _dropf else [],
                     'groups': group_names, 'regime_dims': int(regime.shape[1]),
                     'gate_mode': args.gate_mode, 'gate_scalar_col': args.gate_scalar_col,
                     'disable_gate': args.disable_gate,
@@ -1446,9 +1475,16 @@ def _evaluate_contributions(model, X, returns, dates, M, max_days=0):
             raw_ics[di] = _rank_ic_columns(np.asarray(X[s:e], dtype=np.float64), y)
             eff_ics[di] = _rank_ic_columns(effective, y)
             group_ics[di] = _rank_ic_columns(group_effective, y)
-            abs_sum += np.abs(effective).sum(axis=0)
-            sq_sum += (effective * effective).sum(axis=0)
-            group_abs_sum += np.abs(group_effective).sum(axis=0)
+            # 幅度统计必须先做当日截面去均值：ListNet 平移不变，专家输出可以带
+            # 任意大的常数偏置（T098 实测中位 ~10.6、atr_14 到 16），不去均值时
+            # mean_abs/rms 是偏置排行榜（cross_fund 的"25.1% 贡献"恰好=列数占比
+            # 55/219），high_contribution_weak_ic 红旗随之失真。IC 列不受影响
+            #（Spearman 平移不变），无需回算历史 CSV，但横比只能用去均值后的口径。
+            eff_c = effective - effective.mean(axis=0, keepdims=True)
+            grp_c = group_effective - group_effective.mean(axis=0, keepdims=True)
+            abs_sum += np.abs(eff_c).sum(axis=0)
+            sq_sum += (eff_c * eff_c).sum(axis=0)
+            group_abs_sum += np.abs(grp_c).sum(axis=0)
             gate_rows[di] = w_np
             rows += e - s
 

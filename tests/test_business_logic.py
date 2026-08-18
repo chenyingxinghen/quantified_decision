@@ -1,4 +1,3 @@
-import hashlib
 import os
 import tempfile
 import unittest
@@ -433,18 +432,62 @@ class FactorCacheManifestTests(unittest.TestCase):
 
 
 class ArtifactAndCacheTests(unittest.TestCase):
+    """自动化绑定的模型 / 归一化统计量 / 因子缓存三者必须自洽。
+
+    历史：这条测试原来断言 automation/ 目录下有一份与归档 SHA256 相同的
+    lightgbm pkl。那个目录后来空了，测试就一直红着——它报告的是真问题
+    （自动化没有可加载的模型），不是测试写错。2026-08-18 接入 T115 时改写成
+    「载体无关」的契约：只管**同批产出**和**面板对得上缓存**，不再写死模型族。
+    """
+
+    def _automation_paths(self):
+        return PROJECT_ROOT / AUTO_MODEL_PATH, PROJECT_ROOT / AUTO_NORM_STATS_PATH
+
     def test_automation_model_has_bound_normalization_artifact(self):
-        model_path = PROJECT_ROOT / AUTO_MODEL_PATH
-        norm_path = PROJECT_ROOT / AUTO_NORM_STATS_PATH
-        archived_model = norm_path.parent / 'lightgbm_factor_model.pkl'
-        self.assertTrue(model_path.exists())
-        self.assertTrue(norm_path.exists())
-        self.assertTrue(archived_model.exists())
+        model_path, norm_path = self._automation_paths()
+        self.assertTrue(model_path.exists(), f'AUTO_MODEL_PATH 不存在: {model_path}')
+        self.assertTrue(norm_path.exists(), f'AUTO_NORM_STATS_PATH 不存在: {norm_path}')
+        # 同批产出：权重与归一化统计量必须来自同一次训练的同一个存档目录，
+        # 否则连续列会以错误量纲进模型，而且不报错。
+        self.assertEqual(
+            model_path.parent.resolve(), norm_path.parent.resolve(),
+            '模型与 norm_stats 不在同一存档目录，无法保证同批产出',
+        )
 
-        def sha256(path):
-            return hashlib.sha256(path.read_bytes()).hexdigest()
+    def test_automation_model_panel_is_covered_by_its_bound_cache(self):
+        """模型要的每一列都必须在它绑定的缓存里真实存在。
 
-        self.assertEqual(sha256(model_path), sha256(archived_model))
+        这是接入生产的核心契约。缺列不会报错——ml_factor_strategy 会把整列
+        填成 0.5 然后照常出票。T115（224 列，含 5 个 idx_*）配旧的 219/242 列
+        缓存就是这个情形，本测试就是为了让那种配置在上线前红掉。
+        """
+        import pyarrow.parquet as pq
+        from scripts.select_stocks import (
+            load_model_feature_names, resolve_production_cache_dir,
+        )
+
+        model_path, _ = self._automation_paths()
+        if not model_path.exists():
+            self.fail(f'AUTO_MODEL_PATH 不存在: {model_path}')
+
+        features = load_model_feature_names(str(model_path))
+        self.assertTrue(features, '模型存档缺少 feature_names.json，无法校验面板')
+
+        cache_dir = resolve_production_cache_dir(str(model_path))
+        parquets = sorted(Path(cache_dir).glob('*_factors.parquet'))
+        if not parquets:
+            self.skipTest(f'绑定缓存为空（新机器尚未建缓存）: {cache_dir}')
+
+        # 列是否存在是 schema 级事实，读若干个文件的 schema 即可，不必扫全量。
+        covered = set()
+        for path in parquets[:32]:
+            covered.update(pq.read_schema(path).names)
+        missing = [c for c in features if c not in covered]
+        self.assertEqual(
+            missing, [],
+            f'绑定缓存 {cache_dir} 缺少模型所需的列 {missing[:12]}'
+            f'（这些列会被静默填成常数 0.5）',
+        )
 
     @patch('core.data.market_sentiment_calculator.MarketSentimentCalculator')
     @patch('scripts.select_stocks.MLModelTrainer')
@@ -463,6 +506,143 @@ class ArtifactAndCacheTests(unittest.TestCase):
                 workers=1,
             )
             self.assertEqual(trainer.factors_cache_dir, os.path.abspath(requested))
+
+
+class IndexRelativeFactorTests(unittest.TestCase):
+    """idx_* 的生产实现必须与当初注入训练缓存的离线脚本**逐位**一致。
+
+    这 5 列先在 scripts/build_idxrel_cache.py 里离线注入进 T115 训练缓存，
+    T115 晋级后才搬进 core/factors/index_relative_factors.py 走生产路径。
+    两份公式一旦分叉，实盘输入的分布就和训练时不同，而且没有任何报错——
+    模型照常出票，只是打分不再是它学到的那个函数。
+    """
+
+    def _series(self, n=400, seed=7):
+        rng = np.random.default_rng(seed)
+        dates = pd.bdate_range('2020-01-01', periods=n).strftime('%Y-%m-%d')
+        rm = pd.Series(rng.normal(0, 0.012, n), index=dates)
+        rb = pd.Series(rng.normal(0, 0.014, n), index=dates)
+        rs = 1.15 * rm + pd.Series(rng.normal(0, 0.018, n), index=dates)
+        return rs, rm, rb
+
+    def test_production_formula_matches_offline_injection(self):
+        from core.factors.index_relative_factors import compute_features as prod
+        from scripts.build_idxrel_cache import compute_features as offline
+
+        rs, rm, rb = self._series()
+        pd.testing.assert_frame_equal(prod(rs, rm, rb), offline(rs, rm, rb))
+
+    def test_suspension_gaps_do_not_shift_windows(self):
+        """停牌（个股日历缺日）时两条实现必须同样处理，别一个 ffill 一个不 ffill。"""
+        from core.factors.index_relative_factors import compute_features as prod
+        from scripts.build_idxrel_cache import compute_features as offline
+
+        rs, rm, rb = self._series()
+        rs = rs.drop(rs.index[100:130])          # 个股停牌 30 天
+        pd.testing.assert_frame_equal(prod(rs, rm, rb), offline(rs, rm, rb))
+
+    def test_board_mapping_covers_every_prefix(self):
+        from core.factors.index_relative_factors import board_series
+
+        idx = {
+            'sh.000001': pd.Series([0.01], index=['2020-01-02']),
+            'sz.399001': pd.Series([0.02], index=['2020-01-02']),
+            'sz.399006_padded': pd.Series([0.03], index=['2020-01-02']),
+        }
+        # 沪主板/科创 -> 上证综指；深主板 -> 深成指；创业板 -> 创业板指(回退后)
+        self.assertEqual(board_series('600000', idx).iloc[0], 0.01)
+        self.assertEqual(board_series('688001', idx).iloc[0], 0.01)
+        self.assertEqual(board_series('000001', idx).iloc[0], 0.02)
+        self.assertEqual(board_series('300750', idx).iloc[0], 0.03)
+        self.assertEqual(board_series('830799', idx).iloc[0], 0.01)   # 北交所兜底
+
+    def test_production_output_matches_training_cache(self):
+        """端到端对拍：真库 + T115 训练缓存。缓存不在（新机器）时跳过。"""
+        import pyarrow.parquet as pq
+        from config.baostock_config import DATABASE_PATH
+        from core.factors.index_relative_factors import (
+            INDEX_REL_COLUMNS, IndexRelativeFactors,
+        )
+
+        cache_dir = PROJECT_ROOT / 'database' / 'system_data' / 'factors_cache_2026-08-18-idxrel'
+        if not cache_dir.is_dir() or not os.path.exists(DATABASE_PATH):
+            self.skipTest('缺少 T115 训练缓存或行情库，跳过端到端对拍')
+
+        # 每个板块前缀各取一只：β/相对强弱的板块基准映射按前缀分支
+        picked = {}
+        for path in sorted(cache_dir.glob('*_factors.parquet')):
+            picked.setdefault(path.name[:2], path)
+        samples = [p for _, p in sorted(picked.items())][:4]
+        if not samples:
+            self.skipTest(f'训练缓存为空: {cache_dir}')
+
+        for path in samples:
+            code = path.name.split('_')[0]
+            table = pq.read_table(path, columns=['date'] + INDEX_REL_COLUMNS)
+            dates = [str(d)[:10] for d in table.column('date').to_pylist()]
+            got = IndexRelativeFactors.calculate(code, dates, DATABASE_PATH)
+            self.assertFalse(got.empty, f'{code}: 生产路径未产出 idx_*')
+            for col in INDEX_REL_COLUMNS:
+                cached = np.asarray(table.column(col).to_numpy(zero_copy_only=False))
+                np.testing.assert_array_equal(
+                    cached, got[col].to_numpy(),
+                    err_msg=f'{code}.{col} 与训练缓存不一致',
+                )
+
+
+class FactorCacheColumnGuardTests(unittest.TestCase):
+    """整列缺失必须硬失败，而不是静默填成常数 0.5。
+
+    _preload_factor_cache 对缺失列填 0.5（rank 后的中性分位）。对**个别**股票
+    缺数据这是对的；但若某列在整个缓存里都不存在，那是模型面板与缓存版本
+    对不上，模型会拿一根常数列继续打分——正是接 T115 时最容易踩的那个坑。
+    """
+
+    def _strategy(self, cache_dir, feature_names):
+        strategy = MLFactorBacktestStrategy.__new__(MLFactorBacktestStrategy)
+        strategy.model = MagicMock(feature_names=list(feature_names))
+        strategy.cache_dir = cache_dir
+        strategy.use_cache = True
+        strategy.preload_start = None
+        strategy.preload_end = None
+        strategy._active_stock_codes = set()
+        strategy._factor_dates_cache = {}
+        strategy._factor_matrix_cache = {}
+        return strategy
+
+    def _write_cache(self, cache_dir, columns):
+        os.makedirs(cache_dir, exist_ok=True)
+        for code in ('000001', '600000'):
+            frame = pd.DataFrame({'date': ['2026-08-10', '2026-08-11']})
+            for col in columns:
+                frame[col] = np.float32(0.3)
+            frame.to_parquet(os.path.join(cache_dir, f'{code}_factors.parquet'),
+                             index=False)
+
+    def test_column_missing_from_whole_cache_raises(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache_dir = os.path.join(root, 'cache')
+            self._write_cache(cache_dir, ['rsi_21', 'atr_14'])
+            strategy = self._strategy(cache_dir, ['rsi_21', 'atr_14', 'idx_beta_60'])
+            with self.assertRaisesRegex(RuntimeError, 'idx_beta_60'):
+                strategy._preload_factor_cache()
+
+    def test_complete_cache_loads_without_raising(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache_dir = os.path.join(root, 'cache')
+            self._write_cache(cache_dir, ['rsi_21', 'atr_14', 'idx_beta_60'])
+            strategy = self._strategy(cache_dir, ['rsi_21', 'atr_14', 'idx_beta_60'])
+            strategy._preload_factor_cache()
+            self.assertEqual(len(strategy._factor_matrix_cache), 2)
+
+    def test_escape_hatch_downgrades_to_warning(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache_dir = os.path.join(root, 'cache')
+            self._write_cache(cache_dir, ['rsi_21'])
+            strategy = self._strategy(cache_dir, ['rsi_21', 'idx_beta_60'])
+            with patch.dict(os.environ, {'ALLOW_MISSING_FACTOR_COLUMNS': '1'}):
+                strategy._preload_factor_cache()
+            self.assertEqual(len(strategy._factor_matrix_cache), 2)
 
 
 class PerformanceForecastSchemaTests(unittest.TestCase):

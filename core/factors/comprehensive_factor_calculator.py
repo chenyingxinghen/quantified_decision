@@ -17,6 +17,7 @@ from core.factors.fundamental_factors import FundamentalFactors, MarketSentiment
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.feature_engineering import FeatureEngineer
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
+from core.factors.index_relative_factors import IndexRelativeFactors, INDEX_REL_FILLS
 from core.factors.factor_filler import FactorFiller
 from config import DATABASE_PATH, FactorConfig, TrainingConfig
 
@@ -63,7 +64,14 @@ class ComprehensiveFactorCalculator:
             all_factors = self._apply_feature_engineering(base_factors, verbose)
         else:
             all_factors = base_factors
-            
+
+        # 2.5 指数相对因子（idx_*，族 index_rel，T115 晋级）
+        # 刻意放在特征工程**之后**：这 5 列的晋级证据只覆盖它们自身，
+        # 若并进基础因子，FE 会自动派生出一堆 idx_* 的比值/交叉项——那是一次
+        # 从未被判定过的面板变更，违反 IC 优先协议；同时会让生产缓存的 schema
+        # 与 T115 训练缓存（242 基础派生列 + 5 注入列）对不上。
+        all_factors = self._attach_index_relative(code, data, all_factors, verbose)
+
         # 3. 填充缺失因子并对齐目标特征
         # 即使计算失败或由于数据不足无法计算，也要确保列存在，且没有 NaN/Inf
         all_factors = self.filler.fill_missing_factors(all_factors, target_factors=target_features, keep_all_generated=True)
@@ -220,6 +228,41 @@ class ComprehensiveFactorCalculator:
                 
             factors = pd.concat(factors_list, axis=1)
             return factors
+
+    def _attach_index_relative(self, code: str, data: pd.DataFrame,
+                               all_factors: pd.DataFrame,
+                               verbose: bool = False) -> pd.DataFrame:
+        """
+        追加 5 列指数相对因子（idx_*）。
+
+        无 date 列时按离线脚本的老路走：补中性值而不是留空——那条分支在缓存里
+        对应「无法与指数对齐」的少数文件，值本身没有信息但列必须在，否则整批
+        缓存的 schema 会不一致。``index_daily`` 整表缺失则让列**缺席**，交给
+        下游的列完整性护栏报错，绝不静默造常数列冒充因子。
+        """
+        try:
+            if 'date' not in data.columns:
+                for col, fill in INDEX_REL_FILLS.items():
+                    all_factors[col] = np.float32(fill)
+                return all_factors
+
+            dates = data['date'].reindex(all_factors.index) \
+                if len(all_factors) != len(data) else data['date']
+            idx_factors = IndexRelativeFactors.calculate(
+                code, list(dates.values), self.db_path)
+            if idx_factors.empty:
+                if verbose:
+                    print(f"  [WARN] {code}: index_daily 不可用，idx_* 列缺席")
+                return all_factors
+            idx_factors.index = all_factors.index
+            return pd.concat([all_factors, idx_factors], axis=1)
+        except Exception as e:
+            # 与其余因子分支一致：打印后继续，缺列由下游护栏拦截，
+            # 不能因为一只票的指数对齐失败就丢掉它全部 242 列因子。
+            import traceback
+            print(f"  [ERROR] 计算指数相对因子失败 ({code}): {e}")
+            traceback.print_exc()
+            return all_factors
 
     def _apply_feature_engineering(self, base_factors: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
         """应用特征工程变换"""

@@ -60,10 +60,20 @@ CASH_BUFFER = 100
 # ==============================================================================
 
 # 自动化交易使用的模型与其训练期归一化统计量。
-# automation/lightgbm_factor_model.pkl 与下方归档模型 SHA256 完全一致；
-# 显式绑定 norm_stats，避免模型被单独复制后推理分布漂移。
-AUTO_MODEL_PATH = 'models/mark/automation/lightgbm_factor_model.pkl'
-AUTO_NORM_STATS_PATH = 'models/mark/automation/norm_stats.pkl'
+#
+# 载体：全量池纯加性 NAM（T105 终审：混合轴关闭、树头部选股已否证），
+# 面板：T115 的 224 列（219 基础 + 5 列 index_rel，2026-08-18 按族层面证据晋级）。
+#
+# 为什么是 s42 而不是 holdout IC 最高的 s37（0.1246 vs 0.1186）：**不在验证集上
+# 挑种子**。四种子同配方同数据，只有随机初始化不同，用验证 IC 选一个会把
+# 选型偏差（台账实测稳定占 12~13%）当成真实优势带进实盘。s42 是台账全程的
+# 首选种子号，与它作为基准的历史一致。
+#
+# norm_stats 必须与权重**同批产出**（同一存档目录）：归一化统计量和权重对不上
+# 会让连续列以错误量纲进模型，且不报错。策略层默认路径就是模型同目录，
+# 这里显式写出来是为了让「换模型忘了换 norm_stats」变成不可能。
+AUTO_MODEL_PATH = 'models/nam_gate/T115_idxrel_s42/nam_gate_factor_model.pkl'
+AUTO_NORM_STATS_PATH = 'models/nam_gate/T115_idxrel_s42/norm_stats.pkl'
 
 # 信号生成时使用的最低置信度阈值（百分制，0.0 表示不过滤）
 AUTO_MIN_CONFIDENCE = 0.0

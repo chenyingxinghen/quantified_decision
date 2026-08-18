@@ -182,6 +182,45 @@ def _rolling_pct_normalize(df: pd.DataFrame,
     return normed.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
+def _load_macro_m1m2_gap(db_path: Optional[str],
+                         index: pd.DatetimeIndex) -> Optional[pd.Series]:
+    """
+    M1-M2 同比剪刀差（T116 标量门终检的外生条件化信号）。
+
+    PIT 纪律：statMonth 的读数按**次月 15 日**才可见（央行金融统计数据实际
+    发布在次月 10~15 日，取保守端），可见日之前一律用上一期。月度序列在
+    日频索引上前向填充成阶梯；归一化与其余 regime 列共用滚动分位管线。
+
+    表不存在（未跑 ingest_index_and_macro.py --money）时返回 None ——
+    列整体缺席。scalar 门控按列名解析、缺列硬失败，不会静默退化。
+    """
+    db_path = db_path or DATABASE_PATH
+    meta_db = os.path.join(os.path.dirname(db_path), 'stock_meta.db')
+    if not os.path.exists(meta_db):
+        return None
+    conn = sqlite3.connect(meta_db, timeout=30)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='macro_money_supply'")
+        if not cur.fetchone():
+            return None
+        df = pd.read_sql_query(
+            'SELECT statMonth, m1YOY, m2YOY FROM macro_money_supply '
+            'WHERE m1YOY IS NOT NULL AND m2YOY IS NOT NULL '
+            'ORDER BY statMonth ASC', conn)
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    stat = pd.to_datetime(df['statMonth'], format='%Y-%m')
+    visible = stat + pd.offsets.MonthBegin(1) + pd.Timedelta(days=14)
+    gap = pd.Series((df['m1YOY'] - df['m2YOY']).to_numpy(dtype=np.float64),
+                    index=pd.DatetimeIndex(visible)).sort_index()
+    gap = gap[~gap.index.duplicated(keep='last')]
+    return gap.reindex(gap.index.union(index)).ffill().reindex(index)
+
+
 # ---------------------------------------------------------------------------
 # 对外主接口
 # ---------------------------------------------------------------------------
@@ -212,6 +251,11 @@ def build_regime_matrix(db_path: Optional[str] = None,
         return pd.DataFrame()
 
     raw = _build_raw_regime(sent)
+    # T116：外生宏观列（M1-M2 剪刀差，已按发布日 PIT 对齐）。放在归一化之前，
+    # 与内生列共用同一滚动分位管线；表未落库时列缺席（不填 0 假列）。
+    _gap = _load_macro_m1m2_gap(db_path, raw.index)
+    if _gap is not None:
+        raw['macro_m1m2_gap'] = _gap
     if lag_days > 0:
         raw = raw.shift(lag_days)
 

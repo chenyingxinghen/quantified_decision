@@ -51,6 +51,7 @@ FACTOR_GROUPS: List[str] = [
     'status',         # 状态位/标的属性
     'indrel',         # 行业内相对位置（``*__ind``，见 E7）
     'forecast',       # 业绩预告（``fc_*``，见 T089/T090 = E18）
+    'index_rel',      # 指数相对（``idx_*``：β/相对强弱/特异波动，见 T115）
     'other',          # 未匹配兜底
 ]
 
@@ -168,6 +169,11 @@ def assign_group(name: str) -> str:
     # `_log`，落到关键词兜底会被误分。
     if name.startswith('fc_'):
         return 'forecast'
+    # T115：指数相对特征（``idx_*``）。真实指数是面板里第一批**非池内派生**的
+    # 价格信息（β、板块相对强弱、特异波动），经济行为与个股动量/波动族不同，
+    # 独立成族。必须在关键词兜底之前——``idx_idio_vol_20`` 含 ``vol_`` 会被误分。
+    if name.startswith('idx_'):
+        return 'index_rel'
     if _RE_CROSS_FUND.search(name):
         return 'cross_fund'
     if _RE_CROSS_TECH.search(name):

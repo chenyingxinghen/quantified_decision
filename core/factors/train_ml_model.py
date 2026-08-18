@@ -966,17 +966,13 @@ class MLModelTrainer:
                 )
                 atr_rel = atr_raw / (close + 1e-6)
 
-                # 涨跌停阈值计算
-                limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
-                if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
-                    limit_thresholds[:] = MARKET_LIMITS['gem_star']
-                elif code.startswith(MARKET_PREFIXES['bj']):
-                    limit_thresholds[:] = MARKET_LIMITS['bj']
-                
-                if 'is_st' in data.columns:
-                    is_main_board = ~(code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']) or code.startswith(MARKET_PREFIXES['bj']))
-                    if is_main_board:
-                        limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
+                # 涨跌停阈值：默认静态查表；开关打开时用实测历史表
+                # （限额随规则变更，静态表会误判一字涨停 → 样本剔除错误）
+                from core.factors.price_limits import resolve_or_static
+                limit_thresholds = resolve_or_static(
+                    code, data['date'] if 'date' in data.columns else data.index,
+                    data['is_st'] if 'is_st' in data.columns else None,
+                    getattr(TrainingConfig, 'USE_EMPIRICAL_PRICE_LIMITS', False))
 
                 # 不可买入判定 (T+1日一字涨停或停牌，即预测生成后的执行日能否买入)
                 epsilon = 0.002
@@ -1124,16 +1120,11 @@ class MLModelTrainer:
             )
             atr_rel = atr_raw / (close + 1e-6)
 
-            limit_thresholds = np.full(len(data), MARKET_LIMITS['main'], dtype=np.float32)
-            if code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']):
-                limit_thresholds[:] = MARKET_LIMITS['gem_star']
-            elif code.startswith(MARKET_PREFIXES['bj']):
-                limit_thresholds[:] = MARKET_LIMITS['bj']
-
-            if 'is_st' in data.columns:
-                is_main_board = ~(code.startswith(MARKET_PREFIXES['sz_gem']) or code.startswith(MARKET_PREFIXES['star']) or code.startswith(MARKET_PREFIXES['bj']))
-                if is_main_board:
-                    limit_thresholds[data['is_st'] == 1] = MARKET_LIMITS['st']
+            from core.factors.price_limits import resolve_or_static
+            limit_thresholds = resolve_or_static(
+                code, data['date'] if 'date' in data.columns else data.index,
+                data['is_st'] if 'is_st' in data.columns else None,
+                getattr(TrainingConfig, 'USE_EMPIRICAL_PRICE_LIMITS', False))
 
             epsilon = 0.002
             t_plus_1_preclose = data['close'].values

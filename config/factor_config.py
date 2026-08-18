@@ -243,8 +243,16 @@ class TrainingConfig:
     # 退市预警处理
     DELIST_PENALTY_DAYS  = 60      
     DELIST_PENALTY_SCORE = -100      # 退市样本直接给最低分
-    UNBUYABLE_HANDLING   = 'remove'  
+    UNBUYABLE_HANDLING   = 'remove'
     UNBUYABLE_PENALTY_SCORE = 0.0  # 次日无法成交的样本强制进入当日最低标签档
+
+    # 涨跌停限额取值方式（2026-08-18）
+    #   False = 静态 config.MARKET_LIMITS（按代码前缀查表，无时间维度，历史口径）
+    #   True  = 从 price_limit_history 表实测查表（随规则变更自动跟随）
+    # **默认 False**：打开会改变 T+1 一字涨停判定 ⇒ 样本剔除结果变化 ⇒ 新结果与
+    # T113/T115 基线不可配对。等下次本就要重建基线时再开。
+    # 表由 scripts/build_price_limit_history.py 生成；缺表时自动回退静态值并告警。
+    USE_EMPIRICAL_PRICE_LIMITS = False
     
         
 

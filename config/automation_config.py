@@ -75,6 +75,24 @@ CASH_BUFFER = 100
 AUTO_MODEL_PATH = 'models/nam_gate/T115_idxrel_s42/nam_gate_factor_model.pkl'
 AUTO_NORM_STATS_PATH = 'models/nam_gate/T115_idxrel_s42/norm_stats.pkl'
 
+# 可选：多种子**等权集成**载体。非空时策略层把 AUTO_MODEL_PATH 与这里的每个存档
+# 都加载，逐日各自算截面分位排名后**等权平均**（口径与 xgb+lgb 集成一致，
+# 见 core/backtest/strategies/ml_factor_strategy.py 的 ensemble_models 分支）。
+#
+# ⚠ 当前**留空 = 不启用**。T131 实测在两个窗口上不一致：
+#     T115 窗（13y→2022-09-05, 161 holdout 日）：集成 IC +0.12791，赢最幸运种子 +0.00327
+#     T122 窗（ 9y→2026-08-10, 145 holdout 日）：集成 IC +0.06230，**输**最幸运种子 −0.00173
+#                                              且跌日否决门不过（vs 在跑种子 −0.01429）
+#   预注册判据是「必须赢最幸运的那个单种子（线 +0.005）」—— 两窗都不过，故不晋级。
+#   成立的只有较弱的那条：集成稳定赢**随机抽一个种子的期望值**（+0.0078 / +0.0042），
+#   且抽签风险很大（T122 窗单种子头部超额 −0.0045~+0.0034，**符号都会翻**）。
+#   所以这是个「降方差」选项而非「更强」选项，要不要用是**取舍**，不是 IC 结论。
+#
+# 启用时必须同批产出：所有成员同窗口、同超参、同面板，只差随机种子；
+# 策略层会硬校验 feature_names 顺序一致。norm_stats 仍取 AUTO_NORM_STATS_PATH
+# （同配方同窗训练出的归一化统计量在种子间相同，只是权重不同）。
+AUTO_ENSEMBLE_MODEL_PATHS: list = []
+
 # 信号生成时使用的最低置信度阈值（百分制，0.0 表示不过滤）
 AUTO_MIN_CONFIDENCE = 0.0
 

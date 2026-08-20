@@ -136,7 +136,8 @@ def get_latest_signals() -> List[Dict]:
     """
     获取今日信号。直接复用 MLFactorBacktestStrategy，保证与回测逻辑完全一致。
     """
-    from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH, AUTO_TOP_N
+    from config.automation_config import (AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH,
+                                         AUTO_TOP_N, AUTO_ENSEMBLE_MODEL_PATHS)
     from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
     from config.baostock_config import DATABASE_PATH
     from scripts.select_stocks import (
@@ -170,11 +171,15 @@ def get_latest_signals() -> List[Dict]:
         logger.warning(f"因子缓存更新失败，将使用旧缓存继续: {e}", exc_info=True)
 
     try:
+        if AUTO_ENSEMBLE_MODEL_PATHS:
+            logger.info(f"  等权集成: {1 + len(AUTO_ENSEMBLE_MODEL_PATHS)} 个成员"
+                        f"（逐日截面分位后平均）")
         strategy = MLFactorBacktestStrategy(
             model_path=AUTO_MODEL_PATH,
             min_confidence=AUTO_MIN_CONFIDENCE,
             cache_dir=cache_dir,
             norm_stats_path=AUTO_NORM_STATS_PATH,
+            ensemble_model_paths=list(AUTO_ENSEMBLE_MODEL_PATHS),
         )
         strategy.initialize()
 

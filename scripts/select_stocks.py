@@ -40,7 +40,8 @@ from config.strategy_config import (
     ML_FACTOR_RISK_MIN_PRICE,
     ML_FACTOR_RISK_EXCLUDE_ST,
 )
-from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH
+from config.automation_config import (AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH,
+                                     AUTO_ENSEMBLE_MODEL_PATHS)
 from core.factors.ml_factor_model import MLFactorModel
 from core.factors.train_ml_model import MLModelTrainer
 warnings.filterwarnings('ignore')
@@ -334,6 +335,7 @@ def _update_factor_cache_incremental(db_path: str, codes: List[str], cache_dir: 
 def select_stocks(
     model_path: str = DEFAULT_MODEL_PATH,
     norm_stats_path: Optional[str] = None,
+    ensemble_model_paths: Optional[List[str]] = None,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     top_n: int = DEFAULT_TOP_N,
     apply_filter: bool = False,
@@ -359,6 +361,12 @@ def select_stocks(
 
     参数:
         model_path:      训练好的模型文件路径
+        norm_stats_path: 归一化统计量路径；None 且 model_path == AUTO_MODEL_PATH 时
+                         回退到 AUTO_NORM_STATS_PATH
+        ensemble_model_paths: 多种子等权集成的**其余**成员（model_path 自身已算一个）。
+                         None 时若 model_path 就是 AUTO_MODEL_PATH，回退到
+                         AUTO_ENSEMBLE_MODEL_PATHS。策略层逐成员算截面分位后等权平均，
+                         并硬校验 feature_names 顺序一致。
         min_confidence:  最小置信度阈值（百分制）
         top_n:           输出前 N 只股票
         apply_filter:    是否使用基础条件预筛选（后端必须显式传入）
@@ -395,6 +403,21 @@ def select_stocks(
     if norm_stats_path and not os.path.isabs(norm_stats_path):
         norm_stats_path = os.path.join(PROJECT_ROOT, norm_stats_path)
 
+    # 集成成员：与 norm_stats 同一条回退规则 —— 只有在跑的确实是生产载体时才套用
+    # 生产配置，避免用 --model 指定别的存档时被 AUTO_ 配置意外污染。
+    if ensemble_model_paths is None:
+        auto_model_abs = os.path.abspath(os.path.join(PROJECT_ROOT, AUTO_MODEL_PATH))
+        if os.path.abspath(model_path) == auto_model_abs:
+            ensemble_model_paths = list(AUTO_ENSEMBLE_MODEL_PATHS)
+    ensemble_model_paths = [
+        p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+        for p in (ensemble_model_paths or [])
+    ]
+    for _p in ensemble_model_paths:
+        if not os.path.exists(_p):
+            print(f"❌ 集成成员不存在: {_p}")
+            return []
+
     # 因子缓存：未显式指定时按模型绑定清单解析，保证喂进模型的面板和它训练时
     # 用的那一份是同一个公式版本（缺列/错版会在策略 initialize 里硬失败）。
     model_features = load_model_feature_names(model_path)
@@ -410,6 +433,10 @@ def select_stocks(
     print(f" 最低置信度: {min_confidence:.1f}% | top_n: {top_n}")
     print(f" 模型: {os.path.relpath(model_path, PROJECT_ROOT)}"
           f"{f' ({len(model_features)} 列)' if model_features else ''}")
+    if ensemble_model_paths:
+        print(f" 等权集成: {1 + len(ensemble_model_paths)} 个成员（截面分位后平均）")
+        for _p in ensemble_model_paths:
+            print(f"    + {os.path.relpath(_p, PROJECT_ROOT)}")
     print(f" 因子缓存: {cache_dir}")
 
     # ------------------------------------------------------------------
@@ -467,6 +494,7 @@ def select_stocks(
         min_confidence=min_confidence,
         cache_dir=cache_dir,
         norm_stats_path=norm_stats_path,
+        ensemble_model_paths=ensemble_model_paths,
         risk_min_price=effective_risk_min_price,
         risk_exclude_st=effective_risk_exclude_st,
     )

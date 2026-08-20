@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 
-from config.automation_config import AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH
+from config.automation_config import (AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH,
+                                     AUTO_ENSEMBLE_MODEL_PATHS)
 from core.backtest.baostock_data_handler import _prepare_adjusted_stock_data
 from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
 from core.exit_rules import evaluate_exit
@@ -453,6 +454,51 @@ class ArtifactAndCacheTests(unittest.TestCase):
             model_path.parent.resolve(), norm_path.parent.resolve(),
             '模型与 norm_stats 不在同一存档目录，无法保证同批产出',
         )
+
+    def test_automation_ensemble_members_are_same_batch(self):
+        """多种子集成成员必须与主模型**同批产出**：同面板、同缓存版本、同族划分。
+
+        留空（当前默认）时直接通过 —— 集成是可选项，不是契约。
+        非空时校验三件会静默出错的事：
+          1. feature_names 顺序完全一致。策略层也校验，但那是运行时；
+             这里让它在上线前红掉。
+          2. 绑定的因子缓存目录一致。成员各自带 factor_cache_manifest.json，
+             指向不同缓存版本时，同一天的同一只票会拿到两套不同口径的面板，
+             平均出来的排名没有意义，且**不会报错**。
+          3. 成员之间不重复、且不等于主模型 —— 重复成员等于给某个种子加权，
+             而 [[ensemble-beats-single]] 已证伪按权重加权（w=0.7 回测证伪），
+             口径必须是严格等权。
+        """
+        from scripts.select_stocks import (
+            load_model_feature_names, resolve_production_cache_dir,
+        )
+
+        if not AUTO_ENSEMBLE_MODEL_PATHS:
+            self.skipTest('AUTO_ENSEMBLE_MODEL_PATHS 为空 —— 未启用等权集成')
+
+        main_path, _ = self._automation_paths()
+        self.assertTrue(main_path.exists(), f'AUTO_MODEL_PATH 不存在: {main_path}')
+        main_feats = load_model_feature_names(str(main_path))
+        self.assertTrue(main_feats, '主模型缺少 feature_names.json')
+        main_cache = Path(resolve_production_cache_dir(str(main_path))).resolve()
+
+        seen = {main_path.resolve()}
+        for rel in AUTO_ENSEMBLE_MODEL_PATHS:
+            p = (PROJECT_ROOT / rel).resolve()
+            self.assertTrue(p.exists(), f'集成成员不存在: {p}')
+            self.assertNotIn(p, seen, f'集成成员重复（等权口径被破坏）: {p}')
+            seen.add(p)
+
+            feats = load_model_feature_names(str(p))
+            self.assertTrue(feats, f'集成成员缺少 feature_names.json: {p}')
+            self.assertEqual(list(feats), list(main_feats),
+                             f'集成成员面板与主模型不一致: {p}')
+
+            self.assertEqual(Path(resolve_production_cache_dir(str(p))).resolve(), main_cache,
+                             f'集成成员绑定的因子缓存版本与主模型不同: {p}')
+
+            self.assertTrue((p.parent / 'norm_stats.pkl').exists(),
+                            f'集成成员缺少同批 norm_stats.pkl: {p}')
 
     def test_automation_model_panel_is_covered_by_its_bound_cache(self):
         """模型要的每一列都必须在它绑定的缓存里真实存在。

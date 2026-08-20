@@ -175,19 +175,37 @@ class NAMGateNet(_Module):
                  d_regime: int, expert_hidden: int = 16,
                  gate_hidden: Sequence[int] = (64, 32),
                  gate_mode: str = 'softmax', expert_dropout: float = 0.0,
-                 disable_gate: bool = False, gate_scalar_idx: int = 0):
+                 disable_gate: bool = False, gate_scalar_idx: int = 0,
+                 group_norm: bool = False):
         super().__init__()
         self.experts = FactorExpertBank(n_factors, expert_hidden, expert_dropout)
         self.gate = RegimeGate(d_regime, n_groups, gate_hidden, mode=gate_mode,
                                scalar_idx=gate_scalar_idx)
         self.n_groups = n_groups
         self.disable_gate = bool(disable_gate)
+        # T119：族输出截面标准化。动机是乘积 w_k·S_k 在 (w_k→c·w_k, S_k→S_k/c) 下不变
+        # ⇒ 损失曲面有平坦方向 ⇒ 猜测门控权重会沿它随噪声漂移。标准化把 f 的幅度锁死，
+        # 门控只能调"方向/相对重要性"，无法被专家吸收。
+        # ⛔ 该动机已被 T119 自己证伪：锁死平坦方向后，门学到的敏感度向量 a 与不锁时
+        #    **逐种子余弦 +0.991~+1.000**，门控行为分毫不动 ⇒ 平坦方向不是成因。
+        #    开关保留只为复现台账里的 T119/T125 臂，**生产恒为 --disable-gate**，两条路径
+        #    逐位相同。真实成因见台账 T127（|a_k| ∝ n_k^−1.45，权重分配由族边界决定），机制未查明。
+        # 减均值本身无副作用：ListNet 按日 softmax 平移不变。
+        # 仅作用于门控通路；--disable-gate 时不启用，保证纯加性基线逐位不变。
+        self.group_norm = bool(group_norm)
         self.register_buffer('group_ids', torch.as_tensor(group_ids, dtype=torch.long))
         # one-hot 分组矩阵 [N, K]，用矩阵乘做分组求和（比 scatter_add 更快且可导）
         onehot = torch.zeros(n_factors, n_groups)
         onehot[torch.arange(n_factors), torch.as_tensor(group_ids, dtype=torch.long)] = 1.0
         self.register_buffer('group_onehot', onehot)
         self.bias = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _std_groups(group_sums: "torch.Tensor") -> "torch.Tensor":
+        """按当日截面对每族求和做标准化（batch 维即一个交易日的全部股票）。"""
+        mu = group_sums.mean(dim=0, keepdim=True)
+        sd = group_sums.std(dim=0, unbiased=False, keepdim=True)
+        return (group_sums - mu) / (sd + 1e-6)
 
     def forward(self, x: "torch.Tensor", m: "torch.Tensor", temperature: float = 1.0):
         """
@@ -202,7 +220,8 @@ class NAMGateNet(_Module):
             score = group_sums.sum(dim=-1) + self.bias
             return score, w, group_sums
         w = self.gate(m, temperature)                   # [B, K]
-        score = (group_sums * w).sum(dim=-1) + self.bias
+        gs = self._std_groups(group_sums) if self.group_norm else group_sums
+        score = (gs * w).sum(dim=-1) + self.bias
         return score, w, group_sums
 
     def forward_day(self, x: "torch.Tensor", m_row: "torch.Tensor", temperature: float = 1.0):
@@ -219,7 +238,8 @@ class NAMGateNet(_Module):
             score = group_sums.sum(dim=-1) + self.bias
             return score, w, group_sums
         w = self.gate(m_row.unsqueeze(0), temperature)   # [1, K]
-        score = (group_sums * w).sum(dim=-1) + self.bias
+        gs = self._std_groups(group_sums) if self.group_norm else group_sums
+        score = (gs * w).sum(dim=-1) + self.bias
         return score, w.squeeze(0), group_sums
 
 
@@ -338,7 +358,7 @@ class NAMGateModel:
         return device
 
     def build(self, d_regime: int, expert_dropout: float = 0.0,
-               disable_gate: bool = False) -> NAMGateNet:
+               disable_gate: bool = False, group_norm: bool = False) -> NAMGateNet:
         if not _TORCH_OK:
             raise RuntimeError('PyTorch 未安装，无法构建 NAMGateModel')
         n_factors = len(self.feature_names)
@@ -357,8 +377,9 @@ class NAMGateModel:
             d_regime=d_regime, expert_hidden=self.expert_hidden,
             gate_hidden=self.gate_hidden, gate_mode=self.gate_mode,
             expert_dropout=expert_dropout, disable_gate=disable_gate,
-            gate_scalar_idx=scalar_idx,
+            gate_scalar_idx=scalar_idx, group_norm=group_norm,
         ).to(self.device)
+        self.group_norm = bool(group_norm)
         return self.net
 
     def set_context_date(self, date) -> None:
@@ -522,6 +543,7 @@ class NAMGateModel:
             'gate_mode': self.gate_mode,
             'gate_scalar_col': getattr(self, 'gate_scalar_col', 'vol_expand'),
             'disable_gate': bool(getattr(self, 'disable_gate', False)),
+            'group_norm': bool(getattr(self, 'group_norm', False)),
             'feature_importance': self.feature_importance,
             'is_trained': self.is_trained,
             'input_mean': self.input_mean,
@@ -547,6 +569,7 @@ class NAMGateModel:
         self.gate_mode = payload['gate_mode']
         self.gate_scalar_col = str(payload.get('gate_scalar_col', 'vol_expand'))
         self.disable_gate = bool(payload.get('disable_gate', False))
+        self.group_norm = bool(payload.get('group_norm', False))
         self.feature_importance = payload.get('feature_importance', {})
         self.input_mean = payload.get('input_mean')
         self.input_std = payload.get('input_std')
@@ -554,7 +577,8 @@ class NAMGateModel:
         self.is_trained = payload.get('is_trained', False)
 
         if payload.get('state_dict') is not None:
-            self.build(d_regime=len(self.regime_cols), disable_gate=self.disable_gate)
+            self.build(d_regime=len(self.regime_cols), disable_gate=self.disable_gate,
+                       group_norm=self.group_norm)
             self.net.load_state_dict(payload['state_dict'])
             self.net.to(self.device).eval()
         return self

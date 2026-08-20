@@ -92,3 +92,36 @@
   - T106_lb001_s23
   - T106_lb001_s37
   - T106_lb001_s42
+
+# ============================================================================
+# 2026-08-20 清理（门控轴终局封口后）
+# ============================================================================
+
+## 族输出缓存 npz（2.0 GB）—— **确定性派生物，可由冻结存档 + 因子缓存重算**
+  重算命令各写在脚本 docstring 里，约 20~25 分钟一份：
+  - T130_groupsums.npz        1.69 GB  scripts/exp/diag_head_regime_reliability.py
+      （4 个 T115_idxrel 专家 × 13y→2022-09-05 的 S_tr/S_va）
+      删除依据：T130 结论已入台账 + memory，头部/门控两轴均已封口；
+      且 T133 的判定走 diag_seed_ensemble.py，键名不同，用不上这份。
+  - T131_t122_groupsums.npz   349 MB   scripts/exp/diag_seed_ensemble.py
+      （4 个 T122_prod9y × 9y→2026-08-10 的 S_va）
+      删除依据：T131 判定为「不晋级」已归档；T122 预期被 T132 取代。
+  ⚠ 若要复核 T130/T131 的数字，重跑脚本即可，**不要**从台账数字反推。
+
+## 已关轴的训练诊断图表目录（12.8 MB，21 个）
+  内容均为 shape_functions.png / gate_heatmap.png / group_effectiveness.csv 等
+  逐存档诊断产物；所在轴已永久关闭，结论全部已入台账。
+  - nam_gate_T106_lb001{,_s11,_s23,_s37}   λ_lb 轴（生产恒为 --lambda-lb 0）
+  - nam_gate_T110_fp16_s11                 fp16 等价性检验（已通过，fp16 现为默认）
+  - nam_gate_T116_s{11,23,37,42}           外生宏观标量门
+  - nam_gate_T118_s{11,23,37,42}           数据驱动簇
+  - nam_gate_T119_s{11,23,37,42}           group-norm（其 group_effectiveness.csv
+                                           本就是贡献口径修复**前**的产物，台账已标注）
+  - nam_gate_T125_s{11,23,37,42}           簇 + group-norm 合并（2×2 最后一格）
+  保留：T113（T120 回测基线）、T114（瘦身轴对照）、T115（生产件）、T122（候选）。
+
+## 台账精简（TRAINING_ITERATIONS.md）
+  只删**过期脚手架**，判定与陷阱一条不动。被替换成一行指针的是：
+  已完成的「进行中」状态块、被后续轮次推翻/更正的声明、已过期的下一轮预注册、
+  以及三次仓库整理记录。全文在 git 里，恢复命令：
+    git show ccf2032:TRAINING_ITERATIONS.md > /tmp/ledger_full.md

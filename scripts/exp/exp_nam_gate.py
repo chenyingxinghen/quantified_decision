@@ -24,6 +24,7 @@ T027–T038 证明生产 XGBoost LambdaRank 的头部瓶颈是"弱绝对信号 +
 """
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -522,6 +523,119 @@ def _regime_stratified_metrics(pred: np.ndarray, ret: np.ndarray, dates: np.ndar
 # 训练
 # ---------------------------------------------------------------------------
 
+class _DayBatchLoader:
+    """DataLoader 形式的「逐交易日 / 逐块」取数器（2026-08-19）。
+
+    为什么需要它
+    ------------
+    T109 把特征整表搬进显存换来 12.5x 提速，但代价是**窗口长度被显存钉死**：
+    本机 6.00 GiB 显存下 fp16 224 列只能吃约 9.6M 样本（9 年窗），13 年窗
+    (12.1M / 5.05 GiB) 加上 1.7 GiB 的权重+激活+optimizer 就会超配 ——
+    而 Windows 驱动**不报 OOM**，它静默页到主机内存，于是回到 12.5x 慢的老路。
+    本类把「整表驻留」换成「批取数」：特征可以留在 pinned 主机内存里，
+    每个 step 只把当前这一块搬上去，显存占用与窗口长度**解耦**。
+
+    为什么不用 torch.utils.data.DataLoader + num_workers>0
+    ---------------------------------------------------------
+    特征是一整块 10+ GiB 的常驻张量。Windows 用 spawn 起 worker，会把它 pickle
+    一遍再传给子进程 —— 代价远大于收益。所以这里是 num_workers=0 的语义，
+    但保留 DataLoader 的两个关键特性：**批组装**与**预取**（用独立 CUDA stream
+    把 H2D 传输藏在当前块的计算后面）。
+
+    速度预期（别期待加速）
+    ----------------------
+    每个交易日约 4700 行 × 224 列 × 2B ≈ 2.1 MB，pinned H2D 约 12 GB/s ⇒ 0.18 ms；
+    而一个 chunk 的前向+反向是 ~15 ms。所以纯传输开销约 1%，开预取后接近 0。
+    **本类的价值是拿掉容量天花板，不是提速**。
+    ``device='cuda'`` 时退化为零拷贝切片，与 T109~T122 的行为逐位一致。
+    """
+
+    def __init__(self, store, y, M, day_slices, dev, chunk_days=1,
+                 prefetch=True, min_rows=5):
+        self.store = store              # [N, F] 张量，cuda 或 pinned cpu
+        self.y = y                      # [N] cuda
+        self.M = M                      # [D, d_m] cuda（逐日 regime，已按日取首行）
+        self.days = day_slices
+        self.dev = dev
+        self.chunk_days = max(1, int(chunk_days))
+        self.min_rows = min_rows
+        self.on_gpu = store.device.type == dev.type and store.device.type == 'cuda'
+        self.prefetch = bool(prefetch) and not self.on_gpu and dev.type == 'cuda'
+        self.stream = torch.cuda.Stream() if self.prefetch else None
+
+    def _rows(self, s, e):
+        """取 [s,e) 行并放到计算设备上（GPU 驻留时零拷贝）。"""
+        blk = self.store[s:e]
+        return blk if self.on_gpu else blk.to(self.dev, non_blocking=True)
+
+    # ── 逐日路径 ─────────────────────────────────────────────────────────
+    def iter_days(self, order):
+        """yield (di, x_fp32, y_slice, is_last)。x 已升 fp32（fp16 驻留时逐日升精度）。"""
+        idx = [int(d) for d in order
+               if (self.days[int(d)][1] - self.days[int(d)][0]) >= self.min_rows]
+        yield from self._pipelined(idx, self._make_day)
+
+    def _make_day(self, di):
+        s, e = self.days[di]
+        return (di, self._rows(s, e).float(), self.y[s:e])
+
+    # ── 分块路径（chunk_days>1）────────────────────────────────────────────
+    def iter_chunks(self, order):
+        """yield (blk, Xb, yb, mask, is_last)，语义与原地组装一致（补位被 mask 掉）。"""
+        valid = [int(d) for d in order
+                 if (self.days[int(d)][1] - self.days[int(d)][0]) >= self.min_rows]
+        groups = [valid[c0:c0 + self.chunk_days]
+                  for c0 in range(0, len(valid), self.chunk_days)]
+        yield from self._pipelined(groups, self._make_chunk)
+
+    def _make_chunk(self, blk):
+        C = len(blk)
+        L = max(self.days[d][1] - self.days[d][0] for d in blk)
+        F = self.store.shape[1]
+        Xb = torch.zeros((C, L, F), dtype=torch.float32, device=self.dev)
+        yb = self.y.new_zeros((C, L))
+        mask = torch.zeros((C, L), dtype=torch.bool, device=self.dev)
+        for i, d in enumerate(blk):
+            s, e = self.days[d]
+            Xb[i, :e - s] = self._rows(s, e)
+            yb[i, :e - s] = self.y[s:e]
+            mask[i, :e - s] = True
+        return (blk, Xb, yb, mask)
+
+    # ── 深度 1 的预取流水线 ───────────────────────────────────────────────
+    def _pipelined(self, items, make):
+        """惰性产出，并在独立 stream 上预建**下一**批；消费前 wait_stream 保序。
+
+        产出元组末位追加 is_last，供调用方做末尾梯度 flush —— 调用方不该自己
+        len() 整个序列（那会把所有批一次性建出来，显存瞬间爆掉）。
+        GPU 驻留或非 cuda 时退化为直接构造：无 stream、无额外同步、零拷贝。
+        """
+        n = len(items)
+        if not self.prefetch:
+            for i, it in enumerate(items):
+                yield make(it) + (i == n - 1,)
+            return
+        nxt = None
+        for i, it in enumerate(items):
+            if nxt is None:
+                with torch.cuda.stream(self.stream):
+                    nxt = make(it)
+            cur, nxt = nxt, None
+            if i + 1 < n:
+                with torch.cuda.stream(self.stream):
+                    nxt = make(items[i + 1])
+            cs = torch.cuda.current_stream()
+            cs.wait_stream(self.stream)
+            # 必须 record_stream：cur 里的张量是在 self.stream 上分配的，caching
+            # allocator 只跟踪「分配流」的生命周期。不登记消费流的话，本批张量一旦
+            # 在 self.stream 看来空闲，就可能被下一批的分配复用 —— 而默认流上的
+            # 前向可能还没读完，表现为**偶发的脏数据**（无报错、只是结果不对）。
+            for t in cur:
+                if torch.is_tensor(t) and t.is_cuda:
+                    t.record_stream(cs)
+            yield cur + (i == n - 1,)
+
+
 def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                    epochs=60, lr=2e-3, weight_decay=1e-5,
                    lambda_lb=0.01, lambda_ent=0.0, lambda_div=0.0, ema_momentum=0.02,
@@ -531,7 +645,8 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                    warmup_epochs=5, temp_start=2.0, patience=12, min_epochs=20, seed=42,
                    device='auto', verbose=True, disable_gate=False,
                    select_metric='rank_ic', select_topk=20, time_decay_years=0.0,
-                   select_holdout=0.0, chunk_days=1, store_dtype='auto'):
+                   select_holdout=0.0, chunk_days=1, store_dtype='auto', group_norm=False,
+                   store_device='auto', prefetch=True):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -573,22 +688,56 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
     else:
         _fp16 = store_dtype == 'fp16'
     store_dt = torch.float16 if _fp16 else torch.float32
+    _bytes_store = _bytes_fp32 // (2 if _fp16 else 1)
+
+    # ── 驻留设备（2026-08-19）：显存装不下时改走「主机驻留 + 批取数」──────────
+    # auto 的判据是 0.68×显存：实测 T122（9 年窗）特征 3.95 GiB + 非特征开销
+    # 1.70 GiB = 5.65 / 6.00 GiB，即非特征部分约占 28%，所以留 32% 余量。
+    # 旧配方全部落在 cuda 分支（9y 66%、13y/2022 62%），行为逐位不变。
+    # 关键：**auto 以前没有逃生口** —— fp16 仍超配时只能任驱动静默分页（12.5x 慢），
+    # 现在会自动降为主机驻留，代价只有约 1% 的 PCIe 传输（还能被预取藏掉）。
+    _store_dev = dev
+    if dev.type == 'cuda':
+        if store_device == 'host':
+            _store_dev = torch.device('cpu')
+        elif store_device == 'auto' and _bytes_store > 0.68 * _vram:
+            _store_dev = torch.device('cpu')
     if verbose and dev.type == 'cuda':
         print(f"  特征驻留: {'fp16' if _fp16 else 'fp32'} "
-              f"{_bytes_fp32 / 2 ** 30 / (2 if _fp16 else 1):.2f} GiB "
+              f"{_bytes_store / 2 ** 30:.2f} GiB "
               f"/ 显存 {_vram / 2 ** 30:.2f} GiB"
               + ("（fp32 需 %.2f GiB > 85%% 显存，自动降为 fp16 以避免 sysmem 分页）"
                  % (_bytes_fp32 / 2 ** 30) if _fp16 and store_dtype == 'auto' else ''))
+        if _store_dev.type == 'cpu':
+            _why = ('由 --store-device host 显式指定' if store_device == 'host'
+                    else f'{_bytes_store / 2 ** 30:.2f} GiB 超过 0.68×显存 '
+                         f'{0.68 * _vram / 2 ** 30:.2f} GiB，auto 转主机驻留以免驱动静默分页')
+            print(f"  → **主机驻留 + DataLoader 批取数**（{_why}），"
+                  f"预取={'开' if prefetch else '关'}")
 
     _mean32, _std32 = mean.astype(np.float32), std.astype(np.float32)
 
     def _to_gpu(a):
-        """分块归一化并上传 —— 整表 (a-mean)/std 会在主机侧再吃一份 5.93 GiB。"""
-        out = torch.empty((len(a), a.shape[1]), dtype=store_dt, device=dev)
+        """分块归一化并落到驻留设备 —— 整表 (a-mean)/std 会在主机侧再吃一份 5.93 GiB。
+
+        主机驻留时用 pinned 内存：非 pinned 的 H2D 要先在驱动里过一次中转缓冲，
+        且无法与计算重叠（`non_blocking` 失效）。pin 失败（内存不足/系统限制）
+        则退回普通内存，只是慢一点，不影响正确性。
+        """
+        pin = _store_dev.type == 'cpu'
+        try:
+            out = torch.empty((len(a), a.shape[1]), dtype=store_dt,
+                              device=_store_dev, pin_memory=pin)
+        except RuntimeError as _e:
+            if not pin:
+                raise
+            print(f"  [警告] pinned 内存分配失败（{_e}），退回普通主机内存："
+                  f"H2D 无法与计算重叠，会比预期慢")
+            out = torch.empty((len(a), a.shape[1]), dtype=store_dt, device=_store_dev)
         step = 1 << 19
         for s in range(0, len(a), step):
             blk = (np.asarray(a[s:s + step], dtype=np.float32) - _mean32) / _std32
-            out[s:s + step] = torch.from_numpy(blk).to(dev, dtype=store_dt)
+            out[s:s + step] = torch.from_numpy(blk).to(_store_dev, dtype=store_dt)
         return out
 
     Xtr = _to_gpu(Xtr_np)
@@ -638,7 +787,17 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
     Mva = torch.as_tensor(np.stack([fold['M_val'][s] for s, _ in va_days]),
                           dtype=torch.float32, device=dev)
 
-    net = model.build(d_regime=Mtr.shape[1], disable_gate=disable_gate)
+    # DataLoader 形式的取数器。GPU 驻留时是零拷贝切片（与 T109~T122 逐位一致）；
+    # 主机驻留时按块 H2D 并用独立 stream 预取。验证侧不预取：它每 epoch 只跑一遍
+    # 且在 no_grad 下，藏不出什么，多一条 stream 反而增加同步点。
+    n_feat = Xtr.shape[1]
+    train_loader = _DayBatchLoader(Xtr, ytr, Mtr, tr_days, dev,
+                                   chunk_days=chunk_days, prefetch=prefetch)
+    val_loader = _DayBatchLoader(Xva, ytr.new_zeros(0), Mva, va_days, dev,
+                                 chunk_days=1, prefetch=False, min_rows=0)
+
+    net = model.build(d_regime=Mtr.shape[1], disable_gate=disable_gate,
+                      group_norm=group_norm)
     if chunk_days > 1 and (lambda_lb > 0 or lambda_div > 0 or lambda_ent > 0):
         # 门控正则项作用在 GateUsageTracker 的跨日 EMA 上，逐日更新的节奏是它的
         # 语义的一部分；分块会把 chunk_days 天并成一次更新，等于偷偷改了 momentum。
@@ -660,7 +819,7 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
         score_parts, gate_parts = [], []
         with torch.no_grad():
             for j, (s, e) in enumerate(va_days):
-                sc, w, _ = net.forward_day(Xva[s:e].float(), Mva[j], temp)
+                sc, w, _ = net.forward_day(val_loader._rows(s, e).float(), Mva[j], temp)
                 score_parts.append(sc.detach())
                 gate_parts.append(w.detach())
             out = torch.cat(score_parts).to(torch.float32).cpu().numpy()
@@ -695,8 +854,11 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
             s, e = tr_days[di]
             if e - s < 5:
                 continue
-            # .float() 在 fp32 驻留时返回自身（无拷贝），fp16 驻留时逐日升精度
-            score, w, _ = net.forward_day(Xtr[s:e].float(), Mtr[di], temp)
+            # .float() 在 fp32 驻留时返回自身（无拷贝），fp16 驻留时逐日升精度。
+            # 逐日路径**刻意不走预取**：`pos == len(order) - 1` 这个 flush 条件依赖
+            # 未过滤的 order（末日若样本 <5 会被 continue 掉、于是不 flush），
+            # 换成预取器的已过滤序列会改变末尾梯度的处置 —— 不是错，但破坏逐位复现。
+            score, w, _ = net.forward_day(train_loader._rows(s, e).float(), Mtr[di], temp)
             l_rank = listnet_loss(score, ytr[s:e], y_scale=y_scale)
             if day_w is not None:
                 l_rank = l_rank * day_w[di]
@@ -735,20 +897,14 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
             # 与逐日路径语义等价（只有浮点求和顺序不同）。
             # 各交易日股票数不等，按块内最长补齐 + mask：补位 logit 填 -inf
             # 使其在 softmax 里权重恒为 0，目标分布同样置 0。
-            valid = [int(d) for d in order if (tr_days[int(d)][1] - tr_days[int(d)][0]) >= 5]
-            for c0 in range(0, len(valid), chunk_days):
-                blk = valid[c0:c0 + chunk_days]
+            # 2026-08-19：批组装搬进 _DayBatchLoader（DataLoader 形式）。分块序列
+            # 本来就是先过滤 <5 行的日再切块，与预取器完全同构，所以这条路径可以
+            # 安全地开预取；末尾 flush 用 `_last_chunk` 判定，与原 `c0 + chunk_days
+            # >= len(valid)` 等价。
+            _chunks = train_loader.iter_chunks(order)
+            for blk, Xb, yb, mask, _last_chunk in _chunks:
                 C = len(blk)
-                lens = [tr_days[d][1] - tr_days[d][0] for d in blk]
-                L = max(lens)
-                Xb = torch.zeros((C, L, Xtr.shape[1]), dtype=torch.float32, device=dev)
-                yb = ytr.new_zeros((C, L))
-                mask = torch.zeros((C, L), dtype=torch.bool, device=dev)
-                for i, d in enumerate(blk):
-                    s, e = tr_days[d]
-                    Xb[i, :e - s] = Xtr[s:e]
-                    yb[i, :e - s] = ytr[s:e]
-                    mask[i, :e - s] = True
+                L = Xb.shape[1]
                 contrib = net.experts(Xb.reshape(C * L, -1))
                 gsum = (contrib @ net.group_onehot).reshape(C, L, -1)
                 if net.disable_gate:
@@ -774,7 +930,7 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                 _p = _wd / _wd.sum(1, keepdim=True).clamp_min(1e-8)
                 ent_day_sum_t -= (_p * torch.log(_p + 1e-8)).sum()
                 w_days += C
-                if pending >= accum_days or c0 + chunk_days >= len(valid):
+                if pending >= accum_days or _last_chunk:
                     torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
                     opt.step()
                     opt.zero_grad(set_to_none=True)
@@ -986,6 +1142,24 @@ def main():
                          '主机内存，每个 day-step 走 PCIe —— 这是全量池慢的主因，'
                          '不是算力不足。fp16 驻留后 3.70 GiB 装得下。'
                          'fp32=强制旧行为（复现 T098/T106 及更早结果时用）')
+    ap.add_argument('--store-device', choices=('auto', 'cuda', 'host'), default='auto',
+                    help='2026-08-19：特征矩阵驻留在哪。cuda=整表进显存（T109~T122 行为，'
+                         '最快但**窗口长度被显存钉死**）；host=驻留 pinned 主机内存，'
+                         '按 DataLoader 形式逐块 H2D（显存占用与窗口长度解耦）。'
+                         'auto=fp16 后仍超过 68%%显存就自动转 host —— 这是 auto 以前缺的'
+                         '逃生口：超配时 Windows 驱动不报 OOM 而是静默分页，实测慢 12.5x'
+                         '（[[vram-oversubscription-was-the-bottleneck]]），比走 PCIe 批取数差得多。'
+                         '本机 6.00 GiB 显存下：9 年窗 3.95 GiB 走 cuda，13 年窗 5.05 GiB 转 host。'
+                         '开销参考：每日约 2.1 MB，pinned H2D 约 0.18 ms 对一个 chunk 约 15 ms '
+                         '的前反向 ⇒ 约 1%%，且被预取藏掉。**它买的是容量不是速度。**')
+    ap.add_argument('--prefetch', action='store_true',
+                    help='主机驻留时用独立 CUDA stream 预取下一批。**默认关，因为实测无收益**：'
+                         '用真实 NAMGateNet 测得 66.01(预取) vs 66.08(不预取) vs 64.83(cuda驻留) '
+                         'ms/chunk —— 每日 2.1MB 的 H2D 只要 0.18ms，对 65ms 的前反向本就完全'
+                         '被掩盖，藏不出东西；而多一条 stream 要付跨流分配与 record_stream 的开销。'
+                         '留着这个开关是为了将来「窗口大到内存也装不下、需从 parquet 惰性读」时'
+                         '真正需要预取的场景。')
+    ap.set_defaults(prefetch=False)
     ap.add_argument('--select-holdout', type=float, default=0.0,
                     help='T096：把验证折按时间切成「前段选型 / 后段报告」，比例=后段占比。'
                          '0=旧行为（选型与报告同一集合，报告值是 40 次抽样的最大值，'
@@ -1023,6 +1197,12 @@ def main():
                     help='gate-mode=scalar 时驱动门控的 regime 列名（缺列硬失败）')
     ap.add_argument('--disable-gate', action='store_true',
                     help='纯加性 NAM（门控权重恒为 1，隔离门控贡献）')
+    ap.add_argument('--group-norm', action='store_true',
+                    help='T119：门控前对族求和做**当日截面标准化**。'
+                         '乘积 w_k·S_k 在 (w_k→c·w_k, S_k→S_k/c) 下不变 ⇒ 损失曲面有平坦方向 ⇒ '
+                         '门控权重随噪声漂移（T116 实测 status 族 gate_std 4.45 > gate_mean 3.97）。'
+                         '标准化锁死 f 的幅度，门控只能调相对重要性、无法被专家吸收。'
+                         '仅作用于门控通路，--disable-gate 时不生效（纯加性基线逐位不变）。')
     ap.add_argument('--target', default='returns', choices=['scores', 'returns'],
                     help='训练目标：returns=原始收益排名（与回测收益对齐，默认）；'
                          'scores=生产 vol_boosted 标签（已证实与收益解耦，会拟合反号噪声）')
@@ -1058,6 +1238,13 @@ def main():
     ap.add_argument('--drop-features-file', default=None,
                     help='文本文件，每行一个因子名（# 开头为注释行）；与 --drop-features 取并集。'
                          '用于把杀名单固化成可审计的文件而不是命令行长串')
+    ap.add_argument('--group-map-file', default=None,
+                    help='T118：用 {feature: cluster_id} 的 JSON 覆盖 config/factor_groups 的'
+                         '手工分族。立论见 T117 —— 手工 12 族的内聚度与随机划分不可区分'
+                         '（z≈+0.1），而数据驱动簇内聚 0.35~0.50（z≈+73）。'
+                         '映射必须**只由训练段导出**（`diag_factor_clustering.py '
+                         '--emit-group-map`），否则等于把验证信息带进架构选择。'
+                         '缺列/多列一律硬失败。')
     ap.add_argument('--folds', default='0.7:0.8,0.8:1.0',
                     help='折列表，形如 "0.7:0.8,0.8:1.0"')
     ap.add_argument('--skip-baseline', action='store_true',
@@ -1116,6 +1303,14 @@ def main():
     all_features = list(dataset[3])
     print(f"  全部特征 {len(all_features)}，样本 {len(dataset[0])}")
 
+    # 释放标签行情原表：`prepare_dataset` 已把需要的东西全部物化进 dataset，
+    # `_forward_returns_by_horizon` 也已在上面算完。4777 只股票的 DataFrame 字典
+    # 是纯冗余占用。实测该进程提交量 29.01 GB / 峰值工作集 21.54 GB，压在 31.7 GB
+    # 的机器上 —— 内存压力会让 `_to_gpu` 上传时把已换出的页从磁盘错回来，是
+    # 「某个种子随机慢 5~50 倍」的候选成因之一（另一半是显存 95% 贴顶）。
+    del stocks_data
+    gc.collect()
+
     # 已知缓存契约审计：旧 downside_risk 公式会使该列几乎全为 0。
     # exp_nam_gate 使用 cache-only，代码公式修复不会自动重建同名缓存；若不硬失败，
     # 下一轮仍会悄悄训练在坏特征上。
@@ -1170,6 +1365,26 @@ def main():
         nam_features = [f for f in nam_features if f not in _dropf]
         group_names, group_ids = build_group_index(nam_features)
         print(f"  逐列裁剪 {len(_dropf)} 列: 特征 → {len(nam_features)}")
+
+    # T118：用数据驱动簇覆盖手工分族。放在所有裁剪之后，因为映射是对**最终面板**
+    # 逐列给出的；缺列或多列都硬失败（静默 fallback 会让"数据驱动"实际跑成手工族）。
+    if args.group_map_file:
+        with open(args.group_map_file, encoding='utf-8') as _fh:
+            _gmap = json.load(_fh)
+        _miss = [f for f in nam_features if f not in _gmap]
+        _extra = [f for f in _gmap if f not in set(nam_features)]
+        if _miss or _extra:
+            raise ValueError(
+                f"--group-map-file 与最终面板不匹配：缺 {len(_miss)} 列 "
+                f"{_miss[:5]}，多 {len(_extra)} 列 {_extra[:5]}。"
+                f"映射必须对当前面板（{len(nam_features)} 列）逐列给出。")
+        _cids = sorted({int(v) for v in _gmap.values()})
+        _remap = {c: i for i, c in enumerate(_cids)}
+        group_names = [f'c{c}' for c in _cids]
+        group_ids = np.asarray([_remap[int(_gmap[f])] for f in nam_features], dtype=np.int64)
+        _sz = pd.Series(group_ids).value_counts().sort_index().to_dict()
+        print(f"  分族来源: 数据驱动簇 {args.group_map_file} "
+              f"（{len(group_names)} 簇，规模 {_sz}）")
 
     print(f"  因子族 K={len(group_names)}: {group_names}")
 
@@ -1230,6 +1445,13 @@ def main():
                                  multi_horizon=_horizons, fwd_returns=_fwd,
                                  label_transform=args.label_transform,
                                  label_clip=args.label_clip)
+            # 最后一折的 fold 备好之后，原始 dataset 就再无用处（fold 里已是切好、
+            # 归一化好的副本）。单折运行（生产配方全是 --folds 0.8:1.0）能就此砍掉
+            # 约 9 GB：dataset[0] 是 9.5M × 231 float32。多折时保留给后续折用。
+            if (tf, ve) == folds[-1]:
+                dataset = None
+                gc.collect()
+                print('  已释放原始 dataset（最后一折，fold 副本已就绪）')
             for sd in seeds:
                 if multi_seed:
                     print(f"\n--- 种子 {sd}（折 {tag}，数据集复用）---")
@@ -1247,6 +1469,8 @@ def main():
                     time_decay_years=args.time_decay_years,
                     select_holdout=args.select_holdout,
                     chunk_days=args.chunk_days, store_dtype=args.store_dtype,
+                    store_device=args.store_device, prefetch=args.prefetch,
+                    group_norm=args.group_norm,
                 )
                 nam_row = _daily_metrics(pred, fold['ret_val'], np.asarray(fold['d_val']))
                 if args.select_holdout > 0:
@@ -1350,13 +1574,16 @@ def main():
                     'future_days': 7,
                     'nam_features': len(nam_features), 'dropped_manual_interaction': dropped,
                     'dropped_features': sorted(_dropf) if _dropf else [],
+                    'group_map_file': args.group_map_file,
                     'groups': group_names, 'regime_dims': int(regime.shape[1]),
                     'gate_mode': args.gate_mode, 'gate_scalar_col': args.gate_scalar_col,
                     'disable_gate': args.disable_gate,
+                    'group_norm': args.group_norm,
                     'target': args.target, 'label_residualize': args.label_residualize,
                     'label_transform': args.label_transform, 'label_clip': args.label_clip,
                     'lambda_lb': args.lambda_lb,
                     'store_dtype': args.store_dtype,
+                    'store_device': args.store_device, 'prefetch': args.prefetch,
                     'select_metric': args.select_metric, 'select_topk': args.select_topk,
                     'seed': sd, 'seeds_in_process': seeds,
                     'y_scale': args.y_scale,
@@ -1469,8 +1696,20 @@ def _evaluate_contributions(model, X, returns, dates, M, max_days=0):
             contrib = net.experts(xt).cpu().numpy().astype(np.float64)
             w_np = w.cpu().numpy().astype(np.float64)
             group_ids = np.asarray(model.group_ids)
-            effective = contrib * w_np[group_ids]               # [B, N]
-            group_effective = group_sums.cpu().numpy().astype(np.float64) * w_np  # [B, K]
+            gs_np = group_sums.cpu().numpy().astype(np.float64)
+            col_scale = 1.0
+            if getattr(net, 'group_norm', False) and not net.disable_gate:
+                # forward_day 返回的是**归一化前**的 group_sums，而打分实际用的是
+                # _std_groups(group_sums)（逐日截面标准化）。这里必须补上同一口径，
+                # 否则 --group-norm 跑出来的 group_effectiveness.csv 量的是归一化前的
+                # 专家幅度 —— 与真实打分无关。2026-08-19 实测：T119 未修时门前量级
+                # 极差 243x（与不带归一化的 T116 的 208x 几乎一样），一眼看去像
+                # 「归一化没生效」，实则是测量口径错。
+                sd = gs_np.std(axis=0, ddof=0, keepdims=True) + 1e-6
+                gs_np = (gs_np - gs_np.mean(axis=0, keepdims=True)) / sd
+                col_scale = 1.0 / sd[0][group_ids]      # 同族各列共用该缩放
+            effective = contrib * w_np[group_ids] * col_scale   # [B, N]
+            group_effective = gs_np * w_np                      # [B, K]
             y = np.asarray(returns[s:e], dtype=np.float64)
             raw_ics[di] = _rank_ic_columns(np.asarray(X[s:e], dtype=np.float64), y)
             eff_ics[di] = _rank_ic_columns(effective, y)

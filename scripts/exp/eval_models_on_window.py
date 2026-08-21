@@ -107,7 +107,11 @@ def main():
     day_ret = np.array([float(np.nanmean(fold['ret_val'][s:e])) for s, e in va])
 
     res = {'window': {'start': start, 'end': a.end, 'split_date': str(fold['split_date']),
-                      'n_val_days': len(va), 'n_holdout_days': len(va) - n_sel}, 'models': {}}
+                      'n_val_days': len(va), 'n_holdout_days': len(va) - n_sel},
+           # 逐日市场方向存盘：跌日否决门要能**只在 holdout 上**分层，
+           # 而 'down'/'up' 是全验证段的（含各存档自己的选型段，会互相污染）。
+           'day_ret': [float(v) for v in day_ret],
+           'n_select_days': n_sel, 'models': {}}
     print(f'\n{"存档":24s} {"全段IC":>9s} {"holdoutIC":>10s} {"跌日IC":>9s} {"涨日IC":>9s}')
     for name, m in models.items():
         sc = _score_days(m, fold['X_val'], fold['M_val'], va)
@@ -119,6 +123,8 @@ def main():
         up = ics[day_ret >= 0]
         row = {'all': float(np.nanmean(ics)), 'holdout': float(np.nanmean(ho)),
                'down': float(np.nanmean(dn)), 'up': float(np.nanmean(up)),
+               'down_holdout': float(np.nanmean(ics[n_sel:][day_ret[n_sel:] < 0])),
+               'up_holdout': float(np.nanmean(ics[n_sel:][day_ret[n_sel:] >= 0])),
                'n_down': int((day_ret < 0).sum()), 'n_up': int((day_ret >= 0).sum()),
                'holdout_daily': [None if np.isnan(v) else float(v) for v in ho]}
         res['models'][name] = row

@@ -87,8 +87,25 @@ class MLFactorBacktestStrategy(BaseStrategy):
         self._regime_blocked_days = 0
         self._volcap_rejected = 0
         
+        # 因子缓存：未显式指定时按模型存档里的绑定清单解析，而不是硬回退到
+        # TrainingConfig.CACHE_DIR。那个旧共享缓存没有版本清单，既缺 T115 的 5 列
+        # idx_*（NAM 需要）也缺 4 列 fc_*（树需要），两族都会撞下面的列完整性护栏。
+        # 与 scripts/select_stocks.py、scripts/run_backtest.py 同一口径。
         if cache_dir is None:
-            cache_dir = fc.TrainingConfig.CACHE_DIR
+            try:
+                from core.factors.cache_manifest import resolve_model_cache
+                _model_dir = (
+                    self.model_path if os.path.isdir(self.model_path)
+                    else os.path.dirname(self.model_path)
+                )
+                cache_dir = resolve_model_cache(
+                    _model_dir, os.path.join(PROJECT_ROOT, fc.TrainingConfig.CACHE_DIR)
+                )
+            except Exception as _e:
+                # 解析失败不在构造期炸掉（有些单测只构造不 initialize）；
+                # 面板真缺列时 initialize 的护栏会给出更准确的报错。
+                print(f"  缓存绑定解析失败，回退历史共享缓存: {_e}")
+                cache_dir = fc.TrainingConfig.CACHE_DIR
         self.cache_dir = cache_dir
 
         # R2（2026-08-12）：因子面板按回测窗口裁剪日期。
@@ -119,6 +136,25 @@ class MLFactorBacktestStrategy(BaseStrategy):
         from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
         def _load_smart_model(target_path):
             if os.path.isdir(target_path):
+                # 目录形式按存档约定分派，不靠 mtime 猜：
+                #   1) NAM 存档 → nam_gate_factor_model.pkl
+                #   2) 树双模型 → xgb + lgb 等权集成（与 select_stocks 同口径；
+                #      早先这里只取 mtime 最新的那一个，等于把集成静默降级成单模型）
+                #   3) 其余     → 最新的 *_factor_model.pkl
+                nam_path = os.path.join(target_path, 'nam_gate_factor_model.pkl')
+                if os.path.exists(nam_path):
+                    return _load_smart_model(nam_path)
+
+                xgb_path = os.path.join(target_path, 'xgboost_factor_model.pkl')
+                lgb_path = os.path.join(target_path, 'lightgbm_factor_model.pkl')
+                if os.path.exists(xgb_path) and os.path.exists(lgb_path):
+                    m1 = MLFactorModel(model_type='xgboost')
+                    m1.load_model(xgb_path)
+                    m2 = MLFactorModel(model_type='lightgbm')
+                    m2.load_model(lgb_path)
+                    print(f"  已构建 xgb+lgb 等权集成: {target_path}")
+                    return EnsembleFactorModel(models=[m1, m2], weights=[0.5, 0.5])
+
                 pkls = [
                     os.path.join(target_path, f)
                     for f in os.listdir(target_path)
@@ -290,13 +326,22 @@ class MLFactorBacktestStrategy(BaseStrategy):
             should_apply_filter = sc.ENABLE_FUNDAMENTAL_FILTER
 
         if should_apply_filter:
-            # 2. 预筛选 (利用内存快照，无 SQL)。仅在启用过滤时构建，避免无谓遍历全市场。
+            # 关键：基本面筛选**不能**缩小送进模型的横截面，只能在打分之后剔除候选。
+            #
+            # 模型的每一列输入都是 `rankdata(x) / (n+1)` —— 分母和成员一变，同一只
+            # 股票同一天的 219 列输入就全变了。训练时见到的是全市场截面，实盘若先按
+            # 主板 + 价格≤20 砍到千把只再 rank，喂进去的就是另一份特征，回测结论对它
+            # 不成立。这与本方法上面那句注释（"风险资格与已有持仓必须在模型打分后
+            # 处理，否则会改变横截面排名"）是同一条规则，之前只对风险过滤生效。
             info_map = self._get_optimized_info_map(current_date, market_data)
-            predict_codes, _ = self._pre_filter_stocks(all_codes, info_map, 
-                                                 apply_filter=True, 
-                                                 criteria=filter_criteria)
+            eligible_codes = set(self._pre_filter_stocks(
+                all_codes, info_map, apply_filter=True, criteria=filter_criteria,
+            )[0])
         else:
-            predict_codes = all_codes
+            eligible_codes = None
+
+        # 无论是否过滤，模型一律在**完整横截面**上打分
+        predict_codes = all_codes
         
         if not predict_codes: return signals
 
@@ -426,6 +471,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
             # 会把整个候选池砍空（曾导致某次回测仅成交 1 笔）。
             if effective_min_confidence > 0 and confidence < effective_min_confidence: continue
             if code in existing_positions: continue
+
+            # 基本面资格与风险资格一样，都在完整横截面完成归一化和预测**之后**执行，
+            # 这样过滤参数只影响"买不买"，不影响任何一只股票的模型输入。
+            if eligible_codes is not None and code not in eligible_codes:
+                continue
 
             # 仅在完整横截面完成归一化和预测后执行 PIT 风险资格判断。
             if self.risk_min_price is not None or self.risk_exclude_st:

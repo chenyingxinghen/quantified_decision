@@ -10,8 +10,39 @@ from pydantic import BaseModel
 
 from app.deps import get_db_path, get_db_connection, get_user_db, get_project_root
 from app.routers.auth import get_current_user_from_token
+from core.exit_rules import evaluate_exit
 
 router = APIRouter(prefix="/api/paper-trading", tags=["手动实盘验证"])
+
+
+def _wilder_atr(df, period: int = 14) -> float:
+    """ATR，与 core/backtest/strategies/ml_factor_strategy.py 同为 talib 口径。
+
+    talib.ATR 用的是 Wilder 平滑（首值 SMA、其后 (prev*(n-1)+tr)/n），与简单
+    rolling mean 数值不同。三个运行时必须用同一个，否则同一持仓在网页上看到的
+    止损价和回测/实盘算出来的对不上。talib 不可用时退回等价的 Wilder 递推。
+    """
+    import numpy as np
+    import pandas as pd
+
+    if df is None or len(df) < period + 1:
+        return 0.0
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    try:
+        import talib
+        val = talib.ATR(high, low, close, timeperiod=period)[-1]
+        return float(val) if np.isfinite(val) else 0.0
+    except ImportError:
+        prev_close = np.roll(close, 1)
+        tr = np.maximum(high - low,
+                        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+        tr[0] = high[0] - low[0]
+        atr = float(np.mean(tr[1:period + 1]))
+        for t in tr[period + 1:]:
+            atr = (atr * (period - 1) + float(t)) / period
+        return atr if np.isfinite(atr) else 0.0
 
 
 # ── Pydantic 模型 ─────────────────────────────────────────
@@ -273,7 +304,7 @@ async def check_exit_conditions(
             )
         finally:
             conn.close()
-        
+
         # 修复：检测不到数据时，则等待数据更新后再尝试
         if df.empty:
             return {
@@ -282,28 +313,52 @@ async def check_exit_conditions(
                 "conditions": {}
             }
 
+        # 前复权：与训练/回测/实盘同一函数。库里存的是未复权价
+        # （config.ADJUST_FLAG='3'），持仓期间遇到送转会出现几十个点的假跳空，
+        # 直接把 ATR 止损打掉并显示成一笔真实亏损。
+        try:
+            from core.factors.train_ml_model import apply_forward_adjust
+            if "preclose" in df.columns:
+                df = apply_forward_adjust(df)
+        except Exception as _e:
+            print(f"forward adjust skipped: {_e}")
+
         latest = df.iloc[-1]
         current_price = float(latest["close"])
-        holding_days = len(df)
+        # 持有天数口径：买入当日 = 0，与回测 Position.holding_days 和实盘
+        # _get_trading_days_count(entry, today) 一致。原来是 len(df)（买入日算 1 天），
+        # 会让时间止损比另外两个运行时早一天触发。
+        holding_days = max(0, len(df) - 1)
 
-        # ATR 计算
-        highs = df["high"].values.astype(float)
-        lows = df["low"].values.astype(float)
-        closes = df["close"].values.astype(float)
-        tr = np.maximum(highs - lows,
-                        np.maximum(np.abs(highs - np.roll(closes, 1)),
-                                   np.abs(lows - np.roll(closes, 1))))
-        tr[0] = highs[0] - lows[0]
-        atr = pd.Series(tr).rolling(atr_period).mean().iloc[-1] if len(tr) >= atr_period else tr[-1]
+        # ATR：必须与回测/实盘同为 talib 的 Wilder 平滑。
+        # 原实现是 `Series(tr).rolling(period).mean()`（简单平均），同一根 K 线上
+        # 会算出不同的 ATR，于是同一个持仓在网页上和在回测里的止损价不一样。
+        atr = _wilder_atr(df, atr_period)
 
         # 比例计算防 0
         safe_buy_price = buy_price if buy_price > 0 else current_price
-        
+
         stop_loss_price = float(round(safe_buy_price - atr * atr_stop_multiplier, 3))
         take_profit_price = float(round(safe_buy_price + atr * atr_target_multiplier, 3))
-        
+
         # 修复 ZeroDivisionError
         change_pct = float(round((current_price - safe_buy_price) / safe_buy_price * 100, 2)) if safe_buy_price > 0 else 0
+
+        # 权威判定统一走 core.exit_rules.evaluate_exit —— 回测引擎和实盘执行器用的
+        # 是同一个函数。下面每一条 condition 只是把它的输入拆开来给 UI 展示进度，
+        # 不再各自算一遍 triggered（这正是三个运行时判定漂移的来源）。
+        decision = evaluate_exit(
+            current_price=current_price,
+            entry_price=safe_buy_price,
+            holding_days=holding_days,
+            stop_loss=stop_loss_price if enable_stop_loss else None,
+            take_profit=take_profit_price if enable_take_profit else None,
+            enable_stop_loss=bool(enable_stop_loss),
+            enable_take_profit=bool(enable_take_profit),
+            enable_time_stop=bool(enable_time_stop),
+            time_stop_days=int(time_stop_days),
+            time_stop_max_return_pct=float(time_stop_min_loss_pct),
+        )
 
         # Progress Calculation
         def get_progress(curr, start, target):
@@ -312,26 +367,26 @@ async def check_exit_conditions(
             return float(round(max(0, min(100, prog)), 1))
 
         conditions = {}
-        
+
         if enable_stop_loss:
             conditions["stop_loss"] = {
-                "triggered": bool(current_price <= stop_loss_price),
+                "triggered": decision.reason == "stop_loss",
                 "price": stop_loss_price,
                 "label": f"ATR止损监控",
                 "progress": get_progress(current_price, safe_buy_price, stop_loss_price)
             }
-        
+
         if enable_take_profit:
             conditions["take_profit"] = {
-                "triggered": bool(current_price >= take_profit_price),
+                "triggered": decision.reason == "take_profit",
                 "price": take_profit_price,
                 "label": f"ATR止盈监控",
                 "progress": get_progress(current_price, safe_buy_price, take_profit_price)
             }
-            
+
         if enable_time_stop:
             conditions["time_stop"] = {
-                "triggered": bool(holding_days >= time_stop_days and change_pct <= time_stop_min_loss_pct * 100),
+                "triggered": decision.reason == "time_stop",
                 "holding_days": int(holding_days),
                 "max_days": int(time_stop_days),
                 "label": f"时间止损监控",
@@ -394,6 +449,8 @@ async def check_exit_conditions(
             "change_pct": float(change_pct),
             "atr": round(float(atr), 3),
             "conditions": conditions,
+            "should_exit": bool(decision.should_exit),
+            "exit_reason": decision.reason,
             "status": "success"
         }
     except Exception as e:

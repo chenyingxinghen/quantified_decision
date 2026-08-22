@@ -333,7 +333,7 @@ class TrainingConfig:
         return False
 
     # ── 路径 ───────────────────────────────────────────────────────────────
-    CACHE_DIR            = 'database/system_data/factors_cache'  # 旧版共享缓存；历史模型继续使用
+    CACHE_DIR            = 'database/system_data/factors_cache'  # 单一通用因子缓存（NAM 与树共用全集）
     # 因子公式契约版本。公式语义变化时必须升级，并写入独立缓存目录的 manifest；
     # 禁止原地覆盖旧缓存，否则历史模型的训练/推理输入会静默漂移。
     # 2026-08-14 两处语义变化：
@@ -347,6 +347,17 @@ class TrainingConfig:
     #      「同名不同公式」静默错配。
     FACTOR_DEFINITION_VERSION = '2026-08-18-fwdadjust-preclose-forecast-idxrel-v1'
     CACHE_MANIFEST_NAME = 'factor_cache_manifest.json'
+    # 单一通用因子缓存。2026-08-22 起移除 per-model manifest 版本契约机制：
+    # NAM 与树共用本目录，版本演进靠「重命名/删除旧缓存文件夹」完成，不再用
+    # 版本清单做静默错配防护。两条训练入口（scripts/train_tree_model.py、
+    # scripts/train_nam_model.py）的 --cache-dir 都默认指向这里。
+    #
+    # 本目录是两族的**超集**（247 列：219 基础 + 4 列 fc_* + 5 列 idx_* + 8 列
+    # 手工 *_regime_* 交互 + 11 列被 drop_cols 剔除的状态位/原始情绪列）。
+    # 各模型族在其上按自己的配方取子集，是**训练开关**而非版本差异：
+    #   · 树  ：drop_cols 之外全取 → 236 列（含 fc_* 与 8 列手工交互）
+    #   · NAM ：再剔除 *_regime_*（改由门控学习）并 --drop-groups forecast → 224 列
+    CURRENT_CACHE_DIR = 'database/system_data/factors_cache'
     SAVE_DIR             = 'models'                              # 模型保存目录
 
     # ── 训练股票池过滤（与 strategy_config 中的选股条件对齐）──────────────

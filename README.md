@@ -76,24 +76,41 @@ cd ../..
 
 ```bash
 # 增量更新所有市场数据（推荐）
+# 依次跑：个股行情 → 财务 → 指数日线/货币供应 → 因子缓存
 python scripts/update_daily_data.py
 
 # 全量更新
 python scripts/update_daily_data.py --full
+
+# 只刷指数与宏观（idx_* 因子的原料），不动个股与因子缓存
+python scripts/update_daily_data.py --only-index-macro
+
+# 业绩预告（fc_* 因子的原料）
+python scripts/ingest_performance_forecast.py
 ```
 
 ### 2. 训练模型
 
+两条入口按**模型族**分工，共用同一份数据基座
+（`TrainingConfig.CURRENT_CACHE_DIR`）与同一套标签口径：
+
 ```bash
-# 完整训练流程
-python scripts/train_model.py
+# 树模型（XGBoost / LightGBM），236 列面板
+python scripts/train_tree_model.py
+python scripts/train_tree_model.py --stocks 5480 --seed 42
 
-# 指定股票数和并行数
-python scripts/train_model.py --stocks 3000 --workers 16 --force
+# 仅更新因子缓存，不训练
+python scripts/train_tree_model.py --update-cache-only
 
-# 仅更新因子缓存
-python scripts/train_model.py --update-cache-only
+# NAM（当前生产载体），224 列面板。需要 torch 解释器
+python -u scripts/train_nam_model.py --stocks 5480 --years 13 --end 2022-09-05 \
+    --disable-gate --target returns --y-scale 2 --expert-hidden 16 --lr 2e-3 \
+    --drop-groups forecast --select-holdout 0.4 --seed 42 \
+    --save-model-dir models/nam_gate/<tag>_s42
 ```
+
+面板差异只由显式开关决定（NAM 剔 `*_regime_*` + `--drop-groups forecast`），
+不是版本差异。生产推理载体一律放 `models/mark/` 下。
 
 ### 3. 回测
 
@@ -110,8 +127,8 @@ python scripts/select_stocks.py
 # 自定义输出
 python scripts/select_stocks.py --top 30 --min-confidence 65
 
-# 指定模型
-python scripts/select_stocks.py --model models/latest/lightgbm_factor_model.pkl
+# 指定模型（NAM 与树存档都支持，加载器自动识别）
+python scripts/select_stocks.py --model models/mark/T115_idxrel_s42
 ```
 
 ### 5. 自动交易
@@ -122,18 +139,27 @@ python scripts/main_auto_trade.py
 
 自动执行交易日调度：早盘信号生成 → 买入窗口执行 → 午后卖出窗口执行。
 
-### 6. 模型优化与分析
+### 6. 分析与工具
 
 ```bash
-# 超参数 + 集成优化
-python scripts/run_model_optimization.py
-
 # 因子重要性报告
 python scripts/show_factor_importance.py
 
-# 因子参数调优（基于 IC）
-python scripts/tune_factors.py
+# 把已训练的 xgb+lgb 打包成等权集成存档
+python scripts/build_ensemble.py
+
+# 实测各板块涨跌停限额并落库（限额规则变更后需重跑）
+python scripts/build_price_limit_history.py
+
+# 财务数据连续性体检
+python scripts/check_finance_data_gaps.py
+
+# 行业分类更新
+python scripts/update_industry.py
 ```
+
+实验判定口径与同折对照臂在 `scripts/exp/`（见该目录 README）；
+已关闭轴的一次性脚本在 `scripts/archive/`。
 
 ### 7. 启动 Web 管理端
 

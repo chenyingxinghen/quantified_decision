@@ -89,9 +89,11 @@ def init_user_db():
                 sell_reason TEXT,
                 profit_pct  REAL,
                 notes       TEXT DEFAULT '',
+                username    TEXT NOT NULL DEFAULT 'guest',    -- 数据归属，所有查询都按它过滤
+                monitoring  INTEGER NOT NULL DEFAULT 1,
                 created_at  TEXT DEFAULT (datetime('now','localtime'))
             );
-            
+
             CREATE TABLE IF NOT EXISTS users (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 username    TEXT UNIQUE NOT NULL,
@@ -99,19 +101,35 @@ def init_user_db():
                 source      TEXT DEFAULT '',
                 created_at  TEXT DEFAULT (datetime('now','localtime'))
             );
-            
+
             CREATE TABLE IF NOT EXISTS user_configs (
                 username    TEXT PRIMARY KEY,
                 config_json TEXT NOT NULL
             );
-            
+
             CREATE TABLE IF NOT EXISTS sessions (
                 token       TEXT PRIMARY KEY,
                 username    TEXT NOT NULL,
                 created_at  TEXT DEFAULT (datetime('now','localtime'))
             );
+
+            CREATE INDEX IF NOT EXISTS idx_positions_user_status
+                ON positions(username, status);
         """)
-        
+
+        # 幂等迁移：username / monitoring 是后加的列。
+        # 现有库是靠手工 ALTER 补上的，CREATE TABLE 语句一直没跟上 —— 结果是
+        # **全新部署一启动就崩**（所有 positions 查询都 `WHERE username = ?`）。
+        # 这里把两条补列做成幂等迁移，新旧库走同一条路径。
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+        for col, ddl in (
+            ("username", "ALTER TABLE positions ADD COLUMN username TEXT NOT NULL DEFAULT 'guest'"),
+            ("monitoring", "ALTER TABLE positions ADD COLUMN monitoring INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if col not in existing:
+                conn.execute(ddl)
+                print(f"✅ positions 表已补列: {col}")
+
         conn.commit()
     finally:
         conn.close()

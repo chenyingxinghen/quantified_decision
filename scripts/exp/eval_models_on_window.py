@@ -37,7 +37,7 @@ from core.data.baostock_main import BaostockDataManager
 from core.factors.nam_gate_model import NAMGateModel
 from core.factors.regime_features import build_regime_matrix
 from core.factors.train_ml_model import MLModelTrainer
-from scripts.exp.exp_nam_gate import _day_slices, _prepare_fold, _rank_ic_columns
+from scripts.train_nam_model import _day_slices, _prepare_fold, _rank_ic_columns
 
 
 def _score_days(model, X, M, day_slices):
@@ -61,7 +61,7 @@ def _score_days(model, X, M, day_slices):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--models', required=True, help='逗号分隔的存档目录')
-    ap.add_argument('--cache-dir', default='database/system_data/factors_cache_2026-08-18-idxrel')
+    ap.add_argument('--cache-dir', default='database/system_data/factors_cache')
     ap.add_argument('--stocks', type=int, default=6000)
     ap.add_argument('--years', type=int, default=9)
     ap.add_argument('--end', default='2026-08-10')

@@ -191,7 +191,7 @@ def _load_macro_m1m2_gap(db_path: Optional[str],
     发布在次月 10~15 日，取保守端），可见日之前一律用上一期。月度序列在
     日频索引上前向填充成阶梯；归一化与其余 regime 列共用滚动分位管线。
 
-    表不存在（未跑 ingest_index_and_macro.py --money）时返回 None ——
+    表不存在（未跑 update_daily_data.py，或跑时带了 --skip-money）时返回 None ——
     列整体缺席。scalar 门控按列名解析、缺列硬失败，不会静默退化。
     """
     db_path = db_path or DATABASE_PATH

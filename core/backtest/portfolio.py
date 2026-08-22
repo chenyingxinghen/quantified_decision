@@ -189,6 +189,12 @@ class Portfolio:
         available_capital = capital_allocation - commission
         
         # 计算股数
+        #
+        # 这里是**分数股**，不施加 A 股 100 股整手约束 —— 回测的 INITIAL_CAPITAL 是
+        # 归一化的 1.0，整手在这个口径下没有意义（1.0 元买不到任何一手）。实盘侧
+        # 由 execution_controller 按 `int(预算/价格/100)*100` 取整。两者的差异是
+        # 「最后不足一手的零头买不进」，在 K=20 等权、单笔预算约为总资产 5% 时
+        # 相对误差 < 1%，方向上实盘略保守。要精确对齐必须先把回测改成绝对资金口径。
         abs_price = abs(price)
         if abs_price == 0:
             return None

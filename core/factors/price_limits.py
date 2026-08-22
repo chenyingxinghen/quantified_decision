@@ -141,3 +141,36 @@ def resolve_or_static(code: str, dates, is_st, enabled: bool,
         st_arr = np.asarray(pd.Series(is_st).fillna(0)).astype(np.int8)
         out[st_arr == 1] = MARKET_LIMITS['st']
     return out
+
+
+# ---------------------------------------------------------------------------
+# 标量接口 —— 供**执行层**（回测引擎 / 实盘委托）使用
+#
+# 训练侧走上面的向量接口且受 TrainingConfig.USE_EMPIRICAL_PRICE_LIMITS 开关控制
+# （开了会改变样本剔除结果、与 T113/T115 基线不可配对）。**执行层没有这个顾虑**：
+# 「今天这只票的涨停价是多少」是一个客观事实，用错了就是回测买到买不到的票、
+# 实盘挂出被交易所拒绝的委托。所以下面两个函数**无条件**使用实测表。
+# ---------------------------------------------------------------------------
+
+def limit_for(code: str, date: str, is_st: bool = False,
+              db_path: Optional[str] = None) -> float:
+    """单个 (股票, 交易日) 的涨跌停比例，如 0.10 / 0.20 / 0.05。"""
+    return float(resolve(code, [str(date)[:10]], [1 if is_st else 0], db_path)[0])
+
+
+def limit_prices(code: str, date: str, prev_close: float, is_st: bool = False,
+                 db_path: Optional[str] = None):
+    """返回 (涨停价, 跌停价)，按交易所口径 **四舍五入到分**。
+
+    A 股涨跌停价是 ``round(前收 × (1 ± L), 2)`` 这个**精确值**，不是一个区间。
+    因此判定「是否涨停」必须与这个精确价比较，而不是拿收益率去比 1+L ——
+    后者受分位舍入影响，在边界上会给出相反答案（历史上主板静态值写成 0.098
+    正是为了容忍这个误差，代价是 0.2% 的判定盲区）。
+    ``prev_close`` 必须是**未复权**的昨收（raw_preclose），否则舍入到分没有意义。
+    """
+    if not prev_close or not np.isfinite(prev_close) or prev_close <= 0:
+        return None, None
+    lim = limit_for(code, date, is_st, db_path)
+    up = round(float(prev_close) * (1.0 + lim) + 1e-12, 2)
+    down = round(float(prev_close) * (1.0 - lim) + 1e-12, 2)
+    return up, down

@@ -11,9 +11,10 @@ from .portfolio import Portfolio, Trade
 from .data_handler import DataHandler
 from .performance import PerformanceAnalyzer
 from core.exit_rules import evaluate_exit
+from core.factors.price_limits import limit_prices
 import sqlite3
 import os
-from config import DATABASE_PATH, TrainingConfig, MARKET_LIMITS, MARKET_PREFIXES
+from config import DATABASE_PATH, TrainingConfig
 from config.strategy_config import (
     TIME_STOP_DAYS,
     TIME_STOP_MIN_LOSS_PCT,
@@ -22,6 +23,7 @@ from config.strategy_config import (
     ENABLE_TAKE_PROFIT_EXIT,
     ENABLE_SUPPORT_BREAK_EXIT,
     ENABLE_TIME_STOP_EXIT,
+    DELIST_EXIT_HAIRCUT,
 )
 
 
@@ -82,6 +84,9 @@ class BacktestEngine:
         self._trading_date_index = {}  # {date: idx} O(1) 查找
         self._trend_break_cache = {}  # (stock_code, date) -> result
         self._delist_map = self._load_delist_map()  # {stock_code: outDate}
+        # 可成交性统计（cleanup 时打印，用于识别"回测收益里有多少来自买不到/卖不掉的票"）
+        self._blocked_entries = 0
+        self._blocked_exits = 0
 
     def run(
         self,
@@ -190,6 +195,10 @@ class BacktestEngine:
         if verbose:
             print("-" * 80)
             print("回测完成")
+            print(
+                f"可成交性拦截: 开盘涨停买不到 {self._blocked_entries} 次 / "
+                f"停牌或一字跌停卖不掉 {self._blocked_exits} 次"
+            )
 
         # 清理策略
         self.strategy.cleanup()
@@ -294,6 +303,59 @@ class BacktestEngine:
             if not self.portfolio.can_open_position():
                 break
 
+    # ------------------------------------------------------------------
+    # 可成交性判定
+    #
+    # 涨跌停价是 `round(前收 × (1 ± L), 2)` 这个**精确值**。旧实现拿
+    # `next_open > signal_price * (1 + MARKET_LIMITS[...])` 去比，有三个问题：
+    #   1. 静态 MARKET_LIMITS 没有时间维度 —— 创业板 2020-08-24 由 10% 改 20%、
+    #      主板 ST 2026-07-06 由 5% 改 10%，查表一律用错（详见 price_limits.py）。
+    #      静态值还被人为削成 0.098/0.198 来容忍舍入，代价是 0.2% 的判定盲区。
+    #   2. 用 `>` 而非 `>=`：开盘价正好等于涨停价时判为"没涨停"，直接买进一个
+    #      根本买不到的一字板。
+    #   3. 只在 open==high==low==close 的"一字板"上检查。开盘封涨停、盘中打开的
+    #      情形（open==涨停价 但 low<涨停价）照样按 open 成交 —— 集合竞价买不到。
+    # 现在统一改成：拿**未复权**的 raw_preclose 算出精确涨跌停价，与 raw_open /
+    # raw_close 直接比。bar 由 BaostockDataHandler 提供，raw_* 一定存在。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bar_limits(stock_code: str, date: str, bar: dict):
+        """返回该 bar 当日的 (涨停价, 跌停价)，未复权口径。取不到时返回 (None, None)。"""
+        prev_close = bar.get("raw_preclose")
+        if prev_close is None or not (prev_close > 0):
+            return None, None
+        return limit_prices(
+            stock_code, date, float(prev_close), is_st=int(bar.get("is_st", 0) or 0) == 1
+        )
+
+    @staticmethod
+    def _is_suspended(bar: dict) -> bool:
+        """停牌：成交量为 0，或 tradestatus 明确标记非正常交易。"""
+        if not bar.get("volume", 0):
+            return True
+        ts = bar.get("tradestatus")
+        return ts is not None and int(ts) != 1
+
+    def _can_exit_at_close(self, stock_code: str, date: str, bar: dict) -> bool:
+        """当日尾盘能否卖出。
+
+        买入侧一直检查停牌与一字涨停，卖出侧却什么都不查 —— 一字跌停、停牌都
+        照样按 close 成交。这个不对称是单向的乐观偏差：策略总能在最坏的日子里
+        全身而退。这里补齐：停牌、或全天封死跌停（最高价都没离开跌停价），
+        视为卖不掉，仓位留到下一个交易日再按同样的规则重新判定。
+        """
+        if self._is_suspended(bar):
+            return False
+        _, limit_down = self._bar_limits(stock_code, date, bar)
+        if limit_down is None:
+            return True
+        raw_high = bar.get("raw_high")
+        if raw_high is None or not (raw_high > 0):
+            return True
+        # 全天最高价都没有高于跌停价 ⇒ 一字跌停封死，尾盘挂单排不出去
+        return float(raw_high) > limit_down + 1e-9
+
     def _check_exit_signals(self, date: str, market_data: Dict, verbose: bool):
         """检查平仓信号"""
         positions_to_close = []
@@ -312,6 +374,10 @@ class BacktestEngine:
             )
 
             if should_exit:
+                # 触发了退出条件，还要能真的卖得掉
+                if not self._can_exit_at_close(stock_code, date, bar):
+                    self._blocked_exits += 1
+                    continue
                 positions_to_close.append((stock_code, exit_price, exit_reason))
 
         # 执行平仓
@@ -421,18 +487,25 @@ class BacktestEngine:
             return {}
 
     def _check_delist_exit(self, stock_code: str, current_date: str) -> Optional[tuple]:
-        """检查股票是否已退市，若是则返回 (stock_code, exit_price, 'delist')"""
+        """检查股票是否已退市，若是则返回 (stock_code, exit_price, 'delist')
+
+        退市不是按最后一个可见价平价了结的。旧实现直接用 position.current_price
+        （停牌前最后一根 K 线的收盘价）记账，等于假设退市股能原价卖出 —— 现实中
+        退市整理期普遍腰斩以上，进老三板后流动性接近于零。这里按
+        `DELIST_EXIT_HAIRCUT` 打折，把这块损失显式记进回测，而不是当它不存在。
+        """
         out_date = self._delist_map.get(stock_code)
         if not out_date or current_date < out_date:
             return None
         position = self.portfolio.positions.get(stock_code)
         if not position:
             return None
-        exit_price = (
+        last_price = (
             position.current_price
             if position.current_price != 0
             else position.entry_price
         )
+        exit_price = last_price * (1.0 - DELIST_EXIT_HAIRCUT)
         return (stock_code, exit_price, "delist")
 
     def _get_next_entry_price(
@@ -456,28 +529,18 @@ class BacktestEngine:
         if bar is None:
             return None, None
 
-        # 停牌检测 (成交量为0)
-        if bar.get("volume", 0) == 0:
+        # 停牌检测（成交量为 0 或 tradestatus 非正常）
+        if self._is_suspended(bar):
             return None, None
 
-        # 一字涨停检测 (一字涨停无法买入)
-        if bar["open"] == bar["high"] == bar["low"] == bar["close"]:
-            # 获取 ST 标签：优先从行情 bar 中获取，否则设为非 ST
-            is_st = bar.get("is_st", 0) == 1
-
-            # 兼容主板(10%)、创业板/科创板(20%)、北交所(30%)
-            if is_st:
-                limit_threshold = 1.0 + MARKET_LIMITS["st"]
-            elif stock_code.startswith(
-                MARKET_PREFIXES["sz_gem"]
-            ) or stock_code.startswith(MARKET_PREFIXES["star"]):
-                limit_threshold = 1.0 + MARKET_LIMITS["gem_star"]
-            elif stock_code.startswith(MARKET_PREFIXES["bj"]):
-                limit_threshold = 1.0 + MARKET_LIMITS["bj"]
-            else:
-                limit_threshold = 1.0 + MARKET_LIMITS["main"]
-
-            if bar["open"] > signal_price * limit_threshold:
+        # 开盘涨停检测：开盘价触及涨停价即视为买不到。
+        # 这既覆盖一字板，也覆盖「开盘封板、盘中打开」—— 我们的委托是在集合竞价
+        # 阶段发出的，封板价上排队买不到，盘中是否打开与这一笔无关。
+        limit_up, _ = self._bar_limits(stock_code, next_date, bar)
+        raw_open = bar.get("raw_open")
+        if limit_up is not None and raw_open is not None and raw_open > 0:
+            if float(raw_open) >= limit_up - 1e-9:
+                self._blocked_entries += 1
                 return None, None
 
         return next_date, bar["open"]

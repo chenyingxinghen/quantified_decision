@@ -5,14 +5,20 @@
 实现：开盘买入、盘中维持、尾盘卖出的闭环流程。
 
 执行规则（与回测严格对齐）：
-  1. 买入：在开盘时间窗（09:20~09:26）挂涨停价委托，确保以开盘价附近成交。
-     对应回测：next_day_open 成交
-  2. 卖出：仅在尾盘时间窗（14:50~14:57）检查退出条件，触发则挂跌停价委托，
+  1. 买入：在开盘时间窗（09:15~09:30）挂贴近涨停的限价委托，确保以开盘价附近成交。
+     对应回测：next_day_open 成交。委托价走 core.factors.price_limits 的**实测**
+     限额表，基准是**昨收**（法定口径），不是当前价。
+  2. 卖出：仅在尾盘时间窗（14:50~14:57）检查退出条件，触发则挂贴近跌停的限价委托，
      确保以当日收盘价附近成交。
      对应回测：以 close / stop_loss / take_profit / time_stop 价格成交（均在尾盘）
   3. T+1 规则：当日买入的股票不能当日卖出。
-  4. 时间止损：持有 >= AUTO_TIME_STOP_DAYS 个交易日 且 浮亏 >= AUTO_TIME_STOP_MIN_LOSS_PCT
-     才触发（对齐回测 TIME_STOP_DAYS + TIME_STOP_MIN_LOSS_PCT 双条件）。
+  4. 时间止损：语义是「持满预测周期后只要没赚够就走」——
+     `holding_days >= TIME_STOP_DAYS(7)` 且 `收益率 <= TIME_STOP_MIN_LOSS_PCT(+0.15)`。
+     注意 TIME_STOP_MIN_LOSS_PCT 是**收益率上限**而非亏损下限：+0.15 意味着持满 7 日
+     后除非浮盈超过 15% 否则一律清仓，这是策略的主要换手来源。判定与回测共用
+     core.exit_rules.evaluate_exit，此处不重复实现。
+  5. 仓位：单笔预算 = 总资产 / MAX_POSITIONS_AUTO（与回测 total_value/max_positions
+     同口径），再以当前可用现金封顶。
 """
 
 import sys
@@ -30,7 +36,7 @@ from config.baostock_config import PROJECT_ROOT, DATABASE_PATH, SYSTEM_DATA_DIR
 
 from core.automation.trader_interface import AutoTrader
 from config.automation_config import (
-    SINGLE_BUY_RATIO, CASH_BUFFER,
+    SINGLE_BUY_RATIO, CASH_BUFFER, MAX_POSITIONS_AUTO,
     BUY_WINDOW_START, BUY_WINDOW_END, SELL_WINDOW_START, SELL_WINDOW_END,
 )
 from config.strategy_config import TIME_STOP_DAYS, TIME_STOP_MIN_LOSS_PCT
@@ -61,29 +67,84 @@ class OperationStatus(Enum):
 import re as _re
 
 
-def _calc_limit_up_price(ref_price: float, is_st: bool = False, prev_close: float = None) -> float:
-    """
-    计算涨停价（用于买入委托，确保排队靠前）。
-    规则：普通股 +10%，ST股 +5%，向下取整到分（0.01精度）。
-    若提供 prev_close，则基于昨收价计算（更准确）；否则基于 ref_price 估算。
-    """
-    base = prev_close if prev_close and prev_close > 0 else ref_price
-    rate = 0.05 if is_st else 0.10
-    raw = base * (1 + rate)
-    return round(int(raw * 100) / 100, 2)  # 向下取整到分
+def _read_balance_number(balance: Dict, keys: List[str]) -> Optional[float]:
+    """从券商资金表里按候选字段名读一个数（不同客户端/版本字段名不一致）。"""
+    for k in keys:
+        v = balance.get(k)
+        if v is None:
+            continue
+        try:
+            return float(str(v).replace(',', '').strip())
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
-def _calc_limit_down_price(ref_price: float, is_st: bool = False, prev_close: float = None) -> float:
+def _get_prev_close(code: str, db_path: str = None) -> Optional[float]:
+    """取该股最近一个交易日的**未复权**收盘价，作为涨跌停基准。
+
+    涨跌停价的法定基准是「前收盘价」，不是现价。用现价推算会在股票当日已有
+    涨跌幅时算出越界的委托价：例如已跌 8% 时 ``现价×0.9 = 昨收×0.828``，
+    低于跌停价，委托直接被交易所拒绝。
     """
-    计算跌停价（用于卖出委托，确保尾盘成交）。
-    规则：普通股 -10%，ST股 -5%，向上取整到分（0.01精度）。
-    若提供 prev_close，则基于昨收价计算（更准确）；否则基于 ref_price 估算。
-    注意：结果不得低于交易所实际跌停价，否则委托会被拒绝。
+    try:
+        conn = sqlite3.connect(db_path or DATABASE_PATH, timeout=30.0)
+        try:
+            row = conn.execute(
+                "SELECT close FROM daily_data WHERE code = ? AND close > 0 "
+                "ORDER BY date DESC LIMIT 1", (code[:6],)
+            ).fetchone()
+        finally:
+            conn.close()
+        return float(row[0]) if row else None
+    except Exception as e:
+        logger.warning(f"  {code}: 读取昨收失败 ({e})，将退回按现价估算涨跌停。")
+        return None
+
+
+def _limit_prices(code: str, ref_price: float, is_st: bool = False,
+                  prev_close: float = None, db_path: str = None):
+    """返回 (涨停价, 跌停价)，走 `core.factors.price_limits` 的**实测**限额表。
+
+    旧实现硬编码 ``0.05 if is_st else 0.10``，对创业板/科创板(20%)、北交所(30%)
+    全错，且主板 ST 已于 2026-07-06 由 5% 改为 10%（实测表自动跟随，静态表不会）。
+    挂错价的后果是双向的：买入价不到涨停排不进队，卖出价高于跌停在跌停日卖不掉。
     """
+    from core.factors.price_limits import limit_prices as _lp
+
+    base = prev_close if (prev_close and prev_close > 0) else ref_price
+    if not base or base <= 0:
+        return None, None
+    today = datetime.now().strftime('%Y-%m-%d')
+    up, down = _lp(code[:6], today, base, is_st=is_st, db_path=db_path)
+    if up is None:
+        return None, None
+    # 委托价再各让一分，避免边界舍入被判越界；仍稳稳落在涨跌停区间内且排在队首/队尾。
+    return round(up - 0.01, 2), round(down + 0.01, 2)
+
+
+def _calc_limit_up_price(ref_price: float, is_st: bool = False, prev_close: float = None,
+                         code: str = None) -> float:
+    """计算买入委托价（贴近涨停，确保排队靠前）。"""
+    if code:
+        up, _ = _limit_prices(code, ref_price, is_st, prev_close)
+        if up:
+            return up
     base = prev_close if prev_close and prev_close > 0 else ref_price
     rate = 0.05 if is_st else 0.10
-    raw = base * (1 - rate)
-    return round((int(raw * 100) + 1) / 100, 2)  # 向上取整到分，确保不低于跌停价
+    return round(int(base * (1 + rate) * 100) / 100, 2)
+
+
+def _calc_limit_down_price(ref_price: float, is_st: bool = False, prev_close: float = None,
+                           code: str = None) -> float:
+    """计算卖出委托价（贴近跌停，确保尾盘成交）。结果不得低于交易所实际跌停价。"""
+    if code:
+        _, down = _limit_prices(code, ref_price, is_st, prev_close)
+        if down:
+            return down
+    base = prev_close if prev_close and prev_close > 0 else ref_price
+    rate = 0.05 if is_st else 0.10
+    return round((int(base * (1 - rate) * 100) + 1) / 100, 2)
 
 
 def _parse_price_limit_from_error(error_msg: str):
@@ -136,12 +197,14 @@ class ExecutionController:
     交易执行控制核心。
     
     买入逻辑（对齐回测）：
-      - 在开盘时间窗内挂涨停价限价买入，保证以开盘价成交（回测用 next_day_open）。
-    
+      - 在开盘时间窗内挂贴近涨停的限价买入，保证以开盘价成交（回测用 next_day_open）。
+      - 单笔预算 = 总资产 / MAX_POSITIONS_AUTO，以可用现金封顶。
+
     卖出逻辑（对齐回测）：
-      - 仅在尾盘时间窗内检查退出条件（止损/止盈/时间止损）。
-      - 触发条件后挂跌停价限价卖出，保证当日以收盘价附近成交。
-      - 时间止损必须同时满足：持有天数 >= 阈值 且 亏损比例 >= 阈值（双条件）。
+      - 仅在尾盘时间窗内检查退出条件（止损/止盈/时间止损），共用 evaluate_exit。
+      - 触发后挂贴近跌停的限价卖出，保证当日以收盘价附近成交。
+      - **元数据缺失时不卖**：不知道成本价就无法判定任何一条退出规则，
+        在「不知道」和「全部卖掉」之间正确的选择是持有（见 _rebuild_meta_from_position）。
     """
 
     def __init__(self, trader: AutoTrader):
@@ -392,10 +455,31 @@ class ExecutionController:
         
         holding_codes = [p.get('证券代码', p.get('stock_code', ''))[:6] for p in positions]
 
-        # 2. 计算预算 (均分可用资金)
-        budget_per_stock = available_cash * SINGLE_BUY_RATIO
-        budget_per_stock = max(0, budget_per_stock - CASH_BUFFER)
-        
+        # 2. 计算单笔预算 —— 口径必须与回测一致：**总资产 / 最大持仓数**（等权）。
+        #
+        # 旧实现是 `可用现金 × SINGLE_BUY_RATIO`。回测里
+        # `capital_per_position = portfolio.total_value / max_positions`（见
+        # core/backtest/engine.py::_check_entry_signals），分母是**总资产**。
+        # 有持仓时可用现金 ≪ 总资产，按现金比例分配会让每笔仓位系统性偏小，
+        # 且偏小的程度随持仓数变化 —— 回测的收益/回撤对它完全没有约束力。
+        total_assets = _read_balance_number(
+            balance, ['总资产', '资产总值', '总市值加可用', '资产'],
+        )
+        if total_assets is None or total_assets <= 0:
+            # 读不到总资产时用「可用现金 + 持仓市值」兜底，仍优于纯现金口径
+            market_value = _read_balance_number(
+                balance, ['参考市值', '股票市值', '证券市值', '持仓市值', '市值', '总市值'],
+            ) or 0.0
+            total_assets = available_cash + market_value
+            logger.info(f"  总资产字段不可读，按 可用({available_cash:.2f}) + 市值({market_value:.2f}) 估算")
+
+        budget_per_stock = total_assets / max(1, MAX_POSITIONS_AUTO)
+        budget_per_stock = max(0.0, budget_per_stock - CASH_BUFFER)
+        # 单笔不得超过当前可用现金（否则必然报资金不足）
+        budget_per_stock = min(budget_per_stock, max(0.0, available_cash - CASH_BUFFER))
+        logger.info(f"  总资产 {total_assets:.2f} / {MAX_POSITIONS_AUTO} 仓 "
+                    f"→ 单笔预算 {budget_per_stock:.2f}")
+
         # 跟踪当前可用资金（本地跟踪，减少对不稳定性 GUI 的依赖）
         running_avail = available_cash
 
@@ -410,11 +494,11 @@ class ExecutionController:
                 if base_code not in self.tracking_data["positions"]:
                     self.tracking_data["positions"][base_code] = {
                         "entry_date": datetime.now().strftime("%Y-%m-%d"),
-                        "entry_price": signal.get('current_price', 0),
-                        "stop_loss": signal.get('stop_loss'),
-                        "take_profit": signal.get('take_profit'),
-                        "confidence": signal.get('confidence'),
-                        "is_st": signal.get('is_st', False),
+                        "entry_price": s.get('current_price', 0),
+                        "stop_loss": s.get('stop_loss'),
+                        "take_profit": s.get('take_profit'),
+                        "confidence": s.get('confidence'),
+                        "is_st": s.get('is_st', False),
                     }
                     self._save_tracking()
                 continue
@@ -447,7 +531,10 @@ class ExecutionController:
                 continue
 
             is_st = signal.get('is_st', False)
-            limit_up_price = _calc_limit_up_price(ref_price, is_st=is_st)
+            # 涨停价基准必须是**昨收**（法定口径），不是当前价。
+            prev_close = _get_prev_close(code, self._db_path)
+            limit_up_price = _calc_limit_up_price(ref_price, is_st=is_st,
+                                                  prev_close=prev_close, code=code)
             volume = int((budget_per_stock / limit_up_price) / 100) * 100
 
             if volume < 100:
@@ -566,11 +653,22 @@ class ExecutionController:
             avail_amount = int(p.get('可用余额', p.get('可卖数量', p.get('可用数量', 0))) or 0)
 
             if not meta:
-                logger.warning(f"  {code} 无跟踪元数据，执行兜底卖出。")
-                success, op_status = self._do_sell_robust(code, ref_price=current_price, is_st=is_st, avail_amount=avail_amount)
-                self.tracking_data["processed_today"][f"sell_{base_code}"] = op_status.value
-                self._save_tracking()
-                continue
+                # 元数据缺失时**不卖**。
+                #
+                # 旧行为是「兜底卖出」——这把一次 GUI 读数异常直接变成一次清仓。
+                # 缺元数据意味着我们不知道成本价，也就无法判断止损/止盈/时间止损中
+                # 任何一条是否成立；在「不知道」和「全部卖掉」之间，正确的选择是持有。
+                # 先尝试从今日信号 / 实盘成本价重建，重建不了就告警等人工介入。
+                rebuilt = self._rebuild_meta_from_position(base_code, p)
+                if rebuilt:
+                    logger.warning(f"  {code} 元数据缺失，已从实盘成本价重建: {rebuilt}")
+                    meta = rebuilt
+                else:
+                    logger.error(
+                        f"  {code} 无跟踪元数据且无法重建（实盘成本价不可读），"
+                        f"本轮**保持持有**，请人工检查 tracking.json。"
+                    )
+                    continue
 
             entry_price = float(meta.get('entry_price') or 0)
             entry_date_str = meta.get('entry_date', '')
@@ -613,12 +711,61 @@ class ExecutionController:
             else:
                 logger.info(f"  {code} 持有 {holding_days}D | 浮盈 {unrealized_pnl_pct*100:.2f}% | 继续持有。")
 
+    def _rebuild_meta_from_position(self, base_code: str, pos_row: Dict) -> Optional[Dict]:
+        """元数据丢失时，从实盘持仓行 + 今日信号重建最小可用的跟踪记录。
+
+        成本价从实盘读（券商记的账才是真的）；entry_date 无从得知，保守取**今日**
+        —— 这只会让时间止损**推迟**触发，不会提前清仓，是安全方向的错。
+        止损/止盈若能从今日信号恢复就按成交价平移，否则留空（对应"该条退出规则
+        本轮不参与判定"，而不是"立即卖出"）。
+        """
+        cost_keys = ['成本价', '成本', '买入成本', '持仓成本', '买入均价']
+        actual_entry = 0.0
+        for k in cost_keys:
+            if k in pos_row:
+                try:
+                    actual_entry = float(pos_row.get(k))
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if actual_entry <= 0:
+            return None
+
+        signal = next((s for s in self.signals_cache
+                       if s.get('stock_code', '')[:6] == base_code), None)
+        sl = tp = None
+        if signal:
+            ref_price = signal.get('current_price', 0)
+            raw_sl, raw_tp = signal.get('stop_loss'), signal.get('take_profit')
+            if ref_price and ref_price > 0:
+                if raw_sl is not None:
+                    sl = actual_entry - (ref_price - float(raw_sl))
+                if raw_tp is not None:
+                    tp = actual_entry + (float(raw_tp) - ref_price)
+
+        meta = {
+            "entry_date": datetime.now().strftime("%Y-%m-%d"),
+            "entry_price": actual_entry,
+            "stop_loss": sl,
+            "take_profit": tp,
+            "confidence": (signal or {}).get('confidence'),
+            "is_st": (signal or {}).get('is_st', False),
+            "rebuilt": True,   # 标记：entry_date 是推断值，不是真实买入日
+        }
+        self.tracking_data["positions"][base_code] = meta
+        self._save_tracking()
+        return meta
+
     def _do_sell_robust(self, code: str, ref_price: Optional[float], is_st: bool, avail_amount: int = 0):
         """健壮卖出执行。返回 (success: bool, OperationStatus)
         avail_amount 由调用方传入可避免重复 get_positions()，为 0 时内部懒加载兜底。
         """
         base_code = code[:6]
-        sell_price_box = [_calc_limit_down_price(ref_price, is_st=is_st) if ref_price and ref_price > 0 else None]
+        prev_close = _get_prev_close(code, self._db_path)
+        sell_price_box = [
+            _calc_limit_down_price(ref_price, is_st=is_st, prev_close=prev_close, code=code)
+            if ((ref_price and ref_price > 0) or (prev_close and prev_close > 0)) else None
+        ]
 
         def attempt_sell():
             nonlocal avail_amount
@@ -691,13 +838,19 @@ class ExecutionController:
         today_str = datetime.now().strftime("%Y-%m-%d")
         modified = False
 
-        # 1. 移除：本地有但实盘没读到（确认已卖出或手动卖出）
-        tracking_codes = list(self.tracking_data["positions"].keys())
-        for code in tracking_codes:
+        # 1. 实盘未读到的本地记录：**只告警，不删除**。
+        #
+        # 这里曾按「实盘列表的差集」直接 del，与 sync_positions 的保护性设计正好相反
+        # （那里明确写着「GUI 经常漏扫、滚动不到位，按差集删除会导致元数据永久丢失」）。
+        # 后果是一条完整的清仓链：漏扫一次 → 09:31 元数据被删 → 14:50 execute_sells
+        # 发现 `not meta` → 兜底卖出。三个模块各自看着都合理，串起来是无条件清仓。
+        # 元数据的删除只允许发生在 execute_sells 确认成交之后。
+        for code in list(self.tracking_data["positions"].keys()):
             if code not in real_codes:
-                logger.info(f"  {code}: 实盘已无持仓，从本地追踪中移除。")
-                del self.tracking_data["positions"][code]
-                modified = True
+                logger.warning(
+                    f"  [数据同步不一致] 本地追踪 {code} 但本次实盘未读到（GUI 漏扫或已手动卖出），"
+                    f"保留元数据。确认已清仓请手工编辑 tracking.json。"
+                )
 
         # 2. 添加与修正
         for base_code, p in real_positions_dict.items():

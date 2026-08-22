@@ -18,10 +18,23 @@
 
 ## 当前基线（生产：**全量池**纯加性 NAM，`--disable-gate`）
 
-训练：**5480 股** / 13 年 / 截至 2022-09-05 / 219 特征（skip-rank 仅 `market_cap`,`market_type`）/
+训练：**5480 股** / 13 年 / 截至 2022-09-05 / **224 特征**（219 基础 + 5 列 `idx_*`，
+T115 按族层面证据晋级；skip-rank 仅 `market_cap`,`market_type`）/
 `target=returns` / `y-scale=2` / `expert_hidden=16` / `lr=2e-3` / `--drop-groups forecast` /
 `--select-holdout 0.4` / `--store-dtype auto`（全量池自动 fp16 驻留，见 T109）。
-真实成本：买 0.08% / 卖 0.13%（往返 0.21%）。因子缓存 `factors_cache_2026-08-14-fwdadjust`（复权已修）。
+真实成本：买 0.08% / 卖 0.13%（往返 0.21%）。
+因子缓存 **`factors_cache_2026-08-18-idxrel`**（= `TrainingConfig.CURRENT_CACHE_DIR`）。
+
+生产载体存档：`models/mark/T115_idxrel_s42/`（`models/nam_gate/`、`models/tree/`
+是训练产物归档区，不直接进生产）。路径的单一事实来源是
+`config/strategy_config.py` 的「模型载体」一节，`automation_config` 只做别名转发。
+
+**两族共用同一份数据基座**（2026-08-22 统一）：缓存目录是 247 列超集，
+两条训练入口的 `--cache-dir` 都默认指向它，面板差异只由显式开关决定 ——
+NAM 剔 `*_regime_*` 并 `--drop-groups forecast` 得 224 列；
+树取 `drop_cols` 之外全部得 236 列（含 4 列 `fc_*` + 8 列手工交互）。
+此前树全族停在 08-14 面板、缺 5 列 `idx_*`，根因是 `--cache-dir` 默认 `None`
+→ 落到无 manifest 的旧共享缓存 → 既不写缓存清单也不给存档写绑定。
 
 **n=4 种子（42/11/23/37），报中位与 σ —— 不报单点**（T099 实测）：
 
@@ -449,7 +462,7 @@ K=40 的唯一价值仍然成立且已入协议：它把跨种子收益 std 压�
 是行业共同驱动，剥掉行业共同项才剩个股 alpha。这是**新信息**，而不是对已有打分的
 重新加权——这正是 E6 缺的东西。
 
-**实现**（零新数据、零缓存重建）：`scripts/exp/exp_nam_gate.py --industry-relative core`
+**实现**（零新数据、零缓存重建）：`scripts/train_nam_model.py --industry-relative core`
 在内存里按 `(date, industry)` 求 18 个核心因子的百分位，追加为 `<base>__ind` 列，
 `config/factor_groups.py` 新增 `indrel` 族（`drop_empty=True` 保证旧特征集的 K 不变）。
 行业成员 < 10 的当日分组置 0.5（信息不足时中性，而不是给 1 只票 = 1.0 的假极值）。
@@ -585,7 +598,7 @@ E8 说特征侧到顶（信息受限），E10 的新信息轴被 baostock 黑名
 各自做当日截面 rank，再等权平均 —— 噪声约按 √k 衰减、共同的截面信号保留。
 这是在**同一批数据**上提高信噪比，不是再派生一列特征。
 
-实现：`scripts/exp/exp_nam_gate.py --multi-horizon 5,10,20`（新增），
+实现：`scripts/train_nam_model.py --multi-horizon 5,10,20`（新增），
 `_forward_returns_by_horizon` 按 `(code, date)` 从 `stocks_data` 对齐
 （口径与 `prepare_dataset` 的标签一致：`close.shift(-h)/close − 1`）。三条严格性约束：
 
@@ -731,7 +744,7 @@ OOS 熊（2022-09→2024-08）、OOS 牛（2024-08→2026-08）。
 
 **协议升级（已落代码，此后每个轴自动产出）**
 
-1. `scripts/exp/exp_nam_gate.py` 新增 `_regime_stratified_metrics`，把
+1. `scripts/train_nam_model.py` 新增 `_regime_stratified_metrics`，把
    `nam_gate.regime.{all,up_days,down_days}.{rank_ic,topk_excess}` 写进结果 JSON
    （`--regime-topk`，默认 40：K=40 噪声低，只当尺子，生产仍是 K=20）。
 2. `scripts/exp/analyze_multifold.py` 新增 `_regime_gate`：把所有（折 × 种子）的
@@ -1068,7 +1081,7 @@ E16/E17 之后所有不依赖新信息的打分层杠杆都关了（见 E16 的�
 本轮开工先做了一次数据与工具链审计，撞上两件事：
 
 1. **T069 之后的实验脚本全部丢失**（见上文「⚠ 工具链缺失」），
-   `exp_nam_gate.py` / 多折判定器 / 随机零假设全不在了，
+   `train_nam_model.py` / 多折判定器 / 随机零假设全不在了，
    所以 T088 预告的既定下一步（「加列 → 4 种子多折 IC」）**当下跑不动**。
 2. 但要回答的问题不需要重训：预告这列信息**值不值得**付重建工具链 + 8 次训练的代价，
    可以用两个零训练诊断先定界。这与 T082/T084/T085 是同一手法。
@@ -1134,7 +1147,7 @@ E16/E17 之后所有不依赖新信息的打分层杠杆都关了（见 E16 的�
 3. 单因子残差化 IC（+0.029~0.032，t≈9）与混合后的边际（+0.0006）差两个量级，
    说明**基线的 219 列已经间接吃掉了大部分**，但吃掉多少要靠加列重训才能量出来。
 
-**下一步（T090，预注册）**：先按「工具链缺失」一节重建 `exp_nam_gate.py`
+**下一步（T090，预注册）**：先按「工具链缺失」一节重建 `train_nam_model.py`
 并用 `T083_base_s42` 逐折复现校验，再把 4 列预告特征（`fc_type_60d`、`fc_chg_log`、
 `fc_recency`、`fc_type_any`）作为 `forecast` 新因子族加入训练侧，
 按 G4 双条件门槛判定（合并 Δ折均IC ≥ +0.0028 且 4/4；下跌日 ΔIC 不一边倒为负）。
@@ -1375,7 +1388,7 @@ T090_base 单折内 `val_rank_ic` 轨迹：max 0.1011 / min −0.0391 / 均 0.05
 无一可测量」。其中看起来最高的 `T066_accum2` 0.1016 正是「最大值抽样」的典型产物
 （它熊市分位 52.9%，−2.71σ，是全部臂里最差之一）。
 
-**5. NAM 优于树？没有证据。** `exp_nam_gate.py` 的同折 XGBoost 基线臂依赖已丢失的
+**5. NAM 优于树？没有证据。** `train_nam_model.py` 的同折 XGBoost 基线臂依赖已丢失的
 `exp_head_features._train_and_predict`，所有实验一律 `--skip-baseline`；
 78 个历史结果文件里**没有任何一个**含第二个模型臂。而实盘 automation 加载的是
 `models/mark/automation/lightgbm_factor_model.pkl`（2026-06-26 单模型 LightGBM）。
@@ -1725,7 +1738,7 @@ RTX 4050 Laptop 只有 **6.00 GiB**。`torch.as_tensor(..., device='cuda')` 没�
 
 ### 修复
 
-`--store-dtype {auto,fp32,fp16}`（`exp_nam_gate.py`）：特征矩阵的**驻留精度**降为 fp16，
+`--store-dtype {auto,fp32,fp16}`（`train_nam_model.py`）：特征矩阵的**驻留精度**降为 fp16，
 逐日切片时 `.float()` 升回 fp32，**模型权重、前向、反向、优化器全程 fp32 不变**。
 7.39 → **3.70 GiB**，装得下。`auto` = fp32 占用 > 85% 显存时自动降，
 所以 800 只池仍走 fp32、历史结果逐位可复现；全量池自动免疫。
@@ -2617,7 +2630,7 @@ T122 自己就给了线索：全段 362 日 IC 0.0871，最后 145 日只有 0.0
 ## DataLoader 形式的批取数（2026-08-19）：拿掉显存天花板，代价 1.8%
 
 T122 被迫从 13 年缩到 9 年，暴露了 T109「整表驻留显存」方案的结构性上限：
-**窗口长度被显存钉死**。新增 `_DayBatchLoader`（`exp_nam_gate.py`）+
+**窗口长度被显存钉死**。新增 `_DayBatchLoader`（`train_nam_model.py`）+
 `--store-device {auto,cuda,host}`：
 
 - `cuda`：整表进显存（T109~T122 行为，逐位不变）
@@ -3502,3 +3515,58 @@ regime 赢不了基线就等于**自己预测自己的滞后**。T137 刚在这�
 这一段共抓到 7 处判据/实现缺陷。共同形态是**判据与它想问的问题之间存在错位** ——
 门槛对错了基准、模型没拿到该拿的输入、聚合口径混进了无关方差、或者把问题问给了错的对象。
 写完预注册判据后应再问一遍：**这条判据测的真是我想问的那件事吗？**
+
+## D001（2026-08-21，零训练）下游业务逻辑审查 —— **回测数值口径有变，与既有基线不再逐位可配对**
+
+模型层封口后审查「打分 → 选股 → 组合/退出 → 回测引擎 → 实盘执行 → web」全链路。
+本节只记与**回测数值**相关的改动；实盘/web 的修复见 git log。
+
+### 会改变回测结果的三处（都是单向保守，不会让收益变好）
+
+1. **开盘涨停不再可买**（`engine._get_next_entry_price`）
+   旧：仅当 `open==high==low==close`（一字板）且 `open > signal_price × (1+静态限额)` 才拒绝。
+   三个毛病：静态 `MARKET_LIMITS` 无时间维度；用 `>` 而非 `>=`（开盘价正好等于涨停价时放行）；
+   只查一字板。新：用**实测**限额表算出精确到分的涨停价，`raw_open >= 涨停价` 即拒绝。
+   实测 2026-05-01~08-18（385,106 行）：开盘即涨停占 **0.222%**，其中 **22.8% 不是一字板**
+   —— 这一类旧实现全部放行了，而它们恰恰是最想买到的日子。
+2. **卖出侧新增可成交性判定**（`engine._can_exit_at_close`）
+   买入侧一直检查停牌与涨停，卖出侧原先什么都不查 —— 一字跌停、停牌照样按 close 成交。
+   这是单向乐观：策略总能在最坏的日子全身而退。新增：停牌、或全天封死跌停
+   （`raw_high <= 跌停价`）视为卖不掉，仓位留到下一交易日重判。
+   同窗实测：一字跌停封死 0.106%，停牌 0.223%。
+3. **退市了结加折价**（`DELIST_EXIT_HAIRCUT = 0.5`）
+   旧实现按停牌前最后一个可见价平价了结，等于假设退市能原价卖出。
+
+### 影响量级与配对性
+
+烟测（xgb_s42，2026-05-01~08-18，mp20，188 笔成交）：**拦截 0 次**，
+与基准率推算的期望值 `188 × 0.222% ≈ 0.42 笔` 一致 —— 闸门有效且非死代码，
+在短窗口上几乎不动数值。但两年窗口约 2000 笔成交时期望拦截 ~4~5 笔，
+**T115/T122 等既有回测数字不再与新代码逐位可配对**。
+三处改动方向全部为「收益只会更低」，所以旧结论若为负仍为负；
+若要重新引用旧的正向读数，必须用新代码重跑。
+
+### 一处**已确认为误判**的记录（留档防止再犯）
+
+审查初稿曾判定「`run_backtest.py` 走的是未复权的 `DataHandler`，两年约 −6pp 系统性低估」。
+**这是错的**：`core/backtest/__init__.py:10` 有一行
+`from .baostock_data_handler import BaostockDataHandler as DataHandler`，
+回测一直在做完整前复权。误判源于只看了 `run_backtest.py` 的 import 名字没看别名。
+已把 `run_backtest.py` 改为显式 `from core.backtest.baostock_data_handler import BaostockDataHandler`
+（行为不变），因为同目录下确实并存两个同名类、一个复权一个不复权，靠 import 路径区分。
+
+### 与实盘的口径断裂（已对齐，但**实盘配置变了**）
+
+- `MAX_POSITIONS_AUTO` **1 → 20**：原先是全仓押单只，而 K 轴扫完单峰在 20。
+  台账所有 n=4 种子、σ=24~38pp 的统计结论对 K=1 一条都不成立。
+- `AUTO_APPLY_FILTER` **True → False**、`AUTO_MAX_PRICE` 20.0 → None、
+  `SELECTOR_MARKETS` `['sh_main','sz_main']` → None：
+  实盘原先在「主板 + 20 元以下」里选股，回测跑的是无过滤全市场，选股域根本不是一个。
+- **基本面过滤移到打分之后**（`ml_factor_strategy.generate_signals`）：
+  模型每一列输入都是 `rankdata(x)/(n+1)`，过滤先行会改变分母与成员，
+  同一只票同一天喂进去的 219 列全变。该方法自己的注释早就写明这条规则，
+  但此前只对风险过滤生效。现在无论是否过滤，**一律在完整横截面上打分**。
+- 单笔预算口径 `可用现金 × 比例` → `总资产 / MAX_POSITIONS_AUTO`（与回测 total_value 同口径）。
+
+⚠ **`sc.MAX_POSITIONS` 仍为 5**（回测默认值），未随实盘改为 20 —— 改它会静默改变
+所有不带 `--max-positions` 的历史复现结果。需要时显式传参，或另行决定是否统一。

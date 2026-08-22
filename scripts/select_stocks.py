@@ -54,9 +54,9 @@ DEFAULT_TOP_N = 20
 DEFAULT_LOOKBACK_DAYS = 500        # 获取最近 N 天行情用于因子计算
 MIN_DATA_ROWS = 35                 # 最少需要的行情数据条数 (与 ml_factor_strategy.py 一致)
 DEFAULT_WORKERS = 15                # 默认并行线程数
-# 历史遗留共享缓存。仅作**兜底**：无绑定清单的旧模型才落到这里。
-# 新模型（T090 起）在存档目录里带 factor_cache_manifest.json，指向自己训练时
-# 用的版本化缓存，由 resolve_production_cache_dir() 解析。
+# 因子缓存统一为单一通用目录 factors_cache（见 config.factor_config.CACHE_DIR）。
+# 2026-08-22 起移除 per-model manifest 机制：所有模型默认指向这里，版本演进靠
+# 重命名/删除缓存文件夹完成，不再按模型存档里的绑定清单解析。
 LEGACY_CACHE_DIR = os.path.join(PROJECT_ROOT, TrainingConfig.CACHE_DIR)
 DEFAULT_CACHE_DIR = LEGACY_CACHE_DIR   # 向后兼容的别名，勿在新代码里用
 # ============================================================================
@@ -64,12 +64,11 @@ DEFAULT_CACHE_DIR = LEGACY_CACHE_DIR   # 向后兼容的别名，勿在新代码
 # ============================================================================
 def resolve_production_cache_dir(model_path: str) -> str:
     """
-    按模型存档里的绑定清单解析该用哪个因子缓存（与 run_backtest.py 同一口径）。
+    解析模型应使用的因子缓存目录。
 
-    为什么不能直接用 TrainingConfig.CACHE_DIR：那是 2026-08 复权修复**之前**的
-    旧缓存，且没有 T115 的 idx_* 列。拿它喂 224 列的 NAM，5 个新列会被填成常数
-    0.5 —— 现在会被 ml_factor_strategy 的列完整性护栏拦下来硬失败，但正确做法是
-    一开始就取模型自己绑定的那个目录。旧模型无清单时回退到历史缓存，行为不变。
+    单一通用缓存下，所有模型（NAM / 树 / mark / latest）共用 factors_cache，
+    不再按模型存档里的绑定清单解析（manifest 机制已移除，2026-08-22）。
+    model_path 仅用于定位模型目录，缓存目录统一取 config 里的 factors_cache。
     """
     from core.factors.cache_manifest import resolve_model_cache
 
@@ -136,7 +135,13 @@ def load_smart_model(model_path: str):
     """
     智能加载模型（与 ml_factor_strategy.py 中的 _load_smart_model 逻辑对齐）：
     1. 如果是目录，优先尝试加载集成模型（双 pkl），否则加载最新 pkl
-    2. 如果是 pkl 文件，优先尝试 EnsembleFactorModel，再回退到 MLFactorModel
+    2. 如果是 pkl 文件，先嗅探 NAMGateModel，再 EnsembleFactorModel，最后 MLFactorModel
+
+    ⚠ NAMGateModel 的嗅探必须在 Ensemble/ML 之前 —— 否则 NAM 存档会被
+    ``EnsembleFactorModel.load_model`` 误吞成一个树模型。顺序与策略层一致。
+    注意此处返回的模型**没有**挂载 regime 矩阵，只能用于读取元信息
+    （feature_names / get_top_factors），不能用来 predict；真正的推理走
+    ``MLFactorBacktestStrategy.select_for_live()``，那里会 attach_regime。
     """
     from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
 
@@ -153,15 +158,31 @@ def load_smart_model(model_path: str):
             m2.load_model(lgb_path)
             return EnsembleFactorModel(models=[m1, m2], weights=[0.5, 0.5])
 
+        # NAM 存档目录：标准文件名优先于 find_latest_model 的 mtime 启发式。
+        # 否则 norm_stats.pkl 之类的边车文件可能更新，被当成模型 pkl 交给
+        # MLFactorModel 加载，静默退化成一个空壳树模型（feature_names 为空）。
+        nam_path = os.path.join(model_path, 'nam_gate_factor_model.pkl')
+        if os.path.exists(nam_path):
+            return load_smart_model(nam_path)
+
         # 否则寻找最新的 pkl
         latest = find_latest_model(model_path)
         if latest:
             return load_smart_model(latest)
         return None
 
-    # 情况 2: pkl 文件 —— 优先尝试 EnsembleFactorModel，再回退到 MLFactorModel
+    # 情况 2: pkl 文件 —— NAMGate → Ensemble → MLFactor
     if not os.path.exists(model_path):
         return None
+
+    try:
+        from core.factors.nam_gate_model import NAMGateModel
+        if NAMGateModel.is_nam_gate_archive(model_path):
+            m = NAMGateModel()
+            m.load_model(model_path)
+            return m
+    except Exception:
+        pass
 
     try:
         return EnsembleFactorModel.load_model(model_path)

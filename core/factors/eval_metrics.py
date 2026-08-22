@@ -1,7 +1,7 @@
 """评估指标：从 `scripts/exp_horizon_7d_vs_15d.py`（已丢失）重建。
 
 **为什么要重建而不是随便写一个**：`_daily_metrics` 不只用于报告——
-`exp_nam_gate.py:579` 用它的 `rank_ic` 做检查点选型，写错会选出不同的 epoch、
+`train_nam_model.py:579` 用它的 `rank_ic` 做检查点选型，写错会选出不同的 epoch、
 产出不同的模型。所以定义必须与旧实现逐位一致，验收标准是
 `T083_base_s42` 三折的 `rank_ic / rank_ic_std / positive_ic_ratio /
 top5_excess / days / head_pct_top*` 全部复现 `diagnose_output/T083_base_s42.json`
@@ -25,7 +25,7 @@ top5_excess / days / head_pct_top*` 全部复现 `diagnose_output/T083_base_s42.
   需要落盘预测才能判别，成本一次 28 分钟训练，不值得。
   ⇒ ``head_pct_top*`` 一律视为**仅供报告**的重建指标：
   它不参与检查点选型（选型走 `_daily_metrics(pred_va, y_val)`，见
-  `exp_nam_gate.py:662`），也不参与任何门槛。
+  `train_nam_model.py:662`），也不参与任何门槛。
   **绝对值不得与 T083 及之前的台账数字比较**；同一批新代码内部的臂间比较仍有效。
 """
 from __future__ import annotations
@@ -134,3 +134,38 @@ def _compare(nam_row: Dict[str, object], base_row: Dict[str, object]) -> Tuple[D
             deltas[k] = float(a) - float(b)
     passed = deltas.get('rank_ic', 0.0) >= 0.0 and deltas.get('top5_excess', 0.0) >= 0.0
     return deltas, passed
+
+
+def _fold_dataset(dataset, train_fraction, validation_end_fraction):
+    """按时间比例切出一折，训练段与验证段之间留 ``FUTURE_DAYS`` 的 embargo。
+
+    从 ``scripts/diagnose_xgb_oof_head.py`` 提上来（2026-08-22）：它原本住在一个
+    诊断脚本里，却是 ``train_nam_model._prepare_fold`` 的上游依赖 —— 训练入口
+    依赖诊断脚本是反的，且那个脚本本身要归档。函数体逐字未改。
+
+    embargo 是必须的：7 日前向标签会让紧邻切点的训练样本"看见"验证段的收益。
+    这里按**交易日**推进 FUTURE_DAYS 天再取验证起点，不是按行数。
+    """
+    from config.factor_config import TrainingConfig
+
+    dates = dataset[4]
+    unique_dates = np.unique(dates)
+    train_date = dates[int(len(dates) * train_fraction)]
+    split_idx = int(np.searchsorted(dates, train_date, side="left"))
+    split_date_idx = int(np.searchsorted(unique_dates, train_date))
+    val_date_idx = min(split_date_idx + TrainingConfig.FUTURE_DAYS, len(unique_dates) - 1)
+    val_start_date = unique_dates[val_date_idx]
+    val_start_idx = int(np.searchsorted(dates, val_start_date, side="left"))
+    if validation_end_fraction >= 1.0:
+        end_idx = len(dates)
+        end_date = None
+    else:
+        end_date = dates[int(len(dates) * validation_end_fraction)]
+        end_idx = int(np.searchsorted(dates, end_date, side="left"))
+    if not 0 < split_idx < val_start_idx < end_idx:
+        raise ValueError("Invalid fold boundaries")
+    sliced = [value if index == 3 else value[:end_idx] for index, value in enumerate(dataset[:10])]
+    sliced[0] = sliced[0].copy()
+    return tuple(sliced), split_idx / end_idx, val_start_idx, end_idx, str(train_date), (
+        None if end_date is None else str(end_date)
+    )

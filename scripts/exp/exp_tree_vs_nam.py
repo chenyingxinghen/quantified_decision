@@ -2,11 +2,11 @@
 
 **为什么要有这个脚本**：T039 以来约 50 轮实验全部在 NAM 上做，而实盘 automation 加载的是
 `models/mark/automation/lightgbm_factor_model.pkl`（单模型 LightGBM）。翻遍 78 个历史结果
-文件，**没有任何一个含第二个模型臂** —— `exp_nam_gate.py` 的同折 XGBoost 基线依赖已丢失的
+文件，**没有任何一个含第二个模型臂** —— `train_nam_model.py` 的同折 XGBoost 基线依赖已丢失的
 `exp_head_features._train_and_predict`，所有实验一律 `--skip-baseline`。
 也就是说「NAM 比树好」这件事**从未被验证过**，却已经决定了 50 轮实验的载体。
 
-**可比性靠什么保证**：直接复用 `exp_nam_gate._prepare_fold`，所以三个模型吃到的是
+**可比性靠什么保证**：直接复用 `train_nam_model._prepare_fold`，所以三个模型吃到的是
 逐字节相同的 `X_train/y_train/d_train` 与 `X_val/ret_val/d_val`（同一折边界、同一截面
 归一化统计量、同一 rank 标签、同一族裁剪）。评估用同一个 `_metrics._daily_metrics`，
 口径与 `T090_base` 完全一致，可以直接和台账里的 0.09650 比。
@@ -22,9 +22,13 @@
 用法（种子只影响树的 subsample/colsample 抽样）：
   python -u scripts/exp/exp_tree_vs_nam.py --model xgboost --seed 42 \
       --stocks 800 --years 13 --end 2022-09-05 --drop-groups forecast \
-      --cache-dir database/system_data/factors_cache_2026-08-14-fwdadjust \
       --folds 0.6:0.8,0.7:0.9,0.8:1.0 --allow-degenerate-downside-risk \
       --output diagnose_output/T092_xgb_s42.json
+
+``--cache-dir`` 默认 ``TrainingConfig.CURRENT_CACHE_DIR``（单一通用 factors_cache 基座，
+与 NAM 生产件同一份），所以两族天然吃到同一个 247 列超集；面板差异只由
+``--full-panel`` / ``--drop-groups`` 这两个显式开关决定。要复现旧读数，手动传对应
+归档缓存目录（旧缓存已归档于 database/system_data/_quarantine_20260822/）。
 """
 
 import argparse
@@ -44,8 +48,8 @@ from config.factor_groups import build_group_index
 from core.data.baostock_main import BaostockDataManager
 from core.factors.regime_features import build_regime_matrix
 from core.factors.train_ml_model import MLModelTrainer
-from scripts.exp._metrics import _daily_metrics, _day_slices
-from scripts.exp.exp_nam_gate import _prepare_fold, _regime_stratified_metrics
+from core.factors.eval_metrics import _daily_metrics, _day_slices
+from scripts.train_nam_model import _prepare_fold, _regime_stratified_metrics
 
 
 def _day_groups(dates):
@@ -151,7 +155,9 @@ def main():
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--folds', default='0.6:0.8,0.7:0.9,0.8:1.0')
     ap.add_argument('--drop-groups', default='')
-    ap.add_argument('--cache-dir', default=None)
+    ap.add_argument('--cache-dir', default=TrainingConfig.CURRENT_CACHE_DIR,
+                    help='独立版本化因子缓存目录（默认=TrainingConfig.CURRENT_CACHE_DIR，'
+                         '与 NAM 生产件同一份基座）')
     ap.add_argument('--fixed-iter', type=int, default=300,
                     help='不做验证集选型的固定迭代数，用于给出无偏读数')
     ap.add_argument('--full-panel', action='store_true',

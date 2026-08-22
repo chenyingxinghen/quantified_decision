@@ -1,22 +1,50 @@
-"""T039：NAM 单因子专家 + 市场状态门控（NAMGateModel）受控 A/B。
+"""NAM 模型训练入口（NAMGateModel：单因子专家 + 可选市场状态门控）。
 
-背景
-----
-T027–T038 证明生产 XGBoost LambdaRank 的头部瓶颈是"弱绝对信号 + regime 依赖"，
-而中长期市场状态在日频截面上零方差、被迫剔除，只能靠手工 ``{mkt}_regime_{stock}``
-乘积注入。本实验换一条路：
+职责边界
+--------
+本项目有两条并列的训练入口，按**模型族**分工，共用同一份数据基座
+（``TrainingConfig.CURRENT_CACHE_DIR``）与同一套标签口径（``MLModelTrainer.prepare_dataset``）：
 
+  · ``scripts/train_nam_model.py``  ← 本文件。NAM，**当前生产载体**
+  · ``scripts/train_tree_model.py``       XGBoost / LightGBM
+
+面板差异只由显式开关决定，不是版本差异：NAM 线剔除 ``*_regime_*`` 手工交互列
+（改由门控学）并默认 ``--drop-groups forecast``，得到 224 列；树线取 236 列。
+
+生产配方（T115，当前 models/mark 里那两个存档就是这么训出来的）::
+
+    python -u scripts/train_nam_model.py --stocks 5480 --years 13 --end 2022-09-05 \\
+        --disable-gate --target returns --y-scale 2 --expert-hidden 16 --lr 2e-3 \\
+        --drop-groups forecast --select-holdout 0.4 --store-dtype auto \\
+        --seed 42 --save-model-dir models/nam_gate/<tag>_s42
+
+⚠ 需要 torch，只装在 workbuddy 的 3.13.12 解释器里：
+  ``C:/Users/29454/.workbuddy/binaries/python/versions/3.13.12/python.exe``
+
+模型结构
+--------
   score = β0 + Σ_k  w_t[k] · Σ_{i∈group k} f_i(x_i)
 
 - ``f_i``：每个因子一条独立形状函数（NAM）→ 可解释性到"单因子曲线"级别
 - ``w_t``：多时间尺度市场状态 ``m_t`` 经门控网络输出的因子族权重
            → 直接回答"什么行情下哪类因子被放大"
 
+⚠ **门控轴已终审关闭**（T118/T121：2×2 四格全负，两修法合并反向超加性 −0.095）。
+生产一律跑 ``--disable-gate``，即严格加性 NAM。门控代码保留只为可复现历史判定，
+不要在没有新证据的情况下重开这条轴。
+
+历史背景（T039 立项时）
+----------------------
+T027–T038 证明生产 XGBoost LambdaRank 的头部瓶颈是"弱绝对信号 + regime 依赖"，
+而中长期市场状态在日频截面上零方差、被迫剔除，只能靠手工 ``{mkt}_regime_{stock}``
+乘积注入。本实验换一条路，让门控端到端学习行情调节。
+
 受控条件（唯一变量 = 模型族 + 市场信息注入方式）
 - 相同股票池 / 相同 7 日标签 / 相同折切分（历史折 70–80% 选型，最终折 80–100% 确认）
 - 相同截面归一化（复用 trainer 的 rank + robust skip-col 逻辑，保证与回测端一致）
 - NAM 线**剔除** ``*_regime_*`` 手工交互列（改由门控端到端学习）
-- 基线 = 同折 XGBoost LambdaRank（复用 exp_head_features._train_and_predict）
+- 同折树基线见 ``scripts/exp/exp_tree_vs_nam.py``（本脚本内的 ``--skip-baseline``
+  基线臂依赖已丢失的 ``exp_head_features``，不可用）
 
 防专家坍塌（DeepSeek 研讨指出的核心风险）
 - 负载均衡损失 CV² + 门控熵正则 + 温度 warmup
@@ -35,7 +63,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -49,12 +77,12 @@ from core.factors.nam_gate_model import (
 )
 from core.factors.regime_features import align_regime_to_samples, build_regime_matrix
 from core.factors.train_ml_model import MLModelTrainer
-from scripts.diagnose_xgb_oof_head import _fold_dataset
+from core.factors.eval_metrics import _fold_dataset
 # _daily_metrics / _head_percentile / _compare 原在 scripts/exp_horizon_7d_vs_15d.py，
 # 该文件与 exp_head_features.py 一并丢失（从未进 git）。前三个已在 _metrics.py 重建
 # 并用 T083_base_s42 复现校验；_train_and_predict（XGB 基线臂）无法重建，
 # 因此 --skip-baseline 现在是硬要求，缺它时延迟到真正用到才报错。
-from scripts.exp._metrics import _compare, _daily_metrics, _head_percentile
+from core.factors.eval_metrics import _compare, _daily_metrics, _head_percentile
 
 
 def _train_and_predict(*_a, **_kw):
@@ -398,7 +426,7 @@ def _prepare_fold(trainer, dataset, feature_names, train_fraction, val_end, regi
     y_val = _rank_labels_by_day(label_src[val_start:], dates[val_start:])
 
     # E19 幅度标签：**只换训练标签**。y_val 必须保持 rank 口径——它在
-    # exp_nam_gate:579 参与检查点选型，换掉就等于同时换了尺子和被测物；
+    # train_nam_model:579 参与检查点选型，换掉就等于同时换了尺子和被测物；
     # 而且 winsor 的截断会在两端造出并列，连 Rank IC 都不再与基线严格可比。
     # 与 E11 多期标签同一条纪律（见下方注释）。
     if label_transform != 'rank':
@@ -1251,8 +1279,9 @@ def main():
                     help='跳过 XGBoost 基线重跑（用于快速迭代 NAM 超参）')
     ap.add_argument('--allow-degenerate-downside-risk', action='store_true',
                     help='仅用于复现旧实验：允许 downside_risk 缓存退化；新训练禁止使用')
-    ap.add_argument('--cache-dir', default=None,
-                    help='独立版本化因子缓存目录；新公式训练必须显式指定，禁止覆盖历史共享缓存')
+    ap.add_argument('--cache-dir', default=TrainingConfig.CURRENT_CACHE_DIR,
+                    help='独立版本化因子缓存目录（默认=TrainingConfig.CURRENT_CACHE_DIR，'
+                         '与树同一份基座）；禁止覆盖历史共享缓存')
     ap.add_argument('--industry-relative', default='none',
                     help="E7：追加当日行业内百分位列 <base>__ind。'none' 关闭；"
                          "'core' 用内置核心列表；也可传逗号分隔的因子名")
@@ -1312,7 +1341,7 @@ def main():
     gc.collect()
 
     # 已知缓存契约审计：旧 downside_risk 公式会使该列几乎全为 0。
-    # exp_nam_gate 使用 cache-only，代码公式修复不会自动重建同名缓存；若不硬失败，
+    # train_nam_model 使用 cache-only，代码公式修复不会自动重建同名缓存；若不硬失败，
     # 下一轮仍会悄悄训练在坏特征上。
     if 'downside_risk' in all_features:
         _ds_idx = all_features.index('downside_risk')

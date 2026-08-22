@@ -1,3 +1,27 @@
+"""树模型训练入口（XGBoost / LightGBM LambdaRank）。
+
+职责边界
+--------
+本项目有两条并列的训练入口，按**模型族**分工，共用同一份数据基座
+（``TrainingConfig.CURRENT_CACHE_DIR``）与同一套标签口径（``MLModelTrainer.prepare_dataset``）：
+
+  · ``scripts/train_tree_model.py``  ← 本文件。XGBoost / LightGBM
+  · ``scripts/train_nam_model.py``        NAM，**当前生产载体**
+
+面板差异只由显式开关决定，不是版本差异：树线取 ``drop_cols`` 之外的全部 236 列
+（含 4 列 ``fc_*`` 业绩预告与 8 列手工 ``*_regime_*`` 交互）；NAM 线剔除
+``*_regime_*`` 并默认 ``--drop-groups forecast``，得到 224 列。
+
+⚠ 树**不是**当前生产载体：T095 预注册终审判给 NAM（β 0.988 vs 1.255、
+回撤 −35.14% vs −43.31%），T101 又否证了「树更擅长头部选股」。这里保留完整训练
+链路是为了同折对照（见 ``scripts/exp/exp_tree_vs_nam.py``）与随时可切回。
+
+用法::
+
+    python scripts/train_tree_model.py                        # 全市场增量训练
+    python scripts/train_tree_model.py --stocks 5480 --seed 42
+    python scripts/train_tree_model.py --update-cache-only    # 只刷因子缓存不训练
+"""
 import sys
 import os
 import argparse
@@ -16,7 +40,8 @@ import pandas as pd
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Quantified Decision - 机器学习模型训练入口')
+    parser = argparse.ArgumentParser(
+        description='Quantified Decision - 树模型（XGBoost/LightGBM）训练入口')
     parser.add_argument('--start',  type=str, default=None, help='训练开始日期 (YYYY-MM-DD)')
     parser.add_argument('--end',    type=str, default=None, help='训练结束日期 (YYYY-MM-DD)')
     parser.add_argument('--stocks', type=int, default=TrainingConfig.STOCK_NUM,
@@ -49,8 +74,10 @@ def main():
                         help='跳过增量缓存更新步骤，直接进入模型训练')
     parser.add_argument('--cache-end', type=str, default=None,
                         help='缓存更新截止日期 (YYYY-MM-DD)，默认=今天')
-    parser.add_argument('--cache-dir', type=str, default=None,
-                        help='独立因子缓存目录；显式指定时启用公式版本清单与模型绑定')
+    parser.add_argument('--cache-dir', type=str, default=TrainingConfig.CURRENT_CACHE_DIR,
+                        help='独立因子缓存目录（默认=TrainingConfig.CURRENT_CACHE_DIR，'
+                             '与 NAM 同一份基座）。显式指定时启用公式版本清单与模型绑定；'
+                             '传 legacy 可回到无清单的旧共享缓存以复现历史训练')
     parser.add_argument('--seed', type=int, default=None,
                         help='注入 ModelConfig.MODEL_SEED（树的 subsample/colsample 抽样）。'
                              '不传则沿用框架默认，与历史训练逐位一致。'
@@ -295,8 +322,10 @@ def main():
         return
 
     print("\n保存最新模型...")
+    # 落 models/tree/ 而不是 models/ 根：models/ 根下还有 mark（生产载体）、
+    # nam_gate（NAM 归档）、latest、diagnostics，树存档直接摊在根上会和它们混在一起。
     archive_dir = trainer.save_models(
-        save_dir=TrainingConfig.SAVE_DIR,
+        save_dir=os.path.join(TrainingConfig.SAVE_DIR, 'tree'),
         years=TrainingConfig.YEARS_FOR_TRAINING,
         stocks=len(trainer_stocks),
         update_latest=not args.no_update_latest,

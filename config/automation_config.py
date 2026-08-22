@@ -45,14 +45,16 @@ SELL_WINDOW_END   = "14:57:00"
 # 3. 仓位策略 (同步回测逻辑)
 # ==============================================================================
 
-# 最大持仓数量 (与 strategy_config.MAX_POSITIONS 保持一致)
-MAX_POSITIONS_AUTO = 1
+# 最大持仓数量。
+MAX_POSITIONS_AUTO = 5
 
-# 单只股票最大买入比例 (占可用资金的百分比)
+# 单只股票买入比例。仅作向后兼容保留；实际预算由 execution_controller 按
+# 「总资产 / MAX_POSITIONS_AUTO」计算（与回测 total_value/max_positions 同口径），
+# 不再使用「可用现金 × 比例」——后者在有持仓时会让每笔仓位系统性偏小。
 SINGLE_BUY_RATIO = 1.0 / MAX_POSITIONS_AUTO
 
 # 买入金额保留余地 (元)，避免资金不足或滑点
-CASH_BUFFER = 100
+CASH_BUFFER = 10
 
 
 # ==============================================================================
@@ -61,36 +63,13 @@ CASH_BUFFER = 100
 
 # 自动化交易使用的模型与其训练期归一化统计量。
 #
-# 载体：全量池纯加性 NAM（T105 终审：混合轴关闭、树头部选股已否证），
-# 面板：T115 的 224 列（219 基础 + 5 列 index_rel，2026-08-18 按族层面证据晋级）。
-#
-# 为什么是 s42 而不是 holdout IC 最高的 s37（0.1246 vs 0.1186）：**不在验证集上
-# 挑种子**。四种子同配方同数据，只有随机初始化不同，用验证 IC 选一个会把
-# 选型偏差（台账实测稳定占 12~13%）当成真实优势带进实盘。s42 是台账全程的
-# 首选种子号，与它作为基准的历史一致。
-#
-# norm_stats 必须与权重**同批产出**（同一存档目录）：归一化统计量和权重对不上
-# 会让连续列以错误量纲进模型，且不报错。策略层默认路径就是模型同目录，
-# 这里显式写出来是为了让「换模型忘了换 norm_stats」变成不可能。
-AUTO_MODEL_PATH = 'models/nam_gate/T115_idxrel_s42/nam_gate_factor_model.pkl'
-AUTO_NORM_STATS_PATH = 'models/nam_gate/T115_idxrel_s42/norm_stats.pkl'
-
-# 可选：多种子**等权集成**载体。非空时策略层把 AUTO_MODEL_PATH 与这里的每个存档
-# 都加载，逐日各自算截面分位排名后**等权平均**（口径与 xgb+lgb 集成一致，
-# 见 core/backtest/strategies/ml_factor_strategy.py 的 ensemble_models 分支）。
-#
-# ⚠ 当前**留空 = 不启用**。T131 实测在两个窗口上不一致：
-#     T115 窗（13y→2022-09-05, 161 holdout 日）：集成 IC +0.12791，赢最幸运种子 +0.00327
-#     T122 窗（ 9y→2026-08-10, 145 holdout 日）：集成 IC +0.06230，**输**最幸运种子 −0.00173
-#                                              且跌日否决门不过（vs 在跑种子 −0.01429）
-#   预注册判据是「必须赢最幸运的那个单种子（线 +0.005）」—— 两窗都不过，故不晋级。
-#   成立的只有较弱的那条：集成稳定赢**随机抽一个种子的期望值**（+0.0078 / +0.0042），
-#   且抽签风险很大（T122 窗单种子头部超额 −0.0045~+0.0034，**符号都会翻**）。
-#   所以这是个「降方差」选项而非「更强」选项，要不要用是**取舍**，不是 IC 结论。
-#
-# 启用时必须同批产出：所有成员同窗口、同超参、同面板，只差随机种子；
-# 策略层会硬校验 feature_names 顺序一致。norm_stats 仍取 AUTO_NORM_STATS_PATH
-# （同配方同窗训练出的归一化统计量在种子间相同，只是权重不同）。
+# ⚠ 自动化模块有自己的模型加载设置，直接指向生产载体 models/mark/
+# （生产推理载体一律放在 models/mark/ 下，见 strategy_config.py「模型载体」一节）。
+# 不再从 strategy_config 转发 —— 历史上转发导致实盘与回测跑在不同权重上。
+# 要换实盘模型，改这里的 AUTO_MODEL_PATH 即可。
+AUTO_MODEL_PATH = 'models/mark/T115_idxrel_s42/nam_gate_factor_model.pkl'
+AUTO_NORM_STATS_PATH = 'models/mark/T115_idxrel_s42/norm_stats.pkl'
+# 可选多种子等权集成载体（当前留空 = 不启用）
 AUTO_ENSEMBLE_MODEL_PATHS: list = []
 
 # 信号生成时使用的最低置信度阈值（百分制，0.0 表示不过滤）
@@ -109,7 +88,13 @@ AUTO_TOP_N = MAX_POSITIONS_AUTO
 # ==============================================================================
 
 # 是否启用自动化选股的基础条件筛选（市值/PE/股价/ST）
-AUTO_APPLY_FILTER = True
+#
+# **默认关闭**，与回测口径一致（sc.ENABLE_FUNDAMENTAL_FILTER = False）。
+# 注意语义已经变了：筛选现在发生在模型打分**之后**（见 ml_factor_strategy），
+# 所以开启它不再污染横截面 rank，只是把不合格的候选从买入名单里剔除。
+# 即便如此仍建议保持关闭 —— 回测基线是在无过滤的全市场上跑出来的，
+# 任何一条过滤（尤其是下面的价格上限）都会注入一个未经检验的风格暴露。
+AUTO_APPLY_FILTER = False
 
 # 最小流通市值（亿元），过滤微盘股。None = 使用 sc.MIN_MARKET_CAP 兜底
 AUTO_MIN_MARKET_CAP = None       # 至少 20 亿市值
@@ -120,14 +105,21 @@ AUTO_MAX_PE = None              # PE 不高于 150 倍
 # 最大资产负债率（%）。None = 使用 sc.MAX_ZCFZL 兜底
 AUTO_MAX_ZCFZL = None
 
-# 股价区间（元），过滤极低价或高价股。None = 使用 sc.MIN_PRICE/MAX_PRICE 兜底
-AUTO_MIN_PRICE = None            # None = 使用 sc.MIN_PRICE 兜底，保持与回测/前端一致
-AUTO_MAX_PRICE = 20.0           # 最高 20 元
+# 股价区间（元）。None = 使用 sc.MIN_PRICE/MAX_PRICE 兜底
+# ⚠ AUTO_MAX_PRICE 曾是 20.0，配合 AUTO_APPLY_FILTER=True 把选股域砍到「主板 + 20 元
+# 以下」。那是一个强规模/风格暴露，且从未被回测检验过（回测跑的是无过滤全市场）。
+# 现已置 None；要重新启用必须先按同样的过滤条件重跑基线。
+AUTO_MIN_PRICE = None
+AUTO_MAX_PRICE = None
 
-# 是否包含 ST / *ST 股票。None = 使用 sc.INCLUDE_ST 兜底。实盘建议设为 False 规避退市风险
+# 是否包含 ST / *ST 股票。None = 使用 sc.INCLUDE_ST 兜底。
+# 注意：ST 的排除**不依赖**上面的 AUTO_APPLY_FILTER —— 策略层有一条独立的
+# PIT 风险过滤（ML_FACTOR_RISK_EXCLUDE_ST），它同样在打分之后执行，始终生效。
 AUTO_INCLUDE_ST = False
 
 # 市场类型列表。None = 使用 sc.SELECTOR_MARKETS 兜底
-SELECTOR_MARKETS=['sh_main','sz_main']
+# ⚠ 曾硬编码为 ['sh_main','sz_main']，把创业板/科创板整个排除在外，与回测的
+# 全市场池不一致。置 None 以跟随全局配置。
+SELECTOR_MARKETS = None
 
 

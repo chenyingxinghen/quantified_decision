@@ -29,8 +29,16 @@ def find_latest_model(base_dir: str) -> Optional[str]:
     return pkls[0]
 
 def load_smart_model(model_path: str):
+    """按存档类型加载模型：NAMGate → Ensemble(双 pkl) → MLFactor。
+
+    ⚠ NAMGateModel 的嗅探必须排在 Ensemble/ML 之前，否则 NAM 存档会被
+    ``EnsembleFactorModel.load_model`` 误吞。顺序与 ml_factor_strategy 一致。
+    此处返回的 NAM 实例**未挂载 regime 矩阵**，只可用于读元信息
+    （feature_names / feature_importance），不可 predict —— 真正的推理走
+    ``scripts.select_stocks.select_stocks`` → ``select_for_live()``。
+    """
     from core.factors.ml_factor_model import MLFactorModel, EnsembleFactorModel
-    
+
     if os.path.isdir(model_path):
         xgb_path = os.path.join(model_path, 'xgboost_factor_model.pkl')
         lgb_path = os.path.join(model_path, 'lightgbm_factor_model.pkl')
@@ -40,18 +48,37 @@ def load_smart_model(model_path: str):
             m2 = MLFactorModel(model_type='lightgbm')
             m2.load_model(lgb_path)
             return EnsembleFactorModel(models=[m1, m2], weights=[0.5, 0.5])
-        
+
+        # NAM 存档目录：标准文件名优先于 find_latest_model 的 mtime 启发式，
+        # 否则 norm_stats.pkl 更新时会被当成模型 pkl，静默退化成空壳树模型。
+        nam_path = os.path.join(model_path, 'nam_gate_factor_model.pkl')
+        if os.path.exists(nam_path):
+            return load_smart_model(nam_path)
+
         latest = find_latest_model(model_path)
         if latest: return load_smart_model(latest)
         return None
 
     if not os.path.exists(model_path): return None
+
+    try:
+        from core.factors.nam_gate_model import NAMGateModel
+        if NAMGateModel.is_nam_gate_archive(model_path):
+            m = NAMGateModel()
+            m.load_model(model_path)
+            return m
+    except Exception:
+        pass
+
     try:
         return EnsembleFactorModel.load_model(model_path)
     except Exception:
-        m = MLFactorModel()
-        m.load_model(model_path)
-        return m
+        try:
+            m = MLFactorModel()
+            m.load_model(model_path)
+            return m
+        except Exception:
+            return None
 
 # ── 惰性加载重型模块 ────────────────────────────────────────
 _model = None
@@ -93,7 +120,11 @@ async def list_available_models():
                 types.append("xgboost")
             if os.path.exists(os.path.join(path, "lightgbm_factor_model.pkl")):
                 types.append("lgbm")
-            
+            # NAM（专家加性模型）存档：与树同级的一等公民，否则会被归进 custom，
+            # 前端无法按类型选中它。
+            if os.path.exists(os.path.join(path, "nam_gate_factor_model.pkl")):
+                types.append("nam_gate")
+
             # 如果没有标准命名的，检查是否有任何 pkl
             if not types:
                 has_pkl = any(f.endswith(".pkl") for f in os.listdir(path))
@@ -172,10 +203,36 @@ class RunSelectionRequest(BaseModel):
     apply_filter: bool = False
     min_confidence: float = 0
     model_path: Optional[str] = None
-    model_types: List[str] = ["lgbm", "xgboost"]
+    model_types: List[str] = ["lgbm", "xgboost", "nam_gate"]
     guest_config: Optional[str] = None  # 游客本地配置 JSON 字符串，用于基础筛选条件
     markets: Optional[List[str]] = None
     max_zcfzl: Optional[float] = None
+
+
+def _resolve_model_path(user_path: Optional[str]) -> str:
+    """把前端传来的模型路径收敛到 <项目根>/models 之内。
+
+    原实现是 `os.path.join(get_project_root(), req.model_path)` 后直接交给
+    `load_smart_model` → `pickle.load`。req.model_path 完全由请求体控制：
+    `../` 或绝对路径都能跳出项目，而 pickle 反序列化任意文件等于**远程代码执行**
+    （攻击者只要先把 .pkl 写进任何可达路径 —— 例如经由其它上传/日志落盘点）。
+    这里强制 realpath 归一化 + 前缀校验，越界直接 400。
+    """
+    models_root = os.path.realpath(os.path.join(get_project_root(), "models"))
+    if not user_path:
+        default = os.path.join(models_root, "mark")
+        return default if os.path.exists(default) else models_root
+
+    candidate = os.path.realpath(os.path.join(get_project_root(), user_path))
+    try:
+        inside = os.path.commonpath([candidate, models_root]) == models_root
+    except ValueError:      # 跨盘符
+        inside = False
+    if not inside:
+        raise HTTPException(status_code=400, detail="model_path 必须位于 models/ 目录内")
+    if not os.path.exists(candidate):
+        raise HTTPException(status_code=404, detail=f"模型路径不存在: {user_path}")
+    return candidate
 
 
 @router.post("/run")
@@ -184,6 +241,9 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
     global _selection_task
     if _selection_task["running"]:
         raise HTTPException(status_code=409, detail="已有选股任务在运行中")
+
+    # 路径校验必须在进后台线程**之前**做，这样非法路径直接 400 而不是静默失败
+    resolved_base = _resolve_model_path(req.model_path)
 
     _selection_task = {
         "running": True, 
@@ -202,13 +262,10 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
         global _selection_task
         from datetime import datetime
         try:
-            # 1. 确定基准目录
-            if req.model_path:
-                base_path = os.path.join(get_project_root(), req.model_path)
-            else:
-                base_path = os.path.join(get_project_root(), "models", "mark")
-                if not os.path.exists(base_path):
-                    base_path = os.path.join(get_project_root(), ML_FACTOR_MODEL_PATH)
+            # 1. 基准目录（已在请求线程内完成 models/ 边界校验）
+            base_path = resolved_base
+            if not os.path.exists(base_path):
+                base_path = os.path.join(get_project_root(), ML_FACTOR_MODEL_PATH)
             
             # 2. 获取用户配置作为覆盖
             user_filters = {}
@@ -266,6 +323,11 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
                 if "lgbm" in req.model_types:
                     p = os.path.join(base_path, "lightgbm_factor_model.pkl")
                     if os.path.exists(p): run_configs.append(("lgbm", p))
+                # NAM 存档与树同级：不列出来的话 NAM 目录只能落到 ("default", dir)，
+                # 由 select_for_live 内部嗅探——能跑，但前端拿不到 model_type 标签。
+                if "nam_gate" in req.model_types:
+                    p = os.path.join(base_path, "nam_gate_factor_model.pkl")
+                    if os.path.exists(p): run_configs.append(("nam_gate", p))
                 if not run_configs:
                     run_configs.append(("default", base_path))
             else:

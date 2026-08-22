@@ -14,7 +14,7 @@ rank_ic≈0.097 计，SE(IC̄) ≈ 0.102/√90 ≈ 0.011 —— 而 T045–T067 
 
 方法
 ----
-1. 用完全相同的折切分与截面归一化，重建验证集（复用 exp_nam_gate._prepare_fold，
+1. 用完全相同的折切分与截面归一化，重建验证集（复用 train_nam_model._prepare_fold，
    保证与训练/回测三端一致）。
 2. 对每个模型逐日算 Spearman IC，得到长度 D 的序列 ic_a[d]、ic_b[d]。
 3. 差分序列 diff[d] = ic_a[d] - ic_b[d]。
@@ -53,7 +53,7 @@ from config.factor_config import TrainingConfig
 from core.data.baostock_main import BaostockDataManager
 from core.factors.train_ml_model import MLModelTrainer, _fast_rankdata_1d
 from core.factors.nam_gate_model import NAMGateModel
-from scripts.exp.exp_nam_gate import _prepare_fold, build_group_index, build_regime_matrix
+from scripts.train_nam_model import _prepare_fold, build_group_index, build_regime_matrix
 
 
 # ---------------------------------------------------------------------------

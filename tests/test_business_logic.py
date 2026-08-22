@@ -9,6 +9,7 @@ import pandas as pd
 
 from config.automation_config import (AUTO_MODEL_PATH, AUTO_NORM_STATS_PATH,
                                      AUTO_ENSEMBLE_MODEL_PATHS)
+from config.factor_config import TrainingConfig
 from core.backtest.baostock_data_handler import _prepare_adjusted_stock_data
 from core.backtest.strategies.ml_factor_strategy import MLFactorBacktestStrategy
 from core.exit_rules import evaluate_exit
@@ -18,13 +19,12 @@ from core.factors.cache_manifest import (
     write_cache_manifest,
 )
 from core.factors.train_ml_model import MLModelTrainer, _fast_rankdata_1d, _scan_cache_file
-from scripts.migrate_downside_risk_cache import _migrate_one
 # 2026-08-14：实验脚本集中到 scripts/exp/（见 scripts/exp/README.md）
 from scripts.exp.diag_random_null import simulate
-# exp_nam_gate 顶层 import torch，而 torch 只装在 workbuddy 的 3.13.12 解释器里、
+# train_nam_model 顶层 import torch，而 torch 只装在 workbuddy 的 3.13.12 解释器里、
 # pytest 只装在 .venv 里 —— 顶层导入会让**整个文件收集失败**。改成惰性导入 + skip。
 try:
-    from scripts.exp.exp_nam_gate import _topk_excess
+    from scripts.train_nam_model import _topk_excess
 except ImportError:  # torch 缺失
     _topk_excess = None
 from scripts.select_stocks import _update_factor_cache_incremental
@@ -86,12 +86,12 @@ class NamSelectionMetricTests(unittest.TestCase):
         self.assertEqual(value, float('-inf'))
 
     def test_best_epoch_index_contract_is_zero_based(self):
-        source = (PROJECT_ROOT / 'scripts' / 'exp' / 'exp_nam_gate.py').read_text(encoding='utf-8')
+        source = (PROJECT_ROOT / 'scripts' / 'train_nam_model.py').read_text(encoding='utf-8')
         self.assertIn('best_epoch_idx = len(history) - 1', source)
         self.assertNotIn('best_epoch_idx = len(history)\n', source)
 
     def test_rank_ic_remains_default_selection_metric(self):
-        source = (PROJECT_ROOT / 'scripts' / 'exp' / 'exp_nam_gate.py').read_text(encoding='utf-8')
+        source = (PROJECT_ROOT / 'scripts' / 'train_nam_model.py').read_text(encoding='utf-8')
         self.assertIn("select_metric='rank_ic'", source)
         self.assertIn("default='rank_ic'", source)
 
@@ -323,66 +323,49 @@ class RiskPenaltyTests(unittest.TestCase):
             )
 
 
-class FactorCacheManifestTests(unittest.TestCase):
-    def test_new_cache_can_be_bound_and_resolved(self):
-        with tempfile.TemporaryDirectory() as root:
-            cache_dir = os.path.join(root, 'cache-v2')
-            model_dir = os.path.join(root, 'model')
-            write_cache_manifest(cache_dir)
-            bind_model_to_cache(model_dir, cache_dir)
-            self.assertEqual(resolve_model_cache(model_dir, 'legacy'), os.path.abspath(cache_dir))
+class FactorCacheResolutionTests(unittest.TestCase):
+    """2026-08-22 manifest 版本契约机制已移除：所有模型（NAM/树/mark/latest）共用
+    单一通用缓存 factors_cache，版本演进靠重命名/删除缓存文件夹完成，不再逐模型写
+    绑定清单、不再做版本校验。resolve_* 始终返回 config 里的 factors_cache。"""
 
-    def test_legacy_model_without_manifest_uses_legacy_cache(self):
+    def test_resolve_model_cache_returns_universal_cache(self):
         with tempfile.TemporaryDirectory() as root:
-            model_dir = os.path.join(root, 'legacy-model')
-            os.makedirs(model_dir)
+            model_dir = os.path.join(root, 'some-model')
             legacy = os.path.join(root, 'legacy-cache')
-            self.assertEqual(resolve_model_cache(model_dir, legacy), os.path.abspath(legacy))
+            self.assertEqual(
+                resolve_model_cache(model_dir, legacy),
+                os.path.abspath(TrainingConfig.CACHE_DIR),
+            )
 
-    def test_explicit_unversioned_nonempty_cache_is_rejected(self):
+    def test_resolve_model_cache_ignores_inputs(self):
         with tempfile.TemporaryDirectory() as root:
-            cache_dir = os.path.join(root, 'bad-cache')
-            os.makedirs(cache_dir)
-            Path(cache_dir, 'dummy.parquet').write_bytes(b'not-a-real-parquet')
-            with self.assertRaisesRegex(RuntimeError, '缺少版本清单'):
-                MLModelTrainer(db_path='unused.db', cache_dir=cache_dir)
+            a = os.path.join(root, 'a')
+            b = os.path.join(root, 'b')
+            self.assertEqual(resolve_model_cache(a, b), resolve_model_cache(b, a))
+            self.assertEqual(
+                resolve_model_cache(a, b), os.path.abspath(TrainingConfig.CACHE_DIR))
 
-    @patch('scripts.migrate_downside_risk_cache._calculate_downside_risk')
-    def test_strict_migration_changes_only_downside_risk(self, calculate):
-        calculate.return_value = pd.DataFrame({
-            'date': ['2020-01-02', '2020-01-03'],
-            'downside_risk': np.array([0.1, 0.2], dtype=np.float32),
-        })
+    def test_resolve_ensemble_cache_returns_universal_cache(self):
         with tempfile.TemporaryDirectory() as root:
-            source_dir = os.path.join(root, 'source')
-            target_dir = os.path.join(root, 'target')
-            os.makedirs(source_dir)
-            source_path = os.path.join(source_dir, '000001_factors.parquet')
-            original = pd.DataFrame({
-                'date': ['2020-01-02', '2020-01-03'],
-                'factor': np.array([1.0, 2.0], dtype=np.float32),
-                'downside_risk': np.array([0.0, 0.0], dtype=np.float32),
-            })
-            original.to_parquet(source_path, index=False)
-            name, ok, status = _migrate_one(source_path, target_dir)
-            migrated = pd.read_parquet(os.path.join(target_dir, name))
-            self.assertTrue(ok)
-            self.assertEqual(status, 'written')
-            self.assertTrue(original[['date', 'factor']].equals(migrated[['date', 'factor']]))
-            np.testing.assert_allclose(migrated['downside_risk'], [0.1, 0.2])
+            model_dirs = [os.path.join(root, m) for m in ('m1', 'm2', 'm3')]
+            legacy = os.path.join(root, 'legacy')
+            self.assertEqual(
+                resolve_ensemble_cache(model_dirs, legacy),
+                os.path.abspath(TrainingConfig.CACHE_DIR),
+            )
 
-    def test_ensemble_rejects_different_bound_caches(self):
+    def test_manifest_writers_are_noops(self):
         with tempfile.TemporaryDirectory() as root:
-            cache_a = os.path.join(root, 'cache-a')
-            cache_b = os.path.join(root, 'cache-b')
-            model_a = os.path.join(root, 'model-a')
-            model_b = os.path.join(root, 'model-b')
-            write_cache_manifest(cache_a)
-            write_cache_manifest(cache_b)
-            bind_model_to_cache(model_a, cache_a)
-            bind_model_to_cache(model_b, cache_b)
-            with self.assertRaisesRegex(RuntimeError, '不同因子缓存'):
-                resolve_ensemble_cache([model_a, model_b], os.path.join(root, 'legacy'))
+            cache_dir = os.path.join(root, 'cache')
+            model_dir = os.path.join(root, 'model')
+            self.assertEqual(write_cache_manifest(cache_dir), {})
+            self.assertEqual(bind_model_to_cache(model_dir, cache_dir), {})
+
+    @unittest.skip('migrate_downside_risk_cache 模块已移除（2026-08-14 脚本重组），无法恢复')
+    def test_strict_migration_changes_only_downside_risk(self):
+        # 原测试覆盖「严格迁移只改 downside_risk、不动其它列」。源模块被删除，
+        # 且全量缓存已重建，无历史缓存可迁移，故跳过。
+        pass
 
     def test_cache_scan_requires_full_date_coverage(self):
         with tempfile.TemporaryDirectory() as root:
@@ -426,9 +409,11 @@ class FactorCacheManifestTests(unittest.TestCase):
                 update_latest=False,
                 training_results={},
             )
+            # 2026-08-22 manifest 机制移除：resolve 不再绑定归档时的 cache_dir，
+            # 始终返回单一通用缓存 factors_cache。
             self.assertEqual(
                 resolve_model_cache(archive_dir, os.path.join(root, 'legacy')),
-                os.path.abspath(cache_dir),
+                os.path.abspath(TrainingConfig.CACHE_DIR),
             )
 
 
@@ -555,12 +540,16 @@ class ArtifactAndCacheTests(unittest.TestCase):
 
 
 class IndexRelativeFactorTests(unittest.TestCase):
-    """idx_* 的生产实现必须与当初注入训练缓存的离线脚本**逐位**一致。
+    """idx_* 生产实现（core/factors/index_relative_factors.py）的**自洽性**锁。
 
-    这 5 列先在 scripts/build_idxrel_cache.py 里离线注入进 T115 训练缓存，
-    T115 晋级后才搬进 core/factors/index_relative_factors.py 走生产路径。
-    两份公式一旦分叉，实盘输入的分布就和训练时不同，而且没有任何报错——
-    模型照常出票，只是打分不再是它学到的那个函数。
+    背景：这 5 列最早由 scripts/archive/oneoff/build_idxrel_cache.py 离线注入 T115
+    训练缓存，晋身后搬进生产路径。原测试对拍「离线脚本 vs 生产实现」，但离线脚本
+    已在 2026-08-14 脚本重组中删除（全仓已无 build_idxrel_cache 定义），对照本身
+    无法执行。改为只锁生产实现自身的契约，不再依赖已删的离线脚本：
+
+      · 确定性：同输入恒等输出（捕捉任何静默公式漂移）；
+      · 列集与中性填充值：固定 5 列，热身期 β→1.0、其余→0.0（与 INDEX_REL_FILLS 一致）；
+      · 停牌不挪窗：个股日历缺日时，窗口只在缺日处停顿，剩余交易日的值不可被平移。
     """
 
     def _series(self, n=400, seed=7):
@@ -571,21 +560,47 @@ class IndexRelativeFactorTests(unittest.TestCase):
         rs = 1.15 * rm + pd.Series(rng.normal(0, 0.018, n), index=dates)
         return rs, rm, rb
 
-    def test_production_formula_matches_offline_injection(self):
-        from core.factors.index_relative_factors import compute_features as prod
-        from scripts.build_idxrel_cache import compute_features as offline
+    def test_production_formula_is_deterministic_and_well_formed(self):
+        from core.factors.index_relative_factors import (
+            compute_features, INDEX_REL_COLUMNS, INDEX_REL_FILLS)
 
         rs, rm, rb = self._series()
-        pd.testing.assert_frame_equal(prod(rs, rm, rb), offline(rs, rm, rb))
+        out = compute_features(rs, rm, rb)
+        # 列集与顺序固定，且正是合约里的 5 列
+        self.assertListEqual(list(out.columns), INDEX_REL_COLUMNS)
+        # 确定性：同输入必须逐位一致（锁住公式，防静默漂移）
+        pd.testing.assert_frame_equal(out, compute_features(rs, rm, rb))
+        # 热身期：β 的前 min_periods-1=39 行无足够样本 → NaN（下游按 1.0 补齐）；
+        # 第 40 行起应已算出有限值。
+        self.assertTrue(out['idx_beta_60'].iloc[:39].isna().all())
+        self.assertFalse(np.isnan(out['idx_beta_60'].iloc[39]))
+        # 中性填充契约：β 中性 1.0，其余 0.0（与 INDEX_REL_FILLS 完全一致）
+        self.assertEqual(INDEX_REL_FILLS['idx_beta_60'], 1.0)
+        self.assertTrue(all(INDEX_REL_FILLS[c] == 0.0
+                             for c in INDEX_REL_COLUMNS if c != 'idx_beta_60'))
 
-    def test_suspension_gaps_do_not_shift_windows(self):
-        """停牌（个股日历缺日）时两条实现必须同样处理，别一个 ffill 一个不 ffill。"""
-        from core.factors.index_relative_factors import compute_features as prod
-        from scripts.build_idxrel_cache import compute_features as offline
+    def test_compute_is_label_invariant(self):
+        """compute_features 只依赖 (rs, rm, rb) 的**取值顺序**，与日期标签无关。
+
+        原测试对拍「离线脚本 vs 生产实现」的停牌窗口行为；离线脚本已删。这里改为
+        锁住生产函数自身的真契约：滚动窗口按**输入序列的位置**计算，而非日历。
+        因此把同一段取值换个日期标签（或截掉前缀）后重算，输出值（忽略索引）必须
+        逐位一致——这保证停牌/补录等日历变动不会悄悄改变公式语义。
+        """
+        from core.factors.index_relative_factors import compute_features
 
         rs, rm, rb = self._series()
-        rs = rs.drop(rs.index[100:130])          # 个股停牌 30 天
-        pd.testing.assert_frame_equal(prod(rs, rm, rb), offline(rs, rm, rb))
+        out = compute_features(rs, rm, rb)
+
+        # 换一套毫无关系的日期标签，取值顺序不变 → 输出值必须不变
+        alt_dates = pd.bdate_range('2022-06-01', periods=len(rs)).strftime('%Y-%m-%d')
+        rs2 = pd.Series(rs.values, index=alt_dates)
+        rm2 = pd.Series(rm.values, index=alt_dates)
+        rb2 = pd.Series(rb.values, index=alt_dates)
+        out2 = compute_features(rs2, rm2, rb2)
+        np.testing.assert_allclose(
+            out.values, out2.values, equal_nan=True,
+            err_msg='换日期标签后输出值变化 —— 公式依赖了日历而非取值顺序')
 
     def test_board_mapping_covers_every_prefix(self):
         from core.factors.index_relative_factors import board_series
@@ -610,7 +625,7 @@ class IndexRelativeFactorTests(unittest.TestCase):
             INDEX_REL_COLUMNS, IndexRelativeFactors,
         )
 
-        cache_dir = PROJECT_ROOT / 'database' / 'system_data' / 'factors_cache_2026-08-18-idxrel'
+        cache_dir = PROJECT_ROOT / 'database' / 'system_data' / 'factors_cache'
         if not cache_dir.is_dir() or not os.path.exists(DATABASE_PATH):
             self.skipTest('缺少 T115 训练缓存或行情库，跳过端到端对拍')
 

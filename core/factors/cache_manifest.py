@@ -26,72 +26,38 @@ def load_manifest(directory: str) -> Optional[Dict[str, Any]]:
 
 
 def write_cache_manifest(cache_dir: str) -> Dict[str, Any]:
-    """在独立缓存目录写当前公式版本清单；不负责迁移或删除旧缓存。"""
-    cache_dir = os.path.abspath(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True)
-    payload = {
-        'manifest_type': 'factor_cache',
-        'factor_definition_version': TrainingConfig.FACTOR_DEFINITION_VERSION,
-        'cache_dir': cache_dir,
-        'created_at_utc': datetime.now(timezone.utc).isoformat(),
-    }
-    path = manifest_path(cache_dir)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-    return payload
+    """[2026-08-22] manifest 机制已移除：不再写缓存版本清单，直接返回空载体。
+
+    版本演进改为靠重命名/删除缓存文件夹完成；所有模型默认指向 config 里的
+    factors_cache，无需逐缓存写版本清单。
+    """
+    return {}
 
 
 def validate_cache_manifest(cache_dir: str, expected_version: str = None) -> Dict[str, Any]:
-    payload = load_manifest(cache_dir)
-    if payload is None:
-        raise FileNotFoundError(f'独立因子缓存缺少版本清单: {manifest_path(cache_dir)}')
-    actual = payload.get('factor_definition_version')
-    expected = expected_version or TrainingConfig.FACTOR_DEFINITION_VERSION
-    if actual != expected:
-        raise RuntimeError(
-            f'因子缓存版本错配: expected={expected}, actual={actual}, cache={cache_dir}'
-        )
-    return payload
+    """[2026-08-22] manifest 机制已移除：不再做版本校验，直接返回空载体。"""
+    return {}
 
 
 def bind_model_to_cache(model_dir: str, cache_dir: str) -> Dict[str, Any]:
-    """把模型绑定到已验证的独立缓存目录。"""
-    cache_manifest = validate_cache_manifest(cache_dir)
-    payload = {
-        'manifest_type': 'model_factor_cache_binding',
-        'factor_definition_version': cache_manifest['factor_definition_version'],
-        'cache_dir': os.path.abspath(cache_dir),
-    }
-    os.makedirs(model_dir, exist_ok=True)
-    path = manifest_path(model_dir)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-    return payload
+    """[2026-08-22] manifest 机制已移除：不再写模型→缓存绑定清单，直接返回空载体。
+
+    版本演进改为靠重命名/删除缓存文件夹完成；所有模型默认指向 config 里的
+    factors_cache，无需逐模型绑定。
+    """
+    return {}
 
 
 def resolve_model_cache(model_dir: str, legacy_cache_dir: str) -> str:
-    """新模型按绑定清单取缓存；旧模型无清单时兼容历史默认缓存。"""
-    binding = load_manifest(model_dir)
-    if binding is None:
-        return os.path.abspath(legacy_cache_dir)
-    if binding.get('manifest_type') != 'model_factor_cache_binding':
-        raise ValueError(f'模型目录中的因子清单类型错误: {manifest_path(model_dir)}')
-    cache_dir = binding.get('cache_dir')
-    if not cache_dir:
-        raise ValueError(f'模型因子清单缺少 cache_dir: {manifest_path(model_dir)}')
-    validate_cache_manifest(cache_dir, binding.get('factor_definition_version'))
-    return os.path.abspath(cache_dir)
+    """返回单一通用因子缓存 factors_cache。
+
+    2026-08-22 起移除 per-model manifest 版本契约：所有模型（NAM / 树 / mark / latest）
+    共用同一个全集缓存，版本演进靠重命名/删除缓存文件夹完成。不再读取或校验
+    模型目录里的绑定清单，默认即指向 config 里的 factors_cache。
+    """
+    return os.path.abspath(TrainingConfig.CACHE_DIR)
 
 
 def resolve_ensemble_cache(model_dirs: Sequence[str], legacy_cache_dir: str) -> str:
-    """解析集成模型缓存，并拒绝不同公式版本/目录的模型混用。"""
-    resolved = [resolve_model_cache(path, legacy_cache_dir) for path in model_dirs]
-    normalized = {os.path.normcase(os.path.abspath(path)) for path in resolved}
-    if len(normalized) != 1:
-        details = ', '.join(f'{model} -> {cache}' for model, cache in zip(model_dirs, resolved))
-        raise RuntimeError(f'集成模型绑定了不同因子缓存，拒绝混用: {details}')
-    return resolved[0]
+    """集成模型缓存解析：单一通用缓存下所有子模型天然同缓存，直接返回 factors_cache。"""
+    return os.path.abspath(TrainingConfig.CACHE_DIR)

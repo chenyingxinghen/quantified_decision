@@ -55,7 +55,7 @@ from core.data.baostock_main import BaostockDataManager  # noqa: E402
 from core.factors.nam_gate_model import NAMGateModel  # noqa: E402
 from core.factors.regime_features import build_regime_matrix  # noqa: E402
 from core.factors.train_ml_model import MLModelTrainer  # noqa: E402
-from scripts.exp.exp_nam_gate import _prepare_fold, _day_slices  # noqa: E402
+from scripts.train_nam_model import _prepare_fold, _day_slices  # noqa: E402
 
 # 三段窗口：W0 是训练时用于早停的验证窗（样本内），W1/W2 是回测用的 OOS 窗。
 WINDOWS = [

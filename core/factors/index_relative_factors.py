@@ -160,7 +160,7 @@ class IndexRelativeFactors:
         退化成热身期中性值，与全量重算出来的缓存对不上——同一日期在两次运行里
         取到不同的值，是最难查的那类漂移。多一次小查询换取窗口无关性，值。
 
-        表缺失（未跑 ingest_index_and_macro.py）时返回空 DataFrame，
+        表缺失（未跑 update_daily_data.py）时返回空 DataFrame，
         由调用方决定是让列缺席还是报错，本函数不静默造列。
         """
         n = len(dates)

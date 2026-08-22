@@ -129,10 +129,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RateLimitMiddleware)
 
-# CORS —— 允许前端开发服务器访问
+# CORS —— 允许前端访问。
+#
+# 原先是 allow_origins=["*"] + allow_credentials=True：这个组合按 CORS 规范本身
+# 就是非法的，更重要的是本服务的鉴权走自定义 `Token` 请求头而不是 Cookie，
+# 通配放行等于允许**任意网站**的 JS 携带用户 token 调用本 API。
+# 改为显式白名单；需要额外来源时用环境变量 QUANT_CORS_ORIGINS（逗号分隔）追加。
+_default_origins = [
+    "http://localhost:8083", "http://127.0.0.1:8083",
+    "http://localhost:5173", "http://127.0.0.1:5173",   # vite dev server
+]
+_extra_origins = [
+    o.strip() for o in os.environ.get("QUANT_CORS_ORIGINS", "").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_default_origins + _extra_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -157,12 +169,25 @@ if os.path.exists(FRONTEND_DIST):
     # 处理根路径下的所有前端页面 (SPA Fallback)
     @app.get("/{path:path}")
     async def serve_quant_frontend(path: str):
-        # 尝试直接查找文件
-        file_path = os.path.join(FRONTEND_DIST, path)
-        if path and os.path.isfile(file_path):
-            return FileResponse(file_path)
+        # 路径必须**收敛回** FRONTEND_DIST 内部。
+        #
+        # 原实现是 `os.path.join(FRONTEND_DIST, path)` 后直接 FileResponse。
+        # os.path.join 遇到绝对路径会丢弃前缀（`join(dist, "G:/...")` → `G:/...`），
+        # 加上 `../` 也能逐级上跳，于是这个 SPA 兜底路由等于一个任意文件下载接口：
+        # 可以读到 config/trader.json（券商账号密码）、database/*.db、models/*.pkl。
+        # 这里改为 realpath 归一化后校验公共前缀，越界一律回落到 index.html。
+        index_html = os.path.join(FRONTEND_DIST, "index.html")
+        if path:
+            candidate = os.path.realpath(os.path.join(FRONTEND_DIST, path))
+            root = os.path.realpath(FRONTEND_DIST)
+            try:
+                inside = os.path.commonpath([candidate, root]) == root
+            except ValueError:      # 跨盘符（Windows）时 commonpath 抛异常 = 必然越界
+                inside = False
+            if inside and os.path.isfile(candidate):
+                return FileResponse(candidate)
         # 默认为 index.html (SPA)
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+        return FileResponse(index_html)
 
 
 @app.get("/api/health")

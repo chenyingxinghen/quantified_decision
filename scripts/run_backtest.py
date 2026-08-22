@@ -13,7 +13,8 @@ import pandas as pd
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.backtest import BacktestEngine, DataHandler, PerformanceAnalyzer
+from core.backtest import BacktestEngine, PerformanceAnalyzer
+from core.backtest.baostock_data_handler import BaostockDataHandler
 from core.data.baostock_main import BaostockDataManager
 from core.backtest.strategies import MLFactorBacktestStrategy
 from config import DATABASE_PATH,TrainingConfig
@@ -116,8 +117,16 @@ def main():
         return
     
     # 1. 创建数据处理器
-    print("\n初始化数据处理器...")
-    data_handler = DataHandler(DATABASE_PATH)
+    #
+    # 显式写出 BaostockDataHandler（完整前复权），不再依赖 core.backtest.__init__
+    # 里 `BaostockDataHandler as DataHandler` 那个别名。行为完全不变 —— 别名指向的
+    # 就是这个类 —— 但同目录下还躺着一个同名的 core.backtest.data_handler.DataHandler，
+    # 它的 SQL 只 SELECT open/high/low/close，而库里存的是未复权价
+    # （config.ADJUST_FLAG='3'）。两个同名类、一个复权一个不复权、靠 import 路径区分，
+    # 是个随时会踩的坑：实测除权行占 0.35%，平均跳空 −3.22%，5% 分位 −24.6%，
+    # 一次送转就足以击穿 2×ATR 止损并记成真实亏损。写死类名让选错变成不可能。
+    print("\n初始化数据处理器（完整前复权）...")
+    data_handler = BaostockDataHandler(DATABASE_PATH)
     
     # 2. 创建策略
     print("初始化策略...")

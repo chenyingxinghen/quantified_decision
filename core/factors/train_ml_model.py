@@ -333,21 +333,9 @@ class MLModelTrainer:
         self.uses_versioned_cache = cache_dir is not None
         os.makedirs(self.factors_cache_dir, exist_ok=True)
         if self.uses_versioned_cache:
-            from core.factors.cache_manifest import (
-                load_manifest, validate_cache_manifest, write_cache_manifest,
-            )
-            _manifest = load_manifest(self.factors_cache_dir)
-            _has_parquet = any(
-                name.endswith('.parquet') for name in os.listdir(self.factors_cache_dir)
-            )
-            if _manifest is None and _has_parquet:
-                raise RuntimeError(
-                    f'显式缓存目录已有 parquet 但缺少版本清单，拒绝使用: {self.factors_cache_dir}'
-                )
-            if _manifest is None:
-                write_cache_manifest(self.factors_cache_dir)
-            else:
-                validate_cache_manifest(self.factors_cache_dir)
+            # [2026-08-22] manifest 机制已移除：单一通用缓存 factors_cache，版本演进靠
+            # 重命名/删除缓存文件夹完成。直接复用已有 parquet；缺失则在训练时增量构建。
+            os.makedirs(self.factors_cache_dir, exist_ok=True)
 
     @property
     def tech_calculator(self):
@@ -2113,7 +2101,7 @@ class MLModelTrainer:
         
         # 记录原始特征列表，用于同步过滤 X_val
         original_factor_names = list(factor_names)
-        feature_selection_corr_threshold = 0.8
+        feature_selection_corr_threshold = 0.9
         selection_data_signature = _feature_selection_data_signature(
             X_train,
             dates_train,
@@ -2613,7 +2601,7 @@ class MLModelTrainer:
         if getattr(self, 'uses_versioned_cache', False):
             from core.factors.cache_manifest import bind_model_to_cache
             bind_model_to_cache(archive_dir, self.factors_cache_dir)
-            print(f"  [OK] 模型已绑定因子缓存: {self.factors_cache_dir}")
+            print(f"  [OK] 模型缓存目录: {self.factors_cache_dir}")
 
         # 8. 生产训练默认更新 latest；候选实验可只保留独立归档。
         if update_latest:

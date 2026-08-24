@@ -1,0 +1,21 @@
+{
+  "experiment": "phase0 market-level alternative data injection (naive)",
+  "window": {"start": "2022-09-05", "end": "2024-08-05", "label": "bear primary (T069)"},
+  "cost_basis": {"buy": 0.0008, "sell": 0.0013},
+  "paired_models": {
+    "base_s42": {
+      "cache": "factors_cache", "n_features": 228, "has_mkt": false,
+      "backtest_return": -0.0173, "trades": 595, "avg_hold_days": 14.2,
+      "random_null": {"mean": -0.2628, "std": 0.1200, "strategy": -0.0430,
+                      "percentile": 97.2, "z": 1.83, "p_one_sided": 0.0285}
+    },
+    "phase0_mkt_s42": {
+      "cache": "factors_cache_phase0", "n_features": 239, "has_mkt": true,
+      "backtest_return": -0.3249, "trades": 1354, "avg_hold_days": 5.7,
+      "random_null": {"mean": -0.2057, "std": 0.1014, "strategy": -0.3502,
+                      "percentile": 6.7, "z": -1.42, "p_one_sided": 0.9335}
+    }
+  },
+  "verdict": "NAIVE INJECTION FAILED. Market-level columns are constant across stocks each day -> zero cross-sectional discriminative power in additive NAM. Full retrain from scratch perturbed base-feature weights -> model landed in worse local optimum (15% day-1 selection overlap with base vs identical base features + constant mkt_*). NOT a pipeline bug (no feature drops, train rank_ic~0.087, caches aligned).",
+  "next_design": "Transform market/macro data into stock-level varying features (per-stock beta to flows/rates, industry-relative, cross-terms) or use as regime/gating; test new features via isolated pathway (freeze base model) not full retrain."
+}

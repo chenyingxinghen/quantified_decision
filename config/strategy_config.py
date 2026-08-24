@@ -19,6 +19,13 @@ ML_FACTOR_MIN_CONFIDENCE = 0     # 提高置信度阈值以过滤噪音
 ML_FACTOR_RISK_MIN_PRICE = 1.0   # 独立于基本面筛选，排除极端低价退市风险
 ML_FACTOR_RISK_EXCLUDE_ST = True # 独立于基本面筛选，默认排除 ST / *ST
 
+# 置信度口径：固定参考分布校准（使置信度跨日可比，每日 top 不再恒为 100）
+# True  → 置信度 = 原始模型输出在「固定历史窗口参考分布」中的百分位 (0~100)
+# 置信度 z-score 固定尺度（不是逐日重排）：confidence = clip(50 + K·(raw−μ)/σ, 0, 100)。
+# 固定 K 把横截面 spread 拉开显示（top 不再钉 100，top-20 可区分），且排序不变。
+# 调大 K → 顶部/底部更两极分化；调小 → 更向 50 收敛。可按实盘手感微调。
+CONFIDENCE_Z = 10.0
+
 # ==============================================================================
 # 模型载体（单一事实来源）
 # ==============================================================================
@@ -29,24 +36,18 @@ ML_FACTOR_RISK_EXCLUDE_ST = True # 独立于基本面筛选，默认排除 ST / 
 # 模型载体分工（2026-08-22 明确）：
 #   · 生产实盘载体放在 models/mark/ 下（models/nam_gate、models/tree 是训练产物
 #     归档区，不直接进生产），由自动化模块 automation_config.AUTO_MODEL_PATH 直接加载，
-#     不再经本文件转发。载体：全量池纯加性 NAM（T095 预注册终审：混合轴关闭；
-#     T101 树头部选股已否证），面板：T115 的 224 列（219 基础 + 5 列 index_rel）。
-#   · 本文件 ML_FACTOR_MODEL_PATH 指向 models/latest —— 试验新模型、控制回测加载模型
-#     的槽位；models/latest 当前由 models/mark/T115_idxrel_s42 同步而来。
-#   · 为什么是 s42 而不是 holdout IC 最高的 s37（0.1246 vs 0.1186）：**不在验证集上
-#     挑种子**。用验证 IC 选种子会把选型偏差（台账实测稳定占 12~13%）当成真实优势。
-ML_FACTOR_MODEL_PATH = 'models/latest/nam_gate_factor_model.pkl'
+ML_FACTOR_MODEL_PATH = 'models/nam_gate/T133_yscale4_s42'
 
 # 归一化统计量。必须与权重**同批产出**（同一存档目录）：统计量和权重对不上会让
-# 连续列以错误量纲进模型，且不报错。存档里的文件名固定是 norm_stats.pkl
-ML_FACTOR_NORM_STATS_PATH = 'models/latest/norm_stats.pkl'
+# 连续列以错误量纲进模型，且不报错。
+# ML_FACTOR_NORM_STATS_PATH = 'models/latest/norm_stats.pkl'
 
 # 可选：多种子**等权集成**载体（不含 ML_FACTOR_MODEL_PATH 自身）。
 # ⚠ 当前留空 = 不启用。T131 两窗判定不一致，未过「必须赢最幸运单种子」的预注册门：
 #   T115 窗赢 +0.00327 / T122 窗输 −0.00173 且跌日否决门不过。
 #   它是「降方差」选项而非「更强」选项，要不要用是取舍，不是 IC 结论。
 # 启用时必须同批产出（同窗口/同超参/同面板，只差种子），策略层硬校验特征顺序一致。
-ML_FACTOR_ENSEMBLE_MODEL_PATHS: list = []
+ML_FACTOR_ENSEMBLE_MODEL_PATHS: list = ['models/mark/T115_idxrel_s42/nam_gate_factor_model.pkl','models/mark/T115_idxrel_s11/nam_gate_factor_model.pkl']
 
 
 
@@ -75,12 +76,12 @@ SELL_COST_RATE = 0.005
 
 # 基础参数
 INITIAL_CAPITAL = 1.0          # 初始资金
-MAX_POSITIONS = 5
+MAX_POSITIONS = 1
 
 # ATR相关参数（用于止损止盈计算）
 ATR_PERIOD = 14                     # ATR计算周期
-ATR_STOP_MULTIPLIER = 2   if TrainingConfig.SHORT_PREDICTION else 3           # ATR止损倍数 (放宽，减少噪音震出)
-ATR_TARGET_MULTIPLIER = 6 if TrainingConfig.SHORT_PREDICTION else 9           # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
+ATR_STOP_MULTIPLIER = 1   if TrainingConfig.SHORT_PREDICTION else 3           # ATR止损倍数 (放宽，减少噪音震出)
+ATR_TARGET_MULTIPLIER = 3 if TrainingConfig.SHORT_PREDICTION else 9           # ATR目标倍数：降低至2.5x，与7天内最高价分布对齐
 
 # 时间止损参数
 TIME_STOP_DAYS = TrainingConfig.FUTURE_DAYS                 # 与FUTURE_DAYS对齐：持满预测周期再评估

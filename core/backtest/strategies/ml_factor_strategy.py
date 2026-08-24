@@ -447,25 +447,44 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 self.risk_penalty_direction,
             )
 
-        # 置信度口径：**当日截面分位 × 100**，而不是模型原始输出。
-        # 排序类模型（NAM/LambdaRank）的输出无界、量纲随种子与温度漂移 ——
-        # 直接 `probs * 100` 曾打印出「置信度 234712.5%」这种无意义的数字，
-        # 且跨模型/跨种子完全不可比。分位化后 0~100 有确定语义
-        #（「今天这只排在截面前 x%」），并且是**逐日单调变换**，
-        # 所以候选排序与选股结果逐笔不变（已用同窗口回测验证）。
-        # 注意：这同时改变了 min_confidence 阈值的含义 —— 现在它是「分位下限」，
-        # 例如 95 表示只买当日前 5%。默认 ML_FACTOR_MIN_CONFIDENCE=0 即不设阈值。
-        _n_pred = len(probs)
-        if _n_pred > 0:
-            from scipy.stats import rankdata as _rankdata_conf
-            _pct = _rankdata_conf(np.asarray(probs, dtype=float),
-                                  method='average') / _n_pred * 100.0
+        # 置信度口径
+        # ───────────────────────────────────────────────────────────────────
+        # 生产路径（单个 NAM 模型）：probs 是模型**原始、无界**输出。
+        # 旧口径把它做「当日截面分位 ×100」，导致每天第一名恒为 100、跨日不可比，
+        # 抹掉了模型对「今天整体机会强弱」的判断。
+        # 新口径：用**固定尺度**的 sigmoid 把原始输出压到 (0,100)，
+        #   confidence = 100 / (1 + exp(-probs / S))，S = CONFIDENCE_SCALE（固定常数）。
+        # - 不是按天重排，所以**跨日可比**：强日 top 高、弱日 top 低，差异自然显现；
+        # - 仍是逐日单调变换，候选排序与选股结果逐笔不变；
+        # - S 是固定常数（不随数据变化），调大则分数更向 50 收敛、调小则更两极。
+        # 集成路径（>1 个模型）：probs 已是各模型「逐日分位」的平均（0~1），
+        # 此路径原始输出已被内部归一化掉，沿用 *100 旧口径（非生产路径）。
+        if len(self.ensemble_models) > 1:
+            _conf = np.asarray(probs, dtype=float) * 100.0
         else:
-            _pct = np.zeros(0, dtype=float)
+            # 单模型（NAM）的 probs 是原始、无界输出，但其绝对水平近似常数
+            # （~模型偏置，随模型/种子变、不随交易日变），真正有用的信息只在
+            # 横截面内的相对 spread（std≈0.1）。旧口径「当日截面分位×100」把
+            # top-20 全压到 99.6±0.05，分不出强弱且 100 无信息量。
+            # 这里用**固定尺度**的 z-score 线性映射拉开横截面：
+            #   confidence = clip(50 + K·(raw−μ)/σ, 0, 100)，K = CONFIDENCE_Z（固定常数）。
+            # - 固定 K、不按天重排到排名，top 不再钉死 100；
+            # - 仍是 raw 的单调变换，候选排序与选股结果逐笔不变；
+            # - 跨日：原始分布本身逐日近似不变，故单只置信度跨日也近似稳定
+            #   （这是模型特性，非 bug）——若要看「当日模型离散度/信号强度」，
+            #   应另用 σ 或 top-bottom 极差做独立指标，而非改单只置信度。
+            _raw = np.asarray(probs, dtype=float)
+            _mu = _raw.mean()
+            _sd = _raw.std()
+            if _sd < 1e-9:
+                _conf = np.full(len(_raw), 50.0)
+            else:
+                _K = float(getattr(sc, 'CONFIDENCE_Z', 10.0))
+                _conf = np.clip(50.0 + _K * (_raw - _mu) / _sd, 0.0, 100.0)
 
         candidates = []
         for i, code in enumerate(stock_codes_with_data):
-            confidence = float(_pct[i])
+            confidence = float(_conf[i])
             # min_confidence <= 0 语义为"不设阈值"。排序类模型（NAM/LambdaRank）的输出
             # 无界且可为负，负分只代表横截面靠后而非无效，若沿用概率语义做 `< 0` 截断，
             # 会把整个候选池砍空（曾导致某次回测仅成交 1 笔）。

@@ -23,10 +23,10 @@ class ModelConfig:
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
         'n_estimators': 1000,
-        'num_leaves': 7,
+        'num_leaves': 15,
         'learning_rate': 0.04,
 
-        'min_child_weight': 2.5,
+        'min_child_weight': 100,
         'min_gain_to_split': 0.01, # 最小分裂增益，剪掉无意义的分裂
         'reg_alpha': 2.5,          # L1 正则，促进稀疏性
         'reg_lambda': 2.5,         # L2 正则，平滑权重
@@ -40,9 +40,9 @@ class ModelConfig:
         'metric': 'ndcg',
         # 早停 first_metric_only=True 只盯排序后 eval_at 的最小截断位。用 @20 而非 @5：
         # A股 top-5 截面噪声大，@20 对 top-k 选股更稳健、随迭代更单调，作早停主指标更可靠。
-        'eval_at': [20,50],
+        'eval_at': [5,20],
         'lambdarank_truncation_level': 100,
-        'label_gain': [round(i ** 1.5, 4) for i in range(n_bins)],
+        'label_gain': [i for i in range(n_bins)],
 
         # ── 早停开启 (200 轮)，这是冠军 (7/28) 的健康配置，勿再关 ──
         # 教训：曾有一次全量重训 lgb 在第 [1] 轮崩溃 (Unique=7, best_iter=1)，我误判为
@@ -53,7 +53,7 @@ class ModelConfig:
         # 把强信号的【原始未归一化列】和零方差状态位灌进模型，扭曲了训练与早停曲线。
         # 反证：冠军同为 9M/17y/5480，早停正常停在 39 棵、健康。特征泄漏修复后早停即恢复。
         # 弱信号场景 (单特征 IC 天花板 ≈0.07) 就该【浅模型+强正则+早停】，绝不关早停。
-        'early_stopping_rounds': 200,
+        'early_stopping_rounds': 100,
         'n_jobs': -1,  # 使用所有CPU核心
         'verbosity': -1,
     }
@@ -61,13 +61,13 @@ class ModelConfig:
 
     XGBOOST_PARAMS: Dict[str, Any] = {
         'n_estimators': 1000,
-        'max_depth': 3,
+        'max_depth': 4,
         'learning_rate': 0.04,
 
         'subsample': 0.8,
         'colsample_bytree': 0.8,
 
-        'min_child_weight': 2.5,
+        'min_child_weight': 100,
         'gamma': 0.01,              # 最小分裂损失，剪掉无意义的分裂
         'reg_alpha': 2.5,          # L1 正则
         'reg_lambda': 2.5,         # L2 正则
@@ -77,7 +77,7 @@ class ModelConfig:
         'ndcg_exp_gain': False,  
 
         'n_jobs': -1,  # 使用所有CPU核心
-        'early_stopping_rounds': 200,
+        'early_stopping_rounds': 100,
         'verbosity': 1,
     }
 
@@ -118,9 +118,7 @@ class ModelConfig:
                 params['objective'] = 'lambdarank'
         elif task == 'ranking':
             if model_type == 'xgboost':
-                params['objective'] = getattr(
-                    TrainingConfig, 'XGBOOST_RANKING_OBJECTIVE', 'rank:ndcg'
-                )
+                params['objective'] = 'rank:ndcg'
             elif model_type == 'lightgbm':
                 params['objective'] = 'lambdarank'
         elif task == 'regression':
@@ -162,10 +160,10 @@ class TrainingConfig:
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
     YEARS                = baostock_config.HISTORY_YEARS
-    YEARS_FOR_TRAINING   = 17         # 训练数据年数
+    YEARS_FOR_TRAINING   = 10         # 训练数据年数
     YEARS_FOR_BACKTEST   = 2         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
-    SHORT_PREDICTION     = True
+    SHORT_PREDICTION     = False
     FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
 
 
@@ -191,7 +189,6 @@ class TrainingConfig:
     # 且避免 1.2 在近期数据上 best_iter=1~7、预测分数近乎退化的问题。
     # Top-5 超额收益并非每个窗口都占优，因此保留完整训练后的头部指标晋级门槛。
     LABEL_WEIGHT_EXPONENT=0.8
-    XGBOOST_RANKING_OBJECTIVE = 'rank:ndcg'
     
     UPSIDE_WEIGHT        = 1.0
     DOWNSIDE_WEIGHT      = 1.0
@@ -252,7 +249,7 @@ class TrainingConfig:
     # **默认 False**：打开会改变 T+1 一字涨停判定 ⇒ 样本剔除结果变化 ⇒ 新结果与
     # T113/T115 基线不可配对。等下次本就要重建基线时再开。
     # 表由 scripts/build_price_limit_history.py 生成；缺表时自动回退静态值并告警。
-    USE_EMPIRICAL_PRICE_LIMITS = False
+    USE_EMPIRICAL_PRICE_LIMITS = True
     
         
 
@@ -334,29 +331,6 @@ class TrainingConfig:
 
     # ── 路径 ───────────────────────────────────────────────────────────────
     CACHE_DIR            = 'database/system_data/factors_cache'  # 单一通用因子缓存（NAM 与树共用全集）
-    # 因子公式契约版本。公式语义变化时必须升级，并写入独立缓存目录的 manifest；
-    # 禁止原地覆盖旧缓存，否则历史模型的训练/推理输入会静默漂移。
-    # 2026-08-14 两处语义变化：
-    #   ① 价格复权换成 preclose/close 累乘的**完整**前复权（旧的稀疏
-    #      adjust_factor + bfill/ffill 只覆盖 42.5% 除权事件，污染全部滚动窗口因子）；
-    #   ② 新增 4 列业绩预告 fc_*（forecast 族）。
-    # 2026-08-18 一处语义变化（T115 晋级后把公式搬进生产计算器）：
-    #   ③ 新增 5 列指数相对因子 idx_*（index_rel 族），见
-    #      core/factors/index_relative_factors.py。必须 bump：不 bump 的话，
-    #      改动前后建出来的缓存版本串一模一样却列数不同，正是这套契约要防的
-    #      「同名不同公式」静默错配。
-    FACTOR_DEFINITION_VERSION = '2026-08-18-fwdadjust-preclose-forecast-idxrel-v1'
-    CACHE_MANIFEST_NAME = 'factor_cache_manifest.json'
-    # 单一通用因子缓存。2026-08-22 起移除 per-model manifest 版本契约机制：
-    # NAM 与树共用本目录，版本演进靠「重命名/删除旧缓存文件夹」完成，不再用
-    # 版本清单做静默错配防护。两条训练入口（scripts/train_tree_model.py、
-    # scripts/train_nam_model.py）的 --cache-dir 都默认指向这里。
-    #
-    # 本目录是两族的**超集**（247 列：219 基础 + 4 列 fc_* + 5 列 idx_* + 8 列
-    # 手工 *_regime_* 交互 + 11 列被 drop_cols 剔除的状态位/原始情绪列）。
-    # 各模型族在其上按自己的配方取子集，是**训练开关**而非版本差异：
-    #   · 树  ：drop_cols 之外全取 → 236 列（含 fc_* 与 8 列手工交互）
-    #   · NAM ：再剔除 *_regime_*（改由门控学习）并 --drop-groups forecast → 224 列
     CURRENT_CACHE_DIR = 'database/system_data/factors_cache'
     SAVE_DIR             = 'models'                              # 模型保存目录
 

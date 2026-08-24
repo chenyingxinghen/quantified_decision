@@ -10,10 +10,11 @@
       <div class="flex-wrap-mobile" style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap">
         <div class="glass w-full-mobile" style="padding: 4px 12px; display: flex; align-items: center; gap: 12px">
           <span style="font-size: 13px; font-weight: 600; color: var(--text-secondary)">模型</span>
-          <el-select v-model="selectedModelSelection" placeholder="选择模型" size="default" style="flex: 1; min-width: 140px" clearable popper-class="dark-dropdown">
+          <el-select v-model="selectedModelSelection" placeholder="选择模型（可多选对比）" size="default" style="flex: 1; min-width: 140px" clearable multiple collapse-tags collapse-tags-tooltip popper-class="dark-dropdown">
             <el-option-group v-for="m in models" :key="m.path" :label="m.name">
               <el-option v-if="m.types.includes('xgboost')" label="XGBoost 模型" :value="JSON.stringify({ path: m.path, types: ['xgboost'] })" />
               <el-option v-if="m.types.includes('lgbm')" label="LightGBM 模型" :value="JSON.stringify({ path: m.path, types: ['lgbm'] })" />
+              <el-option v-if="m.types.includes('nam_gate')" label="NAM 加性模型" :value="JSON.stringify({ path: m.path, types: ['nam_gate'] })" />
               <el-option v-if="m.types.length > 1" label="混合模型 (全部)" :value="JSON.stringify({ path: m.path, types: m.types })" />
             </el-option-group>
           </el-select>
@@ -240,15 +241,15 @@ const items = ref([])
 const fileName = ref(null)
 
 const models = ref([])
-const selectedModelSelection = ref(null)
+const selectedModelSelection = ref([])
 
 const activeModelTab = ref('')
 const groupedItems = computed(() => {
   const groups = {}
   items.value.forEach(item => {
-    const type = item.model_type || '已选'
-    if (!groups[type]) groups[type] = []
-    groups[type].push(item)
+    const key = item.model || item.model_type || '已选'
+    if (!groups[key]) groups[key] = []
+    groups[key].push(item)
   })
   return groups
 })
@@ -310,9 +311,13 @@ async function refreshAll() {
 async function loadModels() {
   try {
     const { data } = await stockSelector.getModels()
-    models.value = data.models.filter(m => m.path.includes('mark') || m.path.includes('models/mark') || m.path.includes('models\\\\mark')) || []
+    // 后端 /models 已只列举 models/mark 下的目录，前端无需再做平台相关的
+    // 字符串过滤（原 filter 依赖 'models\\\\mark' 这类硬编码分隔符，在 Windows
+    // 反斜杠路径下会漏匹配）。直接取全量，缺数据时回退空数组。
+    models.value = Array.isArray(data?.models) ? data.models : []
   } catch (e) {
     console.error('加载模型失败', e)
+    models.value = []
   }
 }
 
@@ -335,12 +340,12 @@ async function loadLatest() {
 async function runSelection() {
   if (running.value) return
   let modelParams = {}
-  if (selectedModelSelection.value) {
-    try {
-      const parsed = JSON.parse(selectedModelSelection.value)
-      modelParams.model_path = parsed.path
-      modelParams.model_types = parsed.types
-    } catch (e) { console.error('解析错误', e) }
+  const sels = Array.isArray(selectedModelSelection.value) ? selectedModelSelection.value : []
+  if (sels.length) {
+    const model_paths = sels
+      .map(s => { try { return JSON.parse(s) } catch (e) { console.error('解析错误', e); return null } })
+      .filter(Boolean)
+    if (model_paths.length) modelParams.model_paths = model_paths
   }
 
   // 将游客本地配置指纹传给后端，以便基础筛选条件生效

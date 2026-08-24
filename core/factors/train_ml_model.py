@@ -1911,16 +1911,6 @@ class MLModelTrainer:
                         _y_sub[_ds:_de] = np.power(ranks.astype(np.float32), _label_exponent)
                     else:
                         _y_sub[_ds:_de] = ranks
-                    # 离散化 (LightGBM lambdarank 档位)：
-                    # 关键修复——不再对【原始 scores】做 pd.qcut。原始分数在涨跌停/零收益日
-                    # 存在大量并列值，qcut 的分位边界会重合，duplicates='drop' 静默丢弃后
-                    # labels=False 重新编号，导致不同日期产生不同档位数（有的 15 档、有的 8 档），
-                    # 使同一"档位 k"在不同 query 间语义不可比，直接损害 lambdarank 训练信号。
-                    #
-                    # 改为对已算好的【连续 rank】(近似均匀、几乎无并列) 做【固定边界】pd.cut，
-                    # 保证每个截面都恰好切成 _n_bins 档、边界语义跨日完全一致。
-                    # 保留原 skewed 设计意图：bin 0 更窄 (仅覆盖最低 1/_n_bins 分位)，
-                    # 其余档位在剩余分位上等宽。边界固定，与当日分布无关。
                     bin_0_watershed = 1.0 / _n_bins
                     fixed_edges = np.concatenate([
                         [0.0],
@@ -2109,7 +2099,7 @@ class MLModelTrainer:
             feature_selection_corr_threshold,
         )
 
-        apply_feature_selection=True
+        apply_feature_selection=False
         if apply_feature_selection:        
             # 尝试从缓存读取特征选择结果
             loaded_from_cache = False

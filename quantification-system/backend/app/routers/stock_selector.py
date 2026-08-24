@@ -204,6 +204,7 @@ class RunSelectionRequest(BaseModel):
     min_confidence: float = 0
     model_path: Optional[str] = None
     model_types: List[str] = ["lgbm", "xgboost", "nam_gate"]
+    model_paths: Optional[List[dict]] = None  # 多模型一起扫描：[{path, types}, ...]，优先于 model_path
     guest_config: Optional[str] = None  # 游客本地配置 JSON 字符串，用于基础筛选条件
     markets: Optional[List[str]] = None
     max_zcfzl: Optional[float] = None
@@ -242,8 +243,20 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
     if _selection_task["running"]:
         raise HTTPException(status_code=409, detail="已有选股任务在运行中")
 
-    # 路径校验必须在进后台线程**之前**做，这样非法路径直接 400 而不是静默失败
-    resolved_base = _resolve_model_path(req.model_path)
+    # 解析并校验所有模型路径（必须在进后台线程**之前**做，这样非法路径直接 400 而不是静默失败）。
+    # 支持多模型一起扫描：req.model_paths = [{path, types}, ...]；为空则回退单路径 req.model_path。
+    targets = []
+    if req.model_paths:
+        for mp in req.model_paths:
+            _p = (mp or {}).get("path")
+            _tps = (mp or {}).get("types") or ["lgbm", "xgboost", "nam_gate"]
+            _rp = _resolve_model_path(_p)
+            _name = os.path.basename(_rp.rstrip(os.sep))
+            targets.append({"name": _name, "base": _rp, "types": _tps})
+    else:
+        _rp = _resolve_model_path(req.model_path)
+        _name = os.path.basename(os.path.dirname(_rp.rstrip(os.sep))) or os.path.basename(_rp)
+        targets.append({"name": _name, "base": _rp, "types": req.model_types})
 
     _selection_task = {
         "running": True, 
@@ -262,12 +275,7 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
         global _selection_task
         from datetime import datetime
         try:
-            # 1. 基准目录（已在请求线程内完成 models/ 边界校验）
-            base_path = resolved_base
-            if not os.path.exists(base_path):
-                base_path = os.path.join(get_project_root(), ML_FACTOR_MODEL_PATH)
-            
-            # 2. 获取用户配置作为覆盖
+            # 2. 获取用户配置作为覆盖（对所有模型通用，循环外获取一次）
             user_filters = {}
             try:
                 from app.routers.auth import get_current_user_from_token
@@ -314,50 +322,59 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
             except Exception as e:
                 print(f"Loading user config for selection failed: {e}")
 
-            # 3. 收集需要运行的模型路径
-            run_configs = []
-            if os.path.isdir(base_path):
-                if "xgboost" in req.model_types:
-                    p = os.path.join(base_path, "xgboost_factor_model.pkl")
-                    if os.path.exists(p): run_configs.append(("xgboost", p))
-                if "lgbm" in req.model_types:
-                    p = os.path.join(base_path, "lightgbm_factor_model.pkl")
-                    if os.path.exists(p): run_configs.append(("lgbm", p))
-                # NAM 存档与树同级：不列出来的话 NAM 目录只能落到 ("default", dir)，
-                # 由 select_for_live 内部嗅探——能跑，但前端拿不到 model_type 标签。
-                if "nam_gate" in req.model_types:
-                    p = os.path.join(base_path, "nam_gate_factor_model.pkl")
-                    if os.path.exists(p): run_configs.append(("nam_gate", p))
-                if not run_configs:
-                    run_configs.append(("default", base_path))
-            else:
-                run_configs.append(("default", base_path))
-
+            # 3. 多模型一起扫描：遍历所有已校验的模型目标（线程外已完成 models/ 边界校验）
             all_results = []
             executed_types = []
-            for m_type, p in run_configs:
-                _selection_task["progress"] = f"正在使用 {m_type} 模型进行选股..."
-                executed_types.append(m_type)
-                results = select_stocks(
-                    model_path=p,
-                    min_confidence=req.min_confidence,
-                    top_n=req.top_n,
-                    # 优先级：用户配置 > 请求体 > 全局 strategy_config
-                    apply_filter=user_filters.get("apply_filter", req.apply_filter if req.apply_filter else _sc.ENABLE_FUNDAMENTAL_FILTER),
-                    workers=4,
-                    save_csv=False,
-                    min_market_cap=user_filters.get("min_market_cap"),
-                    max_pe=user_filters.get("max_pe"),
-                    max_zcfzl=req.max_zcfzl or user_filters.get("max_zcfzl"),
-                    min_price=user_filters.get("min_price"),
-                    max_price=user_filters.get("max_price"),
-                    include_st=user_filters.get("include_st"),
-                    markets=req.markets or user_filters.get("markets"),
-                )
-                
-                for r in results:
-                    r["model_type"] = m_type
-                all_results.extend(results)
+            for tgt in targets:
+                base_path = tgt["base"]
+                if not os.path.exists(base_path):
+                    base_path = os.path.join(get_project_root(), ML_FACTOR_MODEL_PATH)
+                model_name = tgt["name"]
+                sel_types = tgt["types"]
+
+                # 收集需要运行的模型路径（单目录内多类型）
+                run_configs = []
+                if os.path.isdir(base_path):
+                    if "xgboost" in sel_types:
+                        p = os.path.join(base_path, "xgboost_factor_model.pkl")
+                        if os.path.exists(p): run_configs.append(("xgboost", p))
+                    if "lgbm" in sel_types:
+                        p = os.path.join(base_path, "lightgbm_factor_model.pkl")
+                        if os.path.exists(p): run_configs.append(("lgbm", p))
+                    # NAM 存档与树同级：不列出来的话 NAM 目录只能落到 ("default", dir)，
+                    # 由 select_for_live 内部嗅探——能跑，但前端拿不到 model_type 标签。
+                    if "nam_gate" in sel_types:
+                        p = os.path.join(base_path, "nam_gate_factor_model.pkl")
+                        if os.path.exists(p): run_configs.append(("nam_gate", p))
+                    if not run_configs:
+                        run_configs.append(("default", base_path))
+                else:
+                    run_configs.append(("default", base_path))
+
+                for m_type, p in run_configs:
+                    _selection_task["progress"] = f"正在使用 {model_name}/{m_type} 模型进行选股..."
+                    executed_types.append(m_type)
+                    results = select_stocks(
+                        model_path=p,
+                        min_confidence=req.min_confidence,
+                        top_n=req.top_n,
+                        # 优先级：用户配置 > 请求体 > 全局 strategy_config
+                        apply_filter=user_filters.get("apply_filter", req.apply_filter if req.apply_filter else _sc.ENABLE_FUNDAMENTAL_FILTER),
+                        workers=4,
+                        save_csv=False,
+                        min_market_cap=user_filters.get("min_market_cap"),
+                        max_pe=user_filters.get("max_pe"),
+                        max_zcfzl=req.max_zcfzl or user_filters.get("max_zcfzl"),
+                        min_price=user_filters.get("min_price"),
+                        max_price=user_filters.get("max_price"),
+                        include_st=user_filters.get("include_st"),
+                        markets=req.markets or user_filters.get("markets"),
+                    )
+
+                    for r in results:
+                        r["model_type"] = m_type
+                        r["model"] = model_name
+                    all_results.extend(results)
 
             # 4. 汇总分析
             code_counts = {}
@@ -369,7 +386,7 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
             for r in all_results:
                 r["is_resonance"] = code_counts[r["stock_code"]] > 1
 
-            final_results = sorted(all_results, key=lambda x: (x.get("model_type", ""), -x.get("confidence", 0.0)))
+            final_results = sorted(all_results, key=lambda x: (x.get("model", ""), x.get("model_type", ""), -x.get("confidence", 0.0)))
 
             import pandas as pd
             safe_results = []
@@ -380,7 +397,7 @@ async def run_selection(req: RunSelectionRequest, token: Optional[str] = Header(
             if safe_results:
                 result_dir = os.path.join(get_project_root(), "backtest_result")
                 os.makedirs(result_dir, exist_ok=True)
-                types_str = "_".join(executed_types)
+                types_str = "_".join(sorted(set(executed_types)))
                 csv_path = os.path.join(result_dir, f"selected_stocks_{types_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
                 pd.DataFrame(safe_results).to_csv(csv_path, index=False, encoding='utf-8-sig')
                 _selection_task["file"] = os.path.basename(csv_path)

@@ -1,0 +1,38 @@
+Traceback (most recent call last):
+  File "G:\ai_proj\quantified_decision\scripts\_tmp_verify_multi.py", line 18, in <module>
+    trigger = post("/api/stock-selector/run", {
+        "top_n": 10,
+    ...<3 lines>...
+        ],
+    })
+  File "G:\ai_proj\quantified_decision\scripts\_tmp_verify_multi.py", line 12, in post
+    return json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+                      ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\urllib\request.py", line 189, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\urllib\request.py", line 489, in open
+    response = self._open(req, data)
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\urllib\request.py", line 506, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+                              '_open', req)
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\urllib\request.py", line 466, in _call_chain
+    result = func(*args)
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\urllib\request.py", line 1348, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\urllib\request.py", line 1323, in do_open
+    r = h.getresponse()
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\http\client.py", line 1459, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\http\client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\http\client.py", line 297, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\29454\.workbuddy\binaries\python\versions\3.13.12\Lib\socket.py", line 723, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+TimeoutError: timed out

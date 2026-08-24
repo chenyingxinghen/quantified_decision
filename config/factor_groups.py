@@ -52,6 +52,7 @@ FACTOR_GROUPS: List[str] = [
     'indrel',         # 行业内相对位置（``*__ind``，见 E7）
     'forecast',       # 业绩预告（``fc_*``，见 T089/T090 = E18）
     'index_rel',      # 指数相对（``idx_*``：β/相对强弱/特异波动，见 T115）
+    'macro',          # 市场级外生（``mkt_*``：两融/期指升贴水/利率，阶段0）
     'other',          # 未匹配兜底
 ]
 
@@ -174,6 +175,12 @@ def assign_group(name: str) -> str:
     # 独立成族。必须在关键词兜底之前——``idx_idio_vol_20`` 含 ``vol_`` 会被误分。
     if name.startswith('idx_'):
         return 'index_rel'
+    # 阶段0：市场级外生（``mkt_*``）。两融/期指升贴水/利率是**非池内派生**的
+    # 市场参与者和货币政策信号，与个股动量/波动族经济行为完全不同，独立成族。
+    # 必须在交叉项判定之前——``mkt_basis_if`` 若落到 ``_RE_CROSS_TECH``
+    # （无 _mul_/_sub_/_div_，不会误判），但保险起见与 idx_ 同规则前置。
+    if name.startswith('mkt_'):
+        return 'macro'
     if _RE_CROSS_FUND.search(name):
         return 'cross_fund'
     if _RE_CROSS_TECH.search(name):

@@ -83,6 +83,10 @@ def main():
                         help='风险方向：high=值越高越危险；low=值越低越危险（负回撤列）')
     _parser.add_argument('--ensemble-model', action='append', default=[],
                         help='追加一个等权横截面分位集成子模型；可重复传入')
+    _parser.add_argument('--ensemble-vote', action='store_true', default=False,
+                        help='改用投票共识：每成员取 Top-K 投一票，按票数降序+平均分位取头部（消除单种子噪声）')
+    _parser.add_argument('--ensemble-vote-k', type=int, default=50,
+                        help='投票共识的每成员候选 K（默认 50）')
     _parser.add_argument('--cache-dir', type=str, default=None,
                         help='显式覆盖因子缓存目录；模型有绑定清单时必须版本一致')
     _parser.add_argument('--buy-cost', type=float, default=None,
@@ -173,6 +177,8 @@ def main():
         risk_penalty_feature=_args.risk_penalty_feature,
         risk_penalty_direction=_args.risk_penalty_direction,
         ensemble_model_paths=_args.ensemble_model,
+        ensemble_vote=_args.ensemble_vote,
+        ensemble_vote_k=_args.ensemble_vote_k,
         # R2：因子面板只加载回测窗口内的日期（多留 1 行给 PIT searchsorted），
         # 内存 16 GB → 约 2.5 GB，数值逐位不变。
         preload_start=start_date,

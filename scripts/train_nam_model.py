@@ -669,12 +669,15 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                    lambda_lb=0.01, lambda_ent=0.0, lambda_div=0.0, ema_momentum=0.02,
                    y_scale=10.0,
                    expert_hidden=16, gate_mode='softmax', gate_scalar_col='vol_expand',
+                   gate_scalar_col2='',
                    accum_days=4,
                    warmup_epochs=5, temp_start=2.0, patience=12, min_epochs=20, seed=42,
                    device='auto', verbose=True, disable_gate=False,
                    select_metric='rank_ic', select_topk=20, time_decay_years=0.0,
                    select_holdout=0.0, chunk_days=1, store_dtype='auto', group_norm=False,
-                   store_device='auto', prefetch=True):
+                   store_device='auto', prefetch=True,
+                   pca_mkt_cols=False, init_experts_from=None, freeze_experts=False,
+                   gate_wd=None):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -684,7 +687,8 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
         feature_names=list(feature_names), group_names=list(group_names),
         group_ids=group_ids, regime_cols=list(regime_cols),
         expert_hidden=expert_hidden, gate_mode=gate_mode,
-        gate_scalar_col=gate_scalar_col, device=device,
+        gate_scalar_col=gate_scalar_col, gate_scalar_col2=gate_scalar_col2,
+        device=device,
     )
     model.disable_gate = disable_gate
     dev = torch.device(model.device)
@@ -810,6 +814,66 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
     else:
         day_w = None
     # 每日的市场状态向量：同日全市场同值，只取该日首行
+    # ── scheme B：对 regime 矩阵的 mkt_* 列做 PCA-2（2026-08-24）──────────
+    # 10 个市场级列（两融/期指/SHIBOR/LPR/国债）高度共线，直接喂 scalar 门控
+    # 会稀释驱动信号；先压缩成 2 个正交主成分（mkt_pc1/mkt_pc2），对应
+    # 「利率/流动性轴」与「风险偏好/恐慌轴」。
+    # PCA 拟合**只用训练段日级行**（tr_days 首行），验证段只做投影 —— 防止把
+    # 验证信息带进投影方向（与 select_holdout 同一纪律）。
+    if pca_mkt_cols:
+        _mkt_cols = [c for c in regime_cols if c.startswith('mkt_')]
+        if not _mkt_cols:
+            raise ValueError('pca_mkt_cols=True 但 regime_cols 无 mkt_* 列'
+                             '（训练需 --include-mkt）')
+        # ── 多种子幂等（T069 配对评估会复用同一份 fold）─────────────────────
+        # PCA 块原地改写 fold['M_train']/M_val；若多个 seed 顺序调用 train_nam_gate，
+        # 第二个 seed 进来时 M 已是 32 列，_mkt_idx（按 40 列算）必然越界。
+        # 修法：第一次投影时把 PCA 参数与投影后列名缓存进 fold；后续 seed 检测到
+        # M 列数 == 缓存列数 则跳过重投影、直接复用参数（PCA 必须基于同一训练段
+        # 拟合，跨 seed 共享投影方向，配对才有意义）。
+        _cached = fold.get('_mkt_pca')
+        _n_proj = len(regime_cols) - len(_mkt_cols) + 2
+        if _cached is not None and fold['M_train'].shape[1] == len(_cached['cols']):
+            model.regime_cols = list(_cached['cols'])
+            model.mkt_pca = _cached['params']
+            regime_cols = list(_cached['cols'])
+            if verbose:
+                print(f"  mkt PCA 复用（fold 已投影）: regime {len(regime_cols)} 维")
+        else:
+            _mkt_idx = [regime_cols.index(c) for c in _mkt_cols]
+            _fit = np.stack([fold['M_train'][s] for s, _ in tr_days])[:, _mkt_idx] \
+                .astype(np.float64)
+            _fit_mean = _fit.mean(axis=0, keepdims=True)
+            _fit_c = _fit - _fit_mean
+            _u, _s, _vt = np.linalg.svd(_fit_c, full_matrices=False)
+            _proj = _vt[:2]  # [2, n_mkt] 主方向
+
+            def _apply_pca(M: np.ndarray) -> np.ndarray:
+                _xc = M[:, _mkt_idx].astype(np.float64) - _fit_mean
+                _pc = (_xc @ _proj.T).astype(np.float32)   # [n, 2]
+                _rest = np.delete(M, _mkt_idx, axis=1)
+                return np.hstack([_rest, _pc])
+
+            fold['M_train'] = _apply_pca(fold['M_train'])
+            fold['M_val'] = _apply_pca(fold['M_val'])
+            regime_cols = [c for c in regime_cols if c not in _mkt_cols] + \
+                ['mkt_pc1', 'mkt_pc2']
+            model.regime_cols = list(regime_cols)   # build() 按此解析 scalar 列索引
+            # 持久化 PCA 投影（推理端 attach_regime 时对传入矩阵做同构投影）
+            model.mkt_pca = {
+                'mean': _fit_mean.astype(np.float32),
+                'proj': _proj.astype(np.float32),
+                'mkt_cols': list(_mkt_cols),
+            }
+            fold['_mkt_pca'] = {
+                'params': model.mkt_pca,
+                'cols': list(regime_cols),
+            }
+            _evr = _s[:2] ** 2 / max((_s ** 2).sum(), 1e-12)
+            if verbose:
+                print(f"  mkt PCA-2: {len(_mkt_cols)} 列 → 2 主成分，"
+                      f"累计方差解释率 {_evr.sum():.3f}（PC1 {_evr[0]:.3f} / "
+                      f"PC2 {_evr[1]:.3f}），regime {len(regime_cols)} 维")
     Mtr = torch.as_tensor(np.stack([fold['M_train'][s] for s, _ in tr_days]),
                           dtype=torch.float32, device=dev)
     Mva = torch.as_tensor(np.stack([fold['M_val'][s] for s, _ in va_days]),
@@ -838,7 +902,56 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
               f"regime {Mtr.shape[1]} 维 / 参数 {n_params:,} / device {model.device}")
         print(f"  训练 {len(tr_days)} 日 {len(Xtr_np)} 样本，验证 {len(va_days)} 日 {len(Xva_np)} 样本")
 
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    # ── scheme B：从基线加载 experts 权重（2026-08-24）────────────────────
+    # 冻结前先把 base_s42 收敛好的 experts 权重拷进新网络 —— 这是"隔离新通路"
+    # 的核心：个股打分映射保持与基线逐值一致，只有 gate 在动。
+    if init_experts_from:
+        src = NAMGateModel()
+        src.load_model(init_experts_from)
+        if list(src.feature_names) != list(feature_names):
+            raise ValueError(
+                f'--init-experts-from 特征不匹配: 源 {len(src.feature_names)} '
+                f'vs 当前 {len(feature_names)}（features 必须完全一致才有冻结语义）')
+        if list(src.group_names) != list(group_names) or \
+                not np.array_equal(np.asarray(src.group_ids), np.asarray(group_ids)):
+            raise ValueError('--init-experts-from 的 group 结构与当前不一致，'
+                             '冻结语义不成立（group_sums 分组必须与基线相同）')
+        own = net.state_dict()
+        _ek = [k for k in own if k.startswith('experts.')]
+        for k in _ek:
+            own[k] = src.net.state_dict()[k].to(own[k].device)
+        net.load_state_dict(own)
+        if verbose:
+            print(f"  已从 {init_experts_from} 加载 experts 权重"
+                  f"（{len(_ek)} 组 / {len(feature_names)} 特征一致）")
+
+    if freeze_experts:
+        n_frozen = sum(p.numel() for n, p in net.named_parameters()
+                       if n.startswith('experts.'))
+        for n, p in net.named_parameters():
+            if n.startswith('experts.'):
+                p.requires_grad_(False)
+        if verbose:
+            print(f"  已冻结 experts 权重（{n_frozen:,} 参数），"
+                  f"只训练 gate+bias")
+
+    opt = torch.optim.AdamW(
+        [p for p in net.parameters() if p.requires_grad],
+        lr=lr, weight_decay=weight_decay)
+    if gate_wd is not None:
+        # 收缩先验：gate 参数用独立的、更强的 weight_decay（T046 实证
+        # 330 参数 ridge 最优 γ=0 / 4-bucket 最优 γ=0.1 → 默认收缩到均匀）。
+        # 默认 None=沿用 --weight-decay，保证历史实验逐位不变。
+        opt = torch.optim.AdamW([
+            {'params': [p for n, p in net.named_parameters()
+                        if n.startswith('gate.') and p.requires_grad],
+             'weight_decay': gate_wd},
+            {'params': [p for n, p in net.named_parameters()
+                        if not n.startswith('gate.') and p.requires_grad],
+             'weight_decay': weight_decay},
+        ], lr=lr)
+        if verbose:
+            print(f"  gate 独立收缩先验: gate_wd={gate_wd}（默认 wd={weight_decay}）")
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5)
 
     def _predict_val(temp=1.0):
@@ -1219,10 +1332,27 @@ def main():
     ap.add_argument('--lambda-ent', type=float, default=0.0)
     ap.add_argument('--expert-hidden', type=int, default=16)
     ap.add_argument('--gate-mode', default='softmax',
-                    choices=['softmax', 'multiplicative', 'scalar'],
-                    help="scalar = E6 标量条件化：只有 n_groups 个门控参数，无 MLP")
+                    choices=['softmax', 'multiplicative', 'scalar', 'dual_scalar'],
+                    help="scalar = E6 标量条件化：只有 n_groups 个门控参数，无 MLP；"
+                         "dual_scalar = scheme B：两列信号 logits=a·s1+b·s2，26 参数")
     ap.add_argument('--gate-scalar-col', default='vol_expand',
-                    help='gate-mode=scalar 时驱动门控的 regime 列名（缺列硬失败）')
+                    help='gate-mode=scalar/dual_scalar 时驱动门控的第 1 个 regime 列名（缺列硬失败）')
+    ap.add_argument('--gate-scalar-col2', default='',
+                    help='gate-mode=dual_scalar 时驱动门控的第 2 个 regime 列名（缺列硬失败）')
+    ap.add_argument('--gate-wd', type=float, default=None,
+                    help='门控参数独立的 weight_decay（收缩先验）。默认 None=沿用 --weight-decay，'
+                         '行为与历史逐位一致；scheme B 建议显式传 0.1~0.3 把 gate 压向均匀')
+    ap.add_argument('--init-experts-from', default=None,
+                    help='从已有 NAMGateModel 存档加载 experts 权重（如 base_s42 的 '
+                         'nam_gate_factor_model.pkl），并沿用其 group 结构。特征名必须完全一致，'
+                         '否则硬失败。与 --freeze-experts 搭配实现 scheme B 的"冻主干只训 gate"。')
+    ap.add_argument('--freeze-experts', action='store_true',
+                    help='冻结 experts 权重（requires_grad=False），optimizer 只含 gate+bias。'
+                         '配合 --init-experts-from：gate 学不动→收缩到均匀→退化到 base 基线，不劣化')
+    ap.add_argument('--include-mkt', action='store_true',
+                    help='regime 矩阵追加 market_macro_daily 的 10 个 mkt_* 市场级列'
+                         '（两融/期指升贴水/SHIBOR/LPR/10Y 国债，PIT 滞后 1 日）。'
+                         '仅 scheme B 门控实验开启，默认关闭保持历史矩阵逐位不变')
     ap.add_argument('--disable-gate', action='store_true',
                     help='纯加性 NAM（门控权重恒为 1，隔离门控贡献）')
     ap.add_argument('--group-norm', action='store_true',
@@ -1417,8 +1547,9 @@ def main():
 
     print(f"  因子族 K={len(group_names)}: {group_names}")
 
-    regime = build_regime_matrix(DATABASE_PATH)
-    print(f"  市场状态矩阵: {regime.shape[0]} 日 × {regime.shape[1]} 维")
+    regime = build_regime_matrix(DATABASE_PATH, include_mkt=args.include_mkt)
+    print(f"  市场状态矩阵: {regime.shape[0]} 日 × {regime.shape[1]} 维"
+          + ("（含 mkt_* 市场级列）" if args.include_mkt else ""))
 
     folds = []
     for chunk in args.folds.split(','):
@@ -1491,6 +1622,7 @@ def main():
                     lambda_div=args.lambda_div,
                     ema_momentum=args.ema_momentum, expert_hidden=args.expert_hidden,
                     gate_mode=args.gate_mode, gate_scalar_col=args.gate_scalar_col,
+                    gate_scalar_col2=args.gate_scalar_col2,
                     accum_days=args.accum_days, device=args.device,
                     disable_gate=args.disable_gate, y_scale=args.y_scale,
                     min_epochs=args.min_epochs, seed=sd,
@@ -1500,6 +1632,10 @@ def main():
                     chunk_days=args.chunk_days, store_dtype=args.store_dtype,
                     store_device=args.store_device, prefetch=args.prefetch,
                     group_norm=args.group_norm,
+                    pca_mkt_cols=args.include_mkt,
+                    init_experts_from=args.init_experts_from,
+                    freeze_experts=args.freeze_experts,
+                    gate_wd=args.gate_wd,
                 )
                 nam_row = _daily_metrics(pred, fold['ret_val'], np.asarray(fold['d_val']))
                 if args.select_holdout > 0:
@@ -1536,7 +1672,7 @@ def main():
                 _lab2 = _daily_metrics(fold['y_val'], fold['ret_val'],
                                        np.asarray(fold['d_val']))
                 nam_row['label_vs_return_ic'] = _lab2['rank_ic']
-                print(f"   {  {k: v for k, v in nam_row.items() if k != 'head'} }")
+                print(f"   { {k: v for k, v in nam_row.items() if k != 'head'} }")
                 print(f"   head: {nam_row['head']}")
 
                 entry = {'nam_gate': nam_row, 'split_date': fold['split_date'],
@@ -1626,6 +1762,10 @@ def main():
                 'folds': results,
             }
             out_path = _seed_path(args.output, sd)
+            # --output 允许传目录：收尾时补成 <dir>/results.json，避免把目录当文件写
+            if os.path.isdir(out_path) or out_path.endswith(('/', os.sep)) \
+                    or not os.path.splitext(out_path)[1]:
+                out_path = os.path.join(out_path, 'results.json')
             os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
             with open(out_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)

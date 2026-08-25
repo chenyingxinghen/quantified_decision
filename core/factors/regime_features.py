@@ -221,6 +221,55 @@ def _load_macro_m1m2_gap(db_path: Optional[str],
     return gap.reindex(gap.index.union(index)).ffill().reindex(index)
 
 
+# phase0 市场级另类数据的源列（market_macro_daily 表，与 factors_cache_phase0
+# 注入的 10 个 mkt_* 保持一致；北向已因停披露剔除，lpr_5y 因仅 85 非空剔除）
+MKT_MACRO_SOURCE_COLS: List[str] = [
+    'margin_balance', 'margin_fin_buy',       # 两融：余额 / 融资买入额
+    'basis_if', 'basis_ih', 'basis_ic',       # 期指升贴水（IF/IH/IC）
+    'shibor_on', 'shibor_1w', 'shibor_3m',    # 货币市场利率
+    'lpr_1y', 'cn10y',                        # 贷款市场报价 / 10Y 国债
+]
+
+
+def _load_mkt_macro(db_path: Optional[str],
+                    index: pd.DatetimeIndex) -> Optional[pd.DataFrame]:
+    """
+    读取 ``market_macro_daily`` 的市场级宏观/资金列，PIT 对齐到 ``index``。
+
+    表不存在或为空时返回 None（列整体缺席，build_regime_matrix 里静默跳过）。
+    归一化与其余 regime 列共用同一滚动分位管线（调用方负责）。
+
+    PIT 纪律（统一保守滞后 1 个交易日）：
+    - 两融余额：交易所 T+1 才披露前一日余额
+    - 期指升贴水 / 10Y 国债：收盘后才定值，次日才可用
+    - SHIBOR 当日 9:30 发布、LPR 每月 20 日发布：为统一口径也滞后 1 日
+    滞后后按 ``index`` 前向填充成阶梯。
+    """
+    db_path = db_path or DATABASE_PATH
+    meta_db = os.path.join(os.path.dirname(db_path), 'stock_meta.db')
+    if not os.path.exists(meta_db):
+        return None
+    conn = sqlite3.connect(meta_db, timeout=30)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='market_macro_daily'")
+        if not cur.fetchone():
+            return None
+        cols = ', '.join(MKT_MACRO_SOURCE_COLS)
+        df = pd.read_sql_query(
+            f'SELECT date, {cols} FROM market_macro_daily ORDER BY date ASC', conn)
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date').sort_index()
+    out = df.shift(1).reindex(df.index.union(index)).ffill().reindex(index)
+    out = out.rename(columns={c: f'mkt_{c}' for c in MKT_MACRO_SOURCE_COLS})
+    return out.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # 对外主接口
 # ---------------------------------------------------------------------------
@@ -229,7 +278,8 @@ def build_regime_matrix(db_path: Optional[str] = None,
                         dates: Optional[Sequence] = None,
                         normalize: bool = True,
                         lag_days: int = 0,
-                        return_raw: bool = False) -> pd.DataFrame:
+                        return_raw: bool = False,
+                        include_mkt: bool = False) -> pd.DataFrame:
     """
     构造多时间尺度市场状态矩阵 ``M``。
 
@@ -241,6 +291,10 @@ def build_regime_matrix(db_path: Optional[str] = None,
     lag_days  : 整体后移 N 个交易日。默认 0（与生产管线同日口径一致）；
                 设为 1 可做"严格 T-1 信息"敏感性检验
     return_raw : True 时返回未归一化的原始列（画图/体检用）
+    include_mkt : 是否追加 ``market_macro_daily`` 的 10 个 ``mkt_*`` 市场级列
+                （两融/期指升贴水/SHIBOR/LPR/10Y 国债，已 PIT 滞后 1 日）。
+                **默认 False** —— 保持历史 regime 矩阵逐位不变；仅 scheme B
+                门控实验显式开启。
 
     返回
     ----
@@ -256,6 +310,10 @@ def build_regime_matrix(db_path: Optional[str] = None,
     _gap = _load_macro_m1m2_gap(db_path, raw.index)
     if _gap is not None:
         raw['macro_m1m2_gap'] = _gap
+    if include_mkt:
+        _mkt = _load_mkt_macro(db_path, raw.index)
+        if _mkt is not None:
+            raw = pd.concat([raw, _mkt], axis=1)
     if lag_days > 0:
         raw = raw.shift(lag_days)
 

@@ -66,7 +66,6 @@ CREATE TABLE IF NOT EXISTS market_macro_daily (
     shibor_1w REAL,
     shibor_3m REAL,
     lpr_1y REAL,
-    lpr_5y REAL,
     cn10y REAL,
     fetched_at TEXT
 )
@@ -210,17 +209,16 @@ def main():
         df = ak.macro_china_lpr()
         if df is None or len(df) == 0:
             probe_abort('LPR 探针空返回', df)
-        need = ['TRADE_DATE', 'LPR1Y', 'LPR5Y']
+        need = ['TRADE_DATE', 'LPR1Y']
         missing = [c for c in need if c not in df.columns]
         if missing:
             probe_abort(f'LPR 缺列 {missing}', df)
         df['日期'] = pd.to_datetime(df['TRADE_DATE']).dt.strftime('%Y-%m-%d')
         rows = [{'date': r[0],
-                 'lpr_1y': float(pd.to_numeric(r[1], errors='coerce')),
-                 'lpr_5y': float(pd.to_numeric(r[2], errors='coerce'))}
-                for r in df[['日期', 'LPR1Y', 'LPR5Y']]
+                 'lpr_1y': float(pd.to_numeric(r[1], errors='coerce'))}
+                for r in df[['日期', 'LPR1Y']]
                 .itertuples(index=False, name=None)]
-        upsert(conn, {'lpr_1y': None, 'lpr_5y': None}, rows, now)
+        upsert(conn, {'lpr_1y': None}, rows, now)
         print(f'  LPR: {len(rows)} 行 ({df["日期"].iloc[0]} → {df["日期"].iloc[-1]})')
 
         # 3c. 中国国债 10Y 收益率

@@ -122,20 +122,28 @@ class RegimeGate(_Module):
     立论：T046 的 oracle IC +128% 说明条件结构存在，但可实现增益≈0 的原因是
     在约 90 个独立块上学不动 (64,32) MLP 的 2000+ 参数（台账 E6 节）。
     参数量降三个量级后才有胜算；起点 a=0 → 均匀权重，与 softmax 模式同起点。
+    ``mode='dual_scalar'``（scheme B，2026-08-24）：单列 scalar 的 2 轴推广。
+    取两列 s1、s2（``scalar_idx`` / ``scalar_idx2``），``logits = a·s1 + b·s2``，
+    ``a, b ∈ R^{n_groups}`` 共 26 个参数（2×13 族）。用于 phase0 市场级列的
+    PCA-2 主成分双轴门控（如利率/流动性轴 × 风险偏好/恐慌轴），仍远低于
+    softmax MLP，保持小样本可估；a=b=0 起点 → 均匀权重 → 安全护栏不变。
     """
 
     def __init__(self, d_regime: int, n_groups: int, hidden: Sequence[int] = (64, 32),
                  mode: str = 'softmax', bound: Tuple[float, float] = (0.2, 2.0),
-                 dropout: float = 0.1, scalar_idx: int = 0):
+                 dropout: float = 0.1, scalar_idx: int = 0, scalar_idx2: int = 0):
         super().__init__()
         self.mode = mode
         self.n_groups = n_groups
         self.lo, self.hi = bound
         self.scalar_idx = int(scalar_idx)
+        self.scalar_idx2 = int(scalar_idx2)
 
-        if mode == 'scalar':
+        if mode in ('scalar', 'dual_scalar'):
             # 唯一参数：每族对该标量信号的敏感度。零初始化 → 起步权重均匀。
+            # dual_scalar 再叠加第二个敏感度向量 b（26 = 2×13 参数）。
             self.a = nn.Parameter(torch.zeros(n_groups))
+            self.b = nn.Parameter(torch.zeros(n_groups)) if mode == 'dual_scalar' else None
             self.net = None
             return
 
@@ -153,13 +161,17 @@ class RegimeGate(_Module):
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, m: "torch.Tensor", temperature: float = 1.0) -> "torch.Tensor":
-        if self.mode == 'scalar':
+        if self.mode in ('scalar', 'dual_scalar'):
             # regime 矩阵已由 _rolling_pct_normalize 映射到 [-1,1]、0=历史中位，
             # 直接用即可。2026-08-14 修复：原先在这里又做了一次 2s-1，复合成
             # 4r-3 —— 均匀锚点被推到 75 分位、低波半区杠杆是高波半区的 3 倍、
             # 缺失日填 0 变成满档倾斜。E6 的判定建立在这个畸变实现上。
-            s = m[:, self.scalar_idx:self.scalar_idx + 1]        # [B,1] ∈ [-1,1]
-            logits = self.a.unsqueeze(0) * s                     # [B,K]
+            s1 = m[:, self.scalar_idx:self.scalar_idx + 1]       # [B,1] ∈ [-1,1]
+            if self.mode == 'dual_scalar':
+                s2 = m[:, self.scalar_idx2:self.scalar_idx2 + 1] # [B,1]
+                logits = self.a.unsqueeze(0) * s1 + self.b.unsqueeze(0) * s2
+            else:
+                logits = self.a.unsqueeze(0) * s1                # [B,K]
             return torch.softmax(logits / max(temperature, 1e-3), dim=-1) * self.n_groups
         logits = self.net(m)
         if self.mode == 'softmax':
@@ -176,11 +188,12 @@ class NAMGateNet(_Module):
                  gate_hidden: Sequence[int] = (64, 32),
                  gate_mode: str = 'softmax', expert_dropout: float = 0.0,
                  disable_gate: bool = False, gate_scalar_idx: int = 0,
+                 gate_scalar_idx2: int = 0,
                  group_norm: bool = False):
         super().__init__()
         self.experts = FactorExpertBank(n_factors, expert_hidden, expert_dropout)
         self.gate = RegimeGate(d_regime, n_groups, gate_hidden, mode=gate_mode,
-                               scalar_idx=gate_scalar_idx)
+                               scalar_idx=gate_scalar_idx, scalar_idx2=gate_scalar_idx2)
         self.n_groups = n_groups
         self.disable_gate = bool(disable_gate)
         # T119：族输出截面标准化。动机是乘积 w_k·S_k 在 (w_k→c·w_k, S_k→S_k/c) 下不变
@@ -325,6 +338,7 @@ class NAMGateModel:
                  gate_hidden: Sequence[int] = (64, 32),
                  gate_mode: str = 'softmax',
                  gate_scalar_col: str = 'vol_expand',
+                 gate_scalar_col2: str = '',
                  device: str = 'auto'):
         self.feature_names: List[str] = list(feature_names or [])
         self.group_names: List[str] = list(group_names or [])
@@ -333,8 +347,9 @@ class NAMGateModel:
         self.expert_hidden = expert_hidden
         self.gate_hidden = tuple(gate_hidden)
         self.gate_mode = gate_mode
-        # gate_mode='scalar' 时驱动门控的那一列 regime 名（其余模式忽略）
+        # gate_mode='scalar'/'dual_scalar' 时驱动门控的 regime 列名（其余模式忽略）
         self.gate_scalar_col = str(gate_scalar_col)
+        self.gate_scalar_col2 = str(gate_scalar_col2)
 
         self.net: Optional[NAMGateNet] = None
         self.feature_importance: Dict[str, float] = {}
@@ -342,6 +357,9 @@ class NAMGateModel:
         self.regime_matrix: Optional[pd.DataFrame] = None   # 逐日市场状态
         self.input_mean: Optional[np.ndarray] = None        # 特征标准化统计
         self.input_std: Optional[np.ndarray] = None
+        # scheme B：mkt_* 市场级列的 PCA-2 投影（训练段拟合，随模型持久化，
+        # 推理时对传入的 regime 矩阵做同构投影 → mkt_pc1/mkt_pc2）
+        self.mkt_pca: Optional[Dict[str, np.ndarray]] = None
         self._context_date = None
         self._warned_missing_date = False
 
@@ -363,21 +381,29 @@ class NAMGateModel:
             raise RuntimeError('PyTorch 未安装，无法构建 NAMGateModel')
         n_factors = len(self.feature_names)
         n_groups = len(self.group_names)
-        # scalar 门控需要把列名解析成索引；缺列必须硬失败（静默回退到第 0 列
-        # 会让不同实验的"标量信号"其实不是同一个信号，属 T043/T048 同类口径事故）。
+        # scalar/dual_scalar 门控需要把列名解析成索引；缺列必须硬失败（静默回退到
+        # 第 0 列会让不同实验的"标量信号"其实不是同一个信号，属 T043/T048 同类口径事故）。
         scalar_idx = 0
-        if self.gate_mode == 'scalar':
-            if self.gate_scalar_col not in self.regime_cols:
+        scalar_idx2 = 0
+        if self.gate_mode in ('scalar', 'dual_scalar'):
+            _need = [self.gate_scalar_col]
+            if self.gate_mode == 'dual_scalar':
+                _need.append(self.gate_scalar_col2)
+            _miss = [c for c in _need if c not in self.regime_cols]
+            if _miss:
                 raise ValueError(
-                    f"gate_mode='scalar' 需要的 regime 列不存在: {self.gate_scalar_col}\n"
+                    f"gate_mode={self.gate_mode!r} 需要的 regime 列不存在: {_miss}\n"
                     f"  可用列: {self.regime_cols}")
             scalar_idx = self.regime_cols.index(self.gate_scalar_col)
+            if self.gate_mode == 'dual_scalar':
+                scalar_idx2 = self.regime_cols.index(self.gate_scalar_col2)
         self.net = NAMGateNet(
             n_factors=n_factors, group_ids=self.group_ids, n_groups=n_groups,
             d_regime=d_regime, expert_hidden=self.expert_hidden,
             gate_hidden=self.gate_hidden, gate_mode=self.gate_mode,
             expert_dropout=expert_dropout, disable_gate=disable_gate,
-            gate_scalar_idx=scalar_idx, group_norm=group_norm,
+            gate_scalar_idx=scalar_idx, gate_scalar_idx2=scalar_idx2,
+            group_norm=group_norm,
         ).to(self.device)
         self.group_norm = bool(group_norm)
         return self.net
@@ -387,8 +413,35 @@ class NAMGateModel:
         self._context_date = pd.Timestamp(date)
 
     def attach_regime(self, regime_matrix: pd.DataFrame) -> None:
+        if regime_matrix is None or regime_matrix.empty:
+            self.regime_matrix = regime_matrix
+            self.regime_cols = list(getattr(regime_matrix, 'columns', []) or [])
+            return
+        if self.mkt_pca is not None:
+            # scheme B：传入矩阵若含 mkt_* 原始列，先投影成 mkt_pc1/mkt_pc2
+            # （训练段拟合的 PCA 方向），再挂载 —— 保证推理与训练同构。
+            _need = [c for c in self.mkt_pca['mkt_cols'] if c not in regime_matrix.columns]
+            if _need:
+                raise ValueError(
+                    f'模型绑定 mkt PCA 但 regime 矩阵缺列: {_need}\n'
+                    f'回测/推理需用 build_regime_matrix(include_mkt=True)')
+            regime_matrix = self._apply_mkt_pca(regime_matrix)
         self.regime_matrix = regime_matrix
         self.regime_cols = list(regime_matrix.columns)
+
+    def _apply_mkt_pca(self, mat: pd.DataFrame) -> pd.DataFrame:
+        """把 mkt_* 列投影成 2 个主成分（mkt_pc1/mkt_pc2），替换原列。"""
+        pca = self.mkt_pca
+        mkt_cols = list(pca['mkt_cols'])
+        mean = pca['mean']                       # [1, n_mkt]
+        proj = pca['proj']                       # [2, n_mkt]
+        X = mat[mkt_cols].to_numpy(dtype=np.float64) - mean
+        pc = (X @ proj.T).astype(np.float32)     # [n, 2]
+        rest = mat.drop(columns=mkt_cols)
+        out = rest.copy()
+        out['mkt_pc1'] = pc[:, 0]
+        out['mkt_pc2'] = pc[:, 1]
+        return out
 
     # -- 推理 -------------------------------------------------------------
 
@@ -542,12 +595,14 @@ class NAMGateModel:
             'gate_hidden': list(self.gate_hidden),
             'gate_mode': self.gate_mode,
             'gate_scalar_col': getattr(self, 'gate_scalar_col', 'vol_expand'),
+            'gate_scalar_col2': getattr(self, 'gate_scalar_col2', ''),
             'disable_gate': bool(getattr(self, 'disable_gate', False)),
             'group_norm': bool(getattr(self, 'group_norm', False)),
             'feature_importance': self.feature_importance,
             'is_trained': self.is_trained,
             'input_mean': self.input_mean,
             'input_std': self.input_std,
+            'mkt_pca': self.mkt_pca,
             'regime_matrix': self.regime_matrix,
             'state_dict': state,
         }
@@ -568,11 +623,13 @@ class NAMGateModel:
         self.gate_hidden = tuple(payload['gate_hidden'])
         self.gate_mode = payload['gate_mode']
         self.gate_scalar_col = str(payload.get('gate_scalar_col', 'vol_expand'))
+        self.gate_scalar_col2 = str(payload.get('gate_scalar_col2', ''))
         self.disable_gate = bool(payload.get('disable_gate', False))
         self.group_norm = bool(payload.get('group_norm', False))
         self.feature_importance = payload.get('feature_importance', {})
         self.input_mean = payload.get('input_mean')
         self.input_std = payload.get('input_std')
+        self.mkt_pca = payload.get('mkt_pca')
         self.regime_matrix = payload.get('regime_matrix')
         self.is_trained = payload.get('is_trained', False)
 

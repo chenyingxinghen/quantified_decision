@@ -24,6 +24,11 @@ class MLFactorBacktestStrategy(BaseStrategy):
     回测时完全依赖训练阶段生成的因子缓存。
     """
     
+    # R4 内存驻留：进程级因子面板缓存（按 cache_dir + 特征指纹 + 裁剪窗口）。
+    # 同一份 numpy 矩阵跨模型复用，避免每个回测进程重复加载 13.85GB parquet。
+    # 单模型 run_backtest 运行时此字典为空，照常加载，行为完全不变。
+    _GLOBAL_FACTOR_CACHE = {}
+
     def __init__(self,
                  model_path: str,
                  min_confidence: float = sc.ML_FACTOR_MIN_CONFIDENCE,
@@ -41,6 +46,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  ensemble_model_paths: Optional[List[str]] = None,
                  preload_start: Optional[str] = None,
                  preload_end: Optional[str] = None,
+                 ensemble_vote: bool = False,
+                 ensemble_vote_k: int = 50,
                  name: str = "ML因子策略"):
         """初始化策略
 
@@ -77,6 +84,14 @@ class MLFactorBacktestStrategy(BaseStrategy):
             p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
             for p in (ensemble_model_paths or []) if p
         ]
+        # 投票共识（T131）：ensemble 模式二选一。
+        #  - 等权分位平均（默认）：连续分位取均值，弱成员稀释强成员（T051/T055 已证失败）。
+        #  - 投票共识（ensemble_vote=True）：每个成员独立取 Top-K，只有被多数成员
+        #    共同选中的股票才进候选，再按票数降序 + 平均分位降序取 Top-N。
+        #    直接消除单种子头部排序噪声（4 种子持仓 Jaccard 仅 ~5%，单模型选股
+        #    近乎独立抽样）；不挑种子、不用 OOS 信息，符合 T069 纪律。
+        self.ensemble_vote = bool(ensemble_vote)
+        self.ensemble_vote_k = int(ensemble_vote_k or 50)
         self.ensemble_models = []
         if self.risk_penalty_lambda < 0:
             raise ValueError('risk_penalty_lambda 必须 >= 0')
@@ -202,7 +217,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
             try:
                 from config import DATABASE_PATH as _DB
                 from core.factors.regime_features import build_regime_matrix
-                _rm = build_regime_matrix(_DB)
+                # include_mkt=True：scheme B 门控模型需要 mkt_* 市场级列
+                # （attach_regime 内由模型自带的 PCA 投影成 mkt_pc1/mkt_pc2）；
+                # disable-gate 模型忽略 m 矩阵，多 10 列无影响。
+                _rm = build_regime_matrix(_DB, include_mkt=True)
                 for _m in self.ensemble_models:
                     if _m.__class__.__name__ == 'NAMGateModel':
                         _m.attach_regime(_rm)
@@ -414,7 +432,20 @@ class MLFactorBacktestStrategy(BaseStrategy):
                     _pred = np.asarray(_m.predict(X_arr), dtype=float)
                 # 每个模型独立分位化，消除初始化引起的输出温度/尺度差异。
                 _model_ranks.append(_rankdata(_pred, method='average') / (len(_pred) + 1))
-            probs = np.mean(np.vstack(_model_ranks), axis=0)
+            if self.ensemble_vote:
+                # 投票共识：每成员取 Top-K 投一票，按票数降序 + 平均分位降序。
+                # 票数为 0 的股票得 0 分（不会进入头部），边缘随机股被多数票过滤。
+                _ranks = np.vstack(_model_ranks)                 # [n_m, n_stock]
+                _votes = np.zeros(_ranks.shape[1], dtype=np.int32)
+                for _r in _ranks:
+                    _votes[_r >= 1.0 - self.ensemble_vote_k / len(_r)] += 1
+                _mean_rank = _ranks.mean(axis=0)
+                # 组合分：票数优先（最多 n_m 票），同票数内按平均分位微调。
+                # 归一化让票数权重 >> 分位权重（票数差 1 即远超分位差）。
+                _vote_score = _votes.astype(float) * 1e3 + _mean_rank
+                probs = _vote_score
+            else:
+                probs = np.mean(np.vstack(_model_ranks), axis=0)
         elif getattr(self, 'is_nam_gate', False):
             # 门控依赖"当前交易日"的市场状态，必须在打分前显式告知
             self.model.set_context_date(current_date)
@@ -666,6 +697,22 @@ class MLFactorBacktestStrategy(BaseStrategy):
         feature_names = self._get_model_feature_names()
         if not feature_names:
             return
+
+        # ── R4 内存驻留：同 cache_dir + 特征指纹 + 裁剪窗口的面板只加载一次 ──
+        _rk = (
+            self.cache_dir,
+            tuple(feature_names),
+            str(self.preload_start)[:10] if self.preload_start else None,
+            str(self.preload_end)[:10] if self.preload_end else None,
+        )
+        _gc = MLFactorBacktestStrategy._GLOBAL_FACTOR_CACHE.get(_rk)
+        if _gc is not None:
+            self._factor_dates_cache, self._factor_matrix_cache = _gc
+            print(f"  [R4] 复用进程内已加载因子面板: {len(self._factor_dates_cache)} 只 "
+                  f"({self.cache_dir})")
+            return
+        # ──────────────────────────────────────────────────────────────
+
         if not os.path.isdir(self.cache_dir):
             return
 
@@ -759,6 +806,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 covered_cols.update(present)
                 loaded += 1
         print(f"  因子缓存预加载完成: {loaded}/{len(files)}")
+
+        # R4 内存驻留：落盘到进程级缓存，供后续同指纹模型复用
+        MLFactorBacktestStrategy._GLOBAL_FACTOR_CACHE[_rk] = (
+            self._factor_dates_cache, self._factor_matrix_cache)
 
         # 精确复核：上面是抽样，这里用**全部**已加载文件的列并集再判一次。
         if loaded > 0:

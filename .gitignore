@@ -68,4 +68,4 @@ new_data/*
 
 database/*
 .*
-training_iterations/*
+training_iterations/*diagnose_output/

@@ -48,6 +48,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
                  preload_end: Optional[str] = None,
                  ensemble_vote: bool = False,
                  ensemble_vote_k: int = 50,
+                 vote_fill: bool = True,
                  name: str = "ML因子策略"):
         """初始化策略
 
@@ -92,6 +93,10 @@ class MLFactorBacktestStrategy(BaseStrategy):
         #    近乎独立抽样）；不挑种子、不用 OOS 信息，符合 T069 纪律。
         self.ensemble_vote = bool(ensemble_vote)
         self.ensemble_vote_k = int(ensemble_vote_k or 50)
+        # vote_fill：共识股不足 max_positions 时，用 1 票候选按平均分位补足仓位，
+        # 避免"共识太严 → 空仓太多"导致的资金闲置（4 种子 Top-50 共识仅 ~8 只/日）。
+        # 关闭后严格按票数排序，宁缺毋滥（仓位可能长期不满）。
+        self.vote_fill = bool(vote_fill)
         self.ensemble_models = []
         if self.risk_penalty_lambda < 0:
             raise ValueError('risk_penalty_lambda 必须 >= 0')
@@ -550,6 +555,22 @@ class MLFactorBacktestStrategy(BaseStrategy):
             
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
+        # 投票共识的仓位补充（T131）：候选已按"票数×1e3 + 平均分位"排序。
+        # 若共识股（≥2 票）不足 max_positions，默认把 1 票候选（按平均分位降序）
+        # 续接在共识股之后，保证仓位打满、且头部永远是共识股。
+        # 效果等价于把投票分桶从"0/≥2"展平为"0/1/2/3/4"连续桶。
+        if self.ensemble_vote and self.vote_fill and len(candidates) > 0:
+            _cv = np.asarray([c['prob'] for c in candidates])          # probs 即 vote_score
+            _votes = np.floor(_cv / 1e3).astype(int)                   # 还原票数
+            _hi = [c for c, v in zip(candidates, _votes) if v >= 2]
+            _lo = [c for c, v in zip(candidates, _votes) if v == 1]
+            if len(_hi) < self.max_positions and len(_lo) > 0:
+                # 1 票候选按平均分位降序（prob 的 1e3 尾数即 mean_rank）
+                _lo.sort(key=lambda x: x['prob'] - np.floor(x['prob'] / 1e3) * 1e3,
+                         reverse=True)
+                candidates = _hi + _lo
+            # 若 ≥2 票已超持仓上限，保持原投票排序即可（_hi 即头部）。
+
         # 诊断插桩：设置 MLFS_DEBUG_RANK=<文件路径> 时逐日落盘候选池规模与 Top10 打分，
         # 用于验证"不同模型是否真的产生不同选股"。默认关闭，零开销。
         _dbg = os.environ.get('MLFS_DEBUG_RANK')
@@ -874,8 +895,16 @@ class MLFactorBacktestStrategy(BaseStrategy):
         return row.reindex(self._get_model_feature_names()).fillna(0.5).to_numpy(dtype=np.float32)
 
     def _get_model_feature_names(self) -> List[str]:
-        """获取模型需要的特征列，兼容单模型与集成模型。"""
+        """获取模型需要的特征列，兼容单模型与集成模型。
+
+        T133 PCA 压缩模型：模型输入是主成分（pc1..pcK），但归一化/取列必须发生在
+        **投影前**的原始特征面板上（228 列），predict 内部再做 X @ pca_W 投影。
+        因此这里返回原始特征名（pca_raw_feature_names），而非模型 feature_names。
+        """
         names = getattr(self.model, 'feature_names', None)
+        pca_raw = getattr(self.model, 'pca_raw_feature_names', None)
+        if pca_raw:
+            return list(pca_raw)
         if names:
             return list(names)
         models = getattr(self.model, 'models', None)

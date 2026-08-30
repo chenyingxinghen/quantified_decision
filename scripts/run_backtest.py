@@ -135,22 +135,14 @@ def main():
     # 2. 创建策略
     print("初始化策略...")
     
-    # 缓存目录：新模型可在目录清单中绑定独立版本化缓存；旧模型无清单时
-    # 兼容历史 TrainingConfig.CACHE_DIR。显式 --cache-dir 仅用于诊断覆盖。
-    from core.factors.cache_manifest import resolve_ensemble_cache, validate_cache_manifest
-    _cache_model_paths = [model_path] + list(_args.ensemble_model)
-    _cache_model_dirs = [
-        path if os.path.isdir(path) else os.path.dirname(path)
-        for path in _cache_model_paths
-    ]
-    bound_cache_dir = resolve_ensemble_cache(_cache_model_dirs, TrainingConfig.CACHE_DIR)
+    # 缓存目录：单一通用共享缓存。所有模型（NAM / 树 / mark / latest）共用
+    # config 里的 factors_cache（T052 铁律已于 2026-08-27 废止，不再做 per-model
+    # 独立版本化缓存绑定；cache_manifest 的 manifest 机制本身也已在 2026-08-22 移除）。
+    # 显式 --cache-dir 仅用于诊断覆盖。
     if _args.cache_dir:
         cache_dir = os.path.abspath(_args.cache_dir)
-        # 若模型有绑定清单，覆盖目录必须至少是合法当前版本缓存。
-        if os.path.abspath(bound_cache_dir) != os.path.abspath(TrainingConfig.CACHE_DIR):
-            validate_cache_manifest(cache_dir)
     else:
-        cache_dir = bound_cache_dir
+        cache_dir = os.path.abspath(TrainingConfig.CACHE_DIR)
     use_cache = os.path.exists(cache_dir) and any(
         name.endswith('.parquet') for name in os.listdir(cache_dir)
     )

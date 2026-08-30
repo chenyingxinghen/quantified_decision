@@ -11,7 +11,7 @@
 from typing import Dict, Any
 from config import baostock_config
 
-n_bins = 15
+n_bins = 7
 
 # ============================================================================
 # 1. 模型超参数配置
@@ -22,14 +22,14 @@ class ModelConfig:
 
     # ── LightGBM Ranking 配置 ─────────────────────────────────────────────
     LIGHTGBM_PARAMS: Dict[str, Any] = {
-        'n_estimators': 1000,
-        'num_leaves': 15,
-        'learning_rate': 0.04,
+        'n_estimators': 100,
+        'num_leaves': 40,
+        'learning_rate': 0.05,
 
         'min_child_weight': 100,
-        'min_gain_to_split': 0.01, # 最小分裂增益，剪掉无意义的分裂
-        'reg_alpha': 2.5,          # L1 正则，促进稀疏性
-        'reg_lambda': 2.5,         # L2 正则，平滑权重
+        'min_gain_to_split': 10.01, # 最小分裂增益，剪掉无意义的分裂
+        'reg_alpha': 15,          # L1 正则，促进稀疏性
+        'reg_lambda': 15,         # L2 正则，平滑权重
 
         'subsample': 0.8,
         'colsample_bytree': 0.8,
@@ -38,46 +38,36 @@ class ModelConfig:
         # Ranking 专属配置
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        # 早停 first_metric_only=True 只盯排序后 eval_at 的最小截断位。用 @20 而非 @5：
-        # A股 top-5 截面噪声大，@20 对 top-k 选股更稳健、随迭代更单调，作早停主指标更可靠。
+
         'eval_at': [5,20],
         'lambdarank_truncation_level': 100,
         'label_gain': [i for i in range(n_bins)],
 
-        # ── 早停开启 (200 轮)，这是冠军 (7/28) 的健康配置，勿再关 ──
-        # 教训：曾有一次全量重训 lgb 在第 [1] 轮崩溃 (Unique=7, best_iter=1)，我误判为
-        # "9M 大样本下 lambdarank 病态"并关掉早停强训 600 轮 —— 结果制造了过拟合
-        # (train IC 0.11 / val IC 0.01)，回测 -9.14%，远差于冠军 +17.27%。
-        # 真因经诊断另有其人：缓存路径特征泄漏 (raw turnover_rate/amount + is_suspended
-        # 混入 X，见 train_ml_model _extract_stock_components_from_cache 的 keep_cols 修复)，
-        # 把强信号的【原始未归一化列】和零方差状态位灌进模型，扭曲了训练与早停曲线。
-        # 反证：冠军同为 9M/17y/5480，早停正常停在 39 棵、健康。特征泄漏修复后早停即恢复。
-        # 弱信号场景 (单特征 IC 天花板 ≈0.07) 就该【浅模型+强正则+早停】，绝不关早停。
-        'early_stopping_rounds': 100,
+        # 'early_stopping_rounds': 0,
         'n_jobs': -1,  # 使用所有CPU核心
         'verbosity': -1,
     }
 
 
     XGBOOST_PARAMS: Dict[str, Any] = {
-        'n_estimators': 1000,
-        'max_depth': 4,
-        'learning_rate': 0.04,
+        'n_estimators': 70,
+        'max_depth': 6,
+        'learning_rate': 0.05,
 
         'subsample': 0.8,
         'colsample_bytree': 0.8,
 
         'min_child_weight': 100,
-        'gamma': 0.01,              # 最小分裂损失，剪掉无意义的分裂
-        'reg_alpha': 2.5,          # L1 正则
-        'reg_lambda': 2.5,         # L2 正则
+        'gamma': 10.01,              # 最小分裂损失，剪掉无意义的分裂
+        'reg_alpha': 15,          # L1 正则
+        'reg_lambda': 15,         # L2 正则
 
         # Ranking 专属配置
         'eval_metric': 'ndcg',
         'ndcg_exp_gain': False,  
 
         'n_jobs': -1,  # 使用所有CPU核心
-        'early_stopping_rounds': 100,
+        # 'early_stopping_rounds': 0,
         'verbosity': 1,
     }
 
@@ -155,7 +145,7 @@ class TrainingConfig:
     """训练参数配置"""
 
     # ── 模型 ──────────────────────────────────────────────────────────────
-    MODEL_TYPES          = ['lightgbm','xgboost']
+    MODEL_TYPES          = ['lightgbm']
     TASK                 = 'ranking' 
 
     # ── 数据范围 ───────────────────────────────────────────────────────────
@@ -163,7 +153,7 @@ class TrainingConfig:
     YEARS_FOR_TRAINING   = 10         # 训练数据年数
     YEARS_FOR_BACKTEST   = 2         # 回测数据年数
     STOCK_NUM            = 6000      # 参与训练的股票数量上限
-    SHORT_PREDICTION     = False
+    SHORT_PREDICTION     = True
     FUTURE_DAYS          = 7 if SHORT_PREDICTION else 15         # 预测未来 N 个交易日
 
 
@@ -185,6 +175,7 @@ class TrainingConfig:
 
     # 标签变换：回归与 XGBoost ranking 共用连续标签变换；LightGBM ranking 由 label_gain 控制
     LABEL_WEIGHTED_FOR_XGB= True
+    XGB_DISCRETE=True
     # 2026-08 多窗口验证：0.8 在 2019/2021/2023 起始的三个验证阶段均提高 Rank IC，
     # 且避免 1.2 在近期数据上 best_iter=1~7、预测分数近乎退化的问题。
     # Top-5 超额收益并非每个窗口都占优，因此保留完整训练后的头部指标晋级门槛。
@@ -209,29 +200,16 @@ class TrainingConfig:
     PATH_PENALTY         = 0.10      # 先跌后涨路径惩罚幅度（-10%）
     
 
-    WEIGHT_EXPONENT      = 2         # 适度头部加权，让模型更关注真正的强势股信号
+    WEIGHT_EXPONENT      = 1         # 适度头部加权，让模型更关注真正的强势股信号
     USE_SAMPLE_WEIGHT    = False      # 开启样本加权，引导模型关注高质量预测目标
 
     # 时间衰减权重：近期市场结构可能对验证期更有代表性。
     # 权重按交易日计算，同一截面内所有股票权重一致，适配 XGBoost ranking 的 per-group
     # 权重语义，也避免改变单日内部的股票相对重要性。
-    # 2026-08-03 对照（500股/8年/300树）：
-    # off/2y/4y/8y 的验证 Rank IC = 0.0465/0.0294/0.0345/0.0403。
-    # 当前特征与标签下，历史样本提供了有效的跨周期正则，时间衰减反而降低泛化，默认关闭。
     USE_RECENCY_WEIGHT       = False
     RECENCY_HALF_LIFE_YEARS  = 4.0
     RECENCY_MIN_WEIGHT       = 0.10
 
-    # Ranking query 权重：按每日原始标签的截面 IQR 对完整交易日加权。
-    # 权重在 query 内严格一致；默认关闭，实验候选由脚本临时覆盖。
-    QUERY_LABEL_DISPERSION_WEIGHT = 'off'  # off / high / low
-    QUERY_LABEL_WEIGHT_MIN = 0.75
-    QUERY_LABEL_WEIGHT_MAX = 1.25
-
-    # Ranking query 权重的 ATR regime 版本：按每日平均 atr_rel 的跨日分位加权。
-    QUERY_ATR_REGIME_WEIGHT = 'off'  # off / high / low
-    QUERY_ATR_WEIGHT_MIN = 0.75
-    QUERY_ATR_WEIGHT_MAX = 1.25
 
     # ST 股票处理
     ST_LABEL_SCORE       = -50         # ST 样本原始分上限（0=中性）
@@ -246,9 +224,6 @@ class TrainingConfig:
     # 涨跌停限额取值方式（2026-08-18）
     #   False = 静态 config.MARKET_LIMITS（按代码前缀查表，无时间维度，历史口径）
     #   True  = 从 price_limit_history 表实测查表（随规则变更自动跟随）
-    # **默认 False**：打开会改变 T+1 一字涨停判定 ⇒ 样本剔除结果变化 ⇒ 新结果与
-    # T113/T115 基线不可配对。等下次本就要重建基线时再开。
-    # 表由 scripts/build_price_limit_history.py 生成；缺表时自动回退静态值并告警。
     USE_EMPIRICAL_PRICE_LIMITS = True
     
         
@@ -315,9 +290,21 @@ class TrainingConfig:
                 return True
         return False
 
+    # 三臂归一化对照（2026-08-25）：rank（默认，现状）/ sigmoid（全 robust-sigmoid）/
+    # dual（主列 rank + `__z` 幅值旁路）。训练与回测共用 should_skip_rank，此开关单一事实来源。
+    NORMALIZE_MODE = 'rank'
+
     @staticmethod
     def should_skip_rank(col: str) -> bool:
         """判定该因子是否应跳过横截面排名"""
+        mode = getattr(TrainingConfig, 'NORMALIZE_MODE', 'rank')
+        if mode == 'sigmoid':
+            # B 臂：全部走 robust-sigmoid（保留幅值），验证 rank 是否多余
+            return True
+        if mode == 'dual':
+            # C 臂：`__z` 幅值旁路列走 robust-sigmoid，主列照常 rank
+            if col.endswith('__z'):
+                return True
         if col in TrainingConfig.FEATURE_RANK_SKIP_LIST:
             return True
         col_l = col.lower()

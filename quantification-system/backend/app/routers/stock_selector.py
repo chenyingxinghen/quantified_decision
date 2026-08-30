@@ -2,7 +2,8 @@
 选股与信号 API
 """
 
-import os, sys, json, glob, traceback
+import os, sys, json, glob, traceback, re
+from datetime import datetime
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query, Header
 from pydantic import BaseModel
@@ -180,14 +181,32 @@ def _load_candlestick():
 
 @router.get("/latest")
 async def get_latest_selection():
-    """获取最近一次选股结果 (CSV)"""
+    """获取最近一次选股结果 (CSV)
+
+    排序必须按「实际生成时间」倒序，而不是字典序文件名。
+    文件名形如 ``selected_stocks_{types_str}_{%Y%m%d_%H%M%S}.csv``，模型类型前缀
+    (lgbm / nam_gate / xgboost…) 夹在固定词根和日期之间。若用 ``sorted()`` 字典序
+    取 ``[-1]``，会选到**类型字典序最后**的文件（如 ``nam_gate`` > ``lgbm_nam_gate_xgboost``），
+    而非真正最新日的文件。这里优先用文件名内嵌日期，解析失败再回退文件修改时间。
+    """
     result_dir = os.path.join(get_project_root(), "backtest_result")
-    csvs = sorted(glob.glob(os.path.join(result_dir, "selected_stocks_*.csv")))
+    csvs = glob.glob(os.path.join(result_dir, "selected_stocks_*.csv"))
     if not csvs:
         return {"items": [], "file": None}
 
+    def _recency_key(path):
+        m = re.search(r"(\d{8})_(\d{6})", os.path.basename(path))
+        if m:
+            try:
+                return (0, datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S"))
+            except ValueError:
+                pass
+        return (1, datetime.fromtimestamp(os.path.getmtime(path)))
+
+    csvs.sort(key=_recency_key, reverse=True)
+    latest = csvs[0]
+
     import pandas as pd
-    latest = csvs[-1]
     df = pd.read_csv(latest, dtype={'stock_code': str})
     for col in ['stock_code']:
         if col in df.columns:

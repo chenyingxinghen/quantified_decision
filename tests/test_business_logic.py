@@ -447,8 +447,8 @@ class ArtifactAndCacheTests(unittest.TestCase):
         非空时校验三件会静默出错的事：
           1. feature_names 顺序完全一致。策略层也校验，但那是运行时；
              这里让它在上线前红掉。
-          2. 绑定的因子缓存目录一致。成员各自带 factor_cache_manifest.json，
-             指向不同缓存版本时，同一天的同一只票会拿到两套不同口径的面板，
+          2. 因子缓存目录一致（单一通用 factors_cache，所有成员共享）。
+             若成员指向不同缓存目录，同一天的同一只票会拿到两套不同口径的面板，
              平均出来的排名没有意义，且**不会报错**。
           3. 成员之间不重复、且不等于主模型 —— 重复成员等于给某个种子加权，
              而 [[ensemble-beats-single]] 已证伪按权重加权（w=0.7 回测证伪），
@@ -480,17 +480,19 @@ class ArtifactAndCacheTests(unittest.TestCase):
                              f'集成成员面板与主模型不一致: {p}')
 
             self.assertEqual(Path(resolve_production_cache_dir(str(p))).resolve(), main_cache,
-                             f'集成成员绑定的因子缓存版本与主模型不同: {p}')
+                             f'集成成员绑定的因子缓存目录与主模型不同: {p}')
 
             self.assertTrue((p.parent / 'norm_stats.pkl').exists(),
                             f'集成成员缺少同批 norm_stats.pkl: {p}')
 
-    def test_automation_model_panel_is_covered_by_its_bound_cache(self):
-        """模型要的每一列都必须在它绑定的缓存里真实存在。
+    def test_automation_model_panel_is_covered_by_production_cache(self):
+        """模型要的每一列都必须在生产因子缓存里真实存在。
 
         这是接入生产的核心契约。缺列不会报错——ml_factor_strategy 会把整列
         填成 0.5 然后照常出票。T115（224 列，含 5 个 idx_*）配旧的 219/242 列
         缓存就是这个情形，本测试就是为了让那种配置在上线前红掉。
+        （T052 铁律已于 2026-08-27 废止，per-model manifest 绑定机制已移除，
+         生产缓存统一为 config 里的 factors_cache；此处校验的是该共享缓存。）
         """
         import pyarrow.parquet as pq
         from scripts.select_stocks import (

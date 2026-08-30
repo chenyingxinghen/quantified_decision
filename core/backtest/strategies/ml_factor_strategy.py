@@ -102,9 +102,9 @@ class MLFactorBacktestStrategy(BaseStrategy):
         self._regime_blocked_days = 0
         self._volcap_rejected = 0
         
-        # 因子缓存：未显式指定时按模型存档里的绑定清单解析，而不是硬回退到
-        # TrainingConfig.CACHE_DIR。那个旧共享缓存没有版本清单，既缺 T115 的 5 列
-        # idx_*（NAM 需要）也缺 4 列 fc_*（树需要），两族都会撞下面的列完整性护栏。
+        # 因子缓存：未显式指定时取 config 里的单一通用共享 factors_cache
+        # （T052 铁律已于 2026-08-27 废止，per-model manifest 绑定机制已在
+        # 2026-08-22 移除；所有模型共用同一缓存，新增因子直接加进 factor_cache）。
         # 与 scripts/select_stocks.py、scripts/run_backtest.py 同一口径。
         if cache_dir is None:
             try:
@@ -119,7 +119,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
             except Exception as _e:
                 # 解析失败不在构造期炸掉（有些单测只构造不 initialize）；
                 # 面板真缺列时 initialize 的护栏会给出更准确的报错。
-                print(f"  缓存绑定解析失败，回退历史共享缓存: {_e}")
+                print(f"  缓存目录解析失败，回退默认 factors_cache: {_e}")
                 cache_dir = fc.TrainingConfig.CACHE_DIR
         self.cache_dir = cache_dir
 
@@ -159,6 +159,14 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 nam_path = os.path.join(target_path, 'nam_gate_factor_model.pkl')
                 if os.path.exists(nam_path):
                     return _load_smart_model(nam_path)
+
+                # T139 双轴模型（横截面 NAM + 纵截面 LSTM 市场调制）
+                dual_path = os.path.join(target_path, 'dual_axis_model.pkl')
+                if os.path.exists(dual_path):
+                    from core.factors.dual_axis_model import DualAxisModel
+                    m = DualAxisModel.load(dual_path)
+                    print(f"  已识别 DualAxisModel: {target_path}")
+                    return m
 
                 xgb_path = os.path.join(target_path, 'xgboost_factor_model.pkl')
                 lgb_path = os.path.join(target_path, 'lightgbm_factor_model.pkl')
@@ -211,8 +219,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
         if len(self.ensemble_models) > 1:
             print(f"  已启用横截面分位集成: {len(self.ensemble_models)} 个模型")
 
-        # NAMGateModel 需要逐日的宏观 regime 向量作为门控输入，在此一次性挂载
-        self.is_nam_gate = self.model.__class__.__name__ == 'NAMGateModel'
+        # NAMGateModel / DualAxisModel 需要逐日的宏观 regime 向量作为输入，在此一次性挂载
+        self.is_nam_gate = self.model.__class__.__name__ in ('NAMGateModel', 'DualAxisModel')
         if self.is_nam_gate:
             try:
                 from config import DATABASE_PATH as _DB
@@ -220,13 +228,14 @@ class MLFactorBacktestStrategy(BaseStrategy):
                 # include_mkt=True：scheme B 门控模型需要 mkt_* 市场级列
                 # （attach_regime 内由模型自带的 PCA 投影成 mkt_pc1/mkt_pc2）；
                 # disable-gate 模型忽略 m 矩阵，多 10 列无影响。
+                # DualAxisModel 按自身 regime_cols 子集选取，多列亦无影响。
                 _rm = build_regime_matrix(_DB, include_mkt=True)
                 for _m in self.ensemble_models:
-                    if _m.__class__.__name__ == 'NAMGateModel':
+                    if _m.__class__.__name__ in ('NAMGateModel', 'DualAxisModel'):
                         _m.attach_regime(_rm)
                 print(f"  已挂载 regime 矩阵: {_rm.shape[0]} 日 × {_rm.shape[1]} 维")
             except Exception as _e:
-                raise RuntimeError(f"NAMGateModel 需要 regime 矩阵，但构建失败: {_e}")
+                raise RuntimeError(f"{self.model.__class__.__name__} 需要 regime 矩阵，但构建失败: {_e}")
 
         # 加载归一化统计量（与模型同目录的 norm_stats.pkl）
         import pickle as _pickle
@@ -423,7 +432,7 @@ class MLFactorBacktestStrategy(BaseStrategy):
             _model_ranks = []
             _frame = pd.DataFrame(X_arr, columns=feature_names)
             for _m in self.ensemble_models:
-                if _m.__class__.__name__ == 'NAMGateModel':
+                if _m.__class__.__name__ in ('NAMGateModel', 'DualAxisModel'):
                     _m.set_context_date(current_date)
                     _pred = np.asarray(_m.predict(_frame), dtype=float)
                 elif getattr(_m, 'models', None):
@@ -786,6 +795,13 @@ class MLFactorBacktestStrategy(BaseStrategy):
                         a = a[row_idx]
                     matrix[:, feat_pos[c]] = np.nan_to_num(
                         a[lo:hi], nan=0.5, posinf=1.0, neginf=0.0)
+                # dual 归一化（T139 三臂对照）：`__z` 幅值旁路列 = 基列 raw 值。
+                # 缓存无 __z 列，从基列复制保证与训练端（raw 复制）逐位一致。
+                for _j, _name in enumerate(feature_names):
+                    if _name.endswith('__z'):
+                        _base = _name[:-3]
+                        if _base in feat_pos:
+                            matrix[:, _j] = matrix[:, feat_pos[_base]]
                 return code, dates, matrix, present
             except Exception:
                 return None
@@ -840,7 +856,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
             if n_files == 0:
                 return
 
-        absent = [c for c in feature_names if c not in covered]
+        absent = [c for c in feature_names
+                  if c not in covered and not c.endswith('__z')]
         if not absent:
             return
 
@@ -850,8 +867,8 @@ class MLFactorBacktestStrategy(BaseStrategy):
             f"{absent[:12]}{' ...' if len(absent) > 12 else ''}\n"
             f"  缓存目录: {self.cache_dir}\n"
             f"  这些列会被填成常数 0.5，模型将在残缺面板上打分且不报错。\n"
-            f"  处理：改用模型绑定清单里的缓存目录（core.factors.cache_manifest."
-            f"resolve_model_cache），或用当前因子公式重建缓存。\n"
+            f"  处理：向 factors_cache 增补缺失列（用当前因子公式重建或扩展缓存），"
+            f"或显式指定 --cache-dir 指向含这些列的缓存。\n"
             f"  确知无害时可设 ALLOW_MISSING_FACTOR_COLUMNS=1 放行。"
         )
         if os.environ.get('ALLOW_MISSING_FACTOR_COLUMNS') != '1':
@@ -870,8 +887,18 @@ class MLFactorBacktestStrategy(BaseStrategy):
         factors = self._get_factors(stock_code, None, current_date)
         if factors is None or factors.empty:
             return None
+        feat = self._get_model_feature_names()
         row = factors.drop(columns=['date'], errors='ignore').iloc[-1]
-        return row.reindex(self._get_model_feature_names()).fillna(0.5).to_numpy(dtype=np.float32)
+        arr = row.reindex(feat).fillna(0.5).to_numpy(dtype=np.float32)
+        # dual 归一化：`__z` 幅值旁路列 = 基列 raw 值（缓存无 __z 列；R4 预加载
+        # 路径已在矩阵构建时复制，此分支覆盖实时取数路径）
+        for _j, _name in enumerate(feat):
+            if _name.endswith('__z'):
+                _base = _name[:-3]
+                if _base in row.index:
+                    _v = row[_base]
+                    arr[_j] = _v if pd.notna(_v) else 0.5
+        return arr
 
     def _get_model_feature_names(self) -> List[str]:
         """获取模型需要的特征列，兼容单模型与集成模型。"""

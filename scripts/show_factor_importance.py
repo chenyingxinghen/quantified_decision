@@ -25,7 +25,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(description='模型因子重要性分析')
-    parser.add_argument('--model', type=str, default='models/latest',
+    parser.add_argument('--model', type=str, default='models/tree/latest',
                         help='模型目录或 .pkl 文件路径（默认: models/latest）')
     parser.add_argument('--top', type=int, default=20,
                         help='显示 Top-N 因子（默认: 20）')

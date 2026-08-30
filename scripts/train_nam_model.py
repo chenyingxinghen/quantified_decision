@@ -16,7 +16,8 @@
     python -u scripts/train_nam_model.py --stocks 5480 --years 13 --end 2022-09-05 \\
         --disable-gate --target returns --y-scale 2 --expert-hidden 16 --lr 2e-3 \\
         --drop-groups forecast --select-holdout 0.4 --store-dtype auto \\
-        --seed 42 --save-model-dir models/nam_gate/<tag>_s42
+        --seed 42 --save-model-dir models/nam_gate/<tag>_s42 \\
+        --output diagnose_output/<tag>/results.json
 
 ⚠ 需要 torch，只装在 workbuddy 的 3.13.12 解释器里：
   ``C:/Users/29454/.workbuddy/binaries/python/versions/3.13.12/python.exe``
@@ -605,7 +606,7 @@ class _DayBatchLoader:
 
     def _make_day(self, di):
         s, e = self.days[di]
-        return (di, self._rows(s, e).float(), self.y[s:e])
+        return (di, self._rows(s, e).float(), self.y[s:e].to(self.dev, non_blocking=True))
 
     # ── 分块路径（chunk_days>1）────────────────────────────────────────────
     def iter_chunks(self, order):
@@ -621,12 +622,12 @@ class _DayBatchLoader:
         L = max(self.days[d][1] - self.days[d][0] for d in blk)
         F = self.store.shape[1]
         Xb = torch.zeros((C, L, F), dtype=torch.float32, device=self.dev)
-        yb = self.y.new_zeros((C, L))
+        yb = torch.zeros((C, L), device=self.dev)  # y 设备对齐 dev（与 X 对称）
         mask = torch.zeros((C, L), dtype=torch.bool, device=self.dev)
         for i, d in enumerate(blk):
             s, e = self.days[d]
             Xb[i, :e - s] = self._rows(s, e)
-            yb[i, :e - s] = self.y[s:e]
+            yb[i, :e - s] = self.y[s:e].to(self.dev)
             mask[i, :e - s] = True
         return (blk, Xb, yb, mask)
 
@@ -675,9 +676,11 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                    device='auto', verbose=True, disable_gate=False,
                    select_metric='rank_ic', select_topk=20, time_decay_years=0.0,
                    select_holdout=0.0, chunk_days=1, store_dtype='auto', group_norm=False,
+                   expert_zero_output=False,
                    store_device='auto', prefetch=True,
                    pca_mkt_cols=False, init_experts_from=None, freeze_experts=False,
-                   gate_wd=None):
+                   gate_wd=None, fixed_day_order=False,
+                   multi_seed_shuffle=False, multi_seed_shuffle_seeds=(42, 11, 23, 37)):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -753,10 +756,15 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
         """分块归一化并落到驻留设备 —— 整表 (a-mean)/std 会在主机侧再吃一份 5.93 GiB。
 
         主机驻留时用 pinned 内存：非 pinned 的 H2D 要先在驱动里过一次中转缓冲，
-        且无法与计算重叠（`non_blocking` 失效）。pin 失败（内存不足/系统限制）
-        则退回普通内存，只是慢一点，不影响正确性。
+        且无法与计算重叠（`non_blocking` 失效）。
+
+        **> 2 GiB 不做 pinned**：WDDM 下超过 GPU 显存 1/3 的 pinned 分配几乎必然
+        失败，且失败会毒化 CUDA 错误状态（粘性，后续所有 GPU 操作都报 OOM）。
+        T147 yscale=4 两次崩在最后一折：5.48 GiB pinned 失败 → torch.zeros 标量 OOM。
+        chunk_days=4 批前向已解决 H2D 瓶颈，pinned 收益可忽略。
         """
-        pin = _store_dev.type == 'cpu'
+        _pin_size = len(a) * a.shape[1] * store_dt.itemsize
+        pin = _store_dev.type == 'cpu' and _pin_size < 2 * 1024**3
         try:
             out = torch.empty((len(a), a.shape[1]), dtype=store_dt,
                               device=_store_dev, pin_memory=pin)
@@ -765,6 +773,13 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                 raise
             print(f"  [警告] pinned 内存分配失败（{_e}），退回普通主机内存："
                   f"H2D 无法与计算重叠，会比预期慢")
+            # 清除粘性 CUDA 错误状态（安全网：< 2 GiB 时理论不应触发）
+            if dev.type == 'cuda':
+                try:
+                    torch.cuda.synchronize()
+                except RuntimeError:
+                    pass
+                torch.cuda.empty_cache()
             out = torch.empty((len(a), a.shape[1]), dtype=store_dt, device=_store_dev)
         step = 1 << 19
         for s in range(0, len(a), step):
@@ -774,7 +789,10 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
 
     Xtr = _to_gpu(Xtr_np)
     Xva = _to_gpu(Xva_np)
-    ytr = torch.as_tensor(fold['y_train'], dtype=torch.float32, device=dev)
+    ytr = torch.as_tensor(fold['y_train'], dtype=torch.float32, device=_store_dev)
+    # T147(2026-08-26): y 与 X 对称走 _store_dev（329 列时主机驻留），避免整表
+    # 塞 GPU 触发 CUDA OOM；取用时由 _DayBatchLoader 批取 .to(dev)（见 _make_day/
+    # _make_chunk 与逐日 step 的 ytr[s:e].to(dev)）。对原 cuda 路径为 no-op，逐位不变。
 
     tr_days = _day_slices(fold['d_train'])
     va_days = _day_slices(fold['d_val'])
@@ -875,9 +893,9 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                       f"累计方差解释率 {_evr.sum():.3f}（PC1 {_evr[0]:.3f} / "
                       f"PC2 {_evr[1]:.3f}），regime {len(regime_cols)} 维")
     Mtr = torch.as_tensor(np.stack([fold['M_train'][s] for s, _ in tr_days]),
-                          dtype=torch.float32, device=dev)
+                          dtype=torch.float32, device=_store_dev)
     Mva = torch.as_tensor(np.stack([fold['M_val'][s] for s, _ in va_days]),
-                          dtype=torch.float32, device=dev)
+                          dtype=torch.float32, device=_store_dev)
 
     # DataLoader 形式的取数器。GPU 驻留时是零拷贝切片（与 T109~T122 逐位一致）；
     # 主机驻留时按块 H2D 并用独立 stream 预取。验证侧不预取：它每 epoch 只跑一遍
@@ -889,7 +907,7 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                                  chunk_days=1, prefetch=False, min_rows=0)
 
     net = model.build(d_regime=Mtr.shape[1], disable_gate=disable_gate,
-                      group_norm=group_norm)
+                      group_norm=group_norm, expert_zero_output=expert_zero_output)
     if chunk_days > 1 and (lambda_lb > 0 or lambda_div > 0 or lambda_ent > 0):
         # 门控正则项作用在 GateUsageTracker 的跨日 EMA 上，逐日更新的节奏是它的
         # 语义的一部分；分块会把 chunk_days 天并成一次更新，等于偷偷改了 momentum。
@@ -960,7 +978,7 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
         score_parts, gate_parts = [], []
         with torch.no_grad():
             for j, (s, e) in enumerate(va_days):
-                sc, w, _ = net.forward_day(val_loader._rows(s, e).float(), Mva[j], temp)
+                sc, w, _ = net.forward_day(val_loader._rows(s, e).float(), Mva[j].to(dev), temp)
                 score_parts.append(sc.detach())
                 gate_parts.append(w.detach())
             out = torch.cat(score_parts).to(torch.float32).cpu().numpy()
@@ -976,7 +994,21 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
         temp = temp_start - (temp_start - 1.0) * min(1.0, epoch / max(1, warmup_epochs)) \
             if warmup_epochs > 0 else 1.0
         net.train()
-        order = rng.permutation(len(tr_days))
+        # 日序确定逻辑（T145 / T146）：
+        #  - fixed_day_order=True      → 固定时间顺序 np.arange（T145）
+        #  - multi_seed_shuffle=True   → 每个 epoch 用「轮转种子集」的独立排列（T146）：
+        #      epoch 0→seeds[0] 的排列, epoch 1→seeds[1] 的排列, ... 循环。
+        #      单模型在训练中遍历多种子家族的日序轨迹，把后训练种子集成的多样性
+        #      搬进训练内部，压制日序洗牌彩票成分；各 epoch 仍是随机排列（无时间偏置）。
+        #  - 默认                     → rng.permutation（单一 seed 的确定性序列，T045/T143/T144）
+        # 三分支互斥，默认分支即原行为，保持历史实验逐位不变。
+        if fixed_day_order:
+            order = np.arange(len(tr_days))
+        elif multi_seed_shuffle:
+            _ms_seed = int(multi_seed_shuffle_seeds[epoch % len(multi_seed_shuffle_seeds)])
+            order = np.random.default_rng(_ms_seed).permutation(len(tr_days))
+        else:
+            order = rng.permutation(len(tr_days))
         steps = 0
         opt.zero_grad(set_to_none=True)
         pending = 0
@@ -999,8 +1031,8 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
             # 逐日路径**刻意不走预取**：`pos == len(order) - 1` 这个 flush 条件依赖
             # 未过滤的 order（末日若样本 <5 会被 continue 掉、于是不 flush），
             # 换成预取器的已过滤序列会改变末尾梯度的处置 —— 不是错，但破坏逐位复现。
-            score, w, _ = net.forward_day(train_loader._rows(s, e).float(), Mtr[di], temp)
-            l_rank = listnet_loss(score, ytr[s:e], y_scale=y_scale)
+            score, w, _ = net.forward_day(train_loader._rows(s, e).float(), Mtr[di].to(dev, non_blocking=True), temp)
+            l_rank = listnet_loss(score, ytr[s:e].to(dev, non_blocking=True), y_scale=y_scale)
             if day_w is not None:
                 l_rank = l_rank * day_w[di]
             loss = l_rank
@@ -1052,7 +1084,7 @@ def train_nam_gate(fold, feature_names, group_names, group_ids, regime_cols,
                     score = gsum.sum(-1) + net.bias
                     w_blk = torch.ones(C, len(group_names), device=dev)
                 else:
-                    w_blk = net.gate(Mtr[blk], temp)              # [C, K]
+                    w_blk = net.gate(Mtr[blk].to(dev, non_blocking=True), temp)              # [C, K]
                     score = (gsum * w_blk.unsqueeze(1)).sum(-1) + net.bias
                 # 掩码 softmax：补位不参与归一化，也不贡献损失
                 neg = torch.finfo(score.dtype).min
@@ -1356,11 +1388,19 @@ def main():
     ap.add_argument('--disable-gate', action='store_true',
                     help='纯加性 NAM（门控权重恒为 1，隔离门控贡献）')
     ap.add_argument('--group-norm', action='store_true',
-                    help='T119：门控前对族求和做**当日截面标准化**。'
-                         '乘积 w_k·S_k 在 (w_k→c·w_k, S_k→S_k/c) 下不变 ⇒ 损失曲面有平坦方向 ⇒ '
-                         '门控权重随噪声漂移（T116 实测 status 族 gate_std 4.45 > gate_mean 3.97）。'
-                         '标准化锁死 f 的幅度，门控只能调相对重要性、无法被专家吸收。'
-                         '仅作用于门控通路，--disable-gate 时不生效（纯加性基线逐位不变）。')
+                    help='T119 族输出截面标准化（实验用，生产恒关）')
+    ap.add_argument('--expert-zero-output', action='store_true',
+                    help='T144: 专家网络输出层零初始化 → 确定性起点（消除 σ_seed 的初始化彩票成分）')
+    ap.add_argument('--fixed-day-order', action='store_true',
+                    help='T145: 固定 epoch 内训练日序（禁用 rng.permutation 洗牌）。'
+                         '消除日序洗牌的 σ_seed 主成分；默认关保持历史实验逐位不变')
+    ap.add_argument('--multi-seed-shuffle', action='store_true',
+                    help='T146: 每个 epoch 用轮转种子集的独立排列（不锁死单一 seed 的序列）。'
+                         '把后训练种子集成的多样性搬进训练，压制日序洗牌彩票成分；'
+                         '默认关保持历史实验逐位不变。')
+    ap.add_argument('--multi-seed-shuffle-seeds', default='42,11,23,37',
+                    help='T146: --multi-seed-shuffle 使用的轮转种子集，逗号分隔整数，'
+                         '默认 "42,11,23,37"。每个 epoch 依次取 seeds[epoch %% len]。')
     ap.add_argument('--target', default='returns', choices=['scores', 'returns'],
                     help='训练目标：returns=原始收益排名（与回测收益对齐，默认）；'
                          'scores=生产 vol_boosted 标签（已证实与收益解耦，会拟合反号噪声）')
@@ -1421,7 +1461,18 @@ def main():
     ap.add_argument('--save-model-dir', default=None)
     ap.add_argument('--plot-dir', default='diagnose_output/nam_gate')
     ap.add_argument('--output', required=True)
+    ap.add_argument('--normalize-mode', default='rank',
+                    choices=['rank', 'sigmoid', 'dual'],
+                    help='三臂归一化对照：rank=现状（主通道，默认）；'
+                         'sigmoid=全部走 robust-sigmoid 保留幅值（验证 rank 是否多余）；'
+                         'dual=主列 rank + __z 幅值旁路。训练/回测共用 should_skip_rank，'
+                         '此开关是单一事实来源')
     args = ap.parse_args()
+
+    # 三臂归一化：必须在数据构建前设置（should_skip_rank 是训练/回测共用判定）
+    TrainingConfig.NORMALIZE_MODE = args.normalize_mode
+    if args.normalize_mode != 'rank':
+        print(f'  归一化模式: {args.normalize_mode}（非默认，用于三臂对照）')
 
     end_dt = datetime.strptime(args.end, '%Y-%m-%d')
     end = end_dt.strftime('%Y-%m-%d')
@@ -1443,10 +1494,17 @@ def main():
     if _horizons and args.label_transform != 'rank':
         raise SystemExit('--multi-horizon 与 --label-transform 互斥：多期标签是把多个'
                          '窗口的分位相加，本身已经是 rank 复合，再谈幅度没有定义')
+    # 显式经 discover_target_features 拿到面板契约，再传给 prepare_dataset。
+    # 禁止 target_features=None 的越级调用：那样会隐式吞掉 parquet 缓存的全量列，
+    # 使训练面板与 factor_cache 强耦合、不可审计、且与树线 Step 0 不同源。
+    # 与树线（scripts/train_tree_model.py Step 0）同一口径。
+    target_features = trainer.discover_target_features(
+        stocks_data, include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS
+    )
     dataset = trainer.prepare_dataset(
         stocks_data, train_start_date=start, train_end_date=end,
         include_fundamentals=TrainingConfig.INCLUDE_FUNDAMENTALS,
-        n_jobs=args.workers, target_features=None, use_factor_cache_only=True,
+        n_jobs=args.workers, target_features=target_features, use_factor_cache_only=True,
         return_sample_metadata=_indrel or bool(_horizons),
     )
     _fwd = None
@@ -1490,6 +1548,21 @@ def main():
         [f for f in all_features if '_regime_' not in f]
     dropped = len(all_features) - len(nam_features)
     print(f"  NAM 输入特征 {len(nam_features)}（剔除手工交互 {dropped} 列）")
+
+    # 三臂归一化对照（2026-08-25）：dual 模式为每个特征追加 `__z` 幅值旁路列
+    # （复制 raw 列，由 should_skip_rank 的 __z 规则走 robust-sigmoid；主列照常 rank）。
+    # 必须在 nam_features 计算之后、group 构建之前，保证 __z 列参与分族与后续裁剪。
+    if getattr(TrainingConfig, 'NORMALIZE_MODE', 'rank') == 'dual':
+        _idx = {n: i for i, n in enumerate(all_features)}
+        _z_new = np.hstack([dataset[0][:, [_idx[f]]] for f in nam_features])
+        dataset = list(dataset)
+        dataset[0] = np.hstack([dataset[0], _z_new]).astype(np.float32, copy=False)
+        dataset[3] = list(dataset[3]) + [f + '__z' for f in nam_features]
+        dataset = tuple(dataset)
+        all_features = list(dataset[3])
+        nam_features = nam_features + [f + '__z' for f in nam_features]
+        print(f"  双通道归一化（dual）: 追加 {len(nam_features)//2} 个 __z 幅值旁路列，"
+              f"NAM 输入特征 → {len(nam_features)}")
 
     group_names, group_ids = build_group_index(nam_features)
 
@@ -1632,6 +1705,12 @@ def main():
                     chunk_days=args.chunk_days, store_dtype=args.store_dtype,
                     store_device=args.store_device, prefetch=args.prefetch,
                     group_norm=args.group_norm,
+                    expert_zero_output=getattr(args, 'expert_zero_output', False),
+                    fixed_day_order=getattr(args, 'fixed_day_order', False),
+                    multi_seed_shuffle=getattr(args, 'multi_seed_shuffle', False),
+                    multi_seed_shuffle_seeds=tuple(
+                        int(x) for x in getattr(
+                            args, 'multi_seed_shuffle_seeds', '42,11,23,37').split(',')),
                     pca_mkt_cols=args.include_mkt,
                     init_experts_from=args.init_experts_from,
                     freeze_experts=args.freeze_experts,

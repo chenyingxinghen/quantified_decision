@@ -67,8 +67,8 @@ CASH_BUFFER = 10
 # （生产推理载体一律放在 models/mark/ 下，见 strategy_config.py「模型载体」一节）。
 # 不再从 strategy_config 转发 —— 历史上转发导致实盘与回测跑在不同权重上。
 # 要换实盘模型，改这里的 AUTO_MODEL_PATH 即可。
-AUTO_MODEL_PATH = 'models/mark/T115_idxrel_s42/nam_gate_factor_model.pkl'
-AUTO_NORM_STATS_PATH = 'models/mark/T115_idxrel_s42/norm_stats.pkl'
+AUTO_MODEL_PATH = 'models/mark/T147_yscale2_s42/nam_gate_factor_model.pkl'
+AUTO_NORM_STATS_PATH = ''
 # 可选多种子等权集成载体（当前留空 = 不启用）
 AUTO_ENSEMBLE_MODEL_PATHS: list = []
 

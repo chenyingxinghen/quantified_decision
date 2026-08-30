@@ -18,6 +18,9 @@ from core.factors.ml_factor_model import MLFactorModel
 from core.factors.feature_engineering import FeatureEngineer
 from core.factors.advanced_factors import TimeSeriesFactors, RiskFactors
 from core.factors.index_relative_factors import IndexRelativeFactors, INDEX_REL_FILLS
+from core.factors.market_sensitivity import MarketSensitivityFactors, MSENS_FILLS
+from core.factors.turnover_value_factors import (
+    TurnoverValueFactors, TURNOVER_VALUE_FILLS)
 from core.factors.factor_filler import FactorFiller
 from config import DATABASE_PATH, FactorConfig, TrainingConfig
 
@@ -71,6 +74,20 @@ class ComprehensiveFactorCalculator:
         # 从未被判定过的面板变更，违反 IC 优先协议；同时会让生产缓存的 schema
         # 与 T115 训练缓存（242 基础派生列 + 5 注入列）对不上。
         all_factors = self._attach_index_relative(code, data, all_factors, verbose)
+
+        # 2.6 个股级市场敏感度族（msens_*，90 列）与换手率/估值动量族
+        #     （turn_*/val_*，11 列）。这两族此前只存在于 scripts/inject_*.py，
+        #     被离线追加进 parquet 缓存 —— 于是"实时计算器 246 列 vs 缓存 347 列"
+        #     长期分叉：树线按 discover 出的 246 列过滤读缓存，NAM 线传
+        #     target_features=None 读全量 348 列，同一份缓存跑出两套面板。
+        #     接到这里之后公式只有一处，实时与缓存同源。
+        #     同样刻意放在特征工程之后，理由与 idx_* 一致。
+        all_factors = self._attach_external_family(
+            code, data, all_factors, MarketSensitivityFactors,
+            MSENS_FILLS, 'msens_*', verbose)
+        all_factors = self._attach_external_family(
+            code, data, all_factors, TurnoverValueFactors,
+            TURNOVER_VALUE_FILLS, 'turn_*/val_*', verbose)
 
         # 3. 填充缺失因子并对齐目标特征
         # 即使计算失败或由于数据不足无法计算，也要确保列存在，且没有 NaN/Inf
@@ -261,6 +278,42 @@ class ComprehensiveFactorCalculator:
             # 不能因为一只票的指数对齐失败就丢掉它全部 242 列因子。
             import traceback
             print(f"  [ERROR] 计算指数相对因子失败 ({code}): {e}")
+            traceback.print_exc()
+            return all_factors
+
+    def _attach_external_family(self, code: str, data: pd.DataFrame,
+                                all_factors: pd.DataFrame,
+                                family_cls, fills: Dict[str, float],
+                                label: str,
+                                verbose: bool = False) -> pd.DataFrame:
+        """通用挂载：由外部数据源（本股全量日线 / 指数 / 宏观）算出的因子族。
+
+        与 ``_attach_index_relative`` 的语义逐条相同，只是族类可替换：
+
+        - 无 ``date`` 列 → 按中性值补齐整族（缓存 schema 必须一致，值无信息但列要在）；
+        - 族返回空表 → 让列**缺席**，交给下游列完整性护栏报错，不造常数列冒充因子；
+        - 单股异常 → 打印后继续，不能因为一族失败丢掉该股全部基础因子。
+
+        ``family_cls`` 只需提供 ``calculate(code, dates, db_path) -> DataFrame``。
+        """
+        try:
+            if 'date' not in data.columns:
+                for col, fill in fills.items():
+                    all_factors[col] = np.float32(fill)
+                return all_factors
+
+            dates = data['date'].reindex(all_factors.index) \
+                if len(all_factors) != len(data) else data['date']
+            extra = family_cls.calculate(code, list(dates.values), self.db_path)
+            if extra is None or extra.empty:
+                if verbose:
+                    print(f"  [WARN] {code}: {label} 源数据不可用，该族列缺席")
+                return all_factors
+            extra.index = all_factors.index
+            return pd.concat([all_factors, extra], axis=1)
+        except Exception as e:
+            import traceback
+            print(f"  [ERROR] 计算 {label} 因子失败 ({code}): {e}")
             traceback.print_exc()
             return all_factors
 

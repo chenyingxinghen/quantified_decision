@@ -2190,27 +2190,12 @@ class MLModelTrainer:
                             'XGBOOST_RANKING_OBJECTIVE',
                             'rank:ndcg',
                         )
-                        if xgb_objective == 'rank:pairwise':
-                            # XGBoost 3.x 的 NDCG 评估要求 relevance 为非负整数。
-                            # 固定 15 档标签同时保留跨 query 一致的排序语义。
+                        if TrainingConfig.XGB_DISCRETE:
                             y_train_rank = y_train_discrete
                             y_val_rank = y_val_discrete
                         else:
-                            if getattr(self, '_custom_obj', None) is not None:
-                                # 自定义目标：喂离散 15 档标签供内置 ndcg 早停；
-                                # 头部 pair 由连续标签在工厂内构造，唯一差异是目标函数本身。
-                                y_train_rank = y_train_discrete
-                                y_val_rank = y_val_discrete
-                            else:
-                                # 默认喂连续标签（rank^exp）。T032 测试 ndcg_exp_gain
-                                # 时需整数标签，故允许通过 XGBOOST_FORCE_DISCRETE_LABEL
-                                # 强制喂离散档位标签，从而隔离"增益形状"这一单一变量。
-                                if getattr(TrainingConfig, 'XGBOOST_FORCE_DISCRETE_LABEL', False):
-                                    y_train_rank = y_train_discrete
-                                    y_val_rank = y_val_discrete
-                                else:
-                                    y_train_rank = y_train
-                                    y_val_rank = y_val
+                            y_train_rank = y_train
+                            y_val_rank = y_val
                     else:
                         y_train_rank = y_train_discrete
                         y_val_rank = y_val_discrete

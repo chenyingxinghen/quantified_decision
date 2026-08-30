@@ -36,7 +36,7 @@ CONFIDENCE_Z = 10.0
 # 模型载体分工（2026-08-22 明确）：
 #   · 生产实盘载体放在 models/mark/ 下（models/nam_gate、models/tree 是训练产物
 #     归档区，不直接进生产），由自动化模块 automation_config.AUTO_MODEL_PATH 直接加载，
-ML_FACTOR_MODEL_PATH = 'models/nam_gate/T133_yscale4_s42'
+ML_FACTOR_MODEL_PATH = 'models/tree/latest/lightgbm_factor_model.pkl'
 
 # 归一化统计量。必须与权重**同批产出**（同一存档目录）：统计量和权重对不上会让
 # 连续列以错误量纲进模型，且不报错。
@@ -47,7 +47,7 @@ ML_FACTOR_MODEL_PATH = 'models/nam_gate/T133_yscale4_s42'
 #   T115 窗赢 +0.00327 / T122 窗输 −0.00173 且跌日否决门不过。
 #   它是「降方差」选项而非「更强」选项，要不要用是取舍，不是 IC 结论。
 # 启用时必须同批产出（同窗口/同超参/同面板，只差种子），策略层硬校验特征顺序一致。
-ML_FACTOR_ENSEMBLE_MODEL_PATHS: list = ['models/mark/T115_idxrel_s42/nam_gate_factor_model.pkl','models/mark/T115_idxrel_s11/nam_gate_factor_model.pkl']
+ML_FACTOR_ENSEMBLE_MODEL_PATHS: list = []
 
 
 

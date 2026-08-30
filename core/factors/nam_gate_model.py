@@ -67,7 +67,8 @@ class FactorExpertBank(_Module):
     参数量 ≈ N × (2H + H² + 2H + 1)，N=227/H=16 时约 7.4 万，比 GBDT 小两个量级。
     """
 
-    def __init__(self, n_factors: int, hidden: int = 16, dropout: float = 0.0):
+    def __init__(self, n_factors: int, hidden: int = 16, dropout: float = 0.0,
+                 zero_output: bool = False):
         super().__init__()
         self.n_factors = n_factors
         self.hidden = hidden
@@ -84,6 +85,12 @@ class FactorExpertBank(_Module):
         # 输出层: [N,H,1]
         self.w3 = _p(n_factors, hidden, 1, scale=(1.0 / hidden) ** 0.5)
         self.b3 = nn.Parameter(torch.zeros(n_factors, 1))
+        # 确定性起点（T144，2026-08-26）：输出层零初始化 → 模型起点=所有因子贡献 0，
+        # 不依赖随机采样（对齐 RegimeGate 输出层 zero-init 的做法）。目标是消除
+        # σ_seed 里的"初始化彩票"成分：不同 seed 起点完全相同，收敛差异只剩优化轨迹。
+        if zero_output:
+            nn.init.zeros_(self.w3)
+            nn.init.zeros_(self.b3)
 
         self.act = nn.ReLU()
         self.drop = nn.Dropout(dropout) if dropout > 0 else None
@@ -189,9 +196,10 @@ class NAMGateNet(_Module):
                  gate_mode: str = 'softmax', expert_dropout: float = 0.0,
                  disable_gate: bool = False, gate_scalar_idx: int = 0,
                  gate_scalar_idx2: int = 0,
-                 group_norm: bool = False):
+                 group_norm: bool = False, expert_zero_output: bool = False):
         super().__init__()
-        self.experts = FactorExpertBank(n_factors, expert_hidden, expert_dropout)
+        self.experts = FactorExpertBank(n_factors, expert_hidden, expert_dropout,
+                                        zero_output=expert_zero_output)
         self.gate = RegimeGate(d_regime, n_groups, gate_hidden, mode=gate_mode,
                                scalar_idx=gate_scalar_idx, scalar_idx2=gate_scalar_idx2)
         self.n_groups = n_groups
@@ -376,7 +384,8 @@ class NAMGateModel:
         return device
 
     def build(self, d_regime: int, expert_dropout: float = 0.0,
-               disable_gate: bool = False, group_norm: bool = False) -> NAMGateNet:
+               disable_gate: bool = False, group_norm: bool = False,
+               expert_zero_output: bool = False) -> NAMGateNet:
         if not _TORCH_OK:
             raise RuntimeError('PyTorch 未安装，无法构建 NAMGateModel')
         n_factors = len(self.feature_names)
@@ -403,9 +412,10 @@ class NAMGateModel:
             gate_hidden=self.gate_hidden, gate_mode=self.gate_mode,
             expert_dropout=expert_dropout, disable_gate=disable_gate,
             gate_scalar_idx=scalar_idx, gate_scalar_idx2=scalar_idx2,
-            group_norm=group_norm,
+            group_norm=group_norm, expert_zero_output=expert_zero_output,
         ).to(self.device)
         self.group_norm = bool(group_norm)
+        self.expert_zero_output = bool(expert_zero_output)
         return self.net
 
     def set_context_date(self, date) -> None:
@@ -598,6 +608,7 @@ class NAMGateModel:
             'gate_scalar_col2': getattr(self, 'gate_scalar_col2', ''),
             'disable_gate': bool(getattr(self, 'disable_gate', False)),
             'group_norm': bool(getattr(self, 'group_norm', False)),
+            'expert_zero_output': bool(getattr(self, 'expert_zero_output', False)),
             'feature_importance': self.feature_importance,
             'is_trained': self.is_trained,
             'input_mean': self.input_mean,
@@ -626,6 +637,7 @@ class NAMGateModel:
         self.gate_scalar_col2 = str(payload.get('gate_scalar_col2', ''))
         self.disable_gate = bool(payload.get('disable_gate', False))
         self.group_norm = bool(payload.get('group_norm', False))
+        self.expert_zero_output = bool(payload.get('expert_zero_output', False))
         self.feature_importance = payload.get('feature_importance', {})
         self.input_mean = payload.get('input_mean')
         self.input_std = payload.get('input_std')
@@ -635,7 +647,8 @@ class NAMGateModel:
 
         if payload.get('state_dict') is not None:
             self.build(d_regime=len(self.regime_cols), disable_gate=self.disable_gate,
-                       group_norm=self.group_norm)
+                       group_norm=self.group_norm,
+                       expert_zero_output=self.expert_zero_output)
             self.net.load_state_dict(payload['state_dict'])
             self.net.to(self.device).eval()
         return self

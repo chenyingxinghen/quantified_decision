@@ -249,6 +249,82 @@ def _add_industry_relative(dataset, meta, feature_list, min_group=10):
     return tuple(out[:10])
 
 
+def _add_mktcap_neutral(dataset, meta, feature_list, mktcap_col='market_cap',
+                        n_buckets=5, min_group=30):
+    """Task #23：为 ``feature_list`` 追加「市值分位桶内百分位」列 ``<base>__mkt``。
+
+    与 ``_add_industry_relative``（行业内 rank）互补：市值是 A 股最大的截面共同
+    驱动（小票效应），因子的"原始 rank"里混着市值暴露；桶内 rank 把它剥掉，
+    只保留"同市值层级内谁更强"的信息。模型仍可单独用 market_cap 学市值本身。
+
+    实现：当日横截面按 market_cap 分 ``n_buckets`` 个分位桶，桶内做百分位 rank；
+    桶成员 < ``min_group`` 时退化为全截面 rank（信息不足不造假极值）。
+    只用当日信息，无前视。mktcap_col 必须在数据集里，否则硬失败。
+    """
+    X, names = dataset[0], list(dataset[3])
+    dates = dataset[4]
+    if len(meta) != len(X):
+        raise ValueError(f'sample_metadata 行数 {len(meta)} 与 X {len(X)} 不一致')
+    if mktcap_col not in names:
+        raise RuntimeError(f'市值中性化需要 {mktcap_col} 在特征集中（当前 {len(names)} 列）')
+
+    use = [f for f in feature_list if f in names and f != mktcap_col]
+    if not use:
+        raise RuntimeError('没有任何可用的市值中性化基础列')
+    mc_idx = names.index(mktcap_col)
+    feat_idx = [names.index(f) for f in use]
+
+    from scipy.stats import rankdata
+    mc = np.asarray(X[:, mc_idx], dtype=np.float64)
+    df = pd.DataFrame({
+        '_d': dates,
+        '_mc': mc,
+        **{f: np.asarray(X[:, names.index(f)], dtype=np.float64) for f in use},
+    })
+    # 逐日分组：先按日，再按日内的市值分位桶
+    new_cols = np.empty((len(X), len(use)), dtype=np.float32)
+    n_small_bucket = 0
+    n_total_bucket = 0
+    for _d, grp in df.groupby('_d', sort=False):
+        idx_arr = grp.index.to_numpy()
+        g_mc = grp['_mc'].to_numpy()
+        valid = np.isfinite(g_mc)
+        bucket = np.full(len(grp), -1, dtype=np.int64)
+        if valid.sum() >= min_group * n_buckets:
+            try:
+                labels, _ = pd.qcut(pd.Series(g_mc[valid]), n_buckets,
+                                    labels=False, duplicates='drop')
+            except ValueError:
+                labels = np.zeros(valid.sum(), dtype=np.int64)
+            bucket[valid] = labels
+        uniq_b = np.unique(bucket[bucket >= 0])
+        for ci in range(len(use)):
+            vals = np.asarray(grp[use[ci]].to_numpy(), dtype=np.float64)
+            out_vals = np.empty(len(grp), dtype=np.float64)
+            r_global = rankdata(vals) / (len(grp) + 1)
+            for bi in uniq_b:
+                m = bucket == bi
+                if m.sum() >= min_group:
+                    out_vals[m] = rankdata(vals[m]) / (m.sum() + 1)
+                else:
+                    out_vals[m] = r_global[m]
+            out_vals[bucket < 0] = r_global[bucket < 0]
+            new_cols[idx_arr, ci] = out_vals
+        if len(uniq_b):
+            n_total_bucket += len(uniq_b)
+            for bi in uniq_b:
+                if (bucket == bi).sum() < min_group:
+                    n_small_bucket += 1
+
+    new_names = [f'{f}__mkt' for f in use]
+    out = list(dataset)
+    out[0] = np.hstack([X, new_cols]).astype(X.dtype, copy=False)
+    out[3] = names + new_names
+    print(f'  已追加市值中性化列 {len(new_names)} 条'
+          f'（小桶置全截面比例 {n_small_bucket / max(n_total_bucket, 1):.2%}）')
+    return tuple(out[:10])
+
+
 def _forward_returns_by_horizon(stocks_data, meta, horizons):
     """按 ``(code, date)`` 对齐各持有期的前向收益。
 
@@ -390,7 +466,8 @@ def _residualize_returns(label_src: np.ndarray, dates: np.ndarray,
 def _prepare_fold(trainer, dataset, feature_names, train_fraction, val_end, regime_matrix,
                  target='scores', label_residualize='none',
                  multi_horizon=None, fwd_returns=None,
-                 label_transform='rank', label_clip=3.0):
+                 label_transform='rank', label_clip=3.0,
+                 pca_components=0):
     """切折 + 选列 + 截面归一化 + 标签处理 + 市场状态对齐。"""
     full_dates = dataset[4]
     train_date = full_dates[int(len(full_dates) * train_fraction)]
@@ -410,6 +487,33 @@ def _prepare_fold(trainer, dataset, feature_names, train_fraction, val_end, regi
         Xs[val_start:], dates[val_start:], list(feature_names), skip_col_stats=skip_stats
     )
     Xs = np.nan_to_num(Xs, nan=0.5, posinf=1.0, neginf=0.0)
+
+    # T133 PCA 正交压缩：在「横截面归一化后」的特征上做 SVD（训练段 fit），
+    # 投影到前 K 个主成分。目的：消除 85% 冗余（T21：228 因子有效特征值仅 39 维）
+    # 且不硬删因子 —— 保留全部信息方向，只压缩等价解空间 → 压 σ_seed。
+    # 投影公式：Z = (X - mu)/sd，PC = Z @ Vt[:K].T；等价写为
+    #   X @ W + const，其中 W = Vt[:K].T / sd[:, None]（[n_raw, K]）。
+    # 推理端只存 W（mu 的贡献被投影后标准化吸收），训练/推理两端顺序一致：
+    #   归一化 → X @ W → (投影后) input_mean/input_std 标准化。
+    pca_W = None
+    pca_raw_names = list(feature_names)
+    pca_feature_names = None
+    if int(pca_components or 0) > 0:
+        _K = min(int(pca_components), Xs.shape[1])
+        _tr = Xs[:split_idx]
+        _mu = _tr.mean(axis=0)
+        _sd = _tr.std(axis=0)
+        _sd[_sd < 1e-9] = 1.0
+        _Z = (_tr - _mu) / _sd
+        _u, _s, _vt = np.linalg.svd(_Z, full_matrices=False)
+        _ev = (_s ** 2) / max(len(_Z) - 1, 1)
+        _cum = np.cumsum(_ev) / max(_ev.sum(), 1e-12)
+        pca_W = (_vt[:_K].T / _sd[:, None]).astype(np.float32)
+        Xs = Xs @ pca_W
+        pca_feature_names = [f'pc{i + 1}' for i in range(_K)]
+        print(f"  [T133 PCA] {len(feature_names)} 因子 → {_K} 主成分"
+              f"（训练段方差解释 {_cum[_K - 1]:.1%}，K={_K} 时前 K 累计）")
+        feature_names = pca_feature_names
 
     label_src = scores if scores is not None else y
     if target == 'returns':
@@ -480,6 +584,10 @@ def _prepare_fold(trainer, dataset, feature_names, train_fraction, val_end, regi
         'ret_train': ret_train, 'ret_val': returns[val_start:],
         'split_date': str(split_date), 'end_date': None if end_date is None else str(end_date),
         'skip_stats': skip_stats,
+        # T133 PCA 压缩元数据（无压缩时为 None）
+        'pca_W': pca_W,
+        'pca_raw_names': pca_raw_names,
+        'pca_feature_names': pca_feature_names,
     }
 
 
@@ -1455,6 +1563,13 @@ def main():
     ap.add_argument('--industry-relative', default='none',
                     help="E7：追加当日行业内百分位列 <base>__ind。'none' 关闭；"
                          "'core' 用内置核心列表；也可传逗号分隔的因子名")
+    ap.add_argument('--mktcap-neutral', default='none',
+                    help="Task#23：追加市值分位桶内百分位列 <base>__mkt。'none' 关闭；"
+                         "'all' 对全部非市值因子；也可传逗号分隔的因子名")
+    ap.add_argument('--pca-components', type=int, default=0,
+                    help='T133：横截面归一化后对特征做 PCA 正交压缩到前 K 个主成分'
+                         '（默认 0 = 关闭）。不硬删因子，只压缩等价解空间压 σ_seed。'
+                         'PCA 权重随模型持久化，回测端同构投影。')
     ap.add_argument('--multi-horizon', default='none',
                     help="E11：用多持有期复合排名当**训练**标签（验证标签仍是 7 日基线，"
                          "保持可比）。'none' 关闭；例 '5,10,20'")
@@ -1516,6 +1631,15 @@ def main():
         _flist = INDREL_CORE if args.industry_relative.strip().lower() == 'core' else \
             [s.strip() for s in args.industry_relative.split(',') if s.strip()]
         dataset = _add_industry_relative(dataset, _meta, _flist)
+        del _meta
+    _mktc = args.mktcap_neutral.strip().lower()
+    if _mktc != 'none':
+        _meta = dataset[10]
+        if _mktc == 'all':
+            _mflist = [f for f in dataset[3] if f != 'market_cap' and 'date' not in f]
+        else:
+            _mflist = [s.strip() for s in args.mktcap_neutral.split(',') if s.strip()]
+        dataset = _add_mktcap_neutral(dataset, _meta, _mflist)
         del _meta
     all_features = list(dataset[3])
     print(f"  全部特征 {len(all_features)}，样本 {len(dataset[0])}")
@@ -1594,9 +1718,17 @@ def main():
         if _unknown:
             raise ValueError(f"--drop-features 含未知/已被剔除的因子名: {sorted(_unknown)[:10]}"
                              f"（共 {len(_unknown)} 个）")
+        # 派生列联动剔除：E7/Task#23 的 <base>__ind / <base>__mkt 在裁剪前追加，
+        # 若基础列被 drop，其派生列必须一起 drop，否则被剔除因子的行业内/市值
+        # 中性化列会残留进模型面板（等价于把死因子又请了回来）。
+        _drop_derived = set()
+        for _f in _dropf:
+            _drop_derived.add(f'{_f}__ind')
+            _drop_derived.add(f'{_f}__mkt')
+        _dropf |= _drop_derived
         nam_features = [f for f in nam_features if f not in _dropf]
         group_names, group_ids = build_group_index(nam_features)
-        print(f"  逐列裁剪 {len(_dropf)} 列: 特征 → {len(nam_features)}")
+        print(f"  逐列裁剪 {len(_dropf)} 列(含派生): 特征 → {len(nam_features)}")
 
     # T118：用数据驱动簇覆盖手工分族。放在所有裁剪之后，因为映射是对**最终面板**
     # 逐列给出的；缺列或多列都硬失败（静默 fallback 会让"数据驱动"实际跑成手工族）。
@@ -1677,7 +1809,15 @@ def main():
                                  label_residualize=args.label_residualize,
                                  multi_horizon=_horizons, fwd_returns=_fwd,
                                  label_transform=args.label_transform,
-                                 label_clip=args.label_clip)
+                                 label_clip=args.label_clip,
+                                 pca_components=args.pca_components)
+            # T133 PCA：模型输入特征换成主成分名；PCA 元数据随 fold 传递
+            _model_input_names = fold.get('pca_feature_names') or nam_features
+            if fold.get('pca_W') is not None:
+                _pca_group_names, _pca_group_ids = build_group_index(_model_input_names)
+                print(f"  [T133] 模型输入 {len(_model_input_names)} 个主成分"
+                      f"（分族 {_pca_group_names}，单族）")
+                group_names, group_ids = _pca_group_names, _pca_group_ids
             # 最后一折的 fold 备好之后，原始 dataset 就再无用处（fold 里已是切好、
             # 归一化好的副本）。单折运行（生产配方全是 --folds 0.8:1.0）能就此砍掉
             # 约 9 GB：dataset[0] 是 9.5M × 231 float32。多折时保留给后续折用。
@@ -1689,7 +1829,7 @@ def main():
                 if multi_seed:
                     print(f"\n--- 种子 {sd}（折 {tag}，数据集复用）---")
                 model, pred, gates, history, best_ic, best_epoch_idx = train_nam_gate(
-                    fold, nam_features, group_names, group_ids, list(regime.columns),
+                    fold, _model_input_names, group_names, group_ids, list(regime.columns),
                     epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                     lambda_lb=args.lambda_lb, lambda_ent=args.lambda_ent,
                     lambda_div=args.lambda_div,
@@ -1777,6 +1917,10 @@ def main():
                 save_dir = _seed_path(args.save_model_dir, sd) or \
                     os.path.join('models', 'nam_gate')
                 os.makedirs(save_dir, exist_ok=True)
+                # T133 PCA：把投影权重挂到模型上随 pkl 持久化（推理端同构投影）
+                if fold.get('pca_W') is not None:
+                    model.pca_W = fold['pca_W']
+                    model.pca_raw_feature_names = list(fold['pca_raw_names'])
                 mp = os.path.join(save_dir, 'nam_gate_factor_model.pkl')
                 model.save_model(mp)
                 save_sidecar_metadata(model, save_dir)
@@ -1789,10 +1933,13 @@ def main():
                 # 训练端对 skip-rank 连续列做了 robust-sigmoid 归一化，回测端若找不到该文件
                 # 会跳过这一步、以原始量纲喂入模型，造成训练/推理特征尺度错配
                 # （表现为打分被市值类原始大数主导、横截面排名近乎静态、不同模型回测结果雷同）。
+                # T133 PCA：factor_names 必须写**投影前**的原始特征名（归一化与
+                # robust-sigmoid 作用在原始面板上），而不是模型输入的主成分名。
                 import pickle as _pickle
+                _norm_factor_names = list(fold.get('pca_raw_names') or model.feature_names)
                 _norm_stats = {
                     'skip_col_stats': fold.get('skip_stats'),
-                    'factor_names': list(model.feature_names),
+                    'factor_names': _norm_factor_names,
                 }
                 _np_path = os.path.join(save_dir, 'norm_stats.pkl')
                 with open(_np_path, 'wb') as _nf:

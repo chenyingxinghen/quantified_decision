@@ -87,6 +87,8 @@ def main():
                         help='改用投票共识：每成员取 Top-K 投一票，按票数降序+平均分位取头部（消除单种子噪声）')
     _parser.add_argument('--ensemble-vote-k', type=int, default=50,
                         help='投票共识的每成员候选 K（默认 50）')
+    _parser.add_argument('--no-vote-fill', action='store_true', default=False,
+                        help='投票共识下关闭仓位补充：共识股不足持仓数时不补 1 票候选（默认补充）')
     _parser.add_argument('--cache-dir', type=str, default=None,
                         help='显式覆盖因子缓存目录；模型有绑定清单时必须版本一致')
     _parser.add_argument('--buy-cost', type=float, default=None,
@@ -171,6 +173,7 @@ def main():
         ensemble_model_paths=_args.ensemble_model,
         ensemble_vote=_args.ensemble_vote,
         ensemble_vote_k=_args.ensemble_vote_k,
+        vote_fill=not _args.no_vote_fill,
         # R2：因子面板只加载回测窗口内的日期（多留 1 行给 PIT searchsorted），
         # 内存 16 GB → 约 2.5 GB，数值逐位不变。
         preload_start=start_date,

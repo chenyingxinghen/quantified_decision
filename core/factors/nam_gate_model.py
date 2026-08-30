@@ -365,6 +365,11 @@ class NAMGateModel:
         self.regime_matrix: Optional[pd.DataFrame] = None   # 逐日市场状态
         self.input_mean: Optional[np.ndarray] = None        # 特征标准化统计
         self.input_std: Optional[np.ndarray] = None
+        # T133 PCA 正交压缩：模型在「横截面归一化后的原始特征」上投影到主成分空间。
+        # predict 收到原始特征面板（pca_raw_feature_names 列序）→ X @ pca_W → 标准化。
+        # None = 无压缩（旧模型兼容）。pca_W: [raw_n, K] float32
+        self.pca_W: Optional[np.ndarray] = None
+        self.pca_raw_feature_names: Optional[List[str]] = None
         # scheme B：mkt_* 市场级列的 PCA-2 投影（训练段拟合，随模型持久化，
         # 推理时对传入的 regime 矩阵做同构投影 → mkt_pc1/mkt_pc2）
         self.mkt_pca: Optional[Dict[str, np.ndarray]] = None
@@ -485,11 +490,18 @@ class NAMGateModel:
             raise ValueError('NAMGateModel 未训练')
 
         if isinstance(factors, pd.DataFrame):
-            X = factors[self.feature_names].to_numpy(dtype=np.float32)
+            if self.pca_W is not None:
+                # PCA 压缩模型：按原始特征名取列 → 投影到主成分空间
+                raw_cols = self.pca_raw_feature_names or self.feature_names
+                X = factors[list(raw_cols)].to_numpy(dtype=np.float32)
+            else:
+                X = factors[self.feature_names].to_numpy(dtype=np.float32)
         else:
             X = np.asarray(factors, dtype=np.float32)
         X = np.nan_to_num(X, nan=0.5, posinf=1.0, neginf=0.0)
 
+        if self.pca_W is not None:
+            X = X @ self.pca_W
         if self.input_mean is not None:
             X = (X - self.input_mean) / self.input_std
 
@@ -615,6 +627,10 @@ class NAMGateModel:
             'input_std': self.input_std,
             'mkt_pca': self.mkt_pca,
             'regime_matrix': self.regime_matrix,
+            # T133 PCA 正交压缩：predict 收到的是原始特征面板（raw 列名），
+            # 投影到主成分空间后再标准化。None = 无压缩（旧模型兼容）。
+            'pca_W': getattr(self, 'pca_W', None),
+            'pca_raw_feature_names': getattr(self, 'pca_raw_feature_names', None),
             'state_dict': state,
         }
         with open(filepath, 'wb') as f:
@@ -644,6 +660,8 @@ class NAMGateModel:
         self.mkt_pca = payload.get('mkt_pca')
         self.regime_matrix = payload.get('regime_matrix')
         self.is_trained = payload.get('is_trained', False)
+        self.pca_W = payload.get('pca_W')
+        self.pca_raw_feature_names = payload.get('pca_raw_feature_names')
 
         if payload.get('state_dict') is not None:
             self.build(d_regime=len(self.regime_cols), disable_gate=self.disable_gate,

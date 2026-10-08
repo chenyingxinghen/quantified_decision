@@ -421,6 +421,27 @@ class BaostockFetcher:
                     update_time TEXT
                 )
             ''')
+            # 低频数据集的「本期已检查」标记（复权因子等）。
+            #
+            # 为什么不复用 sync_status：那里的 stamp 语义是「**数据已入库**」，
+            # 只在真的写进行之后才落 —— 这是故意的，为了让拉取失败/返回空能被
+            # 下次增量自动重试，不被"假成功"状态掩盖。
+            #
+            # 但有一类数据不适用这个语义：它们的变更时点不定、频率远低于每天。
+            # 复权因子只在除权除息时才变，而财报披露前的那些季度**天天都是空
+            # 返回**。沿用「入库才 stamp」的话，空返回 = 永远不 stamp = 每晚把
+            # 全历史重抓一遍（2026-10 实测 5126 只股票每晚白烧 ~5600 次调用，
+            # 要一直烧到三季报披露）。这类数据的正确语义是「本期已经检查过了」，
+            # 与这次有没有拿到数据无关，因此单独一张表、独立打标。
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS low_freq_sync (
+                    code TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    updated_at TEXT,
+                    PRIMARY KEY (code, kind)
+                )
+            ''')
 
     def _get_sync_status(self, code: str) -> Dict[str, Optional[str]]:
         """获取同步状态"""
@@ -470,6 +491,38 @@ class BaostockFetcher:
             self.safe_commit()
         except Exception as e:
             print(f"  ⚠ 更新同步状态失败 ({code}): {e}")
+
+    def get_low_freq_marker(self, code: str, kind: str) -> Optional[str]:
+        """读某只股票某类低频数据的「已检查期间」（当前约定为 'YYYY-MM'）。
+
+        读不到（没打过标 / 表还没建 / 库被锁）一律返回 None，也就是"该重跑" ——
+        这个方向的失败只会多做一次请求，反过来则会漏掉一次本该做的刷新。
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT period FROM meta.low_freq_sync WHERE code = ? AND kind = ?",
+                (code, kind)).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def set_low_freq_marker(self, code: str, kind: str, period: str):
+        """打上「本期已检查」标记。
+
+        调用方负责只在**这次确实检查过了**时调用：请求正常返回（哪怕数据是空的、
+        因为已退市而结构性缺失）就打标；抛异常（网络错 / 配额超限）则不打标，
+        留给下一次运行重试。
+        """
+        try:
+            self.conn.execute(
+                "INSERT INTO meta.low_freq_sync (code, kind, period, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(code, kind) DO UPDATE SET period = excluded.period, "
+                "updated_at = excluded.updated_at",
+                (code, kind, period, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            self.safe_commit()
+        except Exception as e:
+            print(f"  ⚠ 更新低频标记失败 ({code}/{kind}): {e}")
 
     def _get_stock_basic_from_db(self) -> pd.DataFrame:
         """从元数据库获取股票列表"""

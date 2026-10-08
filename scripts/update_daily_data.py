@@ -5,12 +5,17 @@
 
 一次跑完日常所需的四类数据，顺序**有依赖**，不要随意调换：
 
-  1. 个股日频行情      → stock_daily.db
-  2. 个股财务基本面    → stock_finance.db
-  3. 指数日线 + 货币供应 → index_daily / macro_money_supply
+  1. 指数日线 + 货币供应 → index_daily / macro_money_supply
+  2. 个股日频行情      → stock_daily.db
+  3. 个股财务基本面    → stock_finance.db
   4. 因子缓存增量更新  → TrainingConfig.CURRENT_CACHE_DIR
 
-第 3 步必须排在第 4 步之前：``index_daily`` 是 5 列 ``idx_*`` 指数相对因子
+第 1 步排在最前面是 2026-10-08 调整的：它只花 ~10 次 API 调用，却是 idx_* 的
+原料，而配额是全流程共享的、个股阶段动辄几万次调用。放后面时它会被配额耗尽
+饿死 —— 2026-10-05~07 连续三晚都死在 `ingest_index` 的 QuotaExceededError 上，
+进程 exit 1，调度器后续的覆盖校验/成交价回填全被跳过。
+
+第 1 步必须排在第 4 步之前：``index_daily`` 是 5 列 ``idx_*`` 指数相对因子
 （idx_beta_60 / idx_corr_20 / idx_idio_vol_20 / idx_rs_20 / idx_rs_60）的原料。
 指数没更新到最新交易日的话，因子计算器会让这些列**缺席**（见
 comprehensive_factor_calculator 的 index_daily 分支），推理侧的列完整性护栏
@@ -35,6 +40,8 @@ comprehensive_factor_calculator 的 index_daily 分支），推理侧的列完�
 import sys
 import os
 import argparse
+import socket
+import contextlib
 import sqlite3
 from datetime import datetime
 from tqdm import tqdm
@@ -46,6 +53,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from core.data.baostock_main import BaostockDataManager
 import config
 from config import DATABASE_PATH
+from config.baostock_config import BAOSTOCK_SOCKET_TIMEOUT
 
 
 # ==============================================================================
@@ -261,35 +269,103 @@ def update_multiple_stocks(symbols, incremental=True, workers=None, start_date=N
     finally:
         manager.close()
 
+@contextlib.contextmanager
+def _stdout_to_log():
+    """把当前进程的 Python stdout/stderr 追加到 UTF-8 更新日志。
+
+    不用 os.dup2 替换 fd 1：它会关闭 WindowsConsoleIO 缓存的控制台句柄，
+    让下一条 print 抛 WinError 6。spawn worker 不继承 Python 流对象；
+    定时任务由 scheduler 启动独立进程，在启动时将标准句柄一起接到日志。
+    此上下文会临时替换全局流，不应在线程中与后端请求共用一个进程。
+    """
+    log_dir = os.path.join(PROJECT_ROOT, 'diagnose_output')
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f'daily_update_{datetime.now().strftime("%Y%m%d")}.log')
+    with open(path, 'a', encoding='utf-8', buffering=1) as log_file:
+        with contextlib.redirect_stdout(log_file), contextlib.redirect_stderr(log_file):
+            yield path
+
+
+@contextlib.contextmanager
+def _socket_timeout(seconds):
+    """给本进程新建的 socket 设默认超时，退出时恢复。
+
+    baostock 的 login()/recv() 没有超时参数，服务端不响应时会**永久阻塞**。
+    实测 2026-09-11 的定时任务因此挂起 12 天（max_instances=1 让之后 7 个
+    交易日的定时任务全部被 skip）。这里只改"新建 socket 的默认值"，
+    并在退出时恢复原值，不影响 uvicorn 等已建立的监听 socket。
+    """
+    old = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(old)
+
+
 def update_all_stocks(incremental=True, workers=None, start_date=None, end_date="2030-01-01",
                       do_index=True, do_money=True, index_start='2005-01-01'):
-    """更新所有股票数据 + 指数/货币供应 + 因子缓存。"""
+    """更新所有股票数据 + 指数/货币供应 + 因子缓存。
+
+    外面套两层护栏（2026-09-23 事故后加）：
+      * ``_socket_timeout``  —— 防止 baostock 无响应时永久阻塞；
+      * ``_stdout_to_log``   —— print 输出落盘，事后可查现场。
+    返回日志文件路径；异常向调用方传播。
+    """
+    with _socket_timeout(BAOSTOCK_SOCKET_TIMEOUT):
+        with _stdout_to_log() as log_path:
+            _update_all_stocks_impl(incremental=incremental, workers=workers,
+                                    start_date=start_date, end_date=end_date,
+                                    do_index=do_index, do_money=do_money,
+                                    index_start=index_start)
+            return log_path
+
+
+def _run_index_and_macro_step(do_index, do_money, index_start):
+    """指数 + 货币供应落库，**永不抛异常**。
+
+    这一步只花 ~10 次 API 调用，却是 5 列 idx_* 因子的硬依赖，所以排在个股
+    阶段之前（见 _update_all_stocks_impl）。但它仍然可能因为配额被别的进程
+    吃完 / 登录失败而失败 —— 那不该带走整个每夜更新：2026-10-05~07 连续三晚
+    就是死在这一步的 QuotaExceededError 上，进程 exit 1，导致调度器后续的
+    覆盖校验和成交价回填**全部被跳过**，而当天日线数据其实早就写好了。
+    """
+    print("\n--- 第一步: 同步指数日线 / 货币供应 ---")
+    try:
+        _end = datetime.now().strftime('%Y-%m-%d')
+        if not update_index_and_macro(index_start, _end, do_index=do_index, do_money=do_money):
+            print("[警告] 指数/货币供应落库未完全成功 —— idx_* 因子可能缺最新交易日")
+    except Exception as e:
+        import traceback
+        print(f"[警告] 指数/货币供应落库异常（不中断个股同步）: {e}")
+        traceback.print_exc()
+
+
+def _update_all_stocks_impl(incremental=True, workers=None, start_date=None, end_date="2030-01-01",
+                            do_index=True, do_money=True, index_start='2005-01-01'):
     if workers is None:
         workers = config.WORKERS_NUM
 
     print(f"\n=== 开始同步全市场数据 (源: Baostock) | 模式: {'增量' if incremental else '全量'} ===")
+
+    # 第一步：指数日线 + 货币供应。**必须在最前面**（2026-10-08 调整）：
+    # 它是全流程里最便宜的一步，却排在个股日线/财务之后时会被配额耗尽活活饿死。
+    if do_index or do_money:
+        _run_index_and_macro_step(do_index, do_money, index_start)
+    else:
+        print("\n--- 第一步: 跳过指数/货币供应 (--skip-index / --skip-money) ---")
+
     manager = BaostockDataManager()
     try:
-        # 第一步：获取日频数据
-        print("\n--- 第一步: 同步全市场日频数据 ---")
+        # 第二步：获取日频数据
+        print("\n--- 第二步: 同步全市场日频数据 ---")
         manager.init_all_stocks(incremental=incremental, workers=workers, mode='daily', start_date=start_date, end_date=end_date)
 
-        # 第二步：获取财务数据
-        print("\n--- 第二步: 同步全市场财务数据 ---")
+        # 第三步：获取财务数据
+        print("\n--- 第三步: 同步全市场财务数据 ---")
         manager.init_all_stocks(incremental=incremental, workers=workers, mode='finance')
     finally:
         manager.close()
-
-    # 第三步：指数日线 + 货币供应。
-    # 必须在因子缓存之前 —— index_daily 是 5 列 idx_* 的原料，指数没更新到最新
-    # 交易日的话这些列会缺席，推理侧的列完整性护栏随后硬失败。
-    if do_index or do_money:
-        print("\n--- 第三步: 同步指数日线 / 货币供应 ---")
-        _end = datetime.now().strftime('%Y-%m-%d')
-        if not update_index_and_macro(index_start, _end, do_index=do_index, do_money=do_money):
-            print("[警告] 指数/货币供应落库未完全成功 —— idx_* 因子可能缺最新交易日")
-    else:
-        print("\n--- 第三步: 跳过指数/货币供应 (--skip-index / --skip-money) ---")
 
     # 第四步：更新因子缓存
     print("\n--- 第四步: 更新选股因子缓存 ---")

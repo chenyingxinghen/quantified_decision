@@ -61,6 +61,27 @@ def _register_api_call(n: int = 1, gate: bool = True):
     # 重试后仍失败（表缺失 / 持续锁等待等）：记录告警，避免配额保护在出错时悄悄失效
     print(f"[quota] 警告: 配额登记失败 ({last_err})")
 
+
+def quota_remaining() -> Optional[int]:
+    """今日还剩多少次 API 调用额度；读不到返回 None（**别**把 None 当成 0）。
+
+    配额表是跨进程共享的 SQLite 表，子进程写、父进程读。父进程据此在额度
+    打满时提前收手，而不是让剩下的几千只股票各自抛一遍 QuotaExceededError
+    ——2026-10-05~07 三晚就是这么把日志刷到 1MB、白跑几小时，最后还让指数
+    落库那一步无配额可用、整个进程 exit 1。
+    """
+    from config.baostock_config import META_DB_PATH
+    today = datetime.now().strftime('%Y-%m-%d')
+    try:
+        with sqlite3.connect(META_DB_PATH, timeout=5.0) as conn:
+            row = conn.execute("SELECT count FROM api_quota WHERE date = ?", (today,)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return API_DAILY_QUOTA
+    return max(0, API_DAILY_QUOTA - int(row[0]))
+
+
 class CachedResultSet:
     """模拟 Baostock ResultSet 的对象，预抓取所有数据以保证线程安全"""
     def __init__(self, rs):

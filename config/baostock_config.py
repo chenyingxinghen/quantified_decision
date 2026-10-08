@@ -57,6 +57,35 @@ SESSION_MAX_STOCKS = 10000
 # 单只股票任务超时阈值（秒）。超过此时间未响应则跳过，防止进度卡死
 TASK_TIMEOUT_SECONDS = 120
 
+# 单只股票任务的「硬超时」（秒）：某只股票运行超过该时长仍不返回，判定它已卡死。
+# 2026-09-23 事故：旧实现在超时分支里把**全部**剩余 future 一次性 cancel，
+# 结果 5212 只里只更新了列表前 1173 只（1037 只成功），剩余 4376 只从未被尝试。
+# 现在只放弃卡死的这一只（并终止占用它的工作进程），其余继续跑。
+#
+# 计时口径注意：进程池 worker 的启动（Windows spawn + import pandas/baostock）
+# 算在它接到的第一只股票头上。实测 2026-09-24 回填时首只 600000 就因此被判卡死
+# （数据本来是好的，白白放弃一只）。故取 300s，给启动留足余量。
+TASK_HARD_TIMEOUT_SECONDS = 300
+
+# 连续多少轮「无任何任务完成、也无任务在运行」后判定系统性故障（登录失效/网络断）
+# 并放弃整批。单只卡死不算——那只会被单独放弃。
+TASK_MAX_STALLS = 5
+
+# 同一批次最多重建进程池的次数（卡死后需要新池续跑，防止无限重建）
+MAX_POOL_RESTARTS = 3
+
+# socket 默认超时（秒）。baostock 的 login()/recv() 没有超时参数，服务端不响应时会
+# **永久阻塞** —— 2026-09-11 的定时任务因此挂起 12 天，而 max_instances=1 让
+# 09-14~09-22 共 7 个交易日的定时任务全部被 skip。给 socket 设默认超时把「永久挂起」
+# 变成「抛异常 → 重试/跳过」。
+BAOSTOCK_SOCKET_TIMEOUT = 30
+
+# 覆盖校验的“活跃窗口”天数。某只股票最近一根 bar 距今超过该天数即视为
+# 长期停牌/退市（dead），不再计入每日覆盖校验的 total/covered/missing。
+# 实测：健康日的全市场股票要么当日/昨日有 bar，要么已停牌 ≥31 天，两者零交叠，
+# 30 天窗口能干净剔除死股、又不掩盖真实的“整片拉取失败”（失败股只落后 1 个交易日）。
+COVERAGE_ACTIVE_WINDOW_DAYS = 30
+
 
 # ==================== 市场配置 ====================
 
@@ -157,4 +186,9 @@ __all__ = [
     'ADJUST_FLAG',
     'FINANCE_TABLES',
     'TASK_TIMEOUT_SECONDS',
+    'TASK_HARD_TIMEOUT_SECONDS',
+    'TASK_MAX_STALLS',
+    'MAX_POOL_RESTARTS',
+    'BAOSTOCK_SOCKET_TIMEOUT',
+    'COVERAGE_ACTIVE_WINDOW_DAYS',
 ]
